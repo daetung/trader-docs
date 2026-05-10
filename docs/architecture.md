@@ -77,10 +77,15 @@ Raw JSON (1min / 10tick)
 | `pipeline/07_lgbm_pipeline.md` | LightGBM 5-classifier structure and evaluation |
 | `pipeline/08_dimensionality_reducer.md` | Feature selection pipeline |
 | `pipeline/09_backtest_engine.md` | Backtest logic, slippage model, winning rate |
+| `models/base_model.md` | Abstract base class for model trainers |
 | `optimization/pipeline_optimizer.md` | Agent workflow and experiment logging |
+| `scripts/run_preprocess.md` | Full preprocessing pipeline orchestrator |
+| `scripts/run_train.md` | LightGBM training entry point |
+| `scripts/run_backtest.md` | Backtest simulation entry point |
 | `tools/migration_tool.md` | JSON → DuckDB one-time and incremental migration |
 | `tools/detection_benchmark.md` | Entry detection threshold tuning + timing benchmark |
 | `tools/metadata_crawler.md` | Daily metadata fetch + new data ingestion |
+| `visualization/viz_connector.md` | Abstract base class for visualization backends |
 
 ---
 
@@ -104,8 +109,21 @@ stock-scalping/
 │   │   ├── 07_lgbm_pipeline.md
 │   │   ├── 08_dimensionality_reducer.md
 │   │   └── 09_backtest_engine.md
-│   └── optimization/
-│       └── pipeline_optimizer.md
+│   ├── models/
+│   │   └── base_model.md
+│   ├── optimization/
+│   │   └── pipeline_optimizer.md
+│   ├── scripts/
+│   │   ├── run_preprocess.md
+│   │   ├── run_train.md
+│   │   └── run_backtest.md
+│   ├── tools/
+│   │   ├── migration_tool.md
+│   │   ├── detection_benchmark.md
+│   │   └── metadata_crawler.md
+│   └── visualization/
+│       └── viz_connector.md
+├── models/                        # trained model artifacts (.lgb, _meta.json)
 ├── data/
 │   ├── raw/                       # original JSON (1min / 10tick)
 │   ├── processed/                 # feature matrix (.parquet)
@@ -116,7 +134,6 @@ stock-scalping/
 │   ├── detection/
 │   │   └── entry_detector.py
 │   ├── preprocessing/
-│   │   ├── base.py
 │   │   ├── indicator_calculator.py
 │   │   ├── vectorizer.py
 │   │   └── feature_extractor.py
@@ -129,6 +146,8 @@ stock-scalping/
 │   ├── models/
 │   │   ├── base_model.py
 │   │   └── lgbm_pipeline.py
+│   ├── optimization/
+│   │   └── optimizer.py
 │   ├── backtest/
 │   │   └── engine.py
 │   └── visualization/

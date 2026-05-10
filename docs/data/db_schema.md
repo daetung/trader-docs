@@ -156,6 +156,26 @@ CREATE TABLE labeled_samples (
     PRIMARY KEY (ticker, date, hour)
 );
 
+-- Trade log (output of BacktestEngine)
+CREATE TABLE trade_log (
+    tr_id           VARCHAR     NOT NULL,  -- UUID
+    run_id          VARCHAR,
+    ticker          VARCHAR,
+    date            VARCHAR,
+    entry_bar       INTEGER,
+    exit_bar        INTEGER,
+    signal          VARCHAR,
+    fill_price      DOUBLE,
+    exit_price      DOUBLE,
+    quantity        INTEGER,
+    pnl_pct         DOUBLE,
+    pnl_abs         DOUBLE,
+    exit_reason     VARCHAR,
+    slippage_pct    DOUBLE,
+    cash_remaining  DOUBLE,
+    PRIMARY KEY (tr_id)
+)
+
 -- Experiment log (output of PipelineOptimizer)
 CREATE TABLE experiment_log (
     run_id          VARCHAR      NOT NULL,  -- UUID or timestamp-based

@@ -218,6 +218,6 @@ backtest:
 - Exit price path uses ohlcv_1min H/L only — no tick data for exits
 - 10-tick data used only for entry slippage estimation
 - Cash deduction is sequential in prediction DataFrame order
-- trade_log must be written to DuckDB `trade_log` table (add to db_schema)
+- trade_log must be written to DuckDB `trade_log` table with matching run_id and tr_id(created UUID)
 - summary must be appended to `experiment_log` table with matching run_id
 - inf mode (initial_cash=0): `pnl_abs`, `cash_remaining` set to NaN; winning_rate is the primary metric
