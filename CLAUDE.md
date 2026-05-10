@@ -61,24 +61,25 @@ Label search range:  t bar open → t+59 bar close  (max 60 min)
 
 > Updated between sessions. Check this before starting work.
 
-- [ ] loader.py — DuckDB schema creation and JSON ingestion script
-- [ ] entry_detector.py — EntryPointDetector
-- [ ] indicator_calculator.py — base structure + price/volume/tick indicators
-- [ ] vectorizer.py — 6 transformation methods
-- [ ] labeler.py — 5-class binary labeling + unit tests (start here)
-- [ ] feature_extractor.py
-- [ ] balancer.py
-- [ ] reducer.py
-- [ ] base_model.py
-- [ ] lgbm_pipeline.py
-- [ ] engine.py
-- [ ] viz_connector.py
-- [ ] run_preprocess.py
-- [ ] run_train.py
-- [ ] run_backtest.py
-- [ ] migrate_json_to_duckdb.py
-- [ ] collect_daily.py
-- [ ] detection_benchmark.py
+- [x] loader.py — DuckDB schema creation and JSON ingestion script (48 tests, 97% coverage)
+- [x] entry_detector.py — EntryPointDetector (77 tests, 98% coverage)
+- [x] indicator_calculator.py — all indicator methods (130 tests, 95% coverage)
+- [x] vectorizer.py — 6 transformation methods (38 tests, 96% coverage)
+- [x] labeler.py — 5-class binary labeling + unit tests (55 tests, 100% coverage)
+- [x] feature_extractor.py — 57 tests, 96% coverage
+- [x] balancer.py — 35 tests, 94% coverage
+- [x] reducer.py — 52 tests, 100% coverage
+- [ ] base_model.py — 29 tests, 100% coverage
+- [x] lgbm_pipeline.py — 52 tests, 92% coverage
+- [ ] engine.py — BacktestEngine (40 tests, 97% coverage)
+- [x] viz_connector.py — Abstract base class + factory (14 tests, 100% coverage)
+- [x] run_preprocess.py — full pipeline orchestrator (12 tests, 93% coverage)
+- [ ] run_train.py — 5-class LightGBM training + optional dimensionality reduction (28 tests, 99% coverage, APPROVED)
+- [ ] run_backtest.py — 32 tests, 99% coverage, APPROVED
+- [x] migrate_json_to_duckdb.py — 12 tests, 96% coverage
+- [x] collect_daily.py — 50 tests, 99% coverage
+- [x] detection_benchmark.py — 21 tests, 100% pass
+- [ ] optimizer.py — PipelineOptimizer (feature combination search, train→evaluate→backtest cycle)
 
 ---
 
