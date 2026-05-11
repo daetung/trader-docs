@@ -174,7 +174,7 @@ CREATE TABLE trade_log (
     slippage_pct    DOUBLE,
     cash_remaining  DOUBLE,
     PRIMARY KEY (tr_id)
-)
+);
 
 -- Experiment log (output of PipelineOptimizer)
 CREATE TABLE experiment_log (
