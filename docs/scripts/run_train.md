@@ -31,9 +31,10 @@ test_df:  pd.DataFrame   # test split
 #   - Feature importance top-10 per classifier
 #   - Model save location
 
-# Saved to models/ directory:
-#   models/YYYYMMDD_HHMMSS/{run_id}_{label}.lgb  (5 files)
-#   models/YYYYMMDD_HHMMSS/{run_id}_meta.json
+# Saved to models/lightgbm/{run_id}/ directory:
+#   {run_id}_up5.lgb, {run_id}_up3.lgb, {run_id}_sw.lgb,
+#   {run_id}_dn3.lgb, {run_id}_dn5.lgb
+#   {run_id}_meta.json
 ```
 
 ---
@@ -43,15 +44,19 @@ test_df:  pd.DataFrame   # test split
 ```
 1. Load config from pipeline_config.yaml
 2. Load train/val/test parquet files from data/processed/
-3. Build feature names from FeatureExtractor.get_feature_names()
-4. Identify categorical columns (sector_code)
-5. Select model via config (`model.model_type` key) → instantiate via factory `create_model(config)`
-6. Train 5 classifiers: `model.train(dataset)` where `dataset` wraps train/val splits
-7. Evaluate on test set: eval_result = pipeline.evaluate(models, test, feature_names)
+3. Build feature_names via FeatureExtractor.get_feature_names()
+4. Identify categorical_cols: features ending with "_code" (e.g. ["sector_code"])
+5. Instantiate model via factory: model = create_model(config)
+6. Train 5 classifiers:
+       models = model.train(train_df, val_df, feature_names, categorical_cols)
+7. Evaluate on test set:
+       eval_result = model.evaluate(models, test_df, feature_names)
 8. Print per-class AUC results
-9. Print top-10 features per classifier
-10. Save models: pipeline.save(models, run_id, eval_result, feature_names, categorical_cols)
-11. Optionally run DimensionalityReducer if enabled in config
+9. Print top-10 features per classifier:
+       model.feature_importance(models)
+10. Save artifacts:
+       model.save(models, run_id, eval_result, feature_names, categorical_cols)
+11. Optionally run DimensionalityReducer if --reduce flag is set (see below)
 ```
 
 ---
@@ -59,12 +64,13 @@ test_df:  pd.DataFrame   # test split
 ## CLI Interface
 
 ```bash
-python scripts/run_train.py [--config CONFIG] [--data-dir DIR] [--run-id ID]
+python scripts/run_train.py [--config CONFIG] [--data-dir DIR] [--run-id ID] [--reduce]
 
 Options:
     --config        Path to pipeline_config.yaml (default: configs/pipeline_config.yaml)
     --data-dir      Directory containing train/val/test parquet files (default: data/processed)
     --run-id        Explicit run ID (default: YYYYMMDD_HHMMSS timestamp)
+    --reduce        Run DimensionalityReducer after initial training
 ```
 
 ---
@@ -72,26 +78,24 @@ Options:
 ## Feature Names and Categorical Columns
 
 Feature names are obtained deterministically via `FeatureExtractor.get_feature_names()`.
-Categorical columns are determined from the config — specifically `sector_code` declared
-in the feature groups section. If the config does not explicitly list categorical columns,
-the script should infer `["sector_code"]` from the feature names (features ending with
-"_code" are treated as categorical).
+Categorical columns are inferred from feature names: any feature ending with `"_code"`
+is treated as categorical (e.g. `"sector_code"`). No hardcoding.
 
 ---
 
 ## Optional: Dimensionality Reduction
 
-If `dimensionality_reducer` config is present and enabled, after initial training:
+If `--reduce` flag is provided:
 
 ```
-1. Train baseline on all features
-2. Run DimensionalityReducer.run_all(X_train, X_valid, best_model)
-3. Retrain on selected features
-4. Compare AUC: if within tolerance -> save reduced model
-5. Log both results
+1. Train baseline model on all features (step 6 above)
+2. Run DimensionalityReducer.run_all(X_train, X_val, models)
+3. Retrain model on reduced feature set
+4. Compare AUC: if within tolerance → save reduced model with suffix "_reduced"
+5. Log both baseline and reduced results to stdout
 ```
 
-This is optional and controlled by a `--reduce` flag.
+Controlled exclusively by `--reduce` flag; not run by default.
 
 ---
 
@@ -102,3 +106,4 @@ This is optional and controlled by a `--reduce` flag.
 - Must print summary results even if dimensionality reduction is run
 - Model artifacts must include config snapshot for reproducibility
 - Must handle empty DataFrames gracefully (exit with error message)
+- Variable names `model` (BaseModel instance) and `models` (trained booster dict) must not be mixed

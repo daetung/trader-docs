@@ -86,7 +86,7 @@ Grid search is default. Random search activates when `max_trials < total_combina
          ↓
 3. Run ClassBalancer.split() → train_balanced, val, test
          ↓
-4. Run LGBMPipeline.train() + evaluate()
+4. Run model.train(train, val, feature_names, categorical_cols) + model.evaluate(models, test, feature_names)
          ↓
 5. Run DimensionalityReducer.run_all()
    → if reduced AUC within tolerance: retrain on reduced feature set
@@ -102,26 +102,31 @@ Grid search is default. Random search activates when `max_trials < total_combina
 
 ## Experiment Log Schema (DuckDB)
 
-Table: `experiment_log` (defined in db_schema.md, reproduced here for reference)
+Table: `experiment_log` (authoritative definition in `db_schema.md`, reproduced here for reference)
 
 ```sql
 CREATE TABLE experiment_log (
-    run_id           VARCHAR   PRIMARY KEY,   -- YYYYMMDD_HHMMSS_NNN (NNN=trial index)
-    run_at           VARCHAR   NOT NULL,
-    feature_config   VARCHAR   NOT NULL,      -- JSON: active groups + vectorizer methods
-    n_features       INTEGER,
-    n_features_reduced INTEGER,
-    auc_up5          DOUBLE,
-    auc_up3          DOUBLE,
-    auc_sw           DOUBLE,
-    auc_dn3          DOUBLE,
-    auc_dn5          DOUBLE,
-    auc_mean         DOUBLE,
-    auc_reduced_mean DOUBLE,                  -- after DimensionalityReducer
-    winning_rate     DOUBLE,
-    total_trades     INTEGER,
-    winning_trades   INTEGER,
-    notes            VARCHAR
+    run_id              VARCHAR   PRIMARY KEY,   -- YYYYMMDD_HHMMSS_NNN (NNN=trial index)
+    run_at              VARCHAR   NOT NULL,
+    feature_config      VARCHAR   NOT NULL,      -- JSON: active groups + vectorizer methods
+    n_features          INTEGER,
+    n_features_reduced  INTEGER,                 -- after DimensionalityReducer; NULL if not run
+    auc_up5             DOUBLE,
+    auc_up3             DOUBLE,
+    auc_sw              DOUBLE,
+    auc_dn3             DOUBLE,
+    auc_dn5             DOUBLE,
+    auc_mean            DOUBLE,
+    auc_reduced_mean    DOUBLE,                  -- mean AUC on reduced feature set; NULL if not run
+    winning_rate        DOUBLE,
+    total_trades        INTEGER,
+    winning_trades      INTEGER,
+    avg_pnl_pct         DOUBLE,
+    total_pnl_abs       DOUBLE,
+    avg_slippage_pct    DOUBLE,
+    trades_by_signal    VARCHAR,                 -- JSON: {"up3": {...}, "up5": {...}}
+    trades_by_exit      VARCHAR,                 -- JSON: {"take_profit": n, "stop_loss": n, "time_limit": n}
+    notes               VARCHAR
 );
 ```
 
@@ -189,3 +194,4 @@ See: `tools/detection_benchmark.py`
 - All results written to DuckDB immediately after each trial (not batched) — crash-safe
 - Optimizer does NOT modify `pipeline_config.yaml` — it reads and overrides in-memory only
 - `run_single()` can be called standalone from CLI for manual one-off experiments
+- `feature_config` column stores JSON string of active groups and vectorizer methods (not `feature_set`)

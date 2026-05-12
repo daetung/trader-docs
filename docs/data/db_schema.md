@@ -94,14 +94,14 @@ CREATE TABLE tick_10 (
 
 -- Stock metadata (refreshed daily by metadata crawling tool)
 CREATE TABLE stock_meta (
-    ticker            VARCHAR   PRIMARY KEY,
-    sector            VARCHAR,
-    market_cap        DOUBLE,
+    ticker             VARCHAR   PRIMARY KEY,
+    sector             VARCHAR,
+    market_cap         DOUBLE,
     shares_outstanding BIGINT,
-    price_52h         DOUBLE,
-    price_52l         DOUBLE,
-    avg_volume        DOUBLE,
-    updated_at        VARCHAR
+    price_52h          DOUBLE,
+    price_52l          DOUBLE,
+    avg_volume         DOUBLE,
+    updated_at         VARCHAR
 );
 
 -- Trading halts (crawled from NYSE, refreshed daily)
@@ -110,7 +110,7 @@ CREATE TABLE trading_halts (
     date          VARCHAR   NOT NULL,   -- 'YYYYMMDD'
     halt_start    VARCHAR   NOT NULL,   -- 'HHMMSS'
     halt_end      VARCHAR,              -- NULL if halt not yet resumed at crawl time
-    reason_code   VARCHAR,             -- NYSE halt reason code (e.g. "T1", "T6", "LUDP")
+    reason_code   VARCHAR,              -- NYSE halt reason code (e.g. "T1", "T6", "LUDP")
     PRIMARY KEY (ticker, date, halt_start)
 );
 
@@ -157,40 +157,53 @@ CREATE TABLE labeled_samples (
 );
 
 -- Trade log (output of BacktestEngine)
+-- entry_bar and exit_bar stored as HHMMSS-derived integers (e.g. "093000" → 93000).
+-- BacktestEngine converts hour VARCHAR to integer before writing.
+-- To join back to ohlcv_1min: CAST(entry_bar AS VARCHAR) zero-padded to 6 digits → hour.
 CREATE TABLE trade_log (
     tr_id           VARCHAR     NOT NULL,  -- UUID
     run_id          VARCHAR,
     ticker          VARCHAR,
     date            VARCHAR,
-    entry_bar       INTEGER,
-    exit_bar        INTEGER,
-    signal          VARCHAR,
+    entry_bar       INTEGER,               -- HHMMSS as int (e.g. 93000, 100500)
+    exit_bar        INTEGER,               -- HHMMSS as int
+    signal          VARCHAR,               -- "up3" | "up5"
     fill_price      DOUBLE,
     exit_price      DOUBLE,
     quantity        INTEGER,
     pnl_pct         DOUBLE,
-    pnl_abs         DOUBLE,
-    exit_reason     VARCHAR,
+    pnl_abs         DOUBLE,                -- NULL in inf mode
+    exit_reason     VARCHAR,               -- "take_profit" | "stop_loss" | "time_limit"
     slippage_pct    DOUBLE,
-    cash_remaining  DOUBLE,
+    cash_remaining  DOUBLE,                -- NULL in inf mode
     PRIMARY KEY (tr_id)
 );
 
--- Experiment log (output of PipelineOptimizer)
+-- Experiment log (output of PipelineOptimizer and BacktestEngine)
+-- Written by PipelineOptimizer after each trial.
+-- BacktestEngine appends backtest summary columns to the matching run_id row.
 CREATE TABLE experiment_log (
-    run_id          VARCHAR      NOT NULL,  -- UUID or timestamp-based
-    run_at          VARCHAR      NOT NULL,  -- 'YYYYMMDD_HHMMSS'
-    feature_set     VARCHAR      NOT NULL,  -- JSON string of active feature group keys
-    n_features      INTEGER,
-    auc_up5         DOUBLE,
-    auc_up3         DOUBLE,
-    auc_sw          DOUBLE,
-    auc_dn3         DOUBLE,
-    auc_dn5         DOUBLE,
-    auc_mean        DOUBLE,
-    winning_rate    DOUBLE,
-    total_trades    INTEGER,
-    notes           VARCHAR,
+    run_id              VARCHAR      NOT NULL,  -- YYYYMMDD_HHMMSS or YYYYMMDD_HHMMSS_NNN (optimizer)
+    run_at              VARCHAR      NOT NULL,  -- 'YYYYMMDD_HHMMSS'
+    feature_config      VARCHAR      NOT NULL,  -- JSON: active feature groups + vectorizer methods
+    n_features          INTEGER,
+    n_features_reduced  INTEGER,                -- after DimensionalityReducer; NULL if not run
+    auc_up5             DOUBLE,
+    auc_up3             DOUBLE,
+    auc_sw              DOUBLE,
+    auc_dn3             DOUBLE,
+    auc_dn5             DOUBLE,
+    auc_mean            DOUBLE,
+    auc_reduced_mean    DOUBLE,                 -- mean AUC on reduced feature set; NULL if not run
+    winning_rate        DOUBLE,
+    total_trades        INTEGER,
+    winning_trades      INTEGER,
+    avg_pnl_pct         DOUBLE,
+    total_pnl_abs       DOUBLE,
+    avg_slippage_pct    DOUBLE,
+    trades_by_signal    VARCHAR,                -- JSON: {"up3": {...}, "up5": {...}}
+    trades_by_exit      VARCHAR,                -- JSON: {"take_profit": n, "stop_loss": n, "time_limit": n}
+    notes               VARCHAR,
     PRIMARY KEY (run_id)
 );
 ```
@@ -231,6 +244,18 @@ daily_vol = con.execute("""
     FROM ohlcv_1min
     WHERE ticker = ? AND date = ? AND hour <= ?
 """, ["AAPL", "20250714", "093000"]).fetchone()[0]
+
+# Reconstruct ohlcv_1min join from trade_log entry_bar
+# entry_bar is stored as int (e.g. 93000); zero-pad to 6 digits to get hour VARCHAR
+trades = con.execute("""
+    SELECT t.*, o.high, o.low, o.close
+    FROM trade_log t
+    JOIN ohlcv_1min o
+      ON o.ticker = t.ticker
+     AND o.date   = t.date
+     AND o.hour   = printf('%06d', t.entry_bar)
+    WHERE t.run_id = ?
+""", ["20250715_143022"]).df()
 ```
 
 ---

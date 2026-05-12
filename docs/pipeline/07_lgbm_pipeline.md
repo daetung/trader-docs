@@ -21,8 +21,8 @@ val:   pd.DataFrame    # unbalanced validation split
 test:  pd.DataFrame    # unbalanced test split
 # all splits contain [...features..., label_up5, label_up3, label_sw, label_dn3, label_dn5]
 
-feature_names:      list[str]   # from FeatureExtractor.get_feature_names()
-categorical_cols:   list[str]   # ["sector_code"] — passed to LightGBM
+feature_names:      list[str]         # from FeatureExtractor.get_feature_names()
+categorical_cols:   list[str] | None  # ["sector_code"] — passed to LightGBM; None if not applicable
 ```
 
 **Output:**
@@ -113,10 +113,11 @@ lgbm_params:
 
 ## Model Artifacts
 
-Saved to `models/` directory after each training run.
+Saved to `{model_dir}/{model_type}/{run_id}/` directory after each training run.
+`model_type` for this class is `"lightgbm"`. `model_dir` is read from `config["model"]["model_dir"]`.
 
 ```
-models/
+models/lightgbm/{run_id}/
 ├── {run_id}_up5.lgb
 ├── {run_id}_up3.lgb
 ├── {run_id}_sw.lgb
@@ -132,15 +133,20 @@ models/
 ## Interface
 
 ```python
-class LGBMPipeline:
-    def __init__(self, config: dict): ...
+class LGBMPipeline(BaseModel):
+    @property
+    def model_type(self) -> str:
+        return "lightgbm"
+
+    @property
+    def model_version(self) -> str: ...
 
     def train(
         self,
         train: pd.DataFrame,
         val:   pd.DataFrame,
         feature_names: list[str],
-        categorical_cols: list[str],
+        categorical_cols: list[str] | None = None,
     ) -> dict[str, lgb.Booster]: ...
 
     def evaluate(
@@ -161,7 +167,15 @@ class LGBMPipeline:
         """
         ...
 
-    def save(self, models: dict, run_id: str, eval_result: dict): ...
+    def save(
+        self,
+        models: dict,
+        run_id: str,
+        eval_result: dict,
+        feature_names: list[str],
+        categorical_cols: list[str] | None = None,
+    ) -> None: ...
+
     def load(self, run_id: str) -> tuple[dict[str, lgb.Booster], dict]: ...
 
     def feature_importance(
@@ -177,21 +191,23 @@ class LGBMPipeline:
 
 ## Entry Decision Logic
 
-Used in backtest and live inference.
-Only `up3` and `up5` predictions trigger a buy signal.
+Entry signal determination is the responsibility of the **caller** (BacktestEngine or live inference),
+not the model. `predict()` returns raw probabilities; the caller compares them against a configurable
+threshold and selects a signal.
 
 ```python
-def should_enter(probs: dict, threshold: float = 0.5) -> str | None:
-    """
-    Returns "up5", "up3", or None.
-    up5 takes priority over up3 if both exceed threshold.
-    """
-    if probs["up5"] >= threshold: return "up5"
-    if probs["up3"] >= threshold: return "up3"
+# Caller-side logic (BacktestEngine)
+probs = model.predict(models, X)   # → prob_up5, prob_up3, ...
+threshold = config["backtest"]["entry_threshold"]
+
+def resolve_signal(row, threshold) -> str | None:
+    """Returns "up5", "up3", or None. up5 takes priority over up3."""
+    if row["prob_up5"] >= threshold: return "up5"
+    if row["prob_up3"] >= threshold: return "up3"
     return None
 ```
 
-Threshold is configurable. Initial value: 0.5.
+Threshold is configurable via `config["backtest"]["entry_threshold"]`. Initial value: 0.5.
 
 ---
 
@@ -200,5 +216,5 @@ Threshold is configurable. Initial value: 0.5.
 - Five classifiers trained independently — no shared weights or joint loss
 - `feature_names` order must match FeatureExtractor.get_feature_names() exactly
 - Early stopping patience (50 rounds) is fixed; not exposed to optimizer in phase 1
-- Model artifacts must include config snapshot for full reproducibility
+- Model artifacts must include `feature_names`, `categorical_cols`, and config snapshot for full reproducibility
 - `predict()` returns probabilities, not binary labels — thresholding done by caller

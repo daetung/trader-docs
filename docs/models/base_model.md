@@ -19,7 +19,7 @@ Provides shared artifact management (JSON metadata + pickle model binary).
 train: pd.DataFrame    # balanced training split
 val:   pd.DataFrame    # validation split
 feature_names: list[str]
-categorical_cols: list[str] | None
+categorical_cols: list[str] | None   # None if model does not require categorical handling
 ```
 
 **Output:**
@@ -43,7 +43,13 @@ class BaseModel(ABC):
     @abstractmethod
     def model_version(self) -> str: ...
 
-    def train(self, train, val, feature_names, categorical_cols=None) -> Any: ...
+    def train(
+        self,
+        train: pd.DataFrame,
+        val: pd.DataFrame,
+        feature_names: list[str],
+        categorical_cols: list[str] | None = None,
+    ) -> Any: ...
     def _train_impl(self, train, val, feature_names, categorical_cols) -> Any: ...
 
     def evaluate(self, models, test, feature_names) -> dict[str, Any]: ...
@@ -55,7 +61,14 @@ class BaseModel(ABC):
     def feature_importance(self, models, importance_type="gain") -> pd.DataFrame: ...
     def _feature_importance_impl(self, models, importance_type) -> pd.DataFrame: ...
 
-    def save(self, models, run_id, eval_result, feature_names, categorical_cols) -> None: ...
+    def save(
+        self,
+        models,
+        run_id: str,
+        eval_result: dict,
+        feature_names: list[str],
+        categorical_cols: list[str] | None = None,
+    ) -> None: ...
     def _save_model_impl(self, models, path) -> None: ...
 
     def load(self, run_id) -> tuple[Any, dict]: ...
@@ -70,7 +83,9 @@ class BaseModel(ABC):
 
 Artifacts saved to `{model_dir}/{model_type}/{run_id}/`:
 - `{run_id}.pkl` — serialized model binary (subclass-defined)
-- `{run_id}_meta.json` — metadata (model_type, model_version, feature_names, config, eval_result)
+- `{run_id}_meta.json` — metadata: `model_type`, `model_version`, `feature_names`, `categorical_cols`, `eval_result`, config snapshot
+
+The artifact directory is created automatically on `__init__`.
 
 ---
 
@@ -82,29 +97,37 @@ model:
   model_type: "lightgbm"  # registered model type key
 ```
 
+---
+
 ## Constructor
 
 ```python
 def __init__(self, config: dict) -> None: ...
 ```
 
-Initializes the base class with config-driven settings. Creates the model artifact
-directory automatically on init.
+Initializes the base class with config-driven settings. Reads `config["model"]["model_dir"]`
+and `config["model"]["model_type"]` to construct the artifact directory path.
+Creates the directory automatically on init.
+
+---
 
 ## Constraints
 
 - Subclasses must implement `_train_impl`, `_evaluate_impl`, `_predict_impl`,
   `_feature_importance_impl`, `_save_model_impl`, `_load_model_impl`
-- `model_type` and `model_version` properties must be defined
+- `model_type` and `model_version` properties must be defined by subclass
+- `categorical_cols=None` default allows non-LightGBM models to omit categorical handling
 - Constructor accepts a `config` dict (see Config Keys above)
 - Model instantiation is handled by `src/models/factory.py` via registry pattern —
   `BaseModel` has no knowledge of its subclasses
+
+---
 
 ## Factory
 
 `src/models/factory.py` maintains a registry of concrete implementations:
 
-| Config `model.type` | Concrete class |
+| Config `model.model_type` | Concrete class |
 |---|---|
 | `lightgbm` | `LGBMPipeline` |
 | `mlp` | `MLPPipeline` (planned) |

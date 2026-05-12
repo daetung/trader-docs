@@ -26,7 +26,7 @@ model_dir: Path | None  # directory containing trained model artifacts (optional
 #   - Total trades, winning trades, winning rate
 #   - Avg PnL, total PnL, avg slippage
 #   - Trade breakdown by signal (up3, up5) and exit reason
-#   - Label base rates
+#   - Label base rates (computed directly from test_df — not from BacktestEngine)
 
 # Written to DuckDB:
 #   - trade_log table: individual trade records
@@ -42,16 +42,19 @@ model_dir: Path | None  # directory containing trained model artifacts (optional
 2. Load test_features.parquet from data/processed/
 3. Determine feature column names (exclude labels, probs, identifiers)
 4. If model_dir provided:
-   a. Load model meta (run_id, features, label_keys)
-   b. Apply each classifier model to test data -> probability columns
+   a. Load model: model = create_model(config); models, meta = model.load(run_id)
+   b. Apply predictions: probs_df = model.predict(models, X_test)
    c. Build predictions DataFrame (ticker, date, hour, p_entry, probs, labels)
    Else:
    a. Use test_df columns directly as predictions
+      (prob_* and label_* columns must already exist)
 5. Load OHLCV and tick data from DuckDB for prediction tickers
-6. Run BacktestEngine.run(predictions, ohlcv, ticks, run_id)
-7. Compute label hit rates (base rate per label class)
-8. Print results to stdout
-9. Write trade_log and experiment_log to DuckDB
+6. Run BacktestEngine.run(predictions, ohlcv, ticks) → (trade_log, summary)
+7. Compute label base rates directly from test_df:
+       base_rates = {label: test_df[f"label_{label}"].mean() for label in LABELS}
+8. Print results to stdout (see Output Format below)
+9. Write trade_log to DuckDB trade_log table
+10. Write summary to DuckDB experiment_log table (matching run_id)
 ```
 
 ---
@@ -60,9 +63,8 @@ model_dir: Path | None  # directory containing trained model artifacts (optional
 
 When model_dir is provided:
 ```
-1. Load model via `create_model(config)` → `model.load(run_id)`
-2. Apply predictions via `model.predict(X)` → prob_* columns
-   - Multi-label or single classifier handled internally by model implementation
+1. Load model via create_model(config) → model.load(run_id)
+2. Apply predictions via model.predict(models, X) → prob_* columns
 3. Merge labels from test_df
 4. Build predictions DataFrame with all required columns
 ```
@@ -122,24 +124,29 @@ Avg slippage:   0.0012%
   stop_loss: 456
   time_limit: 211
 
---- Label Base Rates ---
+--- Label Base Rates (test set) ---
   up5: 18204 events, base_rate=6.4%
   up3: 52811 events, base_rate=18.5%
-  ...
+  sw:  ...
+  dn3: ...
+  dn5: ...
 
 Run ID: 20250715_143022
 Elapsed: 45.2s
 ```
 
+Note: Label base rates are computed by `run_backtest.py` directly from `test_df` label columns.
+They are not part of the BacktestEngine summary output.
+
 ---
 
 ## Constraints
 
-- Model loading and prediction via BaseModel interface (create_model → load → predict)
-- Per-label or unified classifier structure is handled internally by model implementation
+- Model loading and prediction via BaseModel interface: create_model → load → predict
 - test_df must contain p_entry column (t bar open price)
 - OHLCV and tick data must be available in DuckDB for prediction tickers
 - Individual trade records written to trade_log table in DuckDB
 - Summary statistics written to experiment_log table in DuckDB
+- Label base rates computed in run_backtest.py, not BacktestEngine
 - If no model_dir provided, test_df must have prob_* and label_* columns
 - BacktestEngine uses 10-tick data for entry slippage, OHLCV H/L for exit pricing

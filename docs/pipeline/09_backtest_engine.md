@@ -78,29 +78,45 @@ Approximate fill price at t bar open + 5s using 10-tick data.
 
 ---
 
+## Entry Decision Logic
+
+BacktestEngine receives raw probability output from `model.predict()` and applies
+threshold comparison to determine the signal. The model is responsible for probabilities only.
+
+```python
+threshold = config["backtest"]["entry_threshold"]
+
+def resolve_signal(row, threshold) -> str | None:
+    """Returns "up5", "up3", or None. up5 takes priority over up3."""
+    if row["prob_up5"] >= threshold: return "up5"
+    if row["prob_up3"] >= threshold: return "up3"
+    return None
+```
+
+---
+
 ## Position Management
 
 ### Entry condition
 ```
-Model output: should_enter(probs) returns "up3" or "up5" (see lgbm_pipeline.md)
 Entry is executed only if:
-    1. Signal is "up3" or "up5"
-    2. No existing position in same ticker opened within last 5 bars
-       (measured from most recent fill bar to current t bar)
-       Exception: if the prior position in this ticker was closed before
-                  the current t-1 bar, re-entry is allowed regardless of timing
+    1. resolve_signal(probs, threshold) returns "up3" or "up5"
+    2. Cooldown check passes (see below)
 ```
 
-### Duplicate entry guard (5-bar window)
-```python
-def can_enter(ticker, current_t_bar_idx, positions) -> bool:
-    last_entry = positions.get_last_entry(ticker)
-    if last_entry is None:
+### Cooldown guard
+```
+Cooldown is measured in minutes to correctly handle empty bars (bars with no trades).
+Bar count is not used because gaps in ohlcv_1min make bar-index distance unreliable.
+
+config key: entry_cooldown_minutes (replaces entry_cooldown_bars)
+
+def can_enter(ticker, current_hour: str, last_entry_hour: str | None, cooldown_minutes: int) -> bool:
+    if last_entry_hour is None:
         return True
-    if last_entry.is_closed and last_entry.close_bar_idx < current_t_bar_idx:
-        return True   # closed before current bar → re-entry allowed
-    bars_since_entry = current_t_bar_idx - last_entry.entry_bar_idx
-    return bars_since_entry >= 5
+    current_min  = int(current_hour[:2]) * 60 + int(current_hour[2:4])
+    last_min     = int(last_entry_hour[:2]) * 60 + int(last_entry_hour[2:4])
+    return (current_min - last_min) >= cooldown_minutes
 ```
 
 ### Cash deduction order (when initial_cash > 0)
@@ -133,34 +149,44 @@ Price path replay uses ohlcv_1min high/low per bar (not tick data for exit).
 
 ```python
 trade_log: pd.DataFrame
+    # Matches trade_log table schema in db_schema.md.
+    # entry_bar and exit_bar are stored as HHMMSS-derived integers
+    # (e.g. hour "093000" → 93000) before writing to DuckDB.
+    # Conversion: int(hour_str) — leading zeros dropped naturally by int().
     columns: [
-        ticker, date, entry_bar, exit_bar,
+        tr_id,               # UUID generated per trade
+        run_id,
+        ticker,
+        date,
+        entry_bar,           # int: e.g. 93000, 100500
+        exit_bar,            # int: e.g. 94500
         signal,              # "up3" or "up5"
-        fill_price,          # entry fill (slippage adjusted)
+        fill_price,
         exit_price,
         quantity,
         pnl_pct,             # (exit_price - fill_price) / fill_price
-        pnl_abs,             # pnl_pct * fill_price * quantity
+        pnl_abs,             # pnl_pct * fill_price * quantity; NaN in inf mode
         exit_reason,         # "take_profit" | "stop_loss" | "time_limit"
         slippage_pct,
-        cash_remaining,      # after this trade (NaN if inf mode)
+        cash_remaining,      # after this trade; NaN in inf mode
     ]
 
 summary: dict
     {
-        "total_trades":    int,
-        "winning_trades":  int,        # exit_reason == "take_profit"
-        "winning_rate":    float,      # winning_trades / total_trades
-        "avg_pnl_pct":     float,
-        "total_pnl_abs":   float,      # only meaningful if not inf mode
-        "avg_slippage_pct": float,
-        "trades_by_signal": {"up3": {...}, "up5": {...}},
-        "trades_by_exit":   {"take_profit": n, "stop_loss": n, "time_limit": n},
+        "total_trades":      int,
+        "winning_trades":    int,        # trades where exit_reason == "take_profit"
+        "winning_rate":      float,      # winning_trades / total_trades
+        "avg_pnl_pct":       float,
+        "total_pnl_abs":     float,      # only meaningful if not inf mode
+        "avg_slippage_pct":  float,
+        "trades_by_signal":  {"up3": {...}, "up5": {...}},   # JSON-serialized on DB write
+        "trades_by_exit":    {"take_profit": n, "stop_loss": n, "time_limit": n},  # JSON-serialized on DB write
     }
 ```
 
-Results are also written to the `experiment_log` table in DuckDB
-(keyed by `run_id` — same run_id as the corresponding LightGBM training run).
+Results are written to DuckDB:
+- `trade_log` table: one row per trade
+- `experiment_log` table: summary columns appended to the matching `run_id` row
 
 ---
 
@@ -200,15 +226,15 @@ class BacktestEngine:
 
 ```yaml
 backtest:
-  initial_cash: 0              # 0 = unlimited
-  position_size_cash_pct: 0.05 # 5% of cash per trade
-  position_size_vol_pct:  0.10 # 10% of t bar volume
+  initial_cash: 0                  # 0 = unlimited
+  position_size_cash_pct: 0.05     # 5% of cash per trade
+  position_size_vol_pct:  0.10     # 10% of t bar volume
   take_profit_up3: 0.03
   take_profit_up5: 0.05
   stop_loss_pct:   0.03
   max_hold_bars:   60
-  entry_cooldown_bars: 5
-  entry_threshold: 0.5         # model probability threshold for entry
+  entry_cooldown_minutes: 5        # minimum elapsed minutes between entries per ticker
+  entry_threshold: 0.5             # model probability threshold for entry signal
 ```
 
 ---
@@ -218,6 +244,9 @@ backtest:
 - Exit price path uses ohlcv_1min H/L only — no tick data for exits
 - 10-tick data used only for entry slippage estimation
 - Cash deduction is sequential in prediction DataFrame order
-- trade_log must be written to DuckDB `trade_log` table with matching run_id and tr_id(created UUID)
-- summary must be appended to `experiment_log` table with matching run_id
+- `entry_bar` and `exit_bar` written to `trade_log` as HHMMSS-derived integers; conversion is `int(hour_str)`
+- `trades_by_signal` and `trades_by_exit` JSON-serialized before writing to `experiment_log`
+- trade_log written to DuckDB `trade_log` table; summary written to `experiment_log` table with matching `run_id`
 - inf mode (initial_cash=0): `pnl_abs`, `cash_remaining` set to NaN; winning_rate is the primary metric
+- Cooldown measured in minutes (`entry_cooldown_minutes`), not bar count, to handle empty bars correctly
+- Entry signal resolved by BacktestEngine via threshold comparison on `predict()` output — not by model
