@@ -29,6 +29,25 @@ This convention is identical in both training data and live inference.
 
 ---
 
+## Session Mode
+
+Entry point detection scope is controlled by `session_mode` config:
+
+```
+"regular"  : entry points from regular session only (093000~155900) [default]
+"pre"      : entry points from pre-market only (040000~092900)
+"combined" : entry points from both pre-market and regular session
+```
+
+After-market (hour > 155900) entry points are excluded in all modes.
+
+Session mode filtering is applied during the **training stage only**.
+The preprocessing stage runs EntryPointDetector for all entry points regardless
+of session mode. Filtering by session mode is applied in run_train.py when
+loading preprocessed data.
+
+---
+
 ## Filter Conditions
 
 Each condition is implemented as an independent method returning `bool`.
@@ -68,28 +87,32 @@ logic:
 
 ### D — Daily Cumulative Volume
 ```
-Today's cumulative volume (sum of all 1-min bars from session open
-through t-1 bar, inclusive) >= 100,000.
+Cumulative volume from volume_base_hour through t-1 bar >= 100,000.
 
 method: filter_D_daily_volume(bars, date, min_volume=100000) -> bool
 
 logic:
-    today_bars = bars[bars["date"] == date]  # session open to t-1
+    today_bars = bars[(bars["date"] == date) & (bars["hour"] >= volume_base_hour)]
     return today_bars["volume"].sum() >= min_volume
+
+volume_base_hour: from config (default: "040000")
 ```
 
 ### E — Daily Volume Turnover Rate
 ```
-Turnover rate = today's cumulative volume / shares_outstanding * 100 >= 5.0 (%)
+Turnover rate = cumulative volume from volume_base_hour / shares_outstanding * 100 >= 5.0 (%)
 
 shares_outstanding sourced from stock_meta table.
 
 method: filter_E_turnover_rate(bars, date, shares_outstanding, min_rate=5.0) -> bool
 
 logic:
-    daily_volume = bars[bars["date"] == date]["volume"].sum()
+    today_bars = bars[(bars["date"] == date) & (bars["hour"] >= volume_base_hour)]
+    daily_volume = today_bars["volume"].sum()
     turnover = daily_volume / shares_outstanding * 100
     return turnover >= min_rate
+
+volume_base_hour: from config (default: "040000")
 ```
 
 ### F — Proximity to Today's Maximum Volume Bar
@@ -102,13 +125,15 @@ excluding t-1 bar itself from the max calculation.
 method: filter_F_volume_proximity(bars, date) -> bool
 
 logic:
-    today_bars = bars[bars["date"] == date]
+    today_bars = bars[(bars["date"] == date) & (bars["hour"] >= volume_base_hour)]
     prior_bars = today_bars.iloc[:-1]          # exclude t-1 bar
     if prior_bars.empty:
         return False
     max_volume = prior_bars["volume"].max()
     ref_volume  = today_bars.iloc[-1]["volume"] # t-1 bar
     return ref_volume >= max_volume * 0.70
+
+volume_base_hour: from config (default: "040000")
 ```
 
 ### G — Volume Ratio vs 20-Bar Average
@@ -194,6 +219,8 @@ class EntryPointDetector:
     ) -> pd.DataFrame:
         """
         Scan all bars for a ticker and return all detected entry points.
+        Includes all session modes — session_mode filtering applied at training stage.
+        After-market entry points (hour > 155900) are always excluded.
 
         Returns:
             pd.DataFrame with columns [ticker, date, hour, p_entry]
@@ -257,6 +284,10 @@ distribution is observed from the first full scan.
 
 ```yaml
 entry_detector:
+  # Session mode
+  session_mode: "regular"        # "pre" | "regular" | "combined"
+  volume_base_hour: "040000"     # base hour for D, E, F conditions
+
   # Individual filter thresholds
   A_max_price: 20.0
   B_min_volume_1min: 50000
@@ -264,12 +295,11 @@ entry_detector:
   C_min_avg_volume: 1000
   D_min_daily_volume: 100000
   E_min_turnover_rate: 5.0       # percent
-  F_proximity_pct: 0.30          # t-1 bar within 30% of daily max
+  F_proximity_pct: 0.30
   G_volume_ratio_bars: 20
   G_min_ratio: 2.5               # 250%
 
-  # Composite expression (for future modification without code change)
-  # Supported operators: and, or, not
+  # Composite expression
   expression: "(A and B and C and D) and (E or F or G)"
 
   # Class balance control (deferred)
@@ -285,6 +315,8 @@ entry_detector:
 - All bars passed in must already be filtered to `t-1 bar` and earlier — this module does not enforce the data boundary itself, but the caller (`scan()`) must guarantee it
 - `shares_outstanding` must never be computed inside this module — always passed in from stock_meta
 - Filter F returns `False` (not an error) when no prior bars exist for the day (first bar of session edge case)
+- After-market entry points (hour > 155900) must never be returned from `scan()`
+- `volume_base_hour` applied to conditions D, E, F only — condition G uses rolling window, no base hour filter
 
 ---
 
@@ -300,3 +332,5 @@ entry_detector:
 | F: t-1 bar is the only bar today | filter_F returns False |
 | G: fewer than 20 bars available | use available bars, no error |
 | Expression changed in config to "A and B" | detect() respects new expression |
+| volume_base_hour = "093000", pre-market bars present | D/E/F exclude pre-market bars |
+| after-market bar as t-1 | scan() excludes from output |

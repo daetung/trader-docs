@@ -66,18 +66,23 @@ After:   up5=800, up3=1800, sw=1800, dn3=1800, dn5=600
 
 ## Train / Validation / Test Split
 
-Performed inside ClassBalancer after balancing.
-Balancing is applied to train split only — validation and test are kept as-is.
+Performed inside `split()`. Balancing is applied to train split only —
+validation and test are kept as-is to reflect true class distribution.
 
 ```
-Split order:
+Split order (inside split()):
 1. Random split full labeled_df → train_raw / val / test  (before balancing)
-2. Apply downsampling to train_raw only → train_balanced
+2. If balance=True: apply downsampling to train_raw only → train_balanced
+   If balance=False: train_raw used as-is → train_balanced = train_raw
 3. Return train_balanced, val, test
 
 Rationale: val and test must reflect true class distribution
            to give meaningful AUC and winning rate estimates.
 ```
+
+`balance()` is available as a standalone method for reporting and testing purposes.
+It must not be called before `split()` in the preprocessing pipeline —
+doing so would apply downsampling to the full dataset including val/test.
 
 ```python
 split_ratios: {train: 0.7, val: 0.15, test: 0.15}  # configurable
@@ -96,16 +101,22 @@ class ClassBalancer:
         self,
         labeled_df: pd.DataFrame,
     ) -> pd.DataFrame:
-        """Downsample to configured class ratio. Returns balanced DataFrame."""
+        """
+        Downsample to configured class ratio.
+        Standalone utility — do not call before split() in pipeline.
+        Returns balanced DataFrame.
+        """
         ...
 
     def split(
         self,
         labeled_df: pd.DataFrame,
+        balance: bool = True,
     ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """
         Split into (train_balanced, val, test).
-        Balancing applied to train only.
+        Balancing applied to train split only when balance=True.
+        balance value passed from run_preprocess.py via config.
         """
         ...
 
@@ -120,6 +131,7 @@ class ClassBalancer:
 
 ```yaml
 class_balancer:
+  apply_balance: true     # passed to split() as balance argument
   max_ratio: 3.0          # max multiple of minority class count
   random_state: 42
   split:
@@ -133,6 +145,8 @@ class_balancer:
 ## Constraints
 
 - Balancing applied to train split only — val and test untouched
+- `split()` is the single entry point in the preprocessing pipeline — `balance()` is not called directly
+- `balance` argument to `split()` is read from `config["class_balancer"]["apply_balance"]` in run_preprocess.py
 - No SMOTE or synthetic oversampling
 - Random state must be fixed for reproducibility
 - `report()` must be called and logged before and after balancing

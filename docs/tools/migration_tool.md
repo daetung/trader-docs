@@ -9,6 +9,7 @@
 
 One-time (and incremental) migration of existing JSON files into DuckDB.
 Supports both directory and zip formats. Skips already-imported data.
+After migration, initializes `trading_calendar` and `ticker_data_coverage` tables.
 
 ---
 
@@ -69,10 +70,16 @@ python tools/migrate_json_to_duckdb.py \
      a. Check DuckDB: if (ticker, date) already exists in target table → SKIP
      b. Load JSON → pd.DataFrame
      c. Cast all fields to correct types (strings → DOUBLE / BIGINT)
-     d. Filter to regular session: hour >= '093000' and hour <= '155900'
+     d. Filter to valid trading hours: hour >= '040000' AND hour <= '200000'
+        (pre-market, regular session, after-market; overnight excluded)
      e. For tick data: assign seq_id within each (ticker, date, hour) group
      f. Bulk insert into DuckDB (INSERT OR IGNORE)
 4. Log: files processed / skipped / failed
+
+5. Post-migration: initialize trading_calendar and ticker_data_coverage
+     a. populate_trading_calendar(db_conn, all_ingested_dates)
+     b. populate_ticker_coverage(db_conn, all_ingested_dates)
+     (both functions sourced from utils.py)
 ```
 
 **Zip handling:**
@@ -95,6 +102,33 @@ df["seq_id"] = df.groupby(["ticker", "date", "hour"]).cumcount()
 
 ---
 
+## Post-Migration: Calendar and Coverage Initialization
+
+After all files are ingested, two tables are populated via shared utils functions:
+
+```python
+from utils import populate_trading_calendar, populate_ticker_coverage
+
+# Build trading_calendar for all dates in ohlcv_1min
+ingested_dates = con.execute(
+    "SELECT DISTINCT date FROM ohlcv_1min ORDER BY date"
+).df()["date"].tolist()
+
+populate_trading_calendar(db_conn=con, date_range=ingested_dates)
+populate_ticker_coverage(db_conn=con, dates=ingested_dates)
+```
+
+`populate_trading_calendar()`:
+- Uses `pandas_market_calendars` (NYSE) to determine `is_trading_day`, `is_holiday`
+- Sets `has_data=True` for dates present in `ohlcv_1min`
+- Safe to re-run (upsert)
+
+`populate_ticker_coverage()`:
+- Groups `ohlcv_1min` and `tick_10` by (ticker, date) to set `has_1min`, `has_tick`
+- Safe to re-run (upsert)
+
+---
+
 ## Output / Logging
 
 ```
@@ -105,6 +139,10 @@ Migration summary:
   Failed   : 0 files
   Duration : 14m 32s
   Rows inserted: ohlcv_1min=9,399,000 | tick_10=43,200,000
+
+Post-migration:
+  trading_calendar   : 1,260 dates populated
+  ticker_data_coverage: 11,847 tickers × dates populated
 ```
 
 Failed files are logged to `tools/migration_errors.log` with filename and exception.
@@ -113,8 +151,10 @@ Failed files are logged to `tools/migration_errors.log` with filename and except
 
 ## Constraints
 
-- Must be runnable independently from the pipeline (no src/ imports required)
+- Must be runnable independently from the pipeline (no src/ imports required, except utils.py)
 - Duplicate skip is at `(ticker, date)` granularity per table — entire file skipped if any row exists
 - Zip files: extract to tempdir, process, clean up — do not leave temp files
-- Session filter applied at ingestion — pre/after market data discarded permanently
+- Time range filter: `hour >= '040000' AND hour <= '200000'` (no session filtering)
 - Must handle malformed JSON files gracefully (log and continue, do not crash)
+- Post-migration calendar/coverage population is mandatory — not optional
+- `populate_trading_calendar()` and `populate_ticker_coverage()` sourced from `utils.py`

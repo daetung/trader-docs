@@ -4,7 +4,7 @@
 
 - **Goal**: Predict short-term price direction at scalping entry points using a LightGBM-based supervised classification pipeline
 - **Primary deliverable**: Preprocessor–model pipeline with optimal winning rate
-- **Data**: US market, multi-month history, 1min OHLCV + 10tick per ticker
+- **Data**: US market, multi-month history, 1min OHLCV + 10tick per ticker (all sessions)
 - **Model**: LightGBM (5 independent binary classifiers) → MLP comparison in later phase
 
 For detailed design rules, refer to the per-module docs listed in the [Docs Index](#docs-index) below.
@@ -14,14 +14,14 @@ For detailed design rules, refer to the per-module docs listed in the [Docs Inde
 ## System Pipeline
 
 ```
-Raw JSON (1min / 10tick)
+Raw JSON (1min / 10tick, all sessions)
         │
         ▼
    DataLoader                JSON → DuckDB / per-ticker DataFrame
-        │
+        │                    trading_calendar + ticker_data_coverage populated
         ▼
  EntryPointDetector           Candidate entry point selection (fixed logic)
-        │                     Refine criteria if sideways class is over-represented
+        │                     All sessions processed; session_mode filter at training stage
         │  (ticker, date, t)
         ▼
  IndicatorCalculator          All indicator calculations → time-series DataFrames
@@ -31,33 +31,46 @@ Raw JSON (1min / 10tick)
         │
         ▼
  FeatureExtractor             Combine vectorized indicators + meta + temporal
-        │  feature matrix
+        │                     extract_batch(): indicators computed once per ticker
+        │  feature matrix [ticker, date, hour, p_entry, features..., labels...]
         ▼
  Labeler                      5 independent binary labels per entry point
-        │                     Reference: P_entry = t bar open (not a feature input)
+        │                     Exit at 15:59 bar; after-market fallback for halt only
+        │                     is_dead_position flag for overnight hold cases
         ▼
- ClassBalancer                Downsampling (sideways class priority)
-        │  random split
-        ├── train / validation / test
+ ClassBalancer                Downsampling via split(balance=config.apply_balance)
+        │  train / validation / test
         ▼
- LightGBM Pipeline            5 independent binary classifiers
-   ├── +5pp classifier
-   ├── +3pp classifier
-   ├── sideways classifier
-   ├── -3pp classifier
-   └── -5pp classifier
-        │  AUC per class
-        ▼
- DimensionalityReducer        Correlation filter → importance filter → SHAP filter
+ PipelineOptimizer            Training endpoint
+   ├── Preprocessor           in-memory preprocess per trial
+   ├── Trainer (AUC loop)     train until auc_threshold or max_trials
+   │     └── LightGBM Pipeline    5 independent binary classifiers
+   │     └── DimensionalityReducer  ImportanceProvider-based (model-agnostic)
+   └── Backtester             run after AUC loop converges
         │
         ▼
- BacktestEngine               Winning rate with slippage approximation
-        │
+ BacktestEngine               DB-direct price tracking, slippage via tick_10
+        │                     Session-close priority exit, dead position handling
         ▼
- PipelineOptimizer            Feature combination / hyperparameter search (Agent)
-        │
-        ▼
- experiment_log.csv           Cumulative results per pipeline configuration
+ experiment_log (DuckDB)      Written by Backtester only
+ train_log (DuckDB)           Written by Trainer per trial
+```
+
+---
+
+## Endpoint Architecture
+
+```
+Training endpoint:   PipelineOptimizer
+                         └── Preprocessor → Trainer (loop) → Backtester
+
+Live inference endpoint: Inferencer  (interface defined; implementation deferred)
+                         └── Preprocessor(live_mode=True) → model.load() → resolve_signal()
+
+Standalone scripts:
+    run_preprocess.py  ← Preprocessor wrapper (CLI)
+    run_train.py       ← Trainer wrapper (CLI)
+    run_backtest.py    ← Backtester wrapper (CLI, sole experiment_log writer)
 ```
 
 ---
@@ -68,21 +81,23 @@ Raw JSON (1min / 10tick)
 |---|---|
 | `data/data_boundary.md` | **Read before any module implementation.** Shared boundary rules, P_entry definition, leakage prevention |
 | `data/db_schema.md` | DuckDB schema and JSON ingestion logic |
-| `pipeline/01_entry_detection.md` | EntryPointDetector logic and interface |
-| `pipeline/02_indicator_calculator.md` | All indicator methods, input/output spec |
+| `pipeline/01_entry_detection.md` | EntryPointDetector logic, session_mode, volume_base_hour |
+| `pipeline/02_indicator_calculator.md` | All indicator methods, VWAP reset_mode, missing bar classification |
 | `pipeline/03_vectorizer.md` | Time-series → vector transformation methods |
-| `pipeline/04_feature_extractor.md` | Integration entrypoint and viz connector interface |
-| `pipeline/05_labeler.md` | 5-class binary labeling logic |
-| `pipeline/06_class_balancer.md` | Downsampling strategy |
+| `pipeline/04_feature_extractor.md` | Integration entrypoint, extract_batch strategy, parquet column structure |
+| `pipeline/05_labeler.md` | 5-class binary labeling, session-close exit, dead position |
+| `pipeline/06_class_balancer.md` | Downsampling strategy, split() as single entry point |
 | `pipeline/07_lgbm_pipeline.md` | LightGBM 5-classifier structure and evaluation |
-| `pipeline/08_dimensionality_reducer.md` | Feature selection pipeline |
-| `pipeline/09_backtest_engine.md` | Backtest logic, slippage model, winning rate |
+| `pipeline/08_dimensionality_reducer.md` | ImportanceProvider pattern, model-agnostic reduction |
+| `pipeline/09_backtest_engine.md` | DB-direct backtest, tick_10 slippage, dead position handling |
 | `models/base_model.md` | Abstract base class for model trainers |
-| `optimization/pipeline_optimizer.md` | Agent workflow and experiment logging |
-| `scripts/run_preprocess.md` | Full preprocessing pipeline orchestrator |
-| `scripts/run_train.md` | LightGBM training entry point |
-| `scripts/run_backtest.md` | Backtest simulation entry point |
-| `tools/migration_tool.md` | JSON → DuckDB one-time and incremental migration |
+| `optimization/pipeline_optimizer.md` | Training endpoint, AUC loop, experiment cycle |
+| `scripts/run_preprocess.md` | Preprocessor class, return_data, live_mode |
+| `scripts/run_train.md` | Trainer class, session_mode filter, train_log |
+| `scripts/run_backtest.md` | Backtester class, sole experiment_log writer |
+| `utils/utils.md` | Shared utilities: bar_sequence, signal, hour conversion, run_id, config, encoding maps |
+| `inferencer/inferencer.md` | Live inference endpoint interface |
+| `tools/migration_tool.md` | JSON → DuckDB migration, trading_calendar/coverage init |
 | `tools/detection_benchmark.md` | Entry detection threshold tuning + timing benchmark |
 | `tools/metadata_crawler.md` | Daily metadata fetch + new data ingestion |
 | `visualization/viz_connector.md` | Abstract base class for visualization backends |
@@ -117,6 +132,10 @@ stock-scalping/
 │   │   ├── run_preprocess.md
 │   │   ├── run_train.md
 │   │   └── run_backtest.md
+│   ├── utils/
+│   │   └── utils.md
+│   ├── inferencer/
+│   │   └── inferencer.md
 │   ├── tools/
 │   │   ├── migration_tool.md
 │   │   ├── detection_benchmark.md
@@ -145,11 +164,16 @@ stock-scalping/
 │   │   └── reducer.py
 │   ├── models/
 │   │   ├── base_model.py
-│   │   └── lgbm_pipeline.py
+│   │   ├── lgbm_pipeline.py
+│   │   └── factory.py
 │   ├── optimization/
 │   │   └── optimizer.py
 │   ├── backtest/
 │   │   └── engine.py
+│   ├── inference/
+│   │   └── inferencer.py
+│   ├── utils/
+│   │   └── utils.py
 │   └── visualization/
 │       └── viz_connector.py
 ├── scripts/
@@ -157,13 +181,16 @@ stock-scalping/
 │   ├── run_train.py
 │   └── run_backtest.py
 ├── tools/
-│   ├── migrate_json_to_duckdb.py  # one-time + incremental JSON migration
-│   ├── collect_daily.py           # daily metadata + ingestion (cron)
-│   └── detection_benchmark.py    # threshold tuning + timing
+│   ├── migrate_json_to_duckdb.py
+│   ├── collect_daily.py
+│   └── detection_benchmark.py
 ├── tests/
 ├── configs/
-│   └── pipeline_config.yaml
-└── experiment_log.csv
+│   ├── pipeline_config.yaml
+│   ├── sector_map.json
+│   ├── day_of_week_map.json
+│   └── secrets.yaml               # gitignored
+└── experiment_log.csv             # legacy; authoritative store is DuckDB
 ```
 
 ---
@@ -174,7 +201,7 @@ stock-scalping/
 |---|---|
 | Full feature indicator list | Before implementing IndicatorCalculator |
 | Per-indicator vectorizer method mapping | During vectorizer design |
-| EntryPointDetector detailed logic | Before implementing detection module |
 | LightGBM hyperparameter search range | After initial model implementation |
 | Visualization tool spec | Separate design phase |
-| Stock meta data source | During data pipeline design |
+| MLPImportanceProvider implementation | MLP phase |
+| Inferencer full implementation | After training pipeline stabilizes |

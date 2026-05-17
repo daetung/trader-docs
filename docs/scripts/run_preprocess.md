@@ -6,16 +6,11 @@
 
 ## Role
 
-CLI entry point that orchestrates the full preprocessing pipeline:
-1. Load data from DuckDB (OHLCV, ticks, stock_meta, trading_halts)
-2. Run EntryPointDetector.scan() for each ticker -> entry_points
-3. Save entry_points to DuckDB
-4. Run Labeler.label() for all entry points -> labeled samples
-5. Save labels to DuckDB
-6. Run FeatureExtractor for each ticker's entries -> feature matrix
-7. Merge features + labels -> full dataset
-8. Apply ClassBalancer.balance() + .split() -> train/val/test
-9. Save feature matrices to data/processed/
+CLI entry point that orchestrates the full preprocessing pipeline.
+Supports three execution modes:
+- **Standalone**: full pipeline, saves parquet to disk
+- **Optimizer (in-memory)**: returns DataFrames without saving, called by PipelineOptimizer
+- **Live (live_mode)**: runs EntryPointDetector + FeatureExtractor only, used by Inferencer
 
 ---
 
@@ -24,18 +19,33 @@ CLI entry point that orchestrates the full preprocessing pipeline:
 **Input:**
 ```python
 # From DuckDB:
-ohlcv_1min: pd.DataFrame  # OHLCV 1-min bars
-tick_10: pd.DataFrame     # 10-tick data
-stock_meta: pd.DataFrame  # stock metadata
-trading_halts: pd.DataFrame  # trading halt records
+ohlcv_1min: pd.DataFrame       # all sessions (no time filter)
+tick_10: pd.DataFrame          # all sessions
+stock_meta: pd.DataFrame
+trading_halts: pd.DataFrame
+trading_calendar: pd.DataFrame
+ticker_data_coverage: pd.DataFrame
 ```
 
-**Output:**
+**Output (standalone mode):**
 ```python
 # Saved to data/processed/:
-train_features.parquet  # balanced training split
-val_features.parquet    # validation split
-test_features.parquet   # test split
+train_features.parquet    # balanced training split
+val_features.parquet      # validation split
+test_features.parquet     # test split
+
+# Parquet column structure per file:
+# [ticker, date, hour, p_entry] + [features...] + [label_up5..label_dn5, is_dead_position]
+```
+
+**Output (in-memory mode, return_data=True):**
+```python
+tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]  # (train, val, test)
+```
+
+**Output (live_mode=True):**
+```python
+pd.DataFrame  # feature matrix for current entry points (no labels)
 ```
 
 ---
@@ -43,16 +53,64 @@ test_features.parquet   # test split
 ## Pipeline Steps
 
 ```
-1. Connect to DuckDB and load all data (OHLCV, ticks, meta, halts)
-2. EntryPointDetector.scan() for each ticker -> entry_points
+[Standard / In-memory mode]
+
+1. Connect to DuckDB and load all data
+2. EntryPointDetector.scan() for each ticker → entry_points (all session modes)
 3. Save entry_points to DuckDB entry_points table
-4. Labeler.label() for all entry points -> labeled samples
-5. Save labeled samples to DuckDB labeled_samples table
-6. FeatureExtractor.extract_batch() for each ticker -> feature matrix
+4. Labeler.label() for all entry points → labeled_samples
+5. Save labeled_samples to DuckDB labeled_samples table
+6. FeatureExtractor.extract_batch() for each ticker → feature matrix
 7. Merge features with labels on (ticker, date, hour)
-8. ClassBalancer.balance() -> downsampling
-9. ClassBalancer.split() -> train/val/test
-10. Save parquet files to data/processed/
+   → parquet columns: [ticker, date, hour, p_entry] + [features] + [labels, is_dead_position]
+8. ClassBalancer.split(balance=config["class_balancer"]["apply_balance"])
+   → (train_balanced, val, test)
+9. If return_data=True: return (train_balanced, val, test)
+   Else: save parquet files to data/processed/
+
+[Live mode — live_mode=True]
+
+1. Connect to DuckDB and load recent OHLCV, ticks, meta
+2. EntryPointDetector.scan() for current bars → entry_points
+3. FeatureExtractor.extract_batch() → feature matrix (no labels)
+4. Return feature matrix directly (no save, no labeling)
+```
+
+---
+
+## Class Interface
+
+`run_preprocess.py` exposes a callable class for use by PipelineOptimizer and Inferencer:
+
+```python
+class Preprocessor:
+    def __init__(self, config: dict, db_conn: duckdb.DuckDBPyConnection): ...
+
+    def run(
+        self,
+        return_data: bool = False,
+        live_mode: bool = False,
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame] | pd.DataFrame | None:
+        """
+        return_data=False, live_mode=False : save parquet, return None
+        return_data=True,  live_mode=False : return (train, val, test), no save
+        live_mode=True                     : return feature matrix only (no labels)
+        """
+        ...
+
+    def save(
+        self,
+        train: pd.DataFrame,
+        val: pd.DataFrame,
+        test: pd.DataFrame,
+        run_id: str | None = None,
+    ) -> None:
+        """
+        Save parquet files to data/processed/.
+        If run_id provided, saves to data/processed/{run_id}/ for trial isolation.
+        Called explicitly by PipelineOptimizer after AUC loop converges.
+        """
+        ...
 ```
 
 ---
@@ -66,26 +124,31 @@ Options:
     --config        Path to pipeline_config.yaml (default: configs/pipeline_config.yaml)
 ```
 
+CLI always runs in standalone mode (return_data=False, live_mode=False).
+
 ---
 
 ## Config Keys Used
 
 ```yaml
-data_paths.*           # all data path settings
-entry_detector.*       # entry detection thresholds
-indicators.*           # indicator parameters
-vectorizer.*           # vectorizer settings
-labeler.*              # labeling parameters
-class_balancer.*       # balancing parameters
-misc.lookback_bars     # passed to FeatureExtractor
+data_paths.*
+entry_detector.*           # includes session_mode, volume_base_hour
+indicators.*
+vectorizer.*
+labeler.*
+class_balancer.*           # includes apply_balance
+misc.lookback_bars
 ```
 
 ---
 
 ## Constraints
 
-- All data loaded from DuckDB in bulk (no per-ticker DB queries)
-- Feature extraction uses extract_batch() — no Python loop over extract()
+- All data loaded from DuckDB in bulk (no per-ticker DB queries during extraction)
+- `extract_batch()` used — no Python loop over `extract()`
 - Empty DataFrames handled gracefully (saves _empty.parquet)
-- ClassBalancer applies balancing to train split only — val/test untouched
-- All parameters from pipeline_config.yaml — nothing hardcoded
+- `ClassBalancer.split()` is the single call — `balance()` is not called separately
+- `balance` argument to `split()` read from `config["class_balancer"]["apply_balance"]`
+- All parameters from `pipeline_config.yaml` — nothing hardcoded
+- `p_entry` included in parquet as identifier column, not feature
+- In live_mode: Labeler and ClassBalancer are not instantiated

@@ -43,6 +43,7 @@ bars (t-N ... t-1)
     ├─► MissingBarClassifier          (pre-processing step)
     │       classify gaps as halt / no_trade
     │       forward-fill no_trade bars; keep halt bars as NaN
+    │       covers all time periods (pre/regular/after-market)
     │       output: cleaned bars + market_structure_features dict
     │
     ├─► IndicatorCalculator
@@ -68,6 +69,29 @@ bars (t-N ... t-1)
 
 ---
 
+## extract_batch() Implementation Strategy
+
+`extract_batch()` must not recompute indicators per entry point.
+The correct strategy is:
+
+```
+1. Compute all indicators once for the full ticker bars DataFrame
+   → dict[str, pd.DataFrame]  (time-series per indicator, full date range)
+
+2. For each entry point in entry_points:
+   a. Slice indicator time-series up to t-1 bar (by hour index)
+   b. Apply Vectorizer to sliced series → feature vector
+   c. Append meta and temporal features
+
+3. Concatenate all feature vectors → feature matrix (pd.DataFrame)
+```
+
+Indicator calculation is performed **once per ticker**, not once per entry point.
+Entry point-level slicing and vectorization is the only per-entry-point operation.
+Python iteration over entry points for slicing is permitted.
+
+---
+
 ## Meta Features
 
 ```python
@@ -81,8 +105,8 @@ meta_features = {
 }
 ```
 
-Sector encoding map is built once from all unique sectors in `stock_meta`
-and persisted to `configs/sector_map.json`.
+Sector encoding map is loaded via `utils.load_encoding_map("sector_map")`.
+Built once from all unique sectors in `stock_meta` and persisted to `configs/sector_map.json`.
 `sector_code` must be registered as LightGBM categorical column.
 
 ---
@@ -92,9 +116,8 @@ and persisted to `configs/sector_map.json`.
 ```python
 temporal_features = {
     # Time position — raw values (no scale transform for LightGBM)
-    "minute_of_session": minutes_since_0930,       # 0~389, int
-    "hour_of_day":       int(hour[:2]),            # 9~15, int
-    "month":             date.month,               # 1~12, int (categorical treatment optional)
+    "minute_of_session": minutes_since_0930,       # int; negative for pre-market entries
+    "hour_of_day":       int(hour[:2]),            # int
 
     # Categorical (LightGBM categorical)
     "day_of_week":       date.strftime("%a"),      # "Mon"/"Tue"/"Wed"/"Thu"/"Fri"
@@ -102,20 +125,25 @@ temporal_features = {
                                                    # registered as LightGBM categorical
 
     # Binary flags
-    "is_first_30min":    1 if minute_of_session < 30 else 0,
+    "is_pre_market":     1 if hour < "093000" else 0,
+    "is_first_30min":    1 if 0 <= minute_of_session < 30 else 0,
     "is_last_30min":     1 if minute_of_session >= 360 else 0,
     "is_pre_holiday":    1 if next trading day is a holiday else 0,
     "is_post_holiday":   1 if previous trading day was a holiday else 0,
 }
 ```
 
-Holiday calendar sourced from `us_holidays` table in DuckDB (see db_schema.md).
-`day_of_week` encoding map persisted to `configs/day_of_week_map.json`.
-`is_monday` and `is_friday` binary features removed — subsumed by `day_of_week` categorical.
+Temporal features use `entry.hour` (t bar open time) as the reference.
+`entry.hour` is the time at which detection fired — it is not t bar OHLCV data,
+and its use as a temporal feature does not constitute data leakage.
+
+Holiday calendar sourced from `us_holidays` table in DuckDB.
+`day_of_week` encoding map loaded via `utils.load_encoding_map("day_of_week_map")`.
+`is_monday` and `is_friday` binary features must NOT be generated (subsumed by `day_of_week`).
 
 Note on scaling: LightGBM is tree-based and invariant to monotonic transforms.
-`minute_of_session` (0~389) is kept as raw integer.
-Scaling will be applied at MLP comparison stage only (`configs/pipeline_config.yaml: scaling.enabled`).
+`minute_of_session` is kept as raw integer.
+Scaling will be applied at MLP comparison stage only.
 
 ---
 
@@ -181,24 +209,50 @@ class FeatureExtractor:
         ticks: pd.DataFrame,
         meta: dict,
     ) -> pd.DataFrame:
-        """Vectorized batch for one ticker. Returns feature matrix."""
+        """
+        Batch feature extraction for one ticker.
+        Indicators computed once for full bars DataFrame.
+        Per-entry slicing and vectorization applied after.
+        Returns feature matrix as pd.DataFrame.
+        """
         ...
 
     def get_feature_names(self) -> list[str]:
-        """Deterministic ordered list of all feature column names."""
+        """
+        Deterministic ordered list of all feature column names.
+        Does NOT include p_entry, ticker, date, hour, or label columns.
+        """
         ...
 ```
+
+---
+
+## Parquet Column Structure
+
+Output parquet files contain the following column groups:
+
+```
+Identifier columns : ticker, date, hour, p_entry
+Feature columns    : get_feature_names() — all float/int features
+Label columns      : label_up5, label_up3, label_sw, label_dn3, label_dn5
+```
+
+`p_entry` is stored as an identifier column, not a feature.
+It must never appear in `get_feature_names()` output.
+It is required by BacktestEngine for fill price calculation.
 
 ---
 
 ## Constraints
 
 - Feature column names must be deterministic and stable across runs
-- `extract_batch()` must not call `extract()` in a Python loop
+- `extract_batch()` computes indicators once per ticker — not once per entry point
 - Disabled feature groups (per config) produce no columns
 - `sector_code`, `day_of_week`, `halt_reason_code` must be passed as categoricals to LightGBM
 - NaN values permitted — do not impute
 - `p_entry` must never appear as a feature column
-- `is_monday` and `is_friday` binary columns must NOT be generated (replaced by `day_of_week`)
+- `is_monday` and `is_friday` binary columns must NOT be generated
 - Missing bar classification must run before IndicatorCalculator receives bars
 - Halt bars (NaN) propagate naturally into indicator NaN — do not suppress
+- Temporal features use `entry.hour` (t bar open time) as reference — this is not data leakage
+- Encoding maps (sector, day_of_week) loaded via `utils.load_encoding_map()` for live inference compatibility

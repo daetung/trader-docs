@@ -21,6 +21,7 @@ bars: pd.DataFrame
     columns: [ticker, date, hour, open, high, low, close, volume]
     # strictly bars t-N ... t-1 (fully closed bars only)
     # t bar must be excluded before passing to this module
+    # may include pre-market and after-market bars
 
 ticks: pd.DataFrame  (optional, for tick-based indicators)
     columns: [ticker, date, hour, price, volume]
@@ -130,12 +131,19 @@ ad(bars)
     → money_flow_multiplier = ((close - low) - (high - close)) / (high - low)
     → ad = cumsum(money_flow_multiplier * volume)
 
-vwap(bars)
+vwap(bars, reset_mode, regular_start)
     → Volume-Weighted Average Price
     → vwap = cumsum(typical_price * volume) / cumsum(volume)
-    → reset per trading session (per date)
-    → note: VWAP is session-cumulative; the value at t-1 bar reflects
-            the average fill price from session open to that bar
+
+    reset_mode = "date" [default]:
+        Reset at date boundary — accumulates from first bar of the date
+        (includes pre-market bars if present)
+
+    reset_mode = "regular_session":
+        Reset at regular_start (default "093000") each date
+        Bars before regular_start are excluded from VWAP calculation (NaN)
+
+    note: VWAP reset_mode is read from config and passed by FeatureExtractor
 ```
 
 ### Level-Based Indicators
@@ -150,6 +158,7 @@ pivot_points(bars)
     → S2  = PP - (prev_high - prev_low)
     → S3  = prev_low - 2 * (prev_high - PP)
     → output: constant value per session bar (step function)
+    → "previous session" = previous date's regular session (093000~155900)
 
 fibonacci_retracement(bars, window_bars)
     → Identify swing high and swing low within window
@@ -215,9 +224,11 @@ hl_spread(bars)
 ### Missing Bar Classification
 ```
 classify_missing_bars(bars, halts_df, date)
-    → Detect gaps in bar sequence (missing HHMMSS within session hours)
+    → Detect gaps in bar sequence (missing HHMMSS within full trading day)
+    → Covers pre-market, regular session, and after-market hours
     → For each missing bar slot:
          if slot overlaps any halt interval in halts_df → "halt"
+             (halts can occur across all time periods, not only regular session)
          else                                           → "no_trade"
     → Output: dict with keys:
          missing_bar_slots  : list of HHMMSS strings
@@ -267,8 +278,9 @@ avg_vol_per_tick(ticks, bars)
 - All window sizes and parameters must be accepted as arguments (not hardcoded)
 - NaN handling: return NaN for warm-up period rows; do not forward-fill silently
 - `dmi()` must not duplicate the calculation logic of `adx()` — call or delegate internally
-- VWAP must reset at session boundary (new `date` value) — do not accumulate across dates
+- VWAP reset behavior is controlled by `reset_mode` argument — caller (FeatureExtractor) reads from config and passes explicitly
 - `fibonacci_retracement()` and `pivot_points()` output level values as absolute prices, not distances — distance features are derived in Vectorizer
+- `classify_missing_bars()` applies halt classification across all time periods — halts_df is the authoritative source regardless of hour
 
 ---
 
@@ -289,6 +301,9 @@ indicators:
   adx_window: 14
   parabolic_sar: {af_start: 0.02, af_step: 0.02, af_max: 0.2}
   volume_ma_windows: [5, 20]
+  vwap:
+    reset_mode: "date"           # "date" | "regular_session"
+    regular_start: "093000"      # used when reset_mode = "regular_session"
   fibonacci: {window_bars: 390}
   lee_ready: {momentum_n: 5}
   roll_spread_window: 20
@@ -330,7 +345,9 @@ class IndicatorCalculator:
     def vr_volume(self, bars: pd.DataFrame, n: int) -> pd.DataFrame: ...
     def obv(self, bars: pd.DataFrame) -> pd.DataFrame: ...
     def ad(self, bars: pd.DataFrame) -> pd.DataFrame: ...
-    def vwap(self, bars: pd.DataFrame) -> pd.DataFrame: ...
+    def vwap(self, bars: pd.DataFrame,
+             reset_mode: str = "date",
+             regular_start: str = "093000") -> pd.DataFrame: ...
 
     # Level-based
     def pivot_points(self, bars: pd.DataFrame) -> pd.DataFrame: ...

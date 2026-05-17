@@ -49,11 +49,11 @@ Each uses its own target label column:
 
 | Classifier key | Target column | Positive class meaning |
 |---|---|---|
-| `up5` | `label_up5` | price rises ≥ +5pp within 60min |
-| `up3` | `label_up3` | price rises +3~5pp within 60min |
+| `up5` | `label_up5` | price rises ≥ +5pp within holding period |
+| `up3` | `label_up3` | price rises +3~5pp within holding period |
 | `sw`  | `label_sw`  | price stays within ±3pp (sideways) |
-| `dn3` | `label_dn3` | price drops -3~5pp within 60min |
-| `dn5` | `label_dn5` | price drops ≥ -5pp within 60min |
+| `dn3` | `label_dn3` | price drops -3~5pp within holding period |
+| `dn5` | `label_dn5` | price drops ≥ -5pp within holding period |
 
 Class weight balancing within LightGBM: `is_unbalance=True` per classifier.
 
@@ -126,7 +126,7 @@ models/lightgbm/{run_id}/
 └── {run_id}_meta.json     # feature_names, categorical_cols, eval_result, config snapshot
 ```
 
-`run_id` format: `YYYYMMDD_HHMMSS`
+`run_id` format: `YYYYMMDD_HHMMSS` (generated via `utils.generate_run_id()`)
 
 ---
 
@@ -192,15 +192,21 @@ class LGBMPipeline(BaseModel):
 ## Entry Decision Logic
 
 Entry signal determination is the responsibility of the **caller** (BacktestEngine or live inference),
-not the model. `predict()` returns raw probabilities; the caller compares them against a configurable
-threshold and selects a signal.
+not the model. `predict()` returns raw probabilities; the caller applies `utils.resolve_signal()`
+against a configurable threshold.
 
 ```python
-# Caller-side logic (BacktestEngine)
+# Caller-side logic (BacktestEngine, Inferencer)
+from utils import resolve_signal
+
 probs = model.predict(models, X)   # → prob_up5, prob_up3, ...
 threshold = config["backtest"]["entry_threshold"]
+signal = resolve_signal(row, threshold)   # → "up5" | "up3" | None
+```
 
-def resolve_signal(row, threshold) -> str | None:
+`resolve_signal()` is defined in `src/utils/utils.py`:
+```python
+def resolve_signal(row: pd.Series, threshold: float) -> str | None:
     """Returns "up5", "up3", or None. up5 takes priority over up3."""
     if row["prob_up5"] >= threshold: return "up5"
     if row["prob_up3"] >= threshold: return "up3"
@@ -217,4 +223,5 @@ Threshold is configurable via `config["backtest"]["entry_threshold"]`. Initial v
 - `feature_names` order must match FeatureExtractor.get_feature_names() exactly
 - Early stopping patience (50 rounds) is fixed; not exposed to optimizer in phase 1
 - Model artifacts must include `feature_names`, `categorical_cols`, and config snapshot for full reproducibility
-- `predict()` returns probabilities, not binary labels — thresholding done by caller
+- `predict()` returns probabilities, not binary labels — thresholding done by caller via `utils.resolve_signal()`
+- `run_id` generated via `utils.generate_run_id()`

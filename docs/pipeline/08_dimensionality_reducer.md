@@ -6,8 +6,13 @@
 
 ## Role
 
-Reduce feature dimensionality after initial LightGBM training to combat the curse of dimensionality.
+Reduce feature dimensionality after initial model training to combat the curse of dimensionality.
 Runs three sequential filters and outputs a reduced feature list for pipeline retraining.
+
+Model-agnostic by design: all model-dependent operations (importance calculation,
+SHAP computation) are delegated to an `ImportanceProvider` implementation.
+Swapping the underlying model (LightGBM → MLP) requires only a provider
+substitution — no changes to `DimensionalityReducer` itself.
 
 ---
 
@@ -15,10 +20,10 @@ Runs three sequential filters and outputs a reduced feature list for pipeline re
 
 **Input:**
 ```python
-X_train: pd.DataFrame        # feature matrix, training split
-X_valid: pd.DataFrame        # feature matrix, validation split
-model: lgb.Booster           # trained LightGBM model (any single classifier)
-feature_names: list[str]     # column names of X_train
+X_train: pd.DataFrame          # feature matrix, training split
+X_valid: pd.DataFrame          # feature matrix, validation split
+provider: ImportanceProvider   # model-specific importance/SHAP provider
+feature_names: list[str]       # column names of X_train
 ```
 
 **Output:**
@@ -29,38 +34,186 @@ reduction_report: dict         # counts and removed feature names per stage
 
 ---
 
+## ImportanceProvider Interface
+
+```python
+class ImportanceProvider(ABC):
+    """
+    Abstract interface for model-dependent importance and SHAP computation.
+    One concrete implementation per model type.
+    """
+
+    @abstractmethod
+    def get_importance(self, feature_names: list[str]) -> pd.Series:
+        """
+        Return feature importance scores indexed by feature name.
+        For multi-classifier models (e.g. LightGBM 5-class), averaging
+        across classifiers is handled here.
+        Averaging strategy controlled by:
+            config["dimensionality_reducer"]["importance_averaging"]
+            "uniform"        — simple mean across classifiers
+            "sample_weighted" — weighted by training sample count per classifier
+
+        Returns:
+            pd.Series: index=feature_name, values=importance score (float)
+        """
+        ...
+
+    @abstractmethod
+    def get_shap_values(
+        self,
+        X: pd.DataFrame,
+    ) -> np.ndarray:
+        """
+        Return mean absolute SHAP values per feature.
+        Shape: (n_features,) — averaged over samples and classifiers.
+        Averaging strategy same as get_importance().
+
+        Returns:
+            np.ndarray: shape (n_features,), dtype float
+        """
+        ...
+```
+
+---
+
+## Concrete Providers
+
+### LGBMImportanceProvider
+
+```python
+class LGBMImportanceProvider(ImportanceProvider):
+    def __init__(
+        self,
+        models: dict[str, lgb.Booster],    # {"up5", "up3", "sw", "dn3", "dn5"}
+        train_labels: dict[str, pd.Series] | None = None,
+                                            # required for sample_weighted averaging
+                                            # key = label name, value = y_train Series
+        config: dict,
+    ): ...
+```
+
+**`get_importance()` logic:**
+```
+For each classifier in models:
+    imp[label] = booster.feature_importance(importance_type="gain")
+
+if importance_averaging == "uniform":
+    result = mean(imp.values())
+
+if importance_averaging == "sample_weighted":
+    weight[label] = train_labels[label].shape[0]   # n_samples per classifier
+    result = weighted_mean(imp.values(), weights=weight.values())
+```
+
+**`get_shap_values()` logic:**
+```
+For each classifier in models:
+    explainer = shap.TreeExplainer(booster)
+    shap_vals[label] = |explainer.shap_values(X)|.mean(axis=0)
+
+averaging: same strategy as get_importance()
+```
+
+### MLPImportanceProvider (deferred — interface defined for forward compatibility)
+
+```python
+class MLPImportanceProvider(ImportanceProvider):
+    def __init__(
+        self,
+        model: nn.Module,
+        X_ref: pd.DataFrame,      # reference dataset for permutation importance
+        y_ref: pd.Series,
+        config: dict,
+    ): ...
+```
+
+**`get_importance()` logic:**
+```
+sklearn.inspection.permutation_importance(model, X_ref, y_ref, n_repeats=10)
+→ result.importances_mean as pd.Series
+```
+
+**`get_shap_values()` logic:**
+```
+explainer = shap.GradientExplainer(model, X_ref)
+→ |explainer.shap_values(X)|.mean(axis=0)
+```
+
+---
+
+## Provider Factory
+
+```python
+def create_importance_provider(
+    model_type: str,
+    models: Any,
+    train_labels: dict[str, pd.Series] | None,
+    config: dict,
+) -> ImportanceProvider:
+    """
+    Factory for ImportanceProvider instances.
+    model_type: "lightgbm" | "mlp"
+    models: dict[str, lgb.Booster] for LightGBM; nn.Module for MLP
+    train_labels: required when importance_averaging == "sample_weighted"
+    Raises ValueError if train_labels is None and averaging == "sample_weighted".
+    """
+    ...
+```
+
+**Caller example (run_train.py):**
+```python
+provider = create_importance_provider(
+    model_type   = config["model"]["model_type"],
+    models       = trained_models,
+    train_labels = {
+        label: train_df[f"label_{label}"]
+        for label in ["up5", "up3", "sw", "dn3", "dn5"]
+    },
+    config = config,
+)
+reducer = DimensionalityReducer(config)
+selected_features, report = reducer.run_all(X_train, X_valid, provider)
+```
+
+---
+
 ## Three-Stage Pipeline
 
 ### Stage 1: Correlation Filter
-Remove one feature from each highly correlated pair to eliminate redundancy (e.g., MA(5) stats and MA(10) stats).
+
+Model-independent. Operates on X_train only.
 
 ```
 For each pair (fi, fj) where |corr(fi, fj)| > threshold:
-    remove the one with lower LightGBM gain importance
-    (or the second one alphabetically if importance not yet available)
+    importance = provider.get_importance(feature_names)
+    remove the feature with lower importance score
+    (alphabetical tiebreak if scores are equal)
 
 Default threshold: 0.95 (configurable)
 ```
 
 ### Stage 2: Importance Filter
-Remove features with negligible contribution to model predictions.
+
+Delegates to provider for importance scores.
 
 ```
-Compute: gain_importance = model.feature_importance(importance_type="gain")
-Remove:  features in the bottom percentile by gain importance
+importance = provider.get_importance(feature_names)
+Remove features in the bottom percentile by importance score.
 
 Default: remove bottom 20% (configurable)
 ```
 
 ### Stage 3: SHAP Filter (optional)
-Fine-grained removal based on actual prediction contribution.
-More expensive — enable after Stage 1+2 have already reduced dimensionality.
+
+Delegates to provider for SHAP computation.
 
 ```
-Compute: mean_abs_shap = |shap_values|.mean(axis=0)
-Remove:  features below absolute SHAP threshold
+shap_vals = provider.get_shap_values(X_train)
+Remove features below absolute SHAP threshold.
 
-Default: disabled — enable via config when feature count > shap_trigger_threshold
+Default: disabled
+Enabled automatically when feature count > shap_trigger_threshold (configurable)
 ```
 
 ---
@@ -69,24 +222,26 @@ Default: disabled — enable via config when feature count > shap_trigger_thresh
 
 ```python
 class DimensionalityReducer:
+    def __init__(self, config: dict): ...
+
     def correlation_filter(
         self,
         X: pd.DataFrame,
-        importance: pd.Series | None = None,
+        provider: ImportanceProvider,
         threshold: float = 0.95,
     ) -> list[str]: ...
 
     def importance_filter(
         self,
         feature_names: list[str],
-        model: lgb.Booster,
+        provider: ImportanceProvider,
         bottom_pct: float = 0.20,
     ) -> list[str]: ...
 
     def shap_filter(
         self,
         X: pd.DataFrame,
-        model: lgb.Booster,
+        provider: ImportanceProvider,
         min_mean_abs_shap: float,
     ) -> list[str]: ...
 
@@ -94,7 +249,7 @@ class DimensionalityReducer:
         self,
         X_train: pd.DataFrame,
         X_valid: pd.DataFrame,
-        model: lgb.Booster,
+        provider: ImportanceProvider,
     ) -> tuple[list[str], dict]:
         """
         Run all enabled stages sequentially.
@@ -110,11 +265,12 @@ class DimensionalityReducer:
 ```
 PipelineOptimizer cycle:
 
-1. Train LightGBM on full feature set  →  baseline AUC
-2. Run DimensionalityReducer.run_all() →  selected_features
-3. Retrain LightGBM on selected_features → reduced AUC
-4. Compare: if reduced_AUC >= baseline_AUC - tolerance → accept reduction
-5. Log both results to experiment_log.csv
+1. Train model on full feature set              → baseline AUC
+2. create_importance_provider(...)              → provider
+3. reducer.run_all(X_train, X_valid, provider)  → selected_features
+4. Retrain model on selected_features           → reduced AUC
+5. Compare: if reduced_AUC >= baseline_AUC - tolerance → accept reduction
+6. Log both results to train_log
 ```
 
 ---
@@ -123,6 +279,8 @@ PipelineOptimizer cycle:
 
 ```yaml
 dimensionality_reducer:
+  importance_averaging: "uniform"   # "uniform" | "sample_weighted"
+                                    # searchable by PipelineOptimizer
   correlation_filter:
     enabled: true
     threshold: 0.95
@@ -140,7 +298,14 @@ dimensionality_reducer:
 
 ## Constraints
 
-- PCA and other transformation-based methods must NOT be used — interpretability of feature importance must be preserved
+- `DimensionalityReducer` must have zero direct imports of `lightgbm`, `torch`,
+  or any model library — all model access via `ImportanceProvider` only
+- PCA and other transformation-based methods must NOT be used —
+  feature interpretability must be preserved
 - Filters operate on feature names only — they do not modify the feature matrix directly
-- The caller (PipelineOptimizer) is responsible for subsetting X_train/X_valid after receiving selected_features
-- reduction_report must record: input count, output count, removed feature names per stage
+- The caller is responsible for subsetting X_train/X_valid after receiving `selected_features`
+- `reduction_report` must record: input count, output count, removed feature names per stage
+- `train_labels` is required when `importance_averaging == "sample_weighted"`;
+  `create_importance_provider()` must raise `ValueError` if not provided in that case
+- `MLPImportanceProvider` implementation is deferred to MLP phase;
+  its interface is defined here for forward compatibility

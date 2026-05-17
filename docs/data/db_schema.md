@@ -55,15 +55,16 @@ Field mapping (applies to both 1min and 10tick):
 - `DATE` format: `YYYYMMDD`
 - `RESOLUTION` values: `min` | `tick`
 - `data_root` is configurable (CLI argument or config file)
-- Both directory and zip formats are supported; zip is extracted to a temp location during ingestion
+- Both directory and zip formats are supported
 - Duplicate detection: if `(ticker, date, resolution)` already exists in DuckDB, the file is skipped
+- **No time-of-day filtering at ingestion** — all bars including pre-market and after-market are stored
 
 ---
 
 ## Table Definitions
 
 ```sql
--- 1-minute OHLCV bars
+-- 1-minute OHLCV bars (all sessions: pre-market, regular, after-market)
 CREATE TABLE ohlcv_1min (
     ticker   VARCHAR      NOT NULL,
     date     VARCHAR      NOT NULL,  -- 'YYYYMMDD'
@@ -76,18 +77,18 @@ CREATE TABLE ohlcv_1min (
     PRIMARY KEY (ticker, date, hour)
 );
 
--- 10-tick data
--- Note: multiple ticks can share the same HHMMSS within one second.
--- seq_id is a sequential counter assigned per (ticker, date, hour) at ingestion time.
+-- 10-tick data (all sessions: pre-market, regular, after-market)
+-- hour: HHMMSS representing the LAST tick timestamp of each 10-tick bundle (second precision)
+-- seq_id: sequential counter assigned per (ticker, date, hour) at ingestion time
 CREATE TABLE tick_10 (
     ticker   VARCHAR      NOT NULL,
     date     VARCHAR      NOT NULL,
-    hour     VARCHAR      NOT NULL,  -- 'HHMMSS', tick timestamp (second precision)
+    hour     VARCHAR      NOT NULL,  -- 'HHMMSS', last tick of bundle (second precision)
     seq_id   INTEGER      NOT NULL,  -- sequential index within same (ticker, date, hour)
-    open     DOUBLE       NOT NULL,  -- Oprc
+    open     DOUBLE       NOT NULL,  -- Oprc (first tick of bundle)
     high     DOUBLE       NOT NULL,  -- Hprc
     low      DOUBLE       NOT NULL,  -- Lprc
-    close    DOUBLE       NOT NULL,  -- Prpr (last traded price)
+    close    DOUBLE       NOT NULL,  -- Prpr (last tick of bundle)
     volume   BIGINT       NOT NULL,  -- CntgVol
     PRIMARY KEY (ticker, date, hour, seq_id)
 );
@@ -105,6 +106,7 @@ CREATE TABLE stock_meta (
 );
 
 -- Trading halts (crawled from NYSE, refreshed daily)
+-- Halts can occur across all time periods, not only regular session
 CREATE TABLE trading_halts (
     ticker        VARCHAR   NOT NULL,
     date          VARCHAR   NOT NULL,   -- 'YYYYMMDD'
@@ -120,17 +122,24 @@ CREATE TABLE us_holidays (
     holiday_name  VARCHAR                 -- e.g. "Christmas Day", "Independence Day"
 );
 
--- After-market tick prices (for labeling exit fallback)
--- Populated from tick_10 rows with hour > '155900'
--- Stored separately to keep tick_10 session-clean
-CREATE TABLE after_market_ticks (
-    ticker   VARCHAR   NOT NULL,
-    date     VARCHAR   NOT NULL,
-    hour     VARCHAR   NOT NULL,   -- 'HHMMSS', after 15:59
-    seq_id   INTEGER   NOT NULL,
-    price    DOUBLE    NOT NULL,
-    volume   BIGINT    NOT NULL,
-    PRIMARY KEY (ticker, date, hour, seq_id)
+-- Trading calendar — all dates with trading day status and data availability
+-- Populated by migrate_json_to_duckdb.py (initial) and collect_daily.py (incremental)
+CREATE TABLE trading_calendar (
+    date            VARCHAR   PRIMARY KEY,  -- 'YYYYMMDD'
+    is_trading_day  BOOLEAN   NOT NULL,     -- NYSE calendar based
+    is_holiday      BOOLEAN   NOT NULL,     -- cross-referenced with us_holidays
+    has_data        BOOLEAN   NOT NULL,     -- ohlcv_1min has rows for this date
+    updated_at      VARCHAR
+);
+
+-- Ticker-level data coverage per date
+-- Populated by migrate_json_to_duckdb.py (initial) and collect_daily.py (incremental)
+CREATE TABLE ticker_data_coverage (
+    ticker      VARCHAR   NOT NULL,
+    date        VARCHAR   NOT NULL,
+    has_1min    BOOLEAN   NOT NULL,
+    has_tick    BOOLEAN   NOT NULL,
+    PRIMARY KEY (ticker, date)
 );
 
 -- Entry points (output of EntryPointDetector)
@@ -144,67 +153,84 @@ CREATE TABLE entry_points (
 
 -- Labeled samples (output of Labeler)
 CREATE TABLE labeled_samples (
-    ticker      VARCHAR      NOT NULL,
-    date        VARCHAR      NOT NULL,
-    hour        VARCHAR      NOT NULL,
-    p_entry     DOUBLE       NOT NULL,
-    label_up5   INTEGER      NOT NULL,  -- 1 or 0
-    label_up3   INTEGER      NOT NULL,
-    label_sw    INTEGER      NOT NULL,
-    label_dn3   INTEGER      NOT NULL,
-    label_dn5   INTEGER      NOT NULL,
+    ticker            VARCHAR      NOT NULL,
+    date              VARCHAR      NOT NULL,
+    hour              VARCHAR      NOT NULL,
+    p_entry           DOUBLE       NOT NULL,
+    label_up5         INTEGER      NOT NULL,  -- 1 or 0
+    label_up3         INTEGER      NOT NULL,
+    label_sw          INTEGER      NOT NULL,
+    label_dn3         INTEGER      NOT NULL,
+    label_dn5         INTEGER      NOT NULL,
+    is_dead_position  BOOLEAN      NOT NULL DEFAULT FALSE,
     PRIMARY KEY (ticker, date, hour)
 );
 
--- Trade log (output of BacktestEngine)
--- entry_bar and exit_bar stored as HHMMSS-derived integers (e.g. "093000" → 93000).
--- BacktestEngine converts hour VARCHAR to integer before writing.
--- To join back to ohlcv_1min: CAST(entry_bar AS VARCHAR) zero-padded to 6 digits → hour.
-CREATE TABLE trade_log (
-    tr_id           VARCHAR     NOT NULL,  -- UUID
-    run_id          VARCHAR,
-    ticker          VARCHAR,
-    date            VARCHAR,
-    entry_bar       INTEGER,               -- HHMMSS as int (e.g. 93000, 100500)
-    exit_bar        INTEGER,               -- HHMMSS as int
-    signal          VARCHAR,               -- "up3" | "up5"
-    fill_price      DOUBLE,
-    exit_price      DOUBLE,
-    quantity        INTEGER,
-    pnl_pct         DOUBLE,
-    pnl_abs         DOUBLE,                -- NULL in inf mode
-    exit_reason     VARCHAR,               -- "take_profit" | "stop_loss" | "time_limit"
-    slippage_pct    DOUBLE,
-    cash_remaining  DOUBLE,                -- NULL in inf mode
-    PRIMARY KEY (tr_id)
-);
-
--- Experiment log (output of PipelineOptimizer and BacktestEngine)
--- Written by PipelineOptimizer after each trial.
--- BacktestEngine appends backtest summary columns to the matching run_id row.
-CREATE TABLE experiment_log (
-    run_id              VARCHAR      NOT NULL,  -- YYYYMMDD_HHMMSS or YYYYMMDD_HHMMSS_NNN (optimizer)
-    run_at              VARCHAR      NOT NULL,  -- 'YYYYMMDD_HHMMSS'
-    feature_config      VARCHAR      NOT NULL,  -- JSON: active feature groups + vectorizer methods
+-- Train log (output of run_train.py — one row per training trial)
+-- Written by run_train.py for every trial including AUC-loop iterations.
+-- optimizer_run_id groups trials belonging to the same optimizer run.
+CREATE TABLE train_log (
+    run_id              VARCHAR      NOT NULL,   -- YYYYMMDD_HHMMSS (utils.generate_run_id())
+    optimizer_run_id    VARCHAR,                 -- NULL if standalone run_train
+    run_at              VARCHAR      NOT NULL,
+    feature_config      VARCHAR      NOT NULL,   -- JSON: active feature groups + vectorizer methods
     n_features          INTEGER,
-    n_features_reduced  INTEGER,                -- after DimensionalityReducer; NULL if not run
+    n_features_reduced  INTEGER,                 -- after DimensionalityReducer; NULL if not run
     auc_up5             DOUBLE,
     auc_up3             DOUBLE,
     auc_sw              DOUBLE,
     auc_dn3             DOUBLE,
     auc_dn5             DOUBLE,
     auc_mean            DOUBLE,
-    auc_reduced_mean    DOUBLE,                 -- mean AUC on reduced feature set; NULL if not run
+    auc_reduced_mean    DOUBLE,
+    best_of_loop        BOOLEAN,                 -- True if this trial proceeded to backtest
+    notes               VARCHAR,
+    PRIMARY KEY (run_id)
+);
+
+-- Experiment log (output of run_backtest.py — one row per completed backtest)
+-- Written only when backtest completes. Linked to train_log via run_id.
+-- optimizer_run_id links back to the optimizer run that produced this experiment.
+CREATE TABLE experiment_log (
+    run_id              VARCHAR      NOT NULL,   -- matches train_log.run_id
+    optimizer_run_id    VARCHAR,                 -- NULL if standalone run_backtest
+    run_at              VARCHAR      NOT NULL,
     winning_rate        DOUBLE,
     total_trades        INTEGER,
     winning_trades      INTEGER,
     avg_pnl_pct         DOUBLE,
     total_pnl_abs       DOUBLE,
     avg_slippage_pct    DOUBLE,
-    trades_by_signal    VARCHAR,                -- JSON: {"up3": {...}, "up5": {...}}
-    trades_by_exit      VARCHAR,                -- JSON: {"take_profit": n, "stop_loss": n, "time_limit": n}
+    dead_position_count INTEGER,
+    dead_position_rate  DOUBLE,
+    trades_by_signal    VARCHAR,                 -- JSON: {"up3": {...}, "up5": {...}}
+    trades_by_exit      VARCHAR,                 -- JSON: {"take_profit": n, ...}
     notes               VARCHAR,
     PRIMARY KEY (run_id)
+);
+
+-- Trade log (output of BacktestEngine)
+-- entry_bar and exit_bar stored as HHMMSS-derived integers via int(hour_str)
+CREATE TABLE trade_log (
+    tr_id             VARCHAR     NOT NULL,  -- UUID
+    run_id            VARCHAR,
+    ticker            VARCHAR,
+    date              VARCHAR,
+    entry_bar         INTEGER,               -- HHMMSS as int (e.g. 93000, 100500)
+    exit_bar          INTEGER,               -- HHMMSS as int
+    signal            VARCHAR,               -- "up3" | "up5"
+    fill_price        DOUBLE,
+    exit_price        DOUBLE,
+    quantity          INTEGER,
+    pnl_pct           DOUBLE,
+    pnl_abs           DOUBLE,                -- NULL in inf mode
+    exit_reason       VARCHAR,               -- "take_profit"|"stop_loss"|"session_end"
+                                             -- |"time_limit"|"dead_position"
+                                             -- |"dead_position_delisted"|"dead_position_no_data"
+    slippage_pct      DOUBLE,
+    cash_remaining    DOUBLE,                -- NULL in inf mode
+    dead_position     BOOLEAN,               -- True if overnight hold occurred
+    PRIMARY KEY (tr_id)
 );
 ```
 
@@ -216,37 +242,49 @@ CREATE TABLE experiment_log (
 import duckdb
 con = duckdb.connect("data/market.duckdb")
 
-# Load N trading days of 1min bars for a ticker
+# Load N trading days of 1min bars for a ticker (all sessions)
 df = con.execute("""
     SELECT * FROM ohlcv_1min
     WHERE ticker = ? AND date >= ? AND date <= ?
     ORDER BY date, hour
 """, ["AAPL", "20250101", "20250630"]).df()
 
+# Load regular session only (when needed)
+df_regular = con.execute("""
+    SELECT * FROM ohlcv_1min
+    WHERE ticker = ? AND date >= ? AND date <= ?
+      AND hour >= '093000' AND hour <= '155900'
+    ORDER BY date, hour
+""", ["AAPL", "20250101", "20250630"]).df()
+
 # Load 10-tick data strictly before t bar open (feature-safe)
-# Order by hour, seq_id to preserve intra-second sequence
 ticks = con.execute("""
     SELECT * FROM tick_10
     WHERE ticker = ? AND date = ? AND hour < ?
     ORDER BY hour, seq_id
 """, ["AAPL", "20250714", "093000"]).df()
 
-# Load 10-tick data within t bar (backtest slippage only)
+# Load 10-tick data within t bar (backtest entry slippage only)
 ticks_t = con.execute("""
     SELECT * FROM tick_10
     WHERE ticker = ? AND date = ? AND hour >= ? AND hour < ?
     ORDER BY hour, seq_id
 """, ["AAPL", "20250714", "093000", "093100"]).df()
 
-# Daily cumulative volume for entry detection condition D
-daily_vol = con.execute("""
-    SELECT SUM(volume) as daily_volume
-    FROM ohlcv_1min
-    WHERE ticker = ? AND date = ? AND hour <= ?
-""", ["AAPL", "20250714", "093000"]).fetchone()[0]
+# Find next trading day for dead position resolution
+next_day = con.execute("""
+    SELECT date, has_data FROM trading_calendar
+    WHERE date > ? AND is_trading_day = TRUE
+    ORDER BY date LIMIT 1
+""", ["20250714"]).fetchone()
+
+# Check ticker data coverage for dead position Case B
+coverage = con.execute("""
+    SELECT 1 FROM ticker_data_coverage
+    WHERE ticker = ? AND date = ?
+""", ["AAPL", "20250715"]).fetchone()
 
 # Reconstruct ohlcv_1min join from trade_log entry_bar
-# entry_bar is stored as int (e.g. 93000); zero-pad to 6 digits to get hour VARCHAR
 trades = con.execute("""
     SELECT t.*, o.high, o.low, o.close
     FROM trade_log t
@@ -263,7 +301,7 @@ trades = con.execute("""
 ## Ingestion Rules
 
 - All numeric fields from JSON are stored as strings → cast to DOUBLE/BIGINT on insert
-- Regular market session only: `hour >= '093000'` and `hour <= '155900'`
-- Pre-market / after-hours data: excluded at ingestion time
+- **No time-of-day filter** — all bars (pre-market, regular, after-market) are stored
 - `seq_id` for tick_10: assigned as row-order index within each `(ticker, date, hour)` group, starting from 0
 - Duplicate skip: check existence of `(ticker, date)` pair in target table before inserting; skip entire file if already present
+- After ingestion: `trading_calendar` and `ticker_data_coverage` updated via `utils.populate_trading_calendar()` and `utils.populate_ticker_coverage()`
