@@ -40,6 +40,9 @@ AUTOMATED (this module):
     → which indicator groups are active
     → which vectorizer methods are applied per indicator group
     → importance_averaging strategy ("uniform" | "sample_weighted")
+    → session_mode ("regular" | "pre" | "combined")
+       passed to ClassBalancer.split() — controls which session's entry points
+       are used for train, val, and test across all trials
 
 MANUAL (edit pipeline_config.yaml directly):
     Individual indicator parameters
@@ -64,6 +67,12 @@ optimizer:
   strategy: "grid"             # "grid" | "random"
 
   search_space:
+    session_mode:
+      options:
+        - "regular"
+        - "pre"
+        - "combined"
+
     feature_groups:
       - name: price_indicators
         options: [on, off]
@@ -100,6 +109,19 @@ optimizer:
           - "sample_weighted"
 ```
 
+Search strategies:
+- `"grid"`   — iterates all combinations in search_space exhaustively, in order;
+               stops early if `auc_threshold` is met before full enumeration
+- `"random"` — samples combinations from search_space without replacement,
+               using `random_state` as seed; stops after `max_trials` attempts
+               or when search space is exhausted, whichever comes first
+
+Note on `session_mode` in search space: each session_mode value produces an independent
+model trained and evaluated on its own session's entry points. Models across different
+session_modes are not directly comparable by AUC — they serve different deployment contexts.
+To search session_mode alongside other parameters, ensure `max_trials` is large enough
+to cover meaningful combinations per session.
+
 ---
 
 ## Full Experiment Cycle
@@ -110,8 +132,12 @@ optimizer_run_id = utils.generate_run_id()
 For each feature_config in search_space:
 
     [Preprocess — in-memory]
+    config_override = utils.apply_overrides(base_config, feature_config)
     preprocessor = Preprocessor(config_override, db_conn)
     train, val, test = preprocessor.run(return_data=True)
+    # ClassBalancer.split() is called inside Preprocessor.run() with
+    # session_mode=config_override["entry_detector"]["session_mode"]
+    # → train, val, test all contain only the target session's entry points
 
     [AUC Loop]
     best_run_id = None
@@ -215,6 +241,13 @@ PipelineOptimizer applies feature_config overrides to config in-memory.
 config_override = utils.apply_overrides(base_config, feature_config)
 ```
 
+`session_mode` override is applied via dot-notation:
+```python
+{"entry_detector.session_mode": "pre"}
+```
+
+This propagates automatically to `ClassBalancer.split()` inside `Preprocessor.run()`.
+
 ---
 
 ## Constraints
@@ -227,3 +260,7 @@ config_override = utils.apply_overrides(base_config, feature_config)
 - `best_of_loop` updated via UPDATE by PipelineOptimizer after loop completes
 - Preprocessed parquet saved only for best trial via `preprocessor.save()`
 - `optimizer_run_id` format: `YYYYMMDD_HHMMSS` (same as run_id, generated once per optimizer run)
+- `"random"` strategy uses `random_state` for reproducible non-replacement sampling;
+  same `random_state` always produces the same trial order
+- `session_mode` is a first-class search variable — each value produces an independent
+  model; results across session_modes are not cross-comparable by AUC

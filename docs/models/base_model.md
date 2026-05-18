@@ -24,7 +24,7 @@ categorical_cols: list[str] | None   # None if model does not require categorica
 
 **Output:**
 ```python
-models: Any              # implementation-defined model artifacts
+models: M                # subclass-defined model artifacts (e.g. dict[str, lgb.Booster])
 eval_result: dict        # evaluation results
 predictions: pd.DataFrame  # probability predictions
 ```
@@ -34,7 +34,13 @@ predictions: pd.DataFrame  # probability predictions
 ## Interface
 
 ```python
-class BaseModel(ABC):
+from typing import Generic, TypeVar
+
+M = TypeVar("M")  # model artifacts type — subclass-defined
+                  # e.g. dict[str, lgb.Booster] for LGBMPipeline
+                  #      nn.Module for MLPPipeline (planned)
+
+class BaseModel(ABC, Generic[M]):
     @property
     @abstractmethod
     def model_type(self) -> str: ...
@@ -49,32 +55,49 @@ class BaseModel(ABC):
         val: pd.DataFrame,
         feature_names: list[str],
         categorical_cols: list[str] | None = None,
-    ) -> Any: ...
-    def _train_impl(self, train, val, feature_names, categorical_cols) -> Any: ...
+    ) -> M:
+        """
+        Train model and return artifacts.
+        Return type M is subclass-defined (e.g. dict[str, lgb.Booster] for LGBMPipeline).
+        Delegates to _train_impl(). Do not override train() directly —
+        subclasses must implement _train_impl() only.
+        Callers must treat the return value as opaque and pass it only to
+        evaluate(), predict(), save(), feature_importance() of the same instance.
+        """
+        ...
+    def _train_impl(self, train, val, feature_names, categorical_cols) -> M: ...
 
-    def evaluate(self, models, test, feature_names) -> dict[str, Any]: ...
-    def _evaluate_impl(self, models, test, feature_names) -> dict[str, Any]: ...
+    def evaluate(self, models: M, test: pd.DataFrame, feature_names: list[str]) -> dict[str, Any]: ...
+    def _evaluate_impl(self, models: M, test: pd.DataFrame, feature_names: list[str]) -> dict[str, Any]: ...
 
-    def predict(self, models, X) -> pd.DataFrame: ...
-    def _predict_impl(self, models, X) -> pd.DataFrame: ...
+    def predict(self, models: M, X: pd.DataFrame) -> pd.DataFrame: ...
+    def _predict_impl(self, models: M, X: pd.DataFrame) -> pd.DataFrame: ...
 
-    def feature_importance(self, models, importance_type="gain") -> pd.DataFrame: ...
-    def _feature_importance_impl(self, models, importance_type) -> pd.DataFrame: ...
+    def feature_importance(self, models: M, importance_type: str = "gain") -> pd.DataFrame: ...
+    def _feature_importance_impl(self, models: M, importance_type: str) -> pd.DataFrame: ...
 
     def save(
         self,
-        models,
+        models: M,
         run_id: str,
         eval_result: dict,
         feature_names: list[str],
         categorical_cols: list[str] | None = None,
     ) -> None: ...
-    def _save_model_impl(self, models, path) -> None: ...
+    def _save_model_impl(self, models: M, path: str) -> None: ...
 
-    def load(self, run_id) -> tuple[Any, dict]: ...
-    def _load_model_impl(self, path) -> Any: ...
+    def load(self, run_id: str) -> tuple[M, dict]: ...
+    def _load_model_impl(self, path: str) -> M: ...
 
-    def list_models(self) -> list[str]: ...
+    def list_run_ids(self) -> list[str]:
+        """
+        Return list of run_ids saved under {model_dir}/{model_type}/.
+        Scans subdirectory names under the artifact path constructed from
+        config["model"]["model_dir"] and self.model_type.
+        Utility method for CLI inspection and debugging.
+        Not called by pipeline scripts.
+        """
+        ...
 ```
 
 ---
@@ -115,11 +138,19 @@ Creates the directory automatically on init.
 
 - Subclasses must implement `_train_impl`, `_evaluate_impl`, `_predict_impl`,
   `_feature_importance_impl`, `_save_model_impl`, `_load_model_impl`
+- Subclasses must NOT override public methods (`train`, `evaluate`, `predict`, etc.) directly —
+  all customization goes into the corresponding `_impl` methods
 - `model_type` and `model_version` properties must be defined by subclass
 - `categorical_cols=None` default allows non-LightGBM models to omit categorical handling
 - Constructor accepts a `config` dict (see Config Keys above)
 - Model instantiation is handled by `src/models/factory.py` via registry pattern —
   `BaseModel` has no knowledge of its subclasses
+- Subclasses must declare their artifacts type via `BaseModel[M]`:
+  e.g. `class LGBMPipeline(BaseModel[dict[str, lgb.Booster]])`
+- `M` is resolved at subclass declaration; erased to `Any` at factory call site.
+  Callers must never pass `models` to a different BaseModel instance.
+- `list_run_ids()` scans `{model_dir}/{model_type}/` using `self.model_type` —
+  utility method for debugging, not called by pipeline scripts
 
 ---
 
@@ -127,9 +158,15 @@ Creates the directory automatically on init.
 
 `src/models/factory.py` maintains a registry of concrete implementations:
 
-| Config `model.model_type` | Concrete class |
-|---|---|
-| `lightgbm` | `LGBMPipeline` |
-| `mlp` | `MLPPipeline` (planned) |
+| Config `model.model_type` | Concrete class | M (artifacts type) |
+|---|---|---|
+| `lightgbm` | `LGBMPipeline` | `dict[str, lgb.Booster]` |
+| `mlp` | `MLPPipeline` (planned) | `nn.Module` |
 
-`run_train.py` instantiates models exclusively via `create_model(config) -> BaseModel`.
+`run_train.py` instantiates models exclusively via `create_model(config) -> BaseModel[Any]`.
+
+Note: `create_model()` returns `BaseModel[Any]` — the concrete artifacts type M is
+resolved at subclass declaration and is available when the subclass is used directly
+(e.g. in tests). At the factory call site, M is erased to Any; callers must treat
+the `models` return value of `train()` as opaque and pass it only to `evaluate()`,
+`predict()`, `save()`, `feature_importance()` of the same instance.

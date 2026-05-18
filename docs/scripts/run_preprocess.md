@@ -12,6 +12,11 @@ Supports three execution modes:
 - **Optimizer (in-memory)**: returns DataFrames without saving, called by PipelineOptimizer
 - **Live (live_mode)**: runs EntryPointDetector + FeatureExtractor only, used by Inferencer
 
+Preprocessor is responsible for feature extraction only. Session_mode filtering
+and class balancing are handled entirely by ClassBalancer.split(), ensuring that
+the preprocessed feature matrix can be reused across different session_mode
+and balancing configurations without re-running feature extraction.
+
 ---
 
 ## Input / Output
@@ -30,9 +35,9 @@ ticker_data_coverage: pd.DataFrame
 **Output (standalone mode):**
 ```python
 # Saved to data/processed/:
-train_features.parquet    # balanced training split
-val_features.parquet      # validation split
-test_features.parquet     # test split
+train_features.parquet    # balanced training split (session-filtered)
+val_features.parquet      # validation split (session-filtered)
+test_features.parquet     # test split (session-filtered)
 
 # Parquet column structure per file:
 # [ticker, date, hour, p_entry] + [features...] + [label_up5..label_dn5, is_dead_position]
@@ -56,15 +61,20 @@ pd.DataFrame  # feature matrix for current entry points (no labels)
 [Standard / In-memory mode]
 
 1. Connect to DuckDB and load all data
-2. EntryPointDetector.scan() for each ticker → entry_points (all session modes)
+2. EntryPointDetector.scan() for each ticker → entry_points (all sessions)
 3. Save entry_points to DuckDB entry_points table
 4. Labeler.label() for all entry points → labeled_samples
 5. Save labeled_samples to DuckDB labeled_samples table
 6. FeatureExtractor.extract_batch() for each ticker → feature matrix
 7. Merge features with labels on (ticker, date, hour)
-   → parquet columns: [ticker, date, hour, p_entry] + [features] + [labels, is_dead_position]
-8. ClassBalancer.split(balance=config["class_balancer"]["apply_balance"])
-   → (train_balanced, val, test)
+   → labeled feature matrix: [ticker, date, hour, p_entry] + [features] + [labels, is_dead_position]
+   → contains all sessions; no session_mode filter applied here
+8. ClassBalancer.split(
+       balance=config["class_balancer"]["apply_balance"],
+       session_mode=config["entry_detector"]["session_mode"]
+   ) → (train_balanced, val, test)
+   → session_mode filter and balancing both applied inside split()
+   → train, val, test all contain only target session's entry points
 9. If return_data=True: return (train_balanced, val, test)
    Else: save parquet files to data/processed/
 
@@ -73,7 +83,7 @@ pd.DataFrame  # feature matrix for current entry points (no labels)
 1. Connect to DuckDB and load recent OHLCV, ticks, meta
 2. EntryPointDetector.scan() for current bars → entry_points
 3. FeatureExtractor.extract_batch() → feature matrix (no labels)
-4. Return feature matrix directly (no save, no labeling)
+4. Return feature matrix directly (no save, no labeling, no session filter)
 ```
 
 ---
@@ -136,7 +146,7 @@ entry_detector.*           # includes session_mode, volume_base_hour
 indicators.*
 vectorizer.*
 labeler.*
-class_balancer.*           # includes apply_balance
+class_balancer.*           # includes apply_balance; session_mode read from entry_detector
 misc.lookback_bars
 ```
 
@@ -144,11 +154,14 @@ misc.lookback_bars
 
 ## Constraints
 
+- Preprocessor is responsible for feature extraction only — no session_mode filter,
+  no balancing applied inside Preprocessor
+- Session_mode filtering and balancing are both handled by ClassBalancer.split()
 - All data loaded from DuckDB in bulk (no per-ticker DB queries during extraction)
-- `extract_batch()` used — no Python loop over `extract()`
+- `extract_batch()` called per ticker — no Python loop over `extract()` per entry point
 - Empty DataFrames handled gracefully (saves _empty.parquet)
 - `ClassBalancer.split()` is the single call — `balance()` is not called separately
 - `balance` argument to `split()` read from `config["class_balancer"]["apply_balance"]`
-- All parameters from `pipeline_config.yaml` — nothing hardcoded
+- `session_mode` argument to `split()` read from `config["entry_detector"]["session_mode"]`
 - `p_entry` included in parquet as identifier column, not feature
 - In live_mode: Labeler and ClassBalancer are not instantiated

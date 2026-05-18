@@ -133,7 +133,7 @@ models/lightgbm/{run_id}/
 ## Interface
 
 ```python
-class LGBMPipeline(BaseModel):
+class LGBMPipeline(BaseModel[dict[str, lgb.Booster]]):
     @property
     def model_type(self) -> str:
         return "lightgbm"
@@ -169,7 +169,7 @@ class LGBMPipeline(BaseModel):
 
     def save(
         self,
-        models: dict,
+        models: dict[str, lgb.Booster],
         run_id: str,
         eval_result: dict,
         feature_names: list[str],

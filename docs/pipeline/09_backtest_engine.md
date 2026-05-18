@@ -60,7 +60,10 @@ Stored in memory and filtered by hour during processing.
 SELECT * FROM trading_halts
 WHERE ticker = ? AND date = ?
 ```
-Used by `build_effective_bar_sequence()` for valid bar counting.
+Loaded once per ticker/date at the start of that ticker/date's processing,
+alongside OHLCV and tick data. Stored in memory and passed explicitly to
+`replay_price_path()` and `build_effective_bar_sequence()` calls within
+the same ticker/date scope.
 
 ### Trading calendar (for dead position resolution)
 ```sql
@@ -342,10 +345,39 @@ class BacktestEngine:
         self,
         bars_future: pd.DataFrame,
         ticks: pd.DataFrame,             # full ticker/date tick_10 for exit interpolation
+        halts_df: pd.DataFrame,          # trading_halts rows for this ticker/date;
+                                         # loaded by run() and passed explicitly
         fill_price: float,
         signal: str,
     ) -> tuple[float, str, bool]:        # (exit_price, exit_reason, dead_position)
         ...
+```
+
+### Data loading pattern in `run()`
+
+`run()` processes predictions grouped by ticker, then by date.
+For each (ticker, date) group, the following data is loaded from DuckDB once
+and passed down to internal methods:
+
+```python
+# Loaded once per ticker
+ohlcv_ticker = db_conn.execute(
+    "SELECT * FROM ohlcv_1min WHERE ticker = ? AND date IN (...)",
+    [ticker, *dates]
+).df()
+
+# Loaded once per ticker/date
+ticks_td   = db_conn.execute("SELECT * FROM tick_10   WHERE ticker = ? AND date = ?", ...).df()
+halts_td   = db_conn.execute("SELECT * FROM trading_halts WHERE ticker = ? AND date = ?", ...).df()
+
+# halts_td passed explicitly to replay_price_path() and build_effective_bar_sequence()
+exit_price, exit_reason, dead_position = self.replay_price_path(
+    bars_future=...,
+    ticks=ticks_td,
+    halts_df=halts_td,
+    fill_price=fill_price,
+    signal=signal,
+)
 ```
 
 ---
@@ -374,7 +406,8 @@ backtest:
 - BacktestEngine accesses DuckDB directly — callers do not pass ohlcv/ticks as arguments
 - `db_conn` injected via constructor for testability (mock DB in tests)
 - OHLCV loaded once per ticker for all its entry dates
-- Tick data loaded once per ticker/date; filtered by hour in memory
+- Tick data and halts_df loaded once per ticker/date; passed explicitly to internal methods
+- `replay_price_path()` receives `halts_df` as an explicit argument — no internal DB queries
 - Session close (15:59 bar) triggers immediate exit — takes priority over time-limit
 - After-market data used only as fallback when 15:59 bar is halt/no_data
 - Dead position: only when session_end fallback also fails

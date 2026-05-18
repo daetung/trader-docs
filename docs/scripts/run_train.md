@@ -20,11 +20,12 @@ Also runnable standalone for single training runs.
 **Input:**
 ```python
 # From preprocessed parquet or in-memory DataFrames:
-train_df: pd.DataFrame   # balanced training split
-val_df:   pd.DataFrame   # validation split
-test_df:  pd.DataFrame   # test split
+train_df: pd.DataFrame   # balanced training split (session-filtered by ClassBalancer)
+val_df:   pd.DataFrame   # validation split (session-filtered by ClassBalancer)
+test_df:  pd.DataFrame   # test split (session-filtered by ClassBalancer)
 # All DataFrames contain:
 # [ticker, date, hour, p_entry, features..., label_up5..label_dn5, is_dead_position]
+# All three splits contain only entry points from the target session_mode.
 ```
 
 **Output:**
@@ -51,31 +52,42 @@ test_df:  pd.DataFrame   # test split
 ```
 1. Load config from pipeline_config.yaml
 2. Load train/val/test (from parquet or in-memory DataFrames)
-3. Apply session_mode filter to training data:
-       if session_mode == "regular": keep hour 093000~155900 only
-       if session_mode == "pre":     keep hour 040000~092900 only
-       if session_mode == "combined": keep hour < 160000
-4. Build feature_names via FeatureExtractor.get_feature_names()
-5. Identify categorical_cols: features ending with "_code" + "day_of_week" + "halt_reason_code"
-6. Instantiate model via factory: model = create_model(config)
-7. Train 5 classifiers:
+   All splits are already session-filtered by ClassBalancer.split() —
+   no additional session_mode filter applied here.
+3. Build feature_names via FeatureExtractor.get_feature_names()
+4. Identify categorical_cols: features ending with "_code" + "day_of_week" + "halt_reason_code"
+5. Instantiate model via factory: model = create_model(config)
+6. Train 5 classifiers:
        models = model.train(train_df, val_df, feature_names, categorical_cols)
-8. Evaluate on test set:
+7. Evaluate on test set:
        eval_result = model.evaluate(models, test_df, feature_names)
-9. Print per-class AUC results
-10. Print top-10 features per classifier:
-        model.feature_importance(models)
-11. Save model artifacts:
-        model.save(models, run_id, eval_result, feature_names, categorical_cols)
-12. Optionally run DimensionalityReducer if --reduce flag is set:
-        provider = create_importance_provider(...)
-        selected_features, report = reducer.run_all(X_train, X_val, provider)
-        Retrain on selected_features → eval_result_reduced
-        Compare AUC: if within tolerance → save reduced model with suffix "_reduced"
-13. Write to train_log (DuckDB):
-        run_id, optimizer_run_id, run_at, feature_config,
-        n_features, n_features_reduced, auc_*, auc_mean,
-        auc_reduced_mean, best_of_loop=False, notes
+8. Print per-class AUC results
+9. Print top-10 features per classifier:
+       model.feature_importance(models)
+10. Save model artifacts:
+       model.save(models, run_id, eval_result, feature_names, categorical_cols)
+11. Optionally run DimensionalityReducer if --reduce flag is set:
+       X_train = train_df[feature_names]   # slice feature columns only
+       X_val   = val_df[feature_names]
+       train_labels = {
+           label: train_df[f"label_{label}"]
+           for label in ["up5", "up3", "sw", "dn3", "dn5"]
+       }
+       provider = create_importance_provider(
+           model_type   = config["model"]["model_type"],
+           models       = models,
+           train_labels = train_labels,
+           config       = config,
+       )
+       reducer = DimensionalityReducer(config)
+       selected_features, report = reducer.run_all(X_train, X_val, provider)
+       Retrain on selected_features → eval_result_reduced
+       Compare AUC: if within config["dimensionality_reducer"]["auc_tolerance"]
+                    → save reduced model with suffix "_reduced"
+12. Write to train_log (DuckDB):
+       run_id, optimizer_run_id, run_at, feature_config,
+       n_features, n_features_reduced, auc_*, auc_mean,
+       auc_reduced_mean, best_of_loop=False, notes
 ```
 
 ---
@@ -106,7 +118,9 @@ class Trainer:
         Returns eval_result dict.
         optimizer_run_id passed via constructor (None for standalone).
         run_id generated via utils.generate_run_id() if not provided.
-        feature_config: active feature group config for logging (None = full config).
+        feature_config: active feature group config for logging (None = standalone mode).
+        All input DataFrames are assumed to be already session-filtered
+        and balanced by ClassBalancer.split().
         """
         ...
 ```
@@ -129,27 +143,6 @@ CLI always runs with `optimizer_run_id=None` (standalone mode).
 
 ---
 
-## Session Mode Filtering
-
-`session_mode` from `config["entry_detector"]["session_mode"]` is applied to training data:
-
-```python
-if session_mode == "regular":
-    train_df = train_df[
-        (train_df["hour"] >= "093000") & (train_df["hour"] <= "155900")
-    ]
-elif session_mode == "pre":
-    train_df = train_df[
-        (train_df["hour"] >= "040000") & (train_df["hour"] < "093000")
-    ]
-elif session_mode == "combined":
-    train_df = train_df[train_df["hour"] < "160000"]
-```
-
-Val and test sets are not filtered — they retain all entry points for consistent evaluation.
-
----
-
 ## train_log Write
 
 Written after every training run (standalone or optimizer loop):
@@ -159,7 +152,9 @@ train_log_row = {
     "run_id":              run_id,
     "optimizer_run_id":    optimizer_run_id,   # None if standalone
     "run_at":              run_at,
-    "feature_config":      json.dumps(feature_config),
+    "feature_config":      json.dumps(feature_config)
+                           if feature_config is not None
+                           else json.dumps(config),  # standalone: full config snapshot
     "n_features":          len(feature_names),
     "n_features_reduced":  len(selected_features) if reduced else None,
     "auc_up5":             eval_result["up5"]["test_auc"],
@@ -170,11 +165,26 @@ train_log_row = {
     "auc_mean":            eval_result["mean_test_auc"],
     "auc_reduced_mean":    eval_result_reduced["mean_test_auc"] if reduced else None,
     "best_of_loop":        False,   # updated by PipelineOptimizer after loop completes
+    "notes":               None,    # free-text memo; may be set by caller or manually
 }
 ```
 
 `best_of_loop` is set to `True` by PipelineOptimizer via UPDATE after the AUC loop
 selects the best trial to proceed to backtest.
+
+---
+
+## Config Keys Used
+
+```yaml
+entry_detector:
+  session_mode: ...          # applied by ClassBalancer.split() upstream — not re-applied here
+
+model.*
+lgbm_params.*
+dimensionality_reducer.*     # auc_tolerance, importance_averaging, filter settings
+misc.*
+```
 
 ---
 
@@ -189,3 +199,12 @@ selects the best trial to proceed to backtest.
 - `run_id` generated via `utils.generate_run_id()`
 - `experiment_log` is NOT written by run_train.py — only train_log
 - `best_of_loop` updated by PipelineOptimizer, not by Trainer itself
+- `feature_config=None` in standalone mode — full config snapshot saved as JSON to satisfy
+  `train_log.feature_config NOT NULL` constraint
+- `notes` defaults to None; may be populated by PipelineOptimizer or set manually
+  for experiment annotation after the fact
+- DimensionalityReducer input must be feature columns only:
+  `X_train = train_df[feature_names]` before passing to `reducer.run_all()`
+- `train_labels` for `create_importance_provider()` sourced from session-filtered `train_df`
+- Session_mode filtering is applied upstream by ClassBalancer.split() —
+  Trainer does not re-apply it

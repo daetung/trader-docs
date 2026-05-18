@@ -169,11 +169,17 @@ CREATE TABLE labeled_samples (
 -- Train log (output of run_train.py — one row per training trial)
 -- Written by run_train.py for every trial including AUC-loop iterations.
 -- optimizer_run_id groups trials belonging to the same optimizer run.
+-- feature_config: JSON string of active feature group config for optimizer trials;
+--   for standalone runs (optimizer_run_id IS NULL), stores full config snapshot.
+--   Never NULL — standalone runs use json.dumps(config) as fallback.
+-- notes: optional free-text memo for experiment annotation; defaults to NULL.
+--   May be populated by PipelineOptimizer or set manually after the fact.
 CREATE TABLE train_log (
     run_id              VARCHAR      NOT NULL,   -- YYYYMMDD_HHMMSS (utils.generate_run_id())
     optimizer_run_id    VARCHAR,                 -- NULL if standalone run_train
     run_at              VARCHAR      NOT NULL,
-    feature_config      VARCHAR      NOT NULL,   -- JSON: active feature groups + vectorizer methods
+    feature_config      VARCHAR      NOT NULL,   -- JSON: active feature groups (optimizer)
+                                                 -- or full config snapshot (standalone)
     n_features          INTEGER,
     n_features_reduced  INTEGER,                 -- after DimensionalityReducer; NULL if not run
     auc_up5             DOUBLE,
@@ -184,7 +190,7 @@ CREATE TABLE train_log (
     auc_mean            DOUBLE,
     auc_reduced_mean    DOUBLE,
     best_of_loop        BOOLEAN,                 -- True if this trial proceeded to backtest
-    notes               VARCHAR,
+    notes               VARCHAR,                 -- NULL by default; free-text experiment memo
     PRIMARY KEY (run_id)
 );
 
