@@ -10,7 +10,7 @@ CLI entry point and callable module for LightGBM training.
 Loads preprocessed train/val/test data, trains 5-class model, evaluates on test set,
 saves model artifacts, and writes results to train_log table.
 
-Called by PipelineOptimizer as part of the AUC loop.
+Called by PipelineOptimizer as part of the rolling fold loop.
 Also runnable standalone for single training runs.
 
 ---
@@ -19,13 +19,13 @@ Also runnable standalone for single training runs.
 
 **Input:**
 ```python
-# From preprocessed parquet or in-memory DataFrames:
-train_df: pd.DataFrame   # balanced training split (session-filtered by ClassBalancer)
-val_df:   pd.DataFrame   # validation split (session-filtered by ClassBalancer)
-test_df:  pd.DataFrame   # test split (session-filtered by ClassBalancer)
+train_df: pd.DataFrame   # balanced training split
+val_df:   pd.DataFrame   # validation split
+test_df:  pd.DataFrame   # test split
 # All DataFrames contain:
-# [ticker, date, hour, p_entry, features..., label_up5..label_dn5, is_dead_position]
-# All three splits contain only entry points from the target session_mode.
+# [ticker, date, hour, p_entry, features..., label_up5..label_dn5,
+#  is_dead_position, dead_position_case, is_ambiguous]
+# Session filtering and balancing applied upstream by ClassBalancer.
 ```
 
 **Output:**
@@ -41,8 +41,7 @@ test_df:  pd.DataFrame   # test split (session-filtered by ClassBalancer)
 #   {run_id}_dn3.lgb, {run_id}_dn5.lgb
 #   {run_id}_meta.json
 
-# Written to DuckDB train_log table:
-#   one row per training run
+# Written to DuckDB train_log table: one row per fold
 ```
 
 ---
@@ -51,14 +50,25 @@ test_df:  pd.DataFrame   # test split (session-filtered by ClassBalancer)
 
 ```
 1. Load config from pipeline_config.yaml
-2. Load train/val/test (from parquet or in-memory DataFrames)
-   All splits are already session-filtered by ClassBalancer.split() —
-   no additional session_mode filter applied here.
-3. Build feature_names via FeatureExtractor.get_feature_names()
+2. Determine feature_names:
+   if feature_names argument provided (exploitation phase): use as-is
+   else: FeatureExtractor.get_feature_names() (full feature set)
+3. Prepare sample weights for ambiguous samples (Trainer responsibility):
+   if config["trainer"]["use_ambiguous_sample_weight"] == True:
+       weight_col = "__sample_weight__"
+       train_df[weight_col] = 1.0
+       train_df.loc[train_df["is_ambiguous"], weight_col] = \
+           config["trainer"]["ambiguous_sample_weight"]
+       sample_weight_col = weight_col
+   else:
+       sample_weight_col = None
+   Note: is_ambiguous column is used here for weight assignment only —
+         it is NOT included in feature_names passed to LightGBM
 4. Identify categorical_cols: features ending with "_code" + "day_of_week" + "halt_reason_code"
 5. Instantiate model via factory: model = create_model(config)
 6. Train 5 classifiers:
-       models = model.train(train_df, val_df, feature_names, categorical_cols)
+       models = model.train(train_df, val_df, feature_names, categorical_cols,
+                            sample_weight_col=sample_weight_col)
 7. Evaluate on test set:
        eval_result = model.evaluate(models, test_df, feature_names)
 8. Print per-class AUC results
@@ -66,8 +76,8 @@ test_df:  pd.DataFrame   # test split (session-filtered by ClassBalancer)
        model.feature_importance(models)
 10. Save model artifacts:
        model.save(models, run_id, eval_result, feature_names, categorical_cols)
-11. Optionally run DimensionalityReducer if --reduce flag is set:
-       X_train = train_df[feature_names]   # slice feature columns only
+11. If run_reducer=True (selection phase — called by PipelineOptimizer only):
+       X_train = train_df[feature_names]   # feature columns only
        X_val   = val_df[feature_names]
        train_labels = {
            label: train_df[f"label_{label}"]
@@ -81,20 +91,45 @@ test_df:  pd.DataFrame   # test split (session-filtered by ClassBalancer)
        )
        reducer = DimensionalityReducer(config)
        selected_features, report = reducer.run_all(X_train, X_val, provider)
-       Retrain on selected_features → eval_result_reduced
-       Compare AUC: if within config["dimensionality_reducer"]["auc_tolerance"]
-                    → save reduced model with suffix "_reduced"
+       → selected_features included in returned result dict
+       → NO retraining here; PipelineOptimizer uses selected_features for voting only
 12. Write to train_log (DuckDB):
-       run_id, optimizer_run_id, run_at, feature_config,
-       n_features, n_features_reduced, auc_*, auc_mean,
-       auc_reduced_mean, best_of_loop=False, notes
+       run_id, optimizer_run_id, run_at, phase, fold_idx, fold_train_end,
+       feature_config, n_features, n_features_reduced,
+       auc_*, auc_mean, auc_std=NULL, auc_reduced_mean=NULL,
+       best_of_loop=False, notes=NULL
+       Note: auc_std is NULL at write time — updated by PipelineOptimizer
+             via UPDATE after all folds in a run/trial complete
 ```
 
 ---
 
-## Class Interface
+## run_reducer vs --reduce: Critical Distinction
 
-`run_train.py` exposes a callable class for use by PipelineOptimizer:
+These two mechanisms trigger DimensionalityReducer but have different behaviors:
+
+**`run_reducer=True` (called by PipelineOptimizer, selection phase):**
+```
+1. Run DimensionalityReducer on current fold's train/val
+2. Return selected_features in result dict for frequency voting
+3. NO retraining — PipelineOptimizer accumulates votes across folds
+4. One model artifact saved (full feature model for this fold)
+```
+
+**`--reduce` CLI flag (standalone use only):**
+```
+1. Run DimensionalityReducer on train/val
+2. Immediately retrain on selected_features
+3. Save second model artifact with "_reduced" suffix
+4. Report both baseline AUC and reduced AUC
+```
+
+The `--reduce` flag is for standalone experimentation.
+PipelineOptimizer never uses it — it calls `run_reducer=True` instead.
+
+---
+
+## Class Interface
 
 ```python
 class Trainer:
@@ -111,16 +146,48 @@ class Trainer:
         val_df: pd.DataFrame,
         test_df: pd.DataFrame,
         run_id: str | None = None,
+        fold_idx: int | None = None,
+        fold_train_end: str | None = None,
         feature_config: dict | None = None,
+        feature_names: list[str] | None = None,
+        run_reducer: bool = False,
+        phase: str | None = None,
     ) -> dict:
         """
         Train, evaluate, save artifacts, write to train_log.
-        Returns eval_result dict.
-        optimizer_run_id passed via constructor (None for standalone).
-        run_id generated via utils.generate_run_id() if not provided.
-        feature_config: active feature group config for logging (None = standalone mode).
-        All input DataFrames are assumed to be already session-filtered
-        and balanced by ClassBalancer.split().
+
+        Returns dict containing:
+            auc_mean:          float — mean test AUC across 5 classifiers
+            auc_up5..auc_dn5:  float — per-classifier test AUC
+            selected_features: list[str] | None — populated if run_reducer=True, else None
+
+        Args:
+            train_df, val_df, test_df:
+                Session-filtered, balanced splits from ClassBalancer.
+                Must not contain p_entry or label columns in feature space.
+            run_id:
+                Generated via utils.generate_run_id() if not provided.
+            fold_idx:
+                0-based fold index for rolling folds.
+                None for standalone CLI runs (single split).
+            fold_train_end:
+                Last date of train window ('YYYYMMDD').
+                Obtained from fold_meta["fold_train_end"] in rolling mode.
+                None for standalone CLI runs.
+            feature_config:
+                Active feature group config dict for train_log logging.
+                None in standalone mode — full config snapshot used instead.
+            feature_names:
+                Explicit feature list (exploitation phase, selected_features).
+                None = use FeatureExtractor.get_feature_names() (full set).
+            run_reducer:
+                True = run DimensionalityReducer, return selected_features.
+                       Used by PipelineOptimizer selection phase only.
+                       Does NOT trigger retraining.
+                False = skip reducer (default).
+            phase:
+                "selection" | "exploitation" | "full" | None (standalone).
+                Recorded in train_log for diagnostics.
         """
         ...
 ```
@@ -130,60 +197,67 @@ class Trainer:
 ## CLI Interface
 
 ```bash
-python scripts/run_train.py [--config CONFIG] [--data-dir DIR] [--run-id ID] [--reduce]
+python scripts/run_train.py [OPTIONS]
 
 Options:
-    --config        Path to pipeline_config.yaml (default: configs/pipeline_config.yaml)
-    --data-dir      Directory containing train/val/test parquet files (default: data/processed)
-    --run-id        Explicit run ID (default: YYYYMMDD_HHMMSS via utils.generate_run_id())
-    --reduce        Run DimensionalityReducer after initial training
+    --config, -c    Path to pipeline_config.yaml (default: configs/pipeline_config.yaml)
+    --data-dir, -d  Directory containing train/val/test parquet files (default: data/processed)
+    --run-id        Explicit run ID (default: YYYYMMDD_HHMMSS)
+    --reduce        Run DimensionalityReducer AND retrain on selected features.
+                    Saves a second "_reduced" model artifact.
+                    Standalone use only — PipelineOptimizer does not use this flag.
+    --features      Path to selected_features.json (load pre-selected feature list)
 ```
 
-CLI always runs with `optimizer_run_id=None` (standalone mode).
+CLI always runs with `optimizer_run_id=None`, `fold_idx=None`, `fold_train_end=None` (standalone mode).
 
 ---
 
 ## train_log Write
 
-Written after every training run (standalone or optimizer loop):
-
 ```python
 train_log_row = {
     "run_id":              run_id,
-    "optimizer_run_id":    optimizer_run_id,   # None if standalone
+    "optimizer_run_id":    optimizer_run_id,
     "run_at":              run_at,
+    "phase":               phase,             # "selection"|"exploitation"|"full"|None
+    "fold_idx":            fold_idx,          # None for standalone
+    "fold_train_end":      fold_train_end,    # None for standalone
     "feature_config":      json.dumps(feature_config)
                            if feature_config is not None
-                           else json.dumps(config),  # standalone: full config snapshot
+                           else json.dumps(config),
     "n_features":          len(feature_names),
-    "n_features_reduced":  len(selected_features) if reduced else None,
+    "n_features_reduced":  len(selected_features) if run_reducer else None,
     "auc_up5":             eval_result["up5"]["test_auc"],
     "auc_up3":             eval_result["up3"]["test_auc"],
     "auc_sw":              eval_result["sw"]["test_auc"],
     "auc_dn3":             eval_result["dn3"]["test_auc"],
     "auc_dn5":             eval_result["dn5"]["test_auc"],
     "auc_mean":            eval_result["mean_test_auc"],
-    "auc_reduced_mean":    eval_result_reduced["mean_test_auc"] if reduced else None,
-    "best_of_loop":        False,   # updated by PipelineOptimizer after loop completes
-    "notes":               None,    # free-text memo; may be set by caller or manually
+    "auc_std":             None,    # set by PipelineOptimizer via UPDATE
+                                    # after all folds in a run/trial complete
+                                    # on the row with MAX(fold_idx) for that run/trial
+    "auc_reduced_mean":    None,    # set only when --reduce CLI flag used
+    "best_of_loop":        False,   # set by PipelineOptimizer via UPDATE
+    "notes":               None,
 }
 ```
-
-`best_of_loop` is set to `True` by PipelineOptimizer via UPDATE after the AUC loop
-selects the best trial to proceed to backtest.
 
 ---
 
 ## Config Keys Used
 
 ```yaml
-entry_detector:
-  session_mode: ...          # applied by ClassBalancer.split() upstream — not re-applied here
-
 model.*
 lgbm_params.*
-dimensionality_reducer.*     # auc_tolerance, importance_averaging, filter settings
-misc.*
+dimensionality_reducer.*
+
+trainer:
+  use_ambiguous_sample_weight: false  # True = apply reduced weight to is_ambiguous=True samples
+  ambiguous_sample_weight: 0.5        # weight value for ambiguous samples (0 < value < 1)
+                                      # only used when use_ambiguous_sample_weight = True
+                                      # ClassBalancer.ambiguous_sample_action must be "keep"
+                                      # for weights to have effect (excluded samples are gone)
 ```
 
 ---
@@ -198,13 +272,16 @@ misc.*
 - Variable names `model` (BaseModel instance) and `models` (trained booster dict) must not be mixed
 - `run_id` generated via `utils.generate_run_id()`
 - `experiment_log` is NOT written by run_train.py — only train_log
-- `best_of_loop` updated by PipelineOptimizer, not by Trainer itself
-- `feature_config=None` in standalone mode — full config snapshot saved as JSON to satisfy
-  `train_log.feature_config NOT NULL` constraint
-- `notes` defaults to None; may be populated by PipelineOptimizer or set manually
-  for experiment annotation after the fact
-- DimensionalityReducer input must be feature columns only:
-  `X_train = train_df[feature_names]` before passing to `reducer.run_all()`
-- `train_labels` for `create_importance_provider()` sourced from session-filtered `train_df`
-- Session_mode filtering is applied upstream by ClassBalancer.split() —
-  Trainer does not re-apply it
+- `best_of_loop` updated by PipelineOptimizer via UPDATE, not by Trainer itself
+- `auc_std` updated by PipelineOptimizer via UPDATE on last fold row, not by Trainer itself
+- `fold_idx` and `fold_train_end` are None for standalone CLI runs
+- `fold_train_end` sourced from fold_meta["fold_train_end"] in rolling mode —
+  Trainer does not compute it independently
+- Sample weight column (`__sample_weight__`) generated inside Trainer when
+  `use_ambiguous_sample_weight=True`; must not appear in feature_names
+- `run_reducer=True` returns selected_features only — no retraining within Trainer.run()
+- `--reduce` CLI flag triggers full reduce-retrain cycle — saves `_reduced` artifact;
+  this behavior is NOT replicated when run_reducer=True is called by PipelineOptimizer
+- Session_mode filtering applied upstream by ClassBalancer — Trainer does not re-apply it
+- `is_ambiguous` column used for weight assignment only —
+  it is a metadata column and must never appear in feature_names

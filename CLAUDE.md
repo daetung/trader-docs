@@ -66,20 +66,45 @@ Label search range:  t bar open → t+59 bar close  (max 60 min)
 - [x] indicator_calculator.py — all indicator methods (130 tests, 95% coverage)
 - [x] vectorizer.py — 6 transformation methods (38 tests, 96% coverage)
 - [x] labeler.py — 5-class binary labeling + unit tests (55 tests, 100% coverage)
+  ↳ SPEC UPDATED: is_ambiguous (individual bar check), dead_position_case A/B/C — re-review required
 - [x] feature_extractor.py — 57 tests, 96% coverage
+  ↳ SPEC UPDATED: synthetic_bar_ratio, consecutive_synthetic_max features added — re-review required
 - [x] balancer.py — 35 tests, 94% coverage
+  ↳ SPEC UPDATED: generate_folds() added (rolling walk-forward), fold_meta yield,
+    temporal split, ambiguous_sample_action "exclude" option, Case C exclusion —
+    PARTIAL REWORK REQUIRED before proceeding
 - [x] reducer.py — 52 tests, 100% coverage
+  ↳ SPEC UPDATED: shap_subsample_n config added, shap_filter() subsampling logic — re-review required
 - [ ] base_model.py — 29 tests, 100% coverage
 - [x] lgbm_pipeline.py — 52 tests, 92% coverage
+  ↳ SPEC UPDATED: sample_weight_col parameter added — re-review required
 - [ ] engine.py — BacktestEngine (40 tests, 97% coverage)
 - [x] viz_connector.py — Abstract base class + factory (14 tests, 100% coverage)
 - [x] run_preprocess.py — full pipeline orchestrator (12 tests, 93% coverage)
-- [ ] run_train.py — 5-class LightGBM training + optional dimensionality reduction (28 tests, 99% coverage, APPROVED)
+  ↳ SPEC UPDATED: return_data=True returns full_labeled_df (unsplit) — re-review required
+- [ ] run_train.py — 28 tests, 99% coverage, APPROVED
+  ↳ SPEC UPDATED: fold_idx/fold_train_end/phase params, run_reducer vs --reduce distinction,
+    sample weight handling (trainer.* config) — implement with updated spec
 - [ ] run_backtest.py — 32 tests, 99% coverage, APPROVED
+  ↳ SPEC UPDATED: suppressed_count, fold_idx/fold_test_start/fold_test_end in experiment_log —
+    implement with updated spec
 - [x] migrate_json_to_duckdb.py — 12 tests, 96% coverage
 - [x] collect_daily.py — 50 tests, 99% coverage
 - [x] detection_benchmark.py — 21 tests, 100% pass
-- [ ] optimizer.py — PipelineOptimizer (feature combination search, train→evaluate→backtest cycle)
+- [ ] optimizer.py — PipelineOptimizer (feature combination search, selection/exploitation/full phases,
+    rolling fold loop, frequency voting)
+
+---
+
+## Re-review Policy for SPEC UPDATED modules
+
+When a module is marked "SPEC UPDATED":
+1. Read the updated spec doc before any implementation work
+2. Identify delta between current implementation and new spec
+3. Add/modify only what changed — do not rewrite the entire module
+4. Re-delegate to @tdd-guide for affected test cases only
+5. Re-delegate to @python-reviewer after @tdd-guide passes
+6. Remove the "SPEC UPDATED" annotation once @python-reviewer approves
 
 ---
 
@@ -123,6 +148,22 @@ Do not proceed past step 3 without confirming
 the implementation matches the spec.
 ```
 
+### Spec-updated module re-review
+```
+Re-review session for SPEC UPDATED module.
+
+Target module: {module_name}
+Spec: docs/pipeline/{0N_module_name}.md
+
+Steps:
+1. Read the updated spec doc
+2. Diff against current implementation in src/{path}/{module_name}.py
+3. Apply only the changed portions
+4. Delegate to @tdd-guide for affected test cases
+5. If @tdd-guide passes, delegate to @python-reviewer
+6. Report final result and remove SPEC UPDATED annotation from CLAUDE.md
+```
+
 ### Short form (when task queue is up to date)
 ```
 Start implementation session.
@@ -150,7 +191,7 @@ Steps:
    Success: reduced AUC within 0.005 of baseline AUC
 
 5. Run: python scripts/run_backtest.py
-   Success: winning rate appended to experiment_log.csv
+   Success: winning rate appended to experiment_log
 
 Final report: baseline AUC / reduced AUC / winning rate / features used
 ```

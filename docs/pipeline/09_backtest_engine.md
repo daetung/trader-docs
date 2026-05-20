@@ -142,11 +142,19 @@ slippage_pct = (fill_price - p_entry) / p_entry
 ```python
 from utils import resolve_signal
 
-threshold = config["backtest"]["entry_threshold"]
-signal = resolve_signal(row, threshold)   # → "up5" | "up3" | None
+threshold          = config["backtest"]["entry_threshold"]
+suppress_threshold = config["backtest"]["suppress_threshold"]  # None = disabled
+signal = resolve_signal(row, threshold, suppress_threshold)
+# → "up5" | "up3" | None
 ```
 
 Entry executed only if signal is not None AND cooldown check passes.
+
+**Suppression behavior:**
+- If `prob_dn5 >= suppress_threshold` or `prob_dn3 >= suppress_threshold`,
+  signal is None regardless of upside probabilities.
+- `suppress_threshold: null` in config disables suppression (original behavior).
+- Suppressed entries are not logged to trade_log (treated same as no-signal).
 
 ### Cooldown guard
 ```python
@@ -305,6 +313,7 @@ summary: dict
         "avg_slippage_pct":     float,
         "dead_position_count":  int,
         "dead_position_rate":   float,      # dead_position_count / total_trades
+        "suppressed_count":     int,        # entries suppressed by suppress_threshold
         "trades_by_signal":     {"up3": {...}, "up5": {...}},
         "trades_by_exit":       {"take_profit": n, "stop_loss": n,
                                  "session_end": n, "time_limit": n,
@@ -394,7 +403,9 @@ backtest:
   stop_loss_pct:   0.03
   max_hold_bars:   60
   entry_cooldown_minutes: 5
-  entry_threshold: 0.5
+  entry_threshold:    0.5            # minimum probability to enter long
+  suppress_threshold: 0.5            # minimum dn probability to suppress entry
+                                     # null = suppression disabled
   exit_interpolation: false          # true = tick_10 interpolation for exit price
   dead_position_penalty_pct: 0.05    # applied to next-day exit price (Case A)
 ```
@@ -414,6 +425,8 @@ backtest:
 - `entry_bar` and `exit_bar` stored as int via `int(hour_str)` (utils.hour_to_int)
 - `trades_by_signal` and `trades_by_exit` JSON-serialized before writing to `experiment_log`
 - Dead position trades included in winning_rate denominator
+- Suppressed entries (suppress_threshold) not logged to trade_log
+- `suppressed_count` tracked in summary for diagnostics
 - `resolve_signal()` sourced from `utils.py`
 - `build_effective_bar_sequence()` sourced from `utils.py`
 - `hour_to_int()`, `hour_to_minutes()`, `hour_add_seconds()` sourced from `utils.py`

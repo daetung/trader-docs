@@ -69,6 +69,11 @@ class ImportanceProvider(ABC):
         Shape: (n_features,) — averaged over samples and classifiers.
         Averaging strategy same as get_importance().
 
+        When shap_subsample_n is set in config, X is pre-subsampled
+        by the caller (DimensionalityReducer.shap_filter) before
+        being passed to get_shap_values(). The provider itself does
+        not apply subsampling — it operates on whatever X is passed.
+
         Returns:
             np.ndarray: shape (n_features,), dtype float
         """
@@ -113,6 +118,9 @@ For each classifier in models:
     shap_vals[label] = |explainer.shap_values(X)|.mean(axis=0)
 
 averaging: same strategy as get_importance()
+
+Note: X passed here is already subsampled if shap_subsample_n is configured.
+      Provider does not apply additional subsampling.
 ```
 
 ### MLPImportanceProvider (deferred — interface defined for forward compatibility)
@@ -207,10 +215,24 @@ Default: remove bottom 20% (configurable)
 ### Stage 3: SHAP Filter (optional)
 
 Delegates to provider for SHAP computation.
+Supports subsampling to control computation time when the full training
+set is large relative to the number of features.
 
 ```
-shap_vals = provider.get_shap_values(X_train)
+if shap_subsample_n is not None AND len(X_train) > shap_subsample_n:
+    X_shap = X_train.sample(n=shap_subsample_n, random_state=config_random_state)
+else:
+    X_shap = X_train
+
+shap_vals = provider.get_shap_values(X_shap)
 Remove features below absolute SHAP threshold.
+
+Subsampling rationale:
+    SHAP computation scales with O(samples × features × trees).
+    For selection phase with ~6,875 train samples and ~500 features,
+    subsampling to 500 rows reduces SHAP time by ~14× with minimal
+    impact on feature rank ordering for selection purposes.
+    Full sample SHAP is recommended for final model analysis.
 
 Default: disabled
 Enabled automatically when feature count > shap_trigger_threshold (configurable)
@@ -243,7 +265,14 @@ class DimensionalityReducer:
         X: pd.DataFrame,
         provider: ImportanceProvider,
         min_mean_abs_shap: float,
-    ) -> list[str]: ...
+    ) -> list[str]:
+        """
+        Apply SHAP-based feature filter.
+        Subsamples X to shap_subsample_n rows before passing to provider
+        if shap_subsample_n is set and len(X) > shap_subsample_n.
+        Provider receives the (possibly subsampled) X directly.
+        """
+        ...
 
     def run_all(
         self,
@@ -263,14 +292,21 @@ class DimensionalityReducer:
 ## Integration with PipelineOptimizer
 
 ```
-PipelineOptimizer cycle:
+Selection phase (PipelineOptimizer):
 
-1. Train model on full feature set              → baseline AUC
-2. create_importance_provider(...)              → provider
-3. reducer.run_all(X_train, X_valid, provider)  → selected_features
-4. Retrain model on selected_features           → reduced AUC
-5. Compare: if reduced_AUC >= baseline_AUC - tolerance → accept reduction
-6. Log both results to train_log
+For each fold in generate_folds():
+    1. Train model on full feature set              → fold model
+    2. create_importance_provider(...)              → provider
+    3. reducer.run_all(X_train, X_valid, provider)  → selected_features for this fold
+    4. Accumulate selected_features in frequency vote
+
+After all folds:
+    5. Apply vote_threshold → confirmed selected_features
+    6. Save to configs/selected_features.json
+    (No per-fold retraining on selected features)
+
+Exploitation phase (PipelineOptimizer):
+    DimensionalityReducer not used — selected_features loaded from JSON
 ```
 
 ---
@@ -290,8 +326,12 @@ dimensionality_reducer:
   shap_filter:
     enabled: false
     min_mean_abs_shap: 0.001
-    trigger_threshold: 200    # enable only if feature count exceeds this
-  auc_tolerance: 0.005        # acceptable AUC drop from reduction
+    trigger_threshold: 200          # enable only if feature count exceeds this
+    shap_subsample_n: 500           # max samples passed to SHAP computation
+                                    # null = use full X_train (no subsampling)
+                                    # recommended: 500 for selection phase speed
+  auc_tolerance: 0.005              # acceptable AUC drop from reduction
+                                    # used by run_train.py --reduce CLI flow only
 ```
 
 ---
@@ -309,3 +349,8 @@ dimensionality_reducer:
   `create_importance_provider()` must raise `ValueError` if not provided in that case
 - `MLPImportanceProvider` implementation is deferred to MLP phase;
   its interface is defined here for forward compatibility
+- SHAP subsampling applied in `shap_filter()` before provider call —
+  provider receives subsampled X and does not apply additional subsampling
+- `shap_subsample_n: null` disables subsampling; full X_train passed to provider
+- Random state for SHAP subsampling sourced from `config["class_balancer"]["random_state"]`
+  for reproducibility consistency across pipeline

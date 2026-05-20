@@ -23,6 +23,7 @@ test:  pd.DataFrame    # unbalanced test split
 
 feature_names:      list[str]         # from FeatureExtractor.get_feature_names()
 categorical_cols:   list[str] | None  # ["sector_code"] — passed to LightGBM; None if not applicable
+sample_weight_col:  str | None        # column name for per-sample weights; None = uniform weights
 ```
 
 **Output:**
@@ -59,17 +60,50 @@ Class weight balancing within LightGBM: `is_unbalance=True` per classifier.
 
 ---
 
+## Sample Weights
+
+Per-sample weights can be passed to LightGBM training via `sample_weight_col`.
+This allows downstream callers (e.g. PipelineOptimizer, Trainer) to reduce
+the influence of ambiguous or uncertain samples without fully excluding them.
+
+```
+If sample_weight_col is not None:
+    weights = train[sample_weight_col].values
+    dtrain = lgb.Dataset(..., weight=weights)
+Else:
+    dtrain = lgb.Dataset(...)  # uniform weights
+
+Val and test sets always use uniform weights regardless of sample_weight_col.
+```
+
+**Intended use case — ambiguous samples:**
+```
+is_ambiguous=True rows may be assigned a reduced weight (e.g. 0.5)
+by the caller before passing to Trainer, rather than being excluded.
+This preserves sample count while reducing label noise influence.
+
+Weight column generation is the caller's responsibility (Trainer or Optimizer).
+LGBMPipeline only reads the column if provided — no weight logic here.
+```
+
+`sample_weight_col` is `None` by default. When not provided, all samples
+receive equal weight (standard LightGBM behavior).
+
+---
+
 ## Training Logic
 
 ```python
 for label in ["up5", "up3", "sw", "dn3", "dn5"]:
     X_train = train[feature_names]
     y_train = train[f"label_{label}"]
+    weights = train[sample_weight_col].values if sample_weight_col else None
 
     X_val = val[feature_names]
     y_val = val[f"label_{label}"]
 
     dtrain = lgb.Dataset(X_train, label=y_train,
+                         weight=weights,
                          categorical_feature=categorical_cols)
     dval   = lgb.Dataset(X_val,   label=y_val,
                          categorical_feature=categorical_cols,
@@ -147,6 +181,7 @@ class LGBMPipeline(BaseModel[dict[str, lgb.Booster]]):
         val:   pd.DataFrame,
         feature_names: list[str],
         categorical_cols: list[str] | None = None,
+        sample_weight_col: str | None = None,
     ) -> dict[str, lgb.Booster]: ...
 
     def evaluate(
@@ -199,21 +234,17 @@ against a configurable threshold.
 # Caller-side logic (BacktestEngine, Inferencer)
 from utils import resolve_signal
 
-probs = model.predict(models, X)   # → prob_up5, prob_up3, ...
-threshold = config["backtest"]["entry_threshold"]
-signal = resolve_signal(row, threshold)   # → "up5" | "up3" | None
+probs = model.predict(models, X)   # → prob_up5, prob_up3, prob_dn3, prob_dn5, ...
+threshold          = config["backtest"]["entry_threshold"]
+suppress_threshold = config["backtest"]["suppress_threshold"]
+signal = resolve_signal(row, threshold, suppress_threshold)
+# → "up5" | "up3" | None
 ```
 
-`resolve_signal()` is defined in `src/utils/utils.py`:
-```python
-def resolve_signal(row: pd.Series, threshold: float) -> str | None:
-    """Returns "up5", "up3", or None. up5 takes priority over up3."""
-    if row["prob_up5"] >= threshold: return "up5"
-    if row["prob_up3"] >= threshold: return "up3"
-    return None
-```
+`resolve_signal()` is defined in `src/utils/utils.py`. See utils.md for full spec.
 
-Threshold is configurable via `config["backtest"]["entry_threshold"]`. Initial value: 0.5.
+Threshold and suppress_threshold are configurable via `config["backtest"]`.
+Initial values: entry_threshold=0.5, suppress_threshold=0.5.
 
 ---
 
@@ -224,4 +255,6 @@ Threshold is configurable via `config["backtest"]["entry_threshold"]`. Initial v
 - Early stopping patience (50 rounds) is fixed; not exposed to optimizer in phase 1
 - Model artifacts must include `feature_names`, `categorical_cols`, and config snapshot for full reproducibility
 - `predict()` returns probabilities, not binary labels — thresholding done by caller via `utils.resolve_signal()`
+- `sample_weight_col` applied to train only — val and test always use uniform weights
+- Weight column must exist in train DataFrame if `sample_weight_col` is not None — caller is responsible
 - `run_id` generated via `utils.generate_run_id()`

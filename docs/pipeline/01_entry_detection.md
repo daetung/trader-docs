@@ -43,8 +43,32 @@ After-market (hour > 155900) entry points are excluded in all modes.
 
 Session mode filtering is applied during the **training stage only**.
 The preprocessing stage runs EntryPointDetector for all entry points regardless
-of session mode. Filtering by session mode is applied in run_train.py when
-loading preprocessed data.
+of session mode. Filtering by session mode is applied in ClassBalancer.split()
+when loading preprocessed data.
+
+---
+
+## Late-Day Entry Exclusion
+
+Entry points detected too close to session close are excluded to avoid
+label horizon distortion. When fewer than 60 valid bars remain before 15:59,
+the label is dominated by session-close exit logic rather than genuine
+price movement — creating a systematic bias.
+
+```
+max_entry_hour: configurable cutoff (default: null — no cutoff applied)
+
+When max_entry_hour is set (e.g. "150000"):
+    entry points with t bar open time > max_entry_hour are excluded
+    from scan() output.
+
+Applied after after-market exclusion, before session_mode filtering.
+```
+
+Rationale: at 15:00, only ~60 valid bars remain before 15:59 close.
+Entries at or after 15:00 are structurally label-distorted.
+Setting `max_entry_hour: "150000"` is recommended for regular session mode.
+For pre-market mode, this setting has no practical effect.
 
 ---
 
@@ -219,8 +243,13 @@ class EntryPointDetector:
     ) -> pd.DataFrame:
         """
         Scan all bars for a ticker and return all detected entry points.
-        Includes all session modes — session_mode filtering applied at training stage.
-        After-market entry points (hour > 155900) are always excluded.
+
+        Exclusion order applied inside scan():
+          1. After-market entry points (hour > 155900) always excluded
+          2. Late-day entry points (hour > max_entry_hour) excluded
+             when max_entry_hour is not null
+          3. Session_mode filtering applied at ClassBalancer.split() stage,
+             not here
 
         Returns:
             pd.DataFrame with columns [ticker, date, hour, p_entry]
@@ -288,6 +317,10 @@ entry_detector:
   session_mode: "regular"        # "pre" | "regular" | "combined"
   volume_base_hour: "040000"     # base hour for D, E, F conditions
 
+  # Late-day exclusion
+  max_entry_hour: "150000"       # null = no cutoff; "150000" recommended for regular session
+                                 # Applied in scan() before session_mode filter
+
   # Individual filter thresholds
   A_max_price: 20.0
   B_min_volume_1min: 50000
@@ -316,6 +349,8 @@ entry_detector:
 - `shares_outstanding` must never be computed inside this module — always passed in from stock_meta
 - Filter F returns `False` (not an error) when no prior bars exist for the day (first bar of session edge case)
 - After-market entry points (hour > 155900) must never be returned from `scan()`
+- Late-day entry points (hour > max_entry_hour) excluded in `scan()` when max_entry_hour is not null
+- `max_entry_hour` exclusion applied before session_mode filter — both are independent constraints
 - `volume_base_hour` applied to conditions D, E, F only — condition G uses rolling window, no base hour filter
 
 ---
@@ -334,3 +369,6 @@ entry_detector:
 | Expression changed in config to "A and B" | detect() respects new expression |
 | volume_base_hour = "093000", pre-market bars present | D/E/F exclude pre-market bars |
 | after-market bar as t-1 | scan() excludes from output |
+| max_entry_hour = "150000", t bar hour = "150100" | scan() excludes from output |
+| max_entry_hour = "150000", t bar hour = "150000" | scan() includes (boundary inclusive) |
+| max_entry_hour = null | no late-day exclusion applied |

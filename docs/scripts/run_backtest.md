@@ -11,8 +11,8 @@ Loads test data, applies model predictions, runs BacktestEngine,
 writes results to trade_log and experiment_log tables.
 
 `run_backtest.py` is the **sole writer** of the `experiment_log` table.
-Called by PipelineOptimizer after AUC loop converges and a winning trial is selected.
-Also runnable standalone.
+Called by PipelineOptimizer after the exploitation/full phase fold pass completes
+and the best trial is selected. Also runnable standalone.
 
 ---
 
@@ -20,7 +20,7 @@ Also runnable standalone.
 
 **Input:**
 ```python
-test_df: pd.DataFrame   # test_features.parquet with features, labels, p_entry
+test_df: pd.DataFrame   # test split with features, labels, p_entry
 model_dir: Path | None  # directory containing trained model artifacts (optional)
 ```
 
@@ -30,8 +30,10 @@ model_dir: Path | None  # directory containing trained model artifacts (optional
 #   - Total trades, winning trades, winning rate
 #   - Avg PnL, total PnL, avg slippage
 #   - Dead position count and rate
+#   - Suppressed entry count
 #   - Trade breakdown by signal and exit reason
 #   - Label base rates (from test_df directly)
+#   - Dead position case distribution (from test_df)
 
 # Written to DuckDB:
 #   - trade_log table: individual trade records
@@ -45,7 +47,8 @@ model_dir: Path | None  # directory containing trained model artifacts (optional
 ```
 1. Load config from pipeline_config.yaml
 2. Load test_features.parquet from data/processed/ (or accept in-memory DataFrame)
-3. Determine feature column names (exclude labels, identifiers)
+3. Determine feature column names (exclude labels, identifiers, metadata columns)
+   Metadata columns excluded from features: is_dead_position, dead_position_case, is_ambiguous
 4. If model_dir provided:
    a. model = create_model(config); models, meta = model.load(run_id)
    b. probs_df = model.predict(models, X_test)
@@ -56,21 +59,23 @@ model_dir: Path | None  # directory containing trained model artifacts (optional
 6. trade_log, summary = engine.run(predictions)
 7. Compute label base rates from test_df:
        base_rates = {label: test_df[f"label_{label}"].mean() for label in LABELS}
-8. Print results to stdout
-9. Write trade_log to DuckDB trade_log table
-10. Write experiment_log row to DuckDB:
+8. Compute dead position case distribution from test_df:
+       dead_case_dist = test_df[test_df["is_dead_position"]]["dead_position_case"].value_counts()
+9. Print results to stdout
+10. Write trade_log to DuckDB trade_log table
+11. Write experiment_log row to DuckDB:
         run_id, optimizer_run_id, run_at,
+        fold_idx, fold_test_start, fold_test_end,
         winning_rate, total_trades, winning_trades,
         avg_pnl_pct, total_pnl_abs, avg_slippage_pct,
         dead_position_count, dead_position_rate,
+        suppressed_count,
         trades_by_signal (JSON), trades_by_exit (JSON)
 ```
 
 ---
 
 ## Class Interface
-
-`run_backtest.py` exposes a callable class for use by PipelineOptimizer:
 
 ```python
 class Backtester:
@@ -86,10 +91,22 @@ class Backtester:
         test_df: pd.DataFrame,
         run_id: str,
         model_dir: Path | None = None,
+        fold_idx: int | None = None,
+        fold_test_start: str | None = None,
+        fold_test_end: str | None = None,
     ) -> dict:
         """
         Run backtest, write trade_log and experiment_log.
         Returns summary dict.
+
+        Args:
+            test_df:         test split DataFrame
+            run_id:          matches the train_log run_id for this backtest
+            model_dir:       directory containing model artifacts (optional)
+            fold_idx:        fold index if called from rolling context; None for standalone
+            fold_test_start: first date of test window ('YYYYMMDD'); None for standalone
+            fold_test_end:   last date of test window ('YYYYMMDD'); None for standalone
+
         optimizer_run_id passed via constructor (None for standalone).
         """
         ...
@@ -109,7 +126,7 @@ Options:
     --run-id            Explicit run ID (default: YYYYMMDD_HHMMSS via utils.generate_run_id())
 ```
 
-CLI always runs with `optimizer_run_id=None` (standalone mode).
+CLI always runs with `optimizer_run_id=None`, `fold_idx=None` (standalone mode).
 
 ---
 
@@ -120,21 +137,29 @@ CLI always runs with `optimizer_run_id=None` (standalone mode).
 
 ```python
 experiment_log_row = {
-    "run_id":              run_id,
-    "optimizer_run_id":    optimizer_run_id,   # None if standalone
-    "run_at":              run_at,
-    "winning_rate":        summary["winning_rate"],
-    "total_trades":        summary["total_trades"],
-    "winning_trades":      summary["winning_trades"],
-    "avg_pnl_pct":         summary["avg_pnl_pct"],
-    "total_pnl_abs":       summary["total_pnl_abs"],
-    "avg_slippage_pct":    summary["avg_slippage_pct"],
-    "dead_position_count": summary["dead_position_count"],
-    "dead_position_rate":  summary["dead_position_rate"],
-    "trades_by_signal":    json.dumps(summary["trades_by_signal"]),
-    "trades_by_exit":      json.dumps(summary["trades_by_exit"]),
+    "run_id":               run_id,
+    "optimizer_run_id":     optimizer_run_id,    # None if standalone
+    "run_at":               run_at,
+    "fold_idx":             fold_idx,            # None if standalone
+    "fold_test_start":      fold_test_start,     # None if standalone
+    "fold_test_end":        fold_test_end,        # None if standalone
+    "winning_rate":         summary["winning_rate"],
+    "total_trades":         summary["total_trades"],
+    "winning_trades":       summary["winning_trades"],
+    "avg_pnl_pct":          summary["avg_pnl_pct"],
+    "total_pnl_abs":        summary["total_pnl_abs"],
+    "avg_slippage_pct":     summary["avg_slippage_pct"],
+    "dead_position_count":  summary["dead_position_count"],
+    "dead_position_rate":   summary["dead_position_rate"],
+    "suppressed_count":     summary["suppressed_count"],
+    "trades_by_signal":     json.dumps(summary["trades_by_signal"]),
+    "trades_by_exit":       json.dumps(summary["trades_by_exit"]),
 }
 ```
+
+`fold_test_start` and `fold_test_end` are sourced from fold_meta when called by
+PipelineOptimizer: `fold_meta["fold_test_start"]`, `fold_meta["fold_test_end"]`.
+In standalone mode, these are derived from `test_df["date"].min()` and `.max()`.
 
 ---
 
@@ -151,6 +176,7 @@ Avg PnL:             0.02%
 Total PnL:           1234.56
 Avg slippage:        0.0012%
 Dead positions:      12  (0.97%)
+Suppressed entries:  45
 
 --- By Signal ---
   up3: 456 trades, win_rate=44.5%, avg_pnl=0.01%
@@ -172,7 +198,13 @@ Dead positions:      12  (0.97%)
   dn3:  ...
   dn5:  ...
 
+--- Dead Position Case Distribution (test set) ---
+  Case A (next-day data available):  8
+  Case B (ticker missing next day):  2
+  Case C (dataset boundary):         2
+
 Run ID: 20250715_143022
+Fold:   13 (2025-09-01 ~ 2025-09-14)
 Elapsed: 45.2s
 ```
 
@@ -181,9 +213,15 @@ Elapsed: 45.2s
 ## Constraints
 
 - `experiment_log` is written only by `run_backtest.py` — no other module writes to it
-- INSERT only — no upsert. run_id collision raises error
+- INSERT only — no upsert; run_id collision raises error
 - Model loading via BaseModel interface: `create_model → load → predict`
 - `test_df` must contain `p_entry` column (loaded from parquet identifier columns)
 - Label base rates computed from `test_df` directly — not from BacktestEngine summary
+- Dead position case distribution computed from `test_df` directly
 - `optimizer_run_id` passed via constructor; `None` for standalone CLI runs
 - `run_id` generated via `utils.generate_run_id()` if not explicitly provided
+- `fold_idx`, `fold_test_start`, `fold_test_end` are None for standalone CLI runs
+- In standalone mode, `fold_test_start`/`fold_test_end` derived from test_df date range
+- `suppressed_count` sourced from BacktestEngine summary — must always be present
+- Metadata columns (`is_dead_position`, `dead_position_case`, `is_ambiguous`) must not
+  be passed to model.predict() as features

@@ -58,26 +58,84 @@ def build_effective_bar_sequence(
 ### Signal Resolution
 
 ```python
-def resolve_signal(row: pd.Series, threshold: float) -> str | None:
+def resolve_signal(
+    row: pd.Series,
+    threshold: float,
+    suppress_threshold: float | None = None,
+) -> str | None:
     """
     Determine entry signal from model probability output.
     up5 takes priority over up3.
 
+    Suppression logic:
+        If suppress_threshold is not None, downside classifiers (dn5, dn3)
+        are checked first. If either exceeds suppress_threshold, the signal
+        is suppressed regardless of upside probabilities.
+
+        This prevents entering long positions when the model has strong
+        conviction of a downside move, even if upside probabilities also
+        happen to exceed threshold.
+
     Used by BacktestEngine and Inferencer.
 
     Args:
-        row:       pd.Series with prob_up5, prob_up3 columns
-        threshold: minimum probability to trigger entry
+        row:                pd.Series with prob_up5, prob_up3, prob_dn3, prob_dn5 columns
+        threshold:          minimum probability to trigger entry signal
+        suppress_threshold: minimum dn5 or dn3 probability to suppress entry;
+                            None = suppression disabled (default)
 
     Returns:
         "up5" | "up3" | None
+
+    Examples:
+        # Normal entry — no suppression triggered
+        prob_up5=0.60, prob_dn5=0.30, threshold=0.5, suppress_threshold=0.5
+        → dn5(0.30) < suppress_threshold(0.5) → no suppression → "up5"
+
+        # Suppression triggered by dn3
+        prob_up3=0.55, prob_dn3=0.60, threshold=0.5, suppress_threshold=0.5
+        → dn3(0.60) >= suppress_threshold(0.5) → suppressed → None
+
+        # Suppression takes priority regardless of upside magnitude
+        prob_up5=0.80, prob_dn5=0.70, threshold=0.5, suppress_threshold=0.5
+        → dn5(0.70) >= suppress_threshold(0.5) → suppressed → None
+
+        # suppression disabled (original behavior)
+        suppress_threshold=None, prob_up5=0.60
+        → suppression check skipped → "up5"
+
+        suppress_threshold=None, prob_up3=0.55, prob_up5=0.40
+        → suppression check skipped → "up3"
+
+        suppress_threshold=None, prob_up5=0.40, prob_up3=0.40
+        → suppression check skipped → neither >= threshold → None
     """
+    # Step 1: suppression check (takes priority over entry signal)
+    if suppress_threshold is not None:
+        if row["prob_dn5"] >= suppress_threshold:
+            return None
+        if row["prob_dn3"] >= suppress_threshold:
+            return None
+
+    # Step 2: entry signal (up5 takes priority over up3)
     if row["prob_up5"] >= threshold:
         return "up5"
     if row["prob_up3"] >= threshold:
         return "up3"
     return None
 ```
+
+**Config keys:**
+```yaml
+backtest:
+  entry_threshold:    0.5   # minimum probability to enter long
+  suppress_threshold: 0.5   # minimum dn probability to suppress entry
+                            # null = suppression disabled
+```
+
+Both thresholds are independently configurable. Setting `suppress_threshold`
+higher than `entry_threshold` results in more permissive suppression (fewer
+entries blocked). Setting them equal is the recommended starting point.
 
 ---
 
@@ -293,6 +351,11 @@ Called by:
   — Labeler and BacktestEngine both import from here; logic must not be duplicated
 - `resolve_signal()` is the single source of truth for entry signal thresholding
   — BacktestEngine and Inferencer both import from here
+- `resolve_signal()` suppression check always precedes entry signal check
+  — suppression takes priority regardless of upside probability magnitude
+- `suppress_threshold=None` disables suppression entirely — when None, the function
+  skips the suppression block and evaluates upside probabilities only;
+  behavior is identical to a version without suppression logic
 - `apply_overrides()` must deep-copy config — original must never be mutated
 - `load_encoding_map()` returns empty dict (not error) when file does not exist
   — FeatureExtractor handles first-run map creation

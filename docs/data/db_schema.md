@@ -123,7 +123,6 @@ CREATE TABLE us_holidays (
 );
 
 -- Trading calendar — all dates with trading day status and data availability
--- Populated by migrate_json_to_duckdb.py (initial) and collect_daily.py (incremental)
 CREATE TABLE trading_calendar (
     date            VARCHAR   PRIMARY KEY,  -- 'YYYYMMDD'
     is_trading_day  BOOLEAN   NOT NULL,     -- NYSE calendar based
@@ -133,7 +132,6 @@ CREATE TABLE trading_calendar (
 );
 
 -- Ticker-level data coverage per date
--- Populated by migrate_json_to_duckdb.py (initial) and collect_daily.py (incremental)
 CREATE TABLE ticker_data_coverage (
     ticker      VARCHAR   NOT NULL,
     date        VARCHAR   NOT NULL,
@@ -152,55 +150,81 @@ CREATE TABLE entry_points (
 );
 
 -- Labeled samples (output of Labeler)
+-- dead_position_case: "A" (next-day data available, ticker found) |
+--                     "B" (next-day exists, ticker missing — possible delisting) |
+--                     "C" (dataset boundary — next day not in dataset) |
+--                     NULL (not a dead position)
+-- is_ambiguous: TRUE if the bar that triggered the first breach had its individual
+--               high >= +threshold_3pp AND low <= -threshold_3pp simultaneously.
+--               Label is still assigned (via ambiguity_priority rule).
+--               ClassBalancer can exclude these from train; Trainer can down-weight them.
 CREATE TABLE labeled_samples (
-    ticker            VARCHAR      NOT NULL,
-    date              VARCHAR      NOT NULL,
-    hour              VARCHAR      NOT NULL,
-    p_entry           DOUBLE       NOT NULL,
-    label_up5         INTEGER      NOT NULL,  -- 1 or 0
-    label_up3         INTEGER      NOT NULL,
-    label_sw          INTEGER      NOT NULL,
-    label_dn3         INTEGER      NOT NULL,
-    label_dn5         INTEGER      NOT NULL,
-    is_dead_position  BOOLEAN      NOT NULL DEFAULT FALSE,
+    ticker              VARCHAR      NOT NULL,
+    date                VARCHAR      NOT NULL,
+    hour                VARCHAR      NOT NULL,
+    p_entry             DOUBLE       NOT NULL,
+    label_up5           INTEGER      NOT NULL,  -- 1 or 0
+    label_up3           INTEGER      NOT NULL,
+    label_sw            INTEGER      NOT NULL,
+    label_dn3           INTEGER      NOT NULL,
+    label_dn5           INTEGER      NOT NULL,
+    is_dead_position    BOOLEAN      NOT NULL DEFAULT FALSE,
+    dead_position_case  VARCHAR,                -- "A" | "B" | "C" | NULL
+    is_ambiguous        BOOLEAN      NOT NULL DEFAULT FALSE,
     PRIMARY KEY (ticker, date, hour)
 );
 
--- Train log (output of run_train.py — one row per training trial)
--- Written by run_train.py for every trial including AUC-loop iterations.
--- optimizer_run_id groups trials belonging to the same optimizer run.
--- feature_config: JSON string of active feature group config for optimizer trials;
---   for standalone runs (optimizer_run_id IS NULL), stores full config snapshot.
---   Never NULL — standalone runs use json.dumps(config) as fallback.
--- notes: optional free-text memo for experiment annotation; defaults to NULL.
---   May be populated by PipelineOptimizer or set manually after the fact.
+-- Train log (output of run_train.py — one row per fold)
+-- fold_idx:      NULL for standalone (single split) runs; 0-based integer for rolling folds.
+-- fold_train_end: last date of train window ('YYYYMMDD'); NULL for standalone.
+-- auc_std:       std of AUC across all folds in the same run or trial.
+--                NULL at write time — populated via UPDATE by PipelineOptimizer
+--                on the row with MAX(fold_idx) for the given optimizer_run_id
+--                (and feature_config group for exploitation phase).
+--                Interpretation: temporal stability of the model across market periods.
+-- phase:         "selection"   — full feature set + reducer, no trial loop
+--                "exploitation" — selected features, trial search loop
+--                "full"        — full feature set, no reducer, one pass
+--                NULL          — standalone run
+-- feature_config: JSON of active feature group config (optimizer trials) or
+--                 full config snapshot (standalone). Never NULL.
+-- notes:         optional free-text memo; NULL by default.
 CREATE TABLE train_log (
-    run_id              VARCHAR      NOT NULL,   -- YYYYMMDD_HHMMSS (utils.generate_run_id())
-    optimizer_run_id    VARCHAR,                 -- NULL if standalone run_train
+    run_id              VARCHAR      NOT NULL,
+    optimizer_run_id    VARCHAR,
     run_at              VARCHAR      NOT NULL,
-    feature_config      VARCHAR      NOT NULL,   -- JSON: active feature groups (optimizer)
-                                                 -- or full config snapshot (standalone)
+    phase               VARCHAR,                 -- "selection"|"exploitation"|"full"|NULL
+    fold_idx            INTEGER,                 -- NULL for standalone; 0-based for rolling
+    fold_train_end      VARCHAR,                 -- 'YYYYMMDD'; NULL for standalone
+    feature_config      VARCHAR      NOT NULL,
     n_features          INTEGER,
-    n_features_reduced  INTEGER,                 -- after DimensionalityReducer; NULL if not run
+    n_features_reduced  INTEGER,
     auc_up5             DOUBLE,
     auc_up3             DOUBLE,
     auc_sw              DOUBLE,
     auc_dn3             DOUBLE,
     auc_dn5             DOUBLE,
     auc_mean            DOUBLE,
+    auc_std             DOUBLE,                  -- NULL until UPDATE by PipelineOptimizer
+                                                 -- set on MAX(fold_idx) row only
     auc_reduced_mean    DOUBLE,
-    best_of_loop        BOOLEAN,                 -- True if this trial proceeded to backtest
-    notes               VARCHAR,                 -- NULL by default; free-text experiment memo
+    best_of_loop        BOOLEAN,
+    notes               VARCHAR,
     PRIMARY KEY (run_id)
 );
 
 -- Experiment log (output of run_backtest.py — one row per completed backtest)
--- Written only when backtest completes. Linked to train_log via run_id.
--- optimizer_run_id links back to the optimizer run that produced this experiment.
+-- fold_idx, fold_test_start, fold_test_end: populated when called from rolling context;
+--   NULL for standalone CLI runs. In standalone mode, fold_test_start/end derived
+--   from test_df date range.
+-- suppressed_count: entries blocked by suppress_threshold during backtest.
 CREATE TABLE experiment_log (
-    run_id              VARCHAR      NOT NULL,   -- matches train_log.run_id
-    optimizer_run_id    VARCHAR,                 -- NULL if standalone run_backtest
+    run_id              VARCHAR      NOT NULL,
+    optimizer_run_id    VARCHAR,
     run_at              VARCHAR      NOT NULL,
+    fold_idx            INTEGER,                 -- NULL for standalone
+    fold_test_start     VARCHAR,                 -- 'YYYYMMDD'; NULL for standalone
+    fold_test_end       VARCHAR,                 -- 'YYYYMMDD'; NULL for standalone
     winning_rate        DOUBLE,
     total_trades        INTEGER,
     winning_trades      INTEGER,
@@ -209,6 +233,7 @@ CREATE TABLE experiment_log (
     avg_slippage_pct    DOUBLE,
     dead_position_count INTEGER,
     dead_position_rate  DOUBLE,
+    suppressed_count    INTEGER,
     trades_by_signal    VARCHAR,                 -- JSON: {"up3": {...}, "up5": {...}}
     trades_by_exit      VARCHAR,                 -- JSON: {"take_profit": n, ...}
     notes               VARCHAR,
@@ -216,14 +241,13 @@ CREATE TABLE experiment_log (
 );
 
 -- Trade log (output of BacktestEngine)
--- entry_bar and exit_bar stored as HHMMSS-derived integers via int(hour_str)
 CREATE TABLE trade_log (
     tr_id             VARCHAR     NOT NULL,  -- UUID
     run_id            VARCHAR,
     ticker            VARCHAR,
     date              VARCHAR,
     entry_bar         INTEGER,               -- HHMMSS as int (e.g. 93000, 100500)
-    exit_bar          INTEGER,               -- HHMMSS as int
+    exit_bar          INTEGER,
     signal            VARCHAR,               -- "up3" | "up5"
     fill_price        DOUBLE,
     exit_price        DOUBLE,
@@ -235,7 +259,7 @@ CREATE TABLE trade_log (
                                              -- |"dead_position_delisted"|"dead_position_no_data"
     slippage_pct      DOUBLE,
     cash_remaining    DOUBLE,                -- NULL in inf mode
-    dead_position     BOOLEAN,               -- True if overnight hold occurred
+    dead_position     BOOLEAN,
     PRIMARY KEY (tr_id)
 );
 ```
@@ -252,14 +276,6 @@ con = duckdb.connect("data/market.duckdb")
 df = con.execute("""
     SELECT * FROM ohlcv_1min
     WHERE ticker = ? AND date >= ? AND date <= ?
-    ORDER BY date, hour
-""", ["AAPL", "20250101", "20250630"]).df()
-
-# Load regular session only (when needed)
-df_regular = con.execute("""
-    SELECT * FROM ohlcv_1min
-    WHERE ticker = ? AND date >= ? AND date <= ?
-      AND hour >= '093000' AND hour <= '155900'
     ORDER BY date, hour
 """, ["AAPL", "20250101", "20250630"]).df()
 
@@ -284,11 +300,54 @@ next_day = con.execute("""
     ORDER BY date LIMIT 1
 """, ["20250714"]).fetchone()
 
-# Check ticker data coverage for dead position Case B
-coverage = con.execute("""
-    SELECT 1 FROM ticker_data_coverage
-    WHERE ticker = ? AND date = ?
-""", ["AAPL", "20250715"]).fetchone()
+# Rolling fold summary — AUC by fold for a given optimizer run
+fold_summary = con.execute("""
+    SELECT fold_idx, fold_train_end, auc_mean, auc_std, n_features, phase
+    FROM train_log
+    WHERE optimizer_run_id = ?
+      AND fold_idx IS NOT NULL
+    ORDER BY fold_idx
+""", ["20250519_143022"]).df()
+
+# Retrieve auc_std for a completed run or trial
+# (recorded on the MAX(fold_idx) row)
+run_auc_std = con.execute("""
+    SELECT auc_std, auc_mean, fold_idx
+    FROM train_log
+    WHERE optimizer_run_id = ?
+      AND fold_idx = (
+          SELECT MAX(fold_idx) FROM train_log
+          WHERE optimizer_run_id = ?
+      )
+""", ["20250519_143022", "20250519_143022"]).fetchone()
+
+# Experiment log with fold period for rolling backtest
+exp_results = con.execute("""
+    SELECT run_id, fold_idx, fold_test_start, fold_test_end,
+           winning_rate, total_trades, suppressed_count
+    FROM experiment_log
+    WHERE optimizer_run_id = ?
+    ORDER BY fold_idx NULLS LAST
+""", ["20250519_143022"]).df()
+
+# Ambiguous sample rate in labeled_samples
+ambig_rate = con.execute("""
+    SELECT
+        COUNT(*) FILTER (WHERE is_ambiguous)       AS ambiguous_count,
+        COUNT(*)                                    AS total_count,
+        COUNT(*) FILTER (WHERE is_ambiguous) * 1.0
+            / COUNT(*)                              AS ambiguous_rate
+    FROM labeled_samples
+""").df()
+
+# Dead position case distribution
+dead_dist = con.execute("""
+    SELECT dead_position_case, COUNT(*) AS count
+    FROM labeled_samples
+    WHERE is_dead_position = TRUE
+    GROUP BY dead_position_case
+    ORDER BY dead_position_case
+""").df()
 
 # Reconstruct ohlcv_1min join from trade_log entry_bar
 trades = con.execute("""
@@ -310,4 +369,5 @@ trades = con.execute("""
 - **No time-of-day filter** — all bars (pre-market, regular, after-market) are stored
 - `seq_id` for tick_10: assigned as row-order index within each `(ticker, date, hour)` group, starting from 0
 - Duplicate skip: check existence of `(ticker, date)` pair in target table before inserting; skip entire file if already present
-- After ingestion: `trading_calendar` and `ticker_data_coverage` updated via `utils.populate_trading_calendar()` and `utils.populate_ticker_coverage()`
+- After ingestion: `trading_calendar` and `ticker_data_coverage` updated via
+  `utils.populate_trading_calendar()` and `utils.populate_ticker_coverage()`

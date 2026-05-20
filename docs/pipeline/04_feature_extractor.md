@@ -149,18 +149,47 @@ Scaling will be applied at MLP comparison stage only.
 
 ## Market Structure Features
 
-Derived from `trading_halts` table and missing bar classification.
+Derived from `trading_halts` table, missing bar classification, and
+synthetic (no_trade) bar analysis within the lookback window.
 
 ```python
 market_structure_features = {
-    "had_halt_today":       1 if any halt before t-1 bar else 0,
-    "bars_since_last_halt": int / NaN,   # bars since last halt ended; NaN if no halt
-    "halt_reason_code":     int,         # category; NaN if no halt today
-                                         # registered as LightGBM categorical
-    "halt_count_today":     int,         # total halts this session before t-1
-    "missing_bar_count":    int,         # no_trade gap bars in lookback window
+    # Halt-related
+    "had_halt_today":           1 if any halt before t-1 bar else 0,
+    "bars_since_last_halt":     int / NaN,   # bars since last halt ended; NaN if no halt
+    "halt_reason_code":         int,         # category; NaN if no halt today
+                                             # registered as LightGBM categorical
+    "halt_count_today":         int,         # total halts this session before t-1
+
+    # Missing bar composition
+    "missing_bar_count":        int,         # total no_trade gap bars in lookback window
+
+    # Synthetic bar quality indicators
+    # These capture the degree to which indicator values in the lookback
+    # window may be distorted by forward-filled synthetic bars.
+    "synthetic_bar_ratio":      float,       # no_trade_bars / total_bars_in_window
+                                             # range [0.0, 1.0]
+                                             # high value → many indicators computed
+                                             # on forward-filled prices (reduced reliability)
+    "consecutive_synthetic_max": int,        # longest run of consecutive no_trade bars
+                                             # in lookback window
+                                             # high value → extended flat price segments
+                                             # distorting slope/trend indicators
 }
 ```
+
+**Synthetic bar ratio computation:**
+```
+lookback_bars = all bars in the t-N...t-1 window passed to IndicatorCalculator
+no_trade_bars = bars classified as no_trade by MissingBarClassifier
+                (halt bars excluded — they are NaN, not forward-filled)
+
+synthetic_bar_ratio      = len(no_trade_bars) / len(lookback_bars)
+consecutive_synthetic_max = max run length of consecutive no_trade bars
+```
+
+These features allow the model to learn when its indicator inputs are less
+reliable due to illiquidity gaps, without modifying IndicatorCalculator itself.
 
 ---
 
@@ -235,11 +264,16 @@ Output parquet files contain the following column groups:
 Identifier columns : ticker, date, hour, p_entry
 Feature columns    : get_feature_names() — all float/int features
 Label columns      : label_up5, label_up3, label_sw, label_dn3, label_dn5
+Metadata columns   : is_dead_position, dead_position_case, is_ambiguous
 ```
 
 `p_entry` is stored as an identifier column, not a feature.
 It must never appear in `get_feature_names()` output.
 It is required by BacktestEngine for fill price calculation.
+
+`is_dead_position`, `dead_position_case`, `is_ambiguous` are stored as
+metadata columns — not features. They must not appear in `get_feature_names()`.
+They are used by ClassBalancer for pre-balance filtering.
 
 ---
 
@@ -256,3 +290,7 @@ It is required by BacktestEngine for fill price calculation.
 - Halt bars (NaN) propagate naturally into indicator NaN — do not suppress
 - Temporal features use `entry.hour` (t bar open time) as reference — this is not data leakage
 - Encoding maps (sector, day_of_week) loaded via `utils.load_encoding_map()` for live inference compatibility
+- `synthetic_bar_ratio` and `consecutive_synthetic_max` computed from MissingBarClassifier output
+  — no changes to IndicatorCalculator or Vectorizer required
+- `is_dead_position`, `dead_position_case`, `is_ambiguous` passed through from Labeler output
+  — not computed by FeatureExtractor

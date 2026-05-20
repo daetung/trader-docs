@@ -35,11 +35,14 @@ trading_calendar: pd.DataFrame
 **Output:**
 ```python
 label_matrix: pd.DataFrame
-    columns: [ticker, date, hour, label_up5, label_up3, label_sw, label_dn3, label_dn5,
-              is_dead_position]
+    columns: [ticker, date, hour,
+              label_up5, label_up3, label_sw, label_dn3, label_dn5,
+              is_dead_position, dead_position_case, is_ambiguous]
     # one row per entry point
     # exactly one label = 1 per row (mutually exclusive by construction)
     # is_dead_position = True if label assigned via next-day price
+    # dead_position_case = "A" | "B" | "C" | None
+    # is_ambiguous = True if same-bar breach of both +3pp and -3pp thresholds
 ```
 
 ---
@@ -53,6 +56,52 @@ label_matrix: pd.DataFrame
 | `label_sw` | Neither ±3pp breached within effective search range |
 | `label_dn3` | -3pp breached first AND -5pp not reached (or +3pp cuts off) |
 | `label_dn5` | -3pp breached first AND -5pp reached before +3pp breach |
+
+---
+
+## Same-Bar Ambiguity
+
+A same-bar ambiguity occurs when a single 1-minute bar's **individual** high and low
+simultaneously breach both the upside and downside thresholds relative to P_entry.
+This is checked against the current bar's own OHLC values — not against the
+cumulative max/min across previously scanned bars.
+
+```
+Ambiguity detection condition (checked per bar i during scan,
+using bar i's individual high and low only):
+
+    (bar_i.high - P_entry) / P_entry >= threshold_3pp
+    AND
+    (P_entry - bar_i.low)  / P_entry >= threshold_3pp
+
+This condition captures bars where both thresholds were touched within
+the same 1-minute window. Tick-level ordering is not recoverable from
+1-minute OHLCV data, so breach direction cannot be determined with certainty.
+
+Distinct from cumulative breach check:
+    max_up(i)   = (max(high of valid bars t..i) - P_entry) / P_entry  ← cumulative
+    max_down(i) = (P_entry - min(low of valid bars t..i)) / P_entry   ← cumulative
+
+    Ambiguity uses bar_i.high and bar_i.low directly — not max_up(i)/max_down(i).
+    A bar can be ambiguous even if prior bars have not yet reached threshold,
+    as long as the current bar itself spans both thresholds.
+
+When ambiguity detected:
+    → Apply ambiguity_priority rule to determine breach direction
+    → Set is_ambiguous = True on the output row
+    → Label is still assigned (not skipped)
+```
+
+`is_ambiguous` is used downstream by ClassBalancer to optionally exclude
+these samples from training, or by Trainer to apply reduced sample weight.
+It does not affect label assignment logic itself.
+
+**Priority rule on simultaneous breach:**
+```yaml
+labeler:
+  ambiguity_priority: "up"   # "up" = treat as upside breach first (default)
+                              # "down" = treat as downside breach first
+```
 
 ---
 
@@ -77,20 +126,28 @@ Target: 60 valid (non-halt) bars.
 
 For each valid bar i in effective sequence (sequential):
 
+    [Ambiguity check — uses bar i's individual high/low, not cumulative]
+    if (bar_i.high - P_entry) / P_entry >= threshold_3pp
+    AND (P_entry - bar_i.low) / P_entry >= threshold_3pp:
+        → is_ambiguous = True
+        → apply ambiguity_priority to select breach direction
+        → treat selected direction as the first breach and proceed
+
+    [Cumulative breach tracking]
     max_up(i)   = ( max(high of valid bars t..i) - P_entry ) / P_entry
     max_down(i) = ( P_entry - min(low of valid bars t..i)  ) / P_entry
 
-    if max_up(i) >= 0.03 (first breach):
+    if max_up(i) >= threshold_3pp (first breach, upside):
         label_up3 = 1  (tentative)
         continue scanning for +5pp:
-            if max_up(j) >= 0.05 before max_down(j) >= 0.03:
+            if max_up(j) >= threshold_5pp before max_down(j) >= threshold_3pp:
                 label_up5 = 1  (override)
         break
 
-    if max_down(i) >= 0.03 (first breach):
+    if max_down(i) >= threshold_3pp (first breach, downside):
         label_dn3 = 1  (tentative)
         continue scanning for -5pp:
-            if max_down(j) >= 0.05 before max_up(j) >= 0.03:
+            if max_down(j) >= threshold_5pp before max_up(j) >= threshold_3pp:
                 label_dn5 = 1  (override)
         break
 
@@ -113,11 +170,11 @@ Triggered when 15:59 bar is reached during scan (before ±3pp breach):
 
     pnl = (exit_price - P_entry) / P_entry
     apply label:
-        pnl >= +0.05  → label_up5
-        pnl >= +0.03  → label_up3
-        -0.03 < pnl < +0.03 → label_sw
-        pnl <= -0.05  → label_dn5
-        pnl <= -0.03  → label_dn3
+        pnl >= +threshold_5pp  → label_up5
+        pnl >= +threshold_3pp  → label_up3
+        -threshold_3pp < pnl < +threshold_3pp → label_sw
+        pnl <= -threshold_5pp  → label_dn5
+        pnl <= -threshold_3pp  → label_dn3
 
 --- Step 4: 60 valid bars exhausted before session close ---
 
@@ -145,15 +202,21 @@ In this case:
                      fallback: next day ohlcv_1min first bar open
         exit_price *= (1 - dead_position_penalty_pct)
         is_dead_position = True
+        dead_position_case = "A"
 
     Case B — next trading day has_data=True AND ticker not in ticker_data_coverage:
         pnl = -1.0  (full loss — possible delisting)
         exit_price = 0
         is_dead_position = True
+        dead_position_case = "B"
 
     Case C — next trading day is future or not in dataset:
         exit_price = P_entry * (1 - 0.5)
         is_dead_position = True
+        dead_position_case = "C"
+        Note: Case C typically indicates a dataset boundary condition
+              (entry near the end of available data), not a genuine overnight hold.
+              ClassBalancer can optionally exclude Case C samples from training.
 
     assign label by pnl threshold (same as Step 3)
 ```
@@ -174,8 +237,11 @@ class Labeler:
         trading_calendar: pd.DataFrame,
     ) -> pd.DataFrame:
         """
-        Returns label_matrix with 5 binary label columns + is_dead_position.
+        Returns label_matrix with 5 binary label columns,
+        is_dead_position, dead_position_case, and is_ambiguous.
         One and only one label column is 1 per row.
+        dead_position_case is None for non-dead-position rows.
+        is_ambiguous is False unless same-bar individual breach detected.
         """
         ...
 
@@ -202,9 +268,14 @@ class Labeler:
 - Halt bars are excluded from the 60-bar valid count — search extends to compensate
 - Regular session close (15:59 bar) triggers immediate exit during scan — after-market is fallback only for 15:59 halt/no_data
 - After-market data usage is limited to 15:59 bar halt/no_data fallback and dead position resolution
-- Threshold values (0.03, 0.05) must be read from config, not hardcoded
+- Threshold values (threshold_3pp, threshold_5pp) must be read from config, not hardcoded
 - `build_effective_bar_sequence()` is sourced from `utils.py` — do not reimplement
 - `is_dead_position` flag must be set in all dead position cases regardless of label assigned
+- `dead_position_case` must be set to "A", "B", or "C" for dead position rows; None otherwise
+- `is_ambiguous` detection uses the current bar's individual high/low only —
+  NOT cumulative max_up/max_down across previously scanned bars
+- `is_ambiguous` is set before cumulative breach tracking proceeds for that bar
+- `ambiguity_priority` controls breach direction on simultaneous breach — read from config
 
 ---
 
@@ -218,6 +289,7 @@ labeler:
   after_market_close_hour: "200000"
   max_holding_bars: 60                # valid (non-halt) bars
   dead_position_penalty_pct: 0.05     # applied to next-day exit price (Case A)
+  ambiguity_priority: "up"            # "up" | "down" — breach direction on same-bar ambiguity
 ```
 
 ---
@@ -235,7 +307,11 @@ labeler:
 | 15:59 bar is halt, after-market tick available | label assigned from after-market tick |
 | 15:59 bar is halt, no after-market data | dead position Case A or C |
 | 5-bar halt mid-session, breach occurs at valid bar 61 | correct label (extended search) |
-| +3pp and -3pp hit simultaneously (same bar) | up3 priority (configurable) |
-| Dead position, next day data available for ticker | is_dead_position=True, Case A |
-| Dead position, next day exists but ticker missing | is_dead_position=True, Case B, pnl=-1.0 |
-| Dead position, next day not in dataset | is_dead_position=True, Case C |
+| bar_i.high >= +3pp AND bar_i.low <= -3pp (individual bar spans both), priority=up | label_up3, is_ambiguous=True |
+| bar_i.high >= +3pp AND bar_i.low <= -3pp (individual bar spans both), priority=down | label_dn3, is_ambiguous=True |
+| cumulative max_up >= +3pp but bar_i alone does not span -3pp | is_ambiguous=False |
+| Normal breach (no same-bar span) | is_ambiguous=False |
+| Dead position, next day data available for ticker | is_dead_position=True, dead_position_case="A" |
+| Dead position, next day exists but ticker missing | is_dead_position=True, dead_position_case="B", pnl=-1.0 |
+| Dead position, next day not in dataset | is_dead_position=True, dead_position_case="C" |
+| Non-dead-position row | dead_position_case=None |
