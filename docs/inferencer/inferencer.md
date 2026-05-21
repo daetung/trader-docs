@@ -18,10 +18,28 @@ and returns entry signals for live trading decisions.
 
 ```
 Live inference endpoint: Inferencer
-    └── Preprocessor.run(live_mode=True)   ← feature extraction only (no labeling)
-    └── model.load(run_id)                 ← load trained artifacts
-    └── model.predict(models, X)           ← probability output
+    └── EntryPointDetector.detect()            ← signal detection (not scan())
+    └── [entry_points INSERT to DuckDB]        ← Inferencer responsibility
+    └── Preprocessor.run(live_mode=True)       ← feature extraction only (no labeling)
+    └── model.load(run_id)                     ← load trained artifacts
+    └── model.predict(models, X)               ← probability output
     └── utils.resolve_signal(row, threshold, suppress_threshold) ← entry decision
+```
+
+**scan() vs detect() in live mode:**
+```
+scan() is NOT called in live inference. scan() is training-only and requires
+bars to include the t bar for p_entry retrieval.
+
+In live inference:
+    1. Inferencer calls detect() with bars up to t-1
+    2. If detect() returns True:
+       a. p_entry obtained from external real-time feed (not from bars DataFrame)
+       b. Inferencer inserts entry point directly into entry_points DuckDB table
+          (ticker, date, hour, p_entry)
+       c. Feature extraction proceeds via Preprocessor.run(live_mode=True)
+
+This ensures entry_points table remains consistent between training and live runs.
 ```
 
 ---
@@ -32,6 +50,7 @@ Live inference endpoint: Inferencer
 ```python
 bars: pd.DataFrame
     # recent ohlcv_1min bars up to and including t-1 bar
+    # t bar must NOT be included — detect() requires t-1 bar boundary
     # all sessions included (no time filter)
 
 ticks: pd.DataFrame
@@ -43,7 +62,7 @@ meta: dict
 entry: dict
     # {ticker, date, hour, p_entry}
     # hour = t bar open time
-    # p_entry = t bar open price
+    # p_entry = t bar open price (from external real-time feed)
 ```
 
 **Output:**
@@ -69,19 +88,29 @@ InferenceResult(
 ## Processing Flow
 
 ```
-1. Preprocessor.run(live_mode=True)
-       → EntryPointDetector.detect() on current bars
+1. EntryPointDetector.detect(bars, date, shares_outstanding)
        → if not a candidate entry point: return None immediately
-       → FeatureExtractor.extract() → feature_vector
 
-2. model.predict(models, X) → probability scores
+2. Obtain p_entry from external real-time feed
+       → p_entry = t bar open price from real-time data source
+       → NOT derived from bars DataFrame (t bar not included in bars)
 
-3. utils.resolve_signal(row, threshold, suppress_threshold) → signal
+3. Insert entry point to DuckDB entry_points table:
+       INSERT OR IGNORE INTO entry_points (ticker, date, hour, p_entry)
+       VALUES (entry["ticker"], entry["date"], entry["hour"], p_entry)
 
-4. Return InferenceResult
+4. Preprocessor.run(live_mode=True)
+       → FeatureExtractor.extract(bars, ticks, meta, entry) → feature_vector
+
+5. model.predict(models, X) → probability scores
+
+6. utils.resolve_signal(row, threshold, suppress_threshold) → signal
+
+7. Return InferenceResult
 ```
 
 live_mode excludes:
+- scan() (not called — detect() used instead)
 - Labeler (future prices unknown)
 - ClassBalancer (training-only)
 
@@ -99,10 +128,10 @@ threshold          = config["backtest"]["entry_threshold"]
 suppress_threshold = config["backtest"]["suppress_threshold"]  # None = disabled
 
 signal = resolve_signal(row, threshold, suppress_threshold)
-suppressed = (signal is None and (
+suppressed = (signal is None and suppress_threshold is not None and (
     row["prob_dn5"] >= suppress_threshold or
     row["prob_dn3"] >= suppress_threshold
-)) if suppress_threshold is not None else False
+))
 ```
 
 `suppressed=True` indicates the entry was blocked by downside conviction,
@@ -139,8 +168,14 @@ feature_names    = meta["feature_names"]
 categorical_cols = meta["categorical_cols"]
 ```
 
+`categorical_cols` is loaded from model artifact meta (saved at training time via
+`FeatureExtractor.get_feature_schema()`). No heuristic pattern matching at inference time.
+
 `run_id` specified in config or passed at runtime.
-Encoding maps loaded via `utils.load_encoding_map()` — same maps used during training.
+Encoding maps loaded via `utils.load_encoding_map()` — same maps used during training:
+- `configs/sector_map.json`
+- `configs/day_of_week_map.json`
+- `configs/halt_reason_code_map.json`
 
 ---
 
@@ -173,14 +208,19 @@ class Inferencer:
 
     def infer(
         self,
-        bars: pd.DataFrame,
+        bars: pd.DataFrame,      # strictly bars t-N ... t-1 (t bar excluded)
         ticks: pd.DataFrame,
         meta: dict,
-        entry: dict,
+        entry: dict,             # {ticker, date, hour, p_entry}
+                                 # p_entry from external real-time feed
     ) -> InferenceResult | None:
         """
         Run live inference for a single entry candidate.
         Returns None if entry detection does not fire.
+
+        Calls detect() (not scan()) for entry detection.
+        Inserts entry point to entry_points table if detect() returns True.
+        p_entry must be provided in entry dict from external real-time feed.
         """
         ...
 
@@ -196,6 +236,7 @@ class Inferencer:
         Returns list of InferenceResult where signal is not None.
         Suppressed entries (signal=None, suppressed=True) are excluded
         from the returned list but counted in internal diagnostics.
+        Each candidate dict must include p_entry from external real-time feed.
         """
         ...
 ```
@@ -205,11 +246,17 @@ class Inferencer:
 ## Constraints
 
 - Inferencer must use identical feature extraction logic as training pipeline
-- Encoding maps (`sector_map`, `day_of_week_map`) loaded via `utils.load_encoding_map()` — must match training-time maps
+- `scan()` must NOT be called in live inference — `detect()` only
+- `p_entry` must be provided from external real-time feed — not derived from bars
+- Entry point insertion to `entry_points` table is Inferencer's responsibility in live mode
+- `entry_points` INSERT uses INSERT OR IGNORE for idempotency
+- Encoding maps (`sector_map`, `day_of_week_map`, `halt_reason_code_map`) loaded via
+  `utils.load_encoding_map()` — must match training-time maps
+- `categorical_cols` loaded from model artifact meta — no heuristic inference
 - `utils.resolve_signal()` used for signal thresholding — same function as BacktestEngine
 - `suppress_threshold` read from same config key as BacktestEngine (`config["backtest"]["suppress_threshold"]`)
-- No data leakage: t bar OHLCV must not be used as feature input
-- `live_mode=True` passed to Preprocessor — Labeler never instantiated
+- No data leakage: t bar OHLCV must not be used as feature input; bars passed must exclude t bar
+- `live_mode=True` passed to Preprocessor — Labeler never instantiated, scan() never called
 - After-market entry points suppressed regardless of session_mode
 - `max_entry_hour` applied in live inference — consistent with training-time scan() behavior
 - Full implementation deferred; this spec defines the interface contract only

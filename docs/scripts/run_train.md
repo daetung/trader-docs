@@ -64,7 +64,17 @@ test_df:  pd.DataFrame   # test split
        sample_weight_col = None
    Note: is_ambiguous column is used here for weight assignment only —
          it is NOT included in feature_names passed to LightGBM
-4. Identify categorical_cols: features ending with "_code" + "day_of_week" + "halt_reason_code"
+4. Identify categorical_cols from FeatureExtractor.get_feature_schema():
+       extractor = FeatureExtractor(config)
+       schema = extractor.get_feature_schema()
+       categorical_cols = [
+           name for name, ftype in schema.items()
+           if ftype == "categorical"
+       ]
+       # For LightGBM: only "categorical" typed features are registered
+       # as categorical_feature. All other types (binary, count, ordinal)
+       # are treated as continuous by LightGBM.
+       # Current categorical features: sector_code, day_of_week, halt_reason_code
 5. Instantiate model via factory: model = create_model(config)
 6. Train 5 classifiers:
        models = model.train(train_df, val_df, feature_names, categorical_cols,
@@ -90,8 +100,9 @@ test_df:  pd.DataFrame   # test split
            config       = config,
        )
        reducer = DimensionalityReducer(config)
-       selected_features, report = reducer.run_all(X_train, X_val, provider)
+       selected_features, reduction_report = reducer.run_all(X_train, X_val, provider)
        → selected_features included in returned result dict
+       → reduction_report included in returned result dict
        → NO retraining here; PipelineOptimizer uses selected_features for voting only
 12. Write to train_log (DuckDB):
        run_id, optimizer_run_id, run_at, phase, fold_idx, fold_train_end,
@@ -100,6 +111,7 @@ test_df:  pd.DataFrame   # test split
        best_of_loop=False, notes=NULL
        Note: auc_std is NULL at write time — updated by PipelineOptimizer
              via UPDATE after all folds in a run/trial complete
+             on the row with fold_run_ids[-1] (guaranteed MAX fold_idx)
 ```
 
 ---
@@ -111,7 +123,7 @@ These two mechanisms trigger DimensionalityReducer but have different behaviors:
 **`run_reducer=True` (called by PipelineOptimizer, selection phase):**
 ```
 1. Run DimensionalityReducer on current fold's train/val
-2. Return selected_features in result dict for frequency voting
+2. Return selected_features and reduction_report in result dict for frequency voting
 3. NO retraining — PipelineOptimizer accumulates votes across folds
 4. One model artifact saved (full feature model for this fold)
 ```
@@ -160,6 +172,8 @@ class Trainer:
             auc_mean:          float — mean test AUC across 5 classifiers
             auc_up5..auc_dn5:  float — per-classifier test AUC
             selected_features: list[str] | None — populated if run_reducer=True, else None
+            reduction_report:  dict | None — populated if run_reducer=True, else None
+                               includes importance_scores for PipelineOptimizer logging
 
         Args:
             train_df, val_df, test_df:
@@ -181,7 +195,8 @@ class Trainer:
                 Explicit feature list (exploitation phase, selected_features).
                 None = use FeatureExtractor.get_feature_names() (full set).
             run_reducer:
-                True = run DimensionalityReducer, return selected_features.
+                True = run DimensionalityReducer, return selected_features
+                       and reduction_report.
                        Used by PipelineOptimizer selection phase only.
                        Does NOT trigger retraining.
                 False = skip reducer (default).
@@ -221,7 +236,7 @@ train_log_row = {
     "optimizer_run_id":    optimizer_run_id,
     "run_at":              run_at,
     "phase":               phase,             # "selection"|"exploitation"|"full"|None
-    "fold_idx":            fold_idx,          # None for standalone
+    "fold_idx":            fold_idx,          # None for standalone; 0-based for rolling
     "fold_train_end":      fold_train_end,    # None for standalone
     "feature_config":      json.dumps(feature_config)
                            if feature_config is not None
@@ -235,8 +250,8 @@ train_log_row = {
     "auc_dn5":             eval_result["dn5"]["test_auc"],
     "auc_mean":            eval_result["mean_test_auc"],
     "auc_std":             None,    # set by PipelineOptimizer via UPDATE
+                                    # on fold_run_ids[-1] (MAX fold_idx)
                                     # after all folds in a run/trial complete
-                                    # on the row with MAX(fold_idx) for that run/trial
     "auc_reduced_mean":    None,    # set only when --reduce CLI flag used
     "best_of_loop":        False,   # set by PipelineOptimizer via UPDATE
     "notes":               None,
@@ -273,13 +288,15 @@ trainer:
 - `run_id` generated via `utils.generate_run_id()`
 - `experiment_log` is NOT written by run_train.py — only train_log
 - `best_of_loop` updated by PipelineOptimizer via UPDATE, not by Trainer itself
-- `auc_std` updated by PipelineOptimizer via UPDATE on last fold row, not by Trainer itself
+- `auc_std` updated by PipelineOptimizer via UPDATE on fold_run_ids[-1] (MAX fold_idx), not by Trainer itself
 - `fold_idx` and `fold_train_end` are None for standalone CLI runs
 - `fold_train_end` sourced from fold_meta["fold_train_end"] in rolling mode —
   Trainer does not compute it independently
 - Sample weight column (`__sample_weight__`) generated inside Trainer when
   `use_ambiguous_sample_weight=True`; must not appear in feature_names
-- `run_reducer=True` returns selected_features only — no retraining within Trainer.run()
+- `categorical_cols` derived from `FeatureExtractor.get_feature_schema()` —
+  no heuristic pattern matching; only "categorical" typed features registered
+- `run_reducer=True` returns selected_features and reduction_report — no retraining within Trainer.run()
 - `--reduce` CLI flag triggers full reduce-retrain cycle — saves `_reduced` artifact;
   this behavior is NOT replicated when run_reducer=True is called by PipelineOptimizer
 - Session_mode filtering applied upstream by ClassBalancer — Trainer does not re-apply it

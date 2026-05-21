@@ -29,7 +29,8 @@ feature_names: list[str]       # column names of X_train
 **Output:**
 ```python
 selected_features: list[str]   # features surviving all active filters
-reduction_report: dict         # counts and removed feature names per stage
+reduction_report: dict         # counts, removed feature names per stage,
+                               # and importance_scores used for selection
 ```
 
 ---
@@ -41,6 +42,8 @@ class ImportanceProvider(ABC):
     """
     Abstract interface for model-dependent importance and SHAP computation.
     One concrete implementation per model type.
+    All implementations must be instantiated after model training is complete.
+    get_importance() is guaranteed to return meaningful scores at call time.
     """
 
     @abstractmethod
@@ -190,12 +193,16 @@ selected_features, report = reducer.run_all(X_train, X_valid, provider)
 
 ### Stage 1: Correlation Filter
 
-Model-independent. Operates on X_train only.
+Operates on X_train data only (no model training required at this stage).
+Importance scores are sourced from the already-trained provider passed to `run_all()`.
+`get_importance()` is called once in `run_all()` before any filter stage and
+reused across all stages — not called again inside individual filter methods.
 
 ```
+importance_scores = provider.get_importance(feature_names)   # called once in run_all()
+
 For each pair (fi, fj) where |corr(fi, fj)| > threshold:
-    importance = provider.get_importance(feature_names)
-    remove the feature with lower importance score
+    remove the feature with lower importance_scores value
     (alphabetical tiebreak if scores are equal)
 
 Default threshold: 0.95 (configurable)
@@ -203,10 +210,9 @@ Default threshold: 0.95 (configurable)
 
 ### Stage 2: Importance Filter
 
-Delegates to provider for importance scores.
+Uses the same `importance_scores` obtained in `run_all()` — no additional provider call.
 
 ```
-importance = provider.get_importance(feature_names)
 Remove features in the bottom percentile by importance score.
 
 Default: remove bottom 20% (configurable)
@@ -240,6 +246,39 @@ Enabled automatically when feature count > shap_trigger_threshold (configurable)
 
 ---
 
+## reduction_report Structure
+
+```python
+reduction_report: dict = {
+    "importance_scores":      pd.Series,   # feature → importance score
+                                           # used across correlation and importance filters
+    "input_feature_count":    int,
+    "output_feature_count":   int,
+    "stages": {
+        "correlation_filter": {
+            "removed_count":    int,
+            "removed_features": list[str],
+        },
+        "importance_filter": {
+            "removed_count":    int,
+            "removed_features": list[str],
+        },
+        "shap_filter": {
+            "enabled":          bool,
+            "removed_count":    int,
+            "removed_features": list[str],
+        },
+    },
+}
+```
+
+`importance_scores` is included in `reduction_report` to enable:
+- Audit trail of which importance values drove feature selection decisions
+- PipelineOptimizer to include per-fold importance in `feature_selection_log.json`
+- Post-hoc analysis of feature selection stability across folds
+
+---
+
 ## Interface
 
 ```python
@@ -249,16 +288,25 @@ class DimensionalityReducer:
     def correlation_filter(
         self,
         X: pd.DataFrame,
-        provider: ImportanceProvider,
+        importance_scores: pd.Series,
         threshold: float = 0.95,
-    ) -> list[str]: ...
+    ) -> list[str]:
+        """
+        importance_scores: pre-computed from provider.get_importance() in run_all().
+        Not called internally — caller (run_all) passes scores directly.
+        """
+        ...
 
     def importance_filter(
         self,
         feature_names: list[str],
-        provider: ImportanceProvider,
+        importance_scores: pd.Series,
         bottom_pct: float = 0.20,
-    ) -> list[str]: ...
+    ) -> list[str]:
+        """
+        importance_scores: same pre-computed scores from run_all().
+        """
+        ...
 
     def shap_filter(
         self,
@@ -282,7 +330,14 @@ class DimensionalityReducer:
     ) -> tuple[list[str], dict]:
         """
         Run all enabled stages sequentially.
+
+        Calls provider.get_importance() exactly once at entry.
+        Passes resulting importance_scores to correlation_filter()
+        and importance_filter() directly — no additional provider calls
+        for importance within this method.
+
         Returns (selected_features, reduction_report).
+        reduction_report includes importance_scores for audit/logging.
         """
         ...
 ```
@@ -297,12 +352,14 @@ Selection phase (PipelineOptimizer):
 For each fold in generate_folds():
     1. Train model on full feature set              → fold model
     2. create_importance_provider(...)              → provider
-    3. reducer.run_all(X_train, X_valid, provider)  → selected_features for this fold
+    3. reducer.run_all(X_train, X_valid, provider)  → selected_features, reduction_report
     4. Accumulate selected_features in frequency vote
+    5. Include reduction_report["importance_scores"] in feature_selection_log
 
 After all folds:
-    5. Apply vote_threshold → confirmed selected_features
-    6. Save to configs/selected_features.json
+    6. Apply vote_threshold → confirmed selected_features
+    7. Save to configs/selected_features.json
+    8. Save feature_selection_log.json (includes per-fold importance_scores)
     (No per-fold retraining on selected features)
 
 Exploitation phase (PipelineOptimizer):
@@ -344,7 +401,9 @@ dimensionality_reducer:
   feature interpretability must be preserved
 - Filters operate on feature names only — they do not modify the feature matrix directly
 - The caller is responsible for subsetting X_train/X_valid after receiving `selected_features`
-- `reduction_report` must record: input count, output count, removed feature names per stage
+- `run_all()` calls `provider.get_importance()` exactly once; result passed to all filter stages
+- `correlation_filter()` and `importance_filter()` receive `importance_scores` as a parameter — not the provider
+- `reduction_report` must include `importance_scores`, input/output counts, and removed features per stage
 - `train_labels` is required when `importance_averaging == "sample_weighted"`;
   `create_importance_provider()` must raise `ValueError` if not provided in that case
 - `MLPImportanceProvider` implementation is deferred to MLP phase;

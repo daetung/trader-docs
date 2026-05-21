@@ -11,7 +11,8 @@ Supports three execution modes:
 - **Standalone**: full pipeline, saves parquet to disk
 - **Optimizer (in-memory)**: returns full labeled DataFrame without splitting or saving,
   called by PipelineOptimizer; fold generation delegated to ClassBalancer
-- **Live (live_mode)**: runs EntryPointDetector + FeatureExtractor only, used by Inferencer
+- **Live (live_mode)**: runs EntryPointDetector.detect() + FeatureExtractor only,
+  used by Inferencer; scan() is NOT called in live mode
 
 Preprocessor is responsible for feature extraction and labeling only.
 Session_mode filtering, temporal splitting, and rolling fold generation
@@ -69,10 +70,14 @@ pd.DataFrame  # feature matrix for current entry points (no labels)
 1. Connect to DuckDB and load all data
 2. EntryPointDetector.scan() for each ticker → entry_points (all sessions)
    max_entry_hour exclusion applied inside scan()
-3. Save entry_points to DuckDB entry_points table
+   scan() retrieves p_entry from bars[i+1]["open"] (t bar included in bars)
+3. Save entry_points to DuckDB entry_points table (INSERT OR IGNORE)
+   DB save occurs in all modes (standalone and return_data=True)
+   "no save" in return_data=True refers to parquet only, not DB tables
 4. Labeler.label() for all entry points → labeled_samples
    (includes is_dead_position, dead_position_case, is_ambiguous)
-5. Save labeled_samples to DuckDB labeled_samples table
+5. Save labeled_samples to DuckDB labeled_samples table (INSERT OR IGNORE)
+   DB save occurs in all modes (standalone and return_data=True)
 6. FeatureExtractor.extract_batch() for each ticker → feature matrix
 7. Merge features with labels on (ticker, date, hour)
    → labeled feature matrix:
@@ -82,7 +87,7 @@ pd.DataFrame  # feature matrix for current entry points (no labels)
    → contains all sessions; no session_mode filter applied here
 
 8a. If return_data=True (optimizer mode):
-    → return full_labeled_df directly (no split, no save)
+    → return full_labeled_df directly (no split, no parquet save)
     → ClassBalancer.generate_folds() or split() called by PipelineOptimizer
 
 8b. If return_data=False (standalone mode):
@@ -90,17 +95,19 @@ pd.DataFrame  # feature matrix for current entry points (no labels)
            balance=config["class_balancer"]["apply_balance"],
            session_mode=config["entry_detector"]["session_mode"]
        ) → (train_balanced, val, test)
-       Note: split_method in config determines temporal vs rolling behavior;
-             standalone mode always uses split() for a single saved output
+       Note: standalone mode always calls split() regardless of split_method config.
+             split_method config applies only in PipelineOptimizer context.
     → save parquet files to data/processed/
 
 [Live mode — live_mode=True]
 
 1. Connect to DuckDB and load recent OHLCV, ticks, meta
-2. EntryPointDetector.scan() for current bars → entry_points
-   (max_entry_hour exclusion applied; after-market excluded)
-3. FeatureExtractor.extract_batch() → feature matrix (no labels)
-4. Return feature matrix directly (no save, no labeling, no session filter)
+2. EntryPointDetector.detect() called per candidate bar
+   scan() is NOT called in live mode
+   p_entry is obtained from external real-time feed by Inferencer
+   entry_points DB insertion is handled by Inferencer directly
+3. FeatureExtractor.extract() → feature vector per detected entry point
+4. Return feature matrix directly (no parquet save, no labeling, no session filter)
 ```
 
 ---
@@ -120,14 +127,24 @@ class Preprocessor:
     ) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame] | None:
         """
         return_data=False, live_mode=False : split via ClassBalancer.split(),
-                                             save parquet, return None
+                                             save parquet, return None.
+                                             DB tables (entry_points, labeled_samples)
+                                             always saved (INSERT OR IGNORE).
         return_data=True,  live_mode=False : return full_labeled_df (unsplit),
-                                             no ClassBalancer call, no save
-        live_mode=True                     : return feature matrix only (no labels)
+                                             no ClassBalancer call, no parquet save.
+                                             DB tables (entry_points, labeled_samples)
+                                             always saved (INSERT OR IGNORE).
+        live_mode=True                     : return feature matrix only (no labels).
+                                             scan() not called; detect() used instead.
+                                             entry_points DB insertion handled by Inferencer.
+                                             No DB table writes in Preprocessor.
 
         When return_data=True, the returned DataFrame contains all sessions
         and all entry points. Caller is responsible for fold generation
         via ClassBalancer.generate_folds() or split().
+
+        Standalone CLI always uses split() regardless of split_method config.
+        split_method config applies only in PipelineOptimizer context.
         """
         ...
 
@@ -171,7 +188,8 @@ entry_detector.*           # includes session_mode, volume_base_hour, max_entry_
 indicators.*
 vectorizer.*
 labeler.*                  # includes ambiguity_priority, dead_position_penalty_pct
-class_balancer.*           # split_method, temporal/rolling params, pre-balance filters
+class_balancer.*           # split_method (PipelineOptimizer context only),
+                           # temporal/rolling params, pre-balance filters
 misc.lookback_bars
 ```
 
@@ -193,6 +211,10 @@ misc.lookback_bars
 - `p_entry` included in parquet as identifier column, not feature
 - `is_dead_position`, `dead_position_case`, `is_ambiguous` passed through from Labeler —
   stored as metadata columns in parquet, not features
+- In live_mode: scan() is NOT called; detect() is used instead by Inferencer
 - In live_mode: Labeler and ClassBalancer are not instantiated
+- In live_mode: entry_points DB insertion is Inferencer's responsibility — not Preprocessor's
+- entry_points and labeled_samples DB saves use INSERT OR IGNORE for idempotency
 - `max_entry_hour` exclusion applied inside EntryPointDetector.scan() —
   no additional filtering needed in Preprocessor
+- Standalone CLI always calls split() — split_method config is only enforced by PipelineOptimizer

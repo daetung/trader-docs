@@ -28,17 +28,22 @@ def build_effective_bar_sequence(
     Build sequence of valid (non-halt) bars starting from t_hour.
     Used by Labeler and BacktestEngine for consistent bar counting.
 
+    Collection boundary: bars up to and including 15:59 (session_close_hour) only.
+    After-market bars (hour > "155900") are NEVER included regardless of
+    target_valid_bars. If 15:59 is reached before target_valid_bars valid bars
+    are collected, collection stops at 15:59.
+
     Halt classification applies across ALL time periods (pre/regular/after-market).
     halts_df is the authoritative source regardless of hour.
 
-    For each missing bar slot in the sequence:
+    For each missing bar slot in the sequence (up to 15:59):
         if slot overlaps any halt interval in halts_df → classified as "halt"
             halt bars: excluded from valid bar count, OHLC = NaN, volume = 0
         else → classified as "no_trade"
             no_trade bars: included in valid count, OHLC = prior close (forward-fill), volume = 0
 
     Continues until target_valid_bars valid (non-halt) bars are collected
-    or no more bars available.
+    or 15:59 bar is reached (whichever comes first).
 
     Args:
         ohlcv_future: bars from t_hour onward for (ticker, date)
@@ -49,6 +54,7 @@ def build_effective_bar_sequence(
 
     Returns:
         pd.DataFrame with columns [hour, open, high, low, close, volume, is_halt, is_valid]
+        Never contains bars with hour > "155900".
     """
     ...
 ```
@@ -288,10 +294,26 @@ def save_encoding_map(map_name: str, mapping: dict, configs_dir: str = "configs"
 
 **Managed maps:**
 
-| File | Built by | Used by |
-|---|---|---|
-| `configs/sector_map.json` | FeatureExtractor (first run) | FeatureExtractor, Inferencer |
-| `configs/day_of_week_map.json` | FeatureExtractor (first run) | FeatureExtractor, Inferencer |
+| File | Built by | Used by | Notes |
+|---|---|---|---|
+| `configs/sector_map.json` | FeatureExtractor (first run) | FeatureExtractor, Inferencer | unknown → 0; known → 1, 2, ... |
+| `configs/day_of_week_map.json` | FeatureExtractor (first run) | FeatureExtractor, Inferencer | always has value, no NaN |
+| `configs/halt_reason_code_map.json` | FeatureExtractor (first run) | FeatureExtractor, Inferencer | "no_halt" → 0; known codes → 1, 2, ...; unknown → -1 |
+
+**halt_reason_code_map.json reserved entry:**
+```json
+{
+    "no_halt": 0,
+    "T1": 1,
+    "T6": 2,
+    "LUDP": 3,
+    ...
+}
+```
+- `"no_halt": 0` is always present — used when `had_halt_today == 0`
+- Known NYSE reason codes start from 1
+- Unknown reason codes encountered at runtime map to -1 (not stored in file)
+- All categorical features are guaranteed integers, never NaN
 
 ---
 
@@ -349,6 +371,8 @@ Called by:
 - All functions are stateless — no module-level state or caching
 - `build_effective_bar_sequence()` is the single source of truth for valid bar counting
   — Labeler and BacktestEngine both import from here; logic must not be duplicated
+- `build_effective_bar_sequence()` never returns bars with hour > "155900" —
+  after-market bars are excluded regardless of target_valid_bars
 - `resolve_signal()` is the single source of truth for entry signal thresholding
   — BacktestEngine and Inferencer both import from here
 - `resolve_signal()` suppression check always precedes entry signal check
@@ -359,4 +383,6 @@ Called by:
 - `apply_overrides()` must deep-copy config — original must never be mutated
 - `load_encoding_map()` returns empty dict (not error) when file does not exist
   — FeatureExtractor handles first-run map creation
+- All categorical encoding maps guarantee integer values, never NaN
+- `halt_reason_code_map.json` must always contain `"no_halt": 0` as a reserved entry
 - No pipeline business logic in this module — utility functions only

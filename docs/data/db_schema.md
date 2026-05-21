@@ -141,6 +141,7 @@ CREATE TABLE ticker_data_coverage (
 );
 
 -- Entry points (output of EntryPointDetector)
+-- Written by Preprocessor (training) and Inferencer (live) via INSERT OR IGNORE
 CREATE TABLE entry_points (
     ticker      VARCHAR      NOT NULL,
     date        VARCHAR      NOT NULL,
@@ -179,8 +180,7 @@ CREATE TABLE labeled_samples (
 -- fold_train_end: last date of train window ('YYYYMMDD'); NULL for standalone.
 -- auc_std:       std of AUC across all folds in the same run or trial.
 --                NULL at write time — populated via UPDATE by PipelineOptimizer
---                on the row with MAX(fold_idx) for the given optimizer_run_id
---                (and feature_config group for exploitation phase).
+--                on fold_run_ids[-1] (MAX fold_idx, guaranteed by generate_folds() order).
 --                Interpretation: temporal stability of the model across market periods.
 -- phase:         "selection"   — full feature set + reducer, no trial loop
 --                "exploitation" — selected features, trial search loop
@@ -206,7 +206,7 @@ CREATE TABLE train_log (
     auc_dn5             DOUBLE,
     auc_mean            DOUBLE,
     auc_std             DOUBLE,                  -- NULL until UPDATE by PipelineOptimizer
-                                                 -- set on MAX(fold_idx) row only
+                                                 -- set on fold_run_ids[-1] (MAX fold_idx) only
     auc_reduced_mean    DOUBLE,
     best_of_loop        BOOLEAN,
     notes               VARCHAR,
@@ -241,6 +241,10 @@ CREATE TABLE experiment_log (
 );
 
 -- Trade log (output of BacktestEngine)
+-- optimizer_run_id is intentionally NOT included in trade_log.
+-- Rationale: trade_log is normalized — optimizer_run_id is accessible via join:
+--     trade_log.run_id → experiment_log.run_id → experiment_log.optimizer_run_id
+-- This avoids redundant storage in a high-volume table.
 CREATE TABLE trade_log (
     tr_id             VARCHAR     NOT NULL,  -- UUID
     run_id            VARCHAR,
@@ -310,7 +314,8 @@ fold_summary = con.execute("""
 """, ["20250519_143022"]).df()
 
 # Retrieve auc_std for a completed run or trial
-# (recorded on the MAX(fold_idx) row)
+# (recorded on fold_run_ids[-1] = MAX fold_idx row,
+#  guaranteed by generate_folds() ascending yield order)
 run_auc_std = con.execute("""
     SELECT auc_std, auc_mean, fold_idx
     FROM train_log
@@ -359,6 +364,15 @@ trades = con.execute("""
      AND o.hour   = printf('%06d', t.entry_bar)
     WHERE t.run_id = ?
 """, ["20250715_143022"]).df()
+
+# Trace trade_log entries to optimizer_run_id via join
+# (optimizer_run_id intentionally excluded from trade_log for normalization)
+trades_by_optimizer = con.execute("""
+    SELECT t.*, e.optimizer_run_id
+    FROM trade_log t
+    JOIN experiment_log e ON t.run_id = e.run_id
+    WHERE e.optimizer_run_id = ?
+""", ["20250519_143022"]).df()
 ```
 
 ---
@@ -369,5 +383,6 @@ trades = con.execute("""
 - **No time-of-day filter** — all bars (pre-market, regular, after-market) are stored
 - `seq_id` for tick_10: assigned as row-order index within each `(ticker, date, hour)` group, starting from 0
 - Duplicate skip: check existence of `(ticker, date)` pair in target table before inserting; skip entire file if already present
+- entry_points table: INSERT OR IGNORE — written by both Preprocessor (training) and Inferencer (live)
 - After ingestion: `trading_calendar` and `ticker_data_coverage` updated via
   `utils.populate_trading_calendar()` and `utils.populate_ticker_coverage()`

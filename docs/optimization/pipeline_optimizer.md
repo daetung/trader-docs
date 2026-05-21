@@ -54,7 +54,8 @@ enabled, then aggregating results via frequency voting.
 - Frequency voting: selected_features collected across all folds
   → features selected in >= vote_threshold fraction of folds → confirmed set
   → saved to configs/selected_features.json
-  → per-fold selections saved to configs/feature_selection_log.json for audit
+  → per-fold selections and importance_scores saved to
+    configs/feature_selection_log.json for audit
 - train_log: one row per fold (fold_idx, fold_train_end populated)
 - No trial search loop — feature_config is fixed at full
 - No backtest — AUC and selected_features reported per fold only
@@ -79,6 +80,9 @@ for train, val, test, fold_meta in balancer.generate_folds(
     balance=config["class_balancer"]["apply_balance"],
     session_mode=config["entry_detector"]["session_mode"],
 ):
+    # generate_folds() yields folds in ascending fold_idx order (0, 1, 2, ...)
+    # fold_run_ids[-1] is guaranteed to be the MAX(fold_idx) row
+
     run_id = utils.generate_run_id()
     result = trainer.run(
         train, val, test,
@@ -96,6 +100,7 @@ for train, val, test, fold_meta in balancer.generate_folds(
         "fold_idx":          fold_meta["fold_idx"],
         "fold_train_end":    fold_meta["fold_train_end"],
         "selected_features": result["selected_features"],
+        "importance_scores": result["reduction_report"]["importance_scores"].to_dict(),
         "auc_mean":          result["auc_mean"],
     })
     fold_aucs.append(result["auc_mean"])
@@ -109,6 +114,8 @@ selected_features = sorted([
 ])
 
 # auc_std UPDATE on last fold row (fold_idx = total_folds - 1)
+# generate_folds() guarantees ascending fold_idx order, so the last
+# yielded fold always has the highest fold_idx.
 auc_std = std(fold_aucs)
 UPDATE train_log SET auc_std = auc_std
 WHERE optimizer_run_id = optimizer_run_id
@@ -134,10 +141,11 @@ Each trial runs all rolling folds with the fixed selected feature set.
 - feature set: loaded from configs/selected_features.json — fixed per run
 - DimensionalityReducer: disabled (run_reducer=False)
 - Execution: trial loop over search_space; each trial runs all folds
+- generate_folds() yields folds in ascending fold_idx order;
+  fold_run_ids[-1] always corresponds to MAX(fold_idx) for that trial
 - AUC aggregation per trial: mean ± std across folds
   → auc_std stored on the row with the highest fold_idx for that trial
-    (last fold row, identified by MAX(fold_idx) within optimizer_run_id
-     and feature_config group)
+    (last fold row, identified by fold_run_ids[-1])
 - Backtest: executed for best trial using last fold's model and test set
 - train_log: one row per fold per trial
 ```
@@ -152,6 +160,7 @@ Intended for baseline measurement and debugging before selection phase.
 - DimensionalityReducer: disabled (run_reducer=False)
 - Execution: one pass through all folds (same structure as selection phase
              but without reducer — not a trial search loop)
+- generate_folds() yields folds in ascending fold_idx order
 - Backtest: executed after fold pass completes
 - train_log: one row per fold
 - auc_std recorded on last fold row (highest fold_idx)
@@ -173,15 +182,10 @@ Recording:
   After all folds complete for a given run or trial:
   1. Compute auc_std = std(fold_aucs)
   2. UPDATE train_log SET auc_std = <value>
-     WHERE optimizer_run_id = <id>
-       AND fold_idx = (
-           SELECT MAX(fold_idx) FROM train_log
-           WHERE optimizer_run_id = <id>
-             AND <feature_config_group_condition>
-       )
+     WHERE run_id = fold_run_ids[-1]
+     # fold_run_ids[-1] is guaranteed to be MAX(fold_idx) because
+     # generate_folds() always yields in ascending fold_idx order
 
-  The "last fold row" is defined as the row with the maximum fold_idx
-  within the same optimizer_run_id (and feature_config for exploitation).
   All other fold rows retain auc_std = NULL.
 
 Interpretation:
@@ -304,6 +308,7 @@ for feature_config in search_space:
         balance=config_override["class_balancer"]["apply_balance"],
         session_mode=config_override["entry_detector"]["session_mode"],
     ):
+        # generate_folds() yields folds in ascending fold_idx order (0, 1, 2, ...)
         run_id = utils.generate_run_id()
         result = trainer.run(
             train, val, test,
@@ -321,9 +326,9 @@ for feature_config in search_space:
     trial_auc_mean = mean(fold_aucs)
     trial_auc_std  = std(fold_aucs)
 
-    # Record auc_std on last fold row for this trial
+    # fold_run_ids[-1] is MAX(fold_idx) row — guaranteed by generate_folds() order
     UPDATE train_log SET auc_std = trial_auc_std
-    WHERE run_id = fold_run_ids[-1]   # last fold = highest fold_idx
+    WHERE run_id = fold_run_ids[-1]
 
     if trial_auc_mean > best_trial_auc_mean:
         best_trial_auc_mean = trial_auc_mean
@@ -335,6 +340,7 @@ for feature_config in search_space:
         break   # early exit if threshold met
 
 # Mark best trial's last fold row
+# fold_run_ids[-1] is guaranteed to be MAX(fold_idx) for that trial
 UPDATE train_log SET best_of_loop = TRUE
 WHERE run_id = best_fold_run_ids[-1]
 
@@ -442,8 +448,9 @@ This propagates automatically to `ClassBalancer.generate_folds()`.
 - `run_single()` callable standalone from CLI for manual one-off experiments
 - `train_log` written by Trainer per fold; `experiment_log` written by Backtester
 - `best_of_loop` set TRUE on the last fold row of the best trial via UPDATE
-- `auc_std` set on the last fold row (MAX fold_idx) of each run or trial via UPDATE
-  — all other fold rows retain auc_std = NULL
+- `auc_std` set on fold_run_ids[-1] (MAX fold_idx, guaranteed by generate_folds() order)
+  via UPDATE — all other fold rows retain auc_std = NULL
+- `feature_selection_log.json` includes per-fold `importance_scores` from `reduction_report`
 - Preprocessed parquet saved only for best trial's last fold via `preprocessor.save()`
 - `optimizer_run_id` format: `YYYYMMDD_HHMMSS` (generated once per optimizer run)
 - `"random"` strategy uses `random_state` for reproducible non-replacement sampling

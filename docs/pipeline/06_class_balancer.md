@@ -44,6 +44,9 @@ Iterator[tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]]
 #   "fold_test_start": str,    # 'YYYYMMDD' — first date of test window
 #   "fold_test_end":   str,    # 'YYYYMMDD' — last date of test window
 # }
+# Folds are always yielded in ascending fold_idx order (0, 1, 2, ...).
+# fold_run_ids[-1] in PipelineOptimizer is guaranteed to correspond to
+# the fold with the highest fold_idx.
 ```
 
 ---
@@ -118,6 +121,14 @@ All filters applied to train split only. Val and test are never filtered.
 
 ## Split Modes
 
+### split_method config scope
+
+`split_method` config key applies **only in the PipelineOptimizer context**:
+- PipelineOptimizer reads `split_method` to decide whether to call `split()` or `generate_folds()`
+- Standalone CLI (`run_preprocess.py`) always calls `split()` regardless of `split_method` config
+- `split()` and `generate_folds()` are independently callable methods with no internal
+  enforcement of `split_method` — the caller determines which to use
+
 ### Mode 1: Temporal Split
 
 Single split based on date ordering. Replaces random split to prevent
@@ -176,6 +187,11 @@ fold_meta contents:
     fold_test_start: first date of test window ('YYYYMMDD')
     fold_test_end:   last date of test window ('YYYYMMDD')
 
+Yield order:
+    Folds are always yielded in ascending fold_idx order (0, 1, 2, ...).
+    This guarantee is relied upon by PipelineOptimizer:
+        fold_run_ids[-1] always corresponds to MAX(fold_idx) for that trial.
+
 Termination:
     Stop when remaining data after train end is insufficient
     to fill val + test windows (accounting for embargo).
@@ -187,7 +203,7 @@ window_weeks: 10   → ~50 trading days, ~12,500 raw train samples
 val_weeks:    2    → ~10 trading days, ~2,500 samples
 test_weeks:   2    → ~10 trading days, ~2,500 samples
 step_weeks:   2    → ~14 folds from 10-month data
-embargo_days: 5    → 1 trading week buffer
+embargo_days: 5    → 1 trading week buffer (trading days)
 ```
 
 These yield ~14 folds covering ~65% of the dataset as out-of-sample.
@@ -221,16 +237,18 @@ class ClassBalancer:
         """
         Temporal split into (train_balanced, val, test).
 
+        Always callable regardless of split_method config.
+        split_method config is only enforced by PipelineOptimizer —
+        not by this method itself.
+
         Order of operations:
           1. session_mode filter
           2. Sort by date, split by date boundaries
-          3. Apply embargo gap
+          3. Apply embargo gap (trading days)
           4. Apply pre-balance filters to train (Case C, ambiguous)
           5. Apply downsampling to train if balance=True
 
         All three splits contain only target session's entry points.
-        split_method must be "temporal" in config to use this method.
-        For rolling mode, use generate_folds() instead.
 
         Args:
             labeled_df:   full labeled feature matrix (all sessions)
@@ -248,6 +266,7 @@ class ClassBalancer:
         """
         Walk-forward fold generator.
         Yields (train_balanced, val, test, fold_meta) per fold.
+        Folds are always yielded in ascending fold_idx order (0, 1, 2, ...).
 
         fold_meta dict keys:
             fold_idx        (int)  : 0-based fold index
@@ -262,9 +281,6 @@ class ClassBalancer:
           4. Apply pre-balance filters to train (Case C, ambiguous)
           5. Apply downsampling to train if balance=True
           6. Yield (train_balanced, val, test, fold_meta)
-
-        Fold parameters read from config rolling section.
-        split_method must be "rolling" in config to use this method.
 
         Args:
             labeled_df:   full labeled feature matrix (all sessions)
@@ -289,17 +305,20 @@ class_balancer:
   random_state: 42
 
   split_method: "rolling"   # "temporal" | "rolling"
-                            # "temporal": single temporal split via split()
-                            # "rolling":  walk-forward folds via generate_folds()
+                            # Applies only in PipelineOptimizer context:
+                            #   "temporal" → PipelineOptimizer calls split()
+                            #   "rolling"  → PipelineOptimizer calls generate_folds()
+                            # Standalone CLI (run_preprocess.py) always uses split()
+                            # regardless of this setting.
 
-  # Temporal split parameters (used when split_method = "temporal")
+  # Temporal split parameters (used when PipelineOptimizer uses split_method = "temporal")
   temporal:
     train_pct: 0.70
     val_pct:   0.15
     test_pct:  0.15
-    embargo_days: 5
+    embargo_days: 5         # trading days
 
-  # Rolling fold parameters (used when split_method = "rolling")
+  # Rolling fold parameters (used when PipelineOptimizer uses split_method = "rolling")
   rolling:
     window_weeks: 10        # fixed train window size
     val_weeks:    2         # validation window per fold
@@ -323,12 +342,11 @@ entry_detector:
 
 ## Constraints
 
-- `split_method` determines which method is used in the pipeline — they are not interchangeable
 - Temporal ordering must be preserved: train always precedes val, val always precedes test
-- Embargo gap applied at both train/val and val/test boundaries
+- Embargo gap applied at both train/val and val/test boundaries (unit: trading days)
 - Pre-balance filters applied to train split only — val and test are never filtered
 - Balancing applied to train split only — val and test untouched by downsampling
-- `split()` is used when split_method="temporal"; `generate_folds()` when split_method="rolling"
+- `split_method` config is enforced only by PipelineOptimizer — `split()` and `generate_folds()` are always callable independently
 - `balance()` is available as a standalone method for reporting and testing — not called directly in pipeline
 - `session_mode=None` disables session filtering — all sessions retained (used for testing)
 - No SMOTE or synthetic oversampling
@@ -336,6 +354,7 @@ entry_detector:
 - `report()` must be called and logged before and after balancing
 - Week boundaries aligned to calendar weeks (Monday); partial weeks >= 3 trading days are included
 - Rolling fold count is determined automatically from data length — not configurable directly
+- `generate_folds()` always yields folds in ascending fold_idx order — this is a hard guarantee
 - `generate_folds()` yields fold_meta as the fourth element of every tuple —
   callers must unpack all four values: `for train, val, test, fold_meta in balancer.generate_folds(...)`
 - `ambiguous_sample_action` controls only include/exclude in ClassBalancer;

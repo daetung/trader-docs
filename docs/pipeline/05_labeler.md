@@ -114,13 +114,14 @@ P_entry = t bar open price (from entry_points.p_entry)
 
 Use build_effective_bar_sequence() from utils.py.
 Collect bars from t onward for this (ticker, date).
+Collection stops at 15:59 bar — after-market bars are NOT included.
 Halt classification applies across all time periods (pre/regular/after-market).
 
-For each missing bar slot:
+For each missing bar slot up to 15:59:
     if slot overlaps halt interval in halts_df → "halt" (excluded from valid count)
     else                                        → "no_trade" (OHLC = prior close, volume=0)
 
-Target: 60 valid (non-halt) bars.
+Target: 60 valid (non-halt) bars, within regular session boundary (≤ 15:59).
 
 --- Step 2: Sequential bar scan ---
 
@@ -166,7 +167,7 @@ Triggered when 15:59 bar is reached during scan (before ±3pp breach):
 
     if 15:59 bar is halt or no_data:
         fallback: first tick_10 row with hour > "155900" (after-market)
-        if no after-market tick: exit_price = last valid bar close before 15:59
+        if no after-market tick: → Dead position (Step 4)
 
     pnl = (exit_price - P_entry) / P_entry
     apply label:
@@ -176,23 +177,14 @@ Triggered when 15:59 bar is reached during scan (before ±3pp breach):
         pnl <= -threshold_5pp  → label_dn5
         pnl <= -threshold_3pp  → label_dn3
 
---- Step 4: 60 valid bars exhausted before session close ---
-
-If 60 valid bars are exhausted before reaching 15:59 bar:
-    exit_price = close of last valid bar
-    pnl = (exit_price - P_entry) / P_entry
-    assign label by pnl threshold (same as Step 3)
-
-    Note: This occurs only when a large number of halt bars
-    pushes the 60-bar window past the regular session boundary
-    into after-market hours, and all remaining bars are also
-    halt/no_trade. In practice this is a rare edge case.
-
---- Step 5: Dead position ---
+--- Step 4: Dead position ---
 
 Dead position occurs only when:
     - Session close exit price cannot be determined (15:59 halt + no after-market data)
-    - AND 60 valid bars not yet exhausted
+
+Note: build_effective_bar_sequence() collects bars up to 15:59 only.
+60 valid bars exhausted before reaching 15:59 is not a separate exit case —
+the scan always proceeds to 15:59 or until a ±3pp breach occurs.
 
 In this case:
     Lookup next trading day via trading_calendar table.
@@ -256,6 +248,7 @@ class Labeler:
         """
         Delegates to utils.build_effective_bar_sequence().
         Halt classification applies across all time periods.
+        Collection stops at 15:59 bar — after-market bars excluded.
         """
         ...
 ```
@@ -266,8 +259,10 @@ class Labeler:
 
 - t bar high/low/close/volume must NOT be used — only t bar open (P_entry) is permitted as reference
 - Halt bars are excluded from the 60-bar valid count — search extends to compensate
-- Regular session close (15:59 bar) triggers immediate exit during scan — after-market is fallback only for 15:59 halt/no_data
-- After-market data usage is limited to 15:59 bar halt/no_data fallback and dead position resolution
+- Regular session close (15:59 bar) triggers immediate exit during scan
+- after-market data usage is limited to 15:59 bar halt/no_data fallback only
+- build_effective_bar_sequence() collects bars up to 15:59 only — after-market bars never included
+- Dead position is the only case where after-market and next-day data are used
 - Threshold values (threshold_3pp, threshold_5pp) must be read from config, not hardcoded
 - `build_effective_bar_sequence()` is sourced from `utils.py` — do not reimplement
 - `is_dead_position` flag must be set in all dead position cases regardless of label assigned
@@ -287,7 +282,7 @@ labeler:
   threshold_5pp: 0.05
   session_close_hour: "155900"
   after_market_close_hour: "200000"
-  max_holding_bars: 60                # valid (non-halt) bars
+  max_holding_bars: 60                # valid (non-halt) bars, within session boundary
   dead_position_penalty_pct: 0.05     # applied to next-day exit price (Case A)
   ambiguity_priority: "up"            # "up" | "down" — breach direction on same-bar ambiguity
 ```
@@ -306,7 +301,7 @@ labeler:
 | Scan reaches 15:59 bar, pnl = +4pp | label_up3 |
 | 15:59 bar is halt, after-market tick available | label assigned from after-market tick |
 | 15:59 bar is halt, no after-market data | dead position Case A or C |
-| 5-bar halt mid-session, breach occurs at valid bar 61 | correct label (extended search) |
+| 5-bar halt mid-session, breach occurs at valid bar 61 | correct label (extended search within session) |
 | bar_i.high >= +3pp AND bar_i.low <= -3pp (individual bar spans both), priority=up | label_up3, is_ambiguous=True |
 | bar_i.high >= +3pp AND bar_i.low <= -3pp (individual bar spans both), priority=down | label_dn3, is_ambiguous=True |
 | cumulative max_up >= +3pp but bar_i alone does not span -3pp | is_ambiguous=False |

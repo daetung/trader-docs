@@ -52,6 +52,7 @@ bars (t-N ... t-1)
     │
     ├─► Vectorizer
     │       for each indicator series, apply mapped transform method(s)
+    │       sr_levels: call vectorizer.sr_distance() directly (not via transform())
     │       output: dict[str, float]
     │
     ├─► MetaFeatureExtractor  (inline)
@@ -81,6 +82,7 @@ The correct strategy is:
 2. For each entry point in entry_points:
    a. Slice indicator time-series up to t-1 bar (by hour index)
    b. Apply Vectorizer to sliced series → feature vector
+      (sr_levels: call vectorizer.sr_distance() directly)
    c. Append meta and temporal features
 
 3. Concatenate all feature vectors → feature matrix (pd.DataFrame)
@@ -101,13 +103,17 @@ meta_features = {
     "log_price_52l":        log(price_52l),
     "log_avg_volume":       log(avg_volume),
     "price_52_range_ratio": (p_entry - price_52l) / (price_52h - price_52l),
-    "sector_code":          int  # from configs/sector_map.json; unknown → -1
+    "sector_code":          int  # from configs/sector_map.json
+                                 # unknown sector → 0
+                                 # known sectors → 1, 2, 3, ...
 }
 ```
 
 Sector encoding map is loaded via `utils.load_encoding_map("sector_map")`.
 Built once from all unique sectors in `stock_meta` and persisted to `configs/sector_map.json`.
+Unknown sector maps to 0 (not -1). Known sectors are encoded starting from 1.
 `sector_code` must be registered as LightGBM categorical column.
+`sector_code` is always an integer — never NaN.
 
 ---
 
@@ -157,25 +163,37 @@ market_structure_features = {
     # Halt-related
     "had_halt_today":           1 if any halt before t-1 bar else 0,
     "bars_since_last_halt":     int / NaN,   # bars since last halt ended; NaN if no halt
-    "halt_reason_code":         int,         # category; NaN if no halt today
+    "halt_reason_code":         int,         # encoded via halt_reason_code_map.json
+                                             # 0 = no halt today ("no_halt" entry in map)
                                              # registered as LightGBM categorical
+                                             # always an integer — never NaN
     "halt_count_today":         int,         # total halts this session before t-1
 
     # Missing bar composition
     "missing_bar_count":        int,         # total no_trade gap bars in lookback window
 
     # Synthetic bar quality indicators
-    # These capture the degree to which indicator values in the lookback
-    # window may be distorted by forward-filled synthetic bars.
     "synthetic_bar_ratio":      float,       # no_trade_bars / total_bars_in_window
                                              # range [0.0, 1.0]
-                                             # high value → many indicators computed
-                                             # on forward-filled prices (reduced reliability)
     "consecutive_synthetic_max": int,        # longest run of consecutive no_trade bars
                                              # in lookback window
-                                             # high value → extended flat price segments
-                                             # distorting slope/trend indicators
 }
+```
+
+**halt_reason_code encoding:**
+```
+Loaded via utils.load_encoding_map("halt_reason_code_map").
+Map file: configs/halt_reason_code_map.json
+
+Reserved entry:
+    "no_halt": 0   ← used when had_halt_today == 0
+Known NYSE reason codes start from 1 (e.g. "T1": 1, "T6": 2, "LUDP": 3, ...)
+Unknown reason codes: map to -1 at runtime (not stored in map file)
+
+When had_halt_today == 0:
+    halt_reason_code = 0   ("no_halt")
+    bars_since_last_halt = NaN
+    halt_count_today = 0
 ```
 
 **Synthetic bar ratio computation:**
@@ -185,11 +203,66 @@ no_trade_bars = bars classified as no_trade by MissingBarClassifier
                 (halt bars excluded — they are NaN, not forward-filled)
 
 synthetic_bar_ratio      = len(no_trade_bars) / len(lookback_bars)
-consecutive_synthetic_max = max run length of consecutive no_trade bars
+```
+
+**consecutive_synthetic_max computation (FeatureExtractor responsibility):**
+```
+From classify_missing_bars() output:
+    classification: dict[HHMMSS → "halt" | "no_trade"]
+
+Steps:
+    1. Sort classification keys (HHMMSS strings) in ascending order
+    2. Iterate sorted slots, tracking current run length of consecutive "no_trade"
+    3. consecutive_synthetic_max = maximum run length observed
+
+Note: HHMMSS string sort is equivalent to chronological sort within a trading day.
+Halt bars are excluded from run counting — only "no_trade" consecutive runs counted.
 ```
 
 These features allow the model to learn when its indicator inputs are less
 reliable due to illiquidity gaps, without modifying IndicatorCalculator itself.
+
+---
+
+## Feature Schema
+
+```python
+def get_feature_schema(self) -> dict[str, str]:
+    """
+    Returns mapping of feature name → feature type for all features
+    in get_feature_names().
+
+    Feature types:
+        "continuous"  : continuous float (most indicator features)
+        "categorical" : nominal integer, always non-NaN
+                        (sector_code, day_of_week, halt_reason_code)
+        "binary"      : 0/1 integer (is_* features, had_halt_today)
+        "count"       : non-negative integer
+                        (halt_count_today, missing_bar_count,
+                         peak_count, trough_count, etc.)
+        "ordinal"     : ordered integer
+                        (minute_of_session, hour_of_day)
+
+    Model-specific interpretation:
+        LightGBM : only "categorical" type registered as categorical_feature.
+                   All other types treated as continuous.
+        MLP      : each type handled separately (embedding for categorical,
+                   normalize for count/ordinal, as-is for binary).
+                   [MLP handling defined at MLP implementation phase]
+
+    Guarantee: "categorical" typed features are always integers, never NaN.
+    """
+    ...
+```
+
+`get_categorical_cols()` is not a separate method. Callers derive categorical
+columns from `get_feature_schema()`:
+```python
+categorical_cols = [
+    name for name, ftype in extractor.get_feature_schema().items()
+    if ftype == "categorical"
+]
+```
 
 ---
 
@@ -242,6 +315,7 @@ class FeatureExtractor:
         Batch feature extraction for one ticker.
         Indicators computed once for full bars DataFrame.
         Per-entry slicing and vectorization applied after.
+        sr_levels: vectorizer.sr_distance() called directly (not via transform()).
         Returns feature matrix as pd.DataFrame.
         """
         ...
@@ -250,6 +324,15 @@ class FeatureExtractor:
         """
         Deterministic ordered list of all feature column names.
         Does NOT include p_entry, ticker, date, hour, or label columns.
+        """
+        ...
+
+    def get_feature_schema(self) -> dict[str, str]:
+        """
+        Mapping of feature name → feature type.
+        Types: "continuous" | "categorical" | "binary" | "count" | "ordinal"
+        "categorical" features are always integers, never NaN.
+        See Feature Schema section for full spec.
         """
         ...
 ```
@@ -283,14 +366,17 @@ They are used by ClassBalancer for pre-balance filtering.
 - `extract_batch()` computes indicators once per ticker — not once per entry point
 - Disabled feature groups (per config) produce no columns
 - `sector_code`, `day_of_week`, `halt_reason_code` must be passed as categoricals to LightGBM
-- NaN values permitted — do not impute
+- NaN values permitted in continuous features — do not impute
 - `p_entry` must never appear as a feature column
 - `is_monday` and `is_friday` binary columns must NOT be generated
 - Missing bar classification must run before IndicatorCalculator receives bars
 - Halt bars (NaN) propagate naturally into indicator NaN — do not suppress
 - Temporal features use `entry.hour` (t bar open time) as reference — this is not data leakage
-- Encoding maps (sector, day_of_week) loaded via `utils.load_encoding_map()` for live inference compatibility
-- `synthetic_bar_ratio` and `consecutive_synthetic_max` computed from MissingBarClassifier output
-  — no changes to IndicatorCalculator or Vectorizer required
-- `is_dead_position`, `dead_position_case`, `is_ambiguous` passed through from Labeler output
-  — not computed by FeatureExtractor
+- Encoding maps (sector, day_of_week, halt_reason_code) loaded via `utils.load_encoding_map()` for live inference compatibility
+- `sector_code` unknown → 0 (not -1); known sectors → 1, 2, 3, ...
+- `halt_reason_code` no halt → 0 ("no_halt" in map); known codes → 1, 2, ...; unknown codes → -1
+- All "categorical" typed features in `get_feature_schema()` are guaranteed integers, never NaN
+- `consecutive_synthetic_max`: computed by FeatureExtractor from `classify_missing_bars()` classification dict, sorted by HHMMSS key ascending
+- `sr_distance()` called directly by FeatureExtractor — never via `transform()`
+- `synthetic_bar_ratio` and `consecutive_synthetic_max` computed from MissingBarClassifier output — no changes to IndicatorCalculator or Vectorizer required
+- `is_dead_position`, `dead_position_case`, `is_ambiguous` passed through from Labeler output — not computed by FeatureExtractor

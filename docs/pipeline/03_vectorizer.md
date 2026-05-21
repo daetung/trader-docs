@@ -89,6 +89,10 @@ Output keys:
 Applies to: sr_levels output from IndicatorCalculator
 Reference: P_entry (passed explicitly)
 
+This method is NOT dispatched via transform().
+FeatureExtractor calls sr_distance() directly on the Vectorizer instance.
+See "sr_distance dispatch" note below.
+
 Output keys (per level N = 1..n_levels):
     dist_rN_pct              ← (local_max_N - P_entry) / P_entry
     bars_since_rN            ← bars elapsed since local_max_N
@@ -140,7 +144,16 @@ class Vectorizer:
 
     def transform(self, series: pd.Series, method: str,
                   name: str, **kwargs) -> dict[str, float]:
-        """Dispatch to named method. Used by FeatureExtractor."""
+        """
+        Dispatch to named method. Used by FeatureExtractor.
+
+        NOTE: sr_distance is explicitly excluded from transform() dispatch.
+        sr_distance accepts pd.DataFrame (not pd.Series) and requires
+        reference_price and n_levels arguments that do not fit the
+        standard transform() interface.
+        FeatureExtractor calls vectorizer.sr_distance() directly for sr_levels.
+        Passing method="sr_distance" to transform() raises ValueError.
+        """
         ...
 ```
 
@@ -152,3 +165,5 @@ class Vectorizer:
 - All method parameters (window splits, prominence settings) from `pipeline_config.yaml`
 - Feature names must be deterministic and stable across runs (used as LightGBM column names)
 - NaN values are allowed in output — LightGBM handles them natively
+- `transform()` must raise `ValueError` if method="sr_distance" is passed
+- `sr_distance()` is always called directly by FeatureExtractor, never via `transform()`

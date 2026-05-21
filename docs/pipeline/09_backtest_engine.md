@@ -171,6 +171,22 @@ def can_enter(
     return (current_min - last_min) >= cooldown_minutes
 ```
 
+**Cooldown across session boundaries (session_mode="combined"):**
+```
+Cooldown is applied continuously across the full time axis regardless of
+session boundaries. Pre-market and regular session are treated as a single
+continuous time axis for cooldown purposes.
+
+Example:
+    Entry at 09:28 (pre-market, last_entry_hour="092800")
+    Next candidate at 09:30 (regular session, current_hour="093000")
+    hour_to_minutes("093000") - hour_to_minutes("092800") = 2 min
+    cooldown_minutes = 5 → entry blocked
+
+This is the intended behavior for "combined" mode — no cooldown reset
+at the pre-market/regular session boundary.
+```
+
 ### Cash deduction order (when initial_cash > 0)
 ```
 Entry candidates at the same bar are processed in the order they appear
@@ -200,7 +216,7 @@ session close (priority over time-limit):
         exit_reason = "session_end"
         if 15:59 bar is halt/no_data:
             fallback: first tick_10 row with hour > "155900"
-            if none: last valid bar close
+            if none: → dead position
 
 time-limit:
     if 60 valid bars elapsed since entry (via build_effective_bar_sequence):
@@ -239,7 +255,7 @@ When `exit_interpolation: true`:
 ```
 exit_price = 15:59 bar close
 tick_10 fallback: first tick_10 row with hour > "155900" (after-market)
-final fallback: last valid bar close before 15:59
+final fallback: → dead position (no price available)
 ```
 
 **time-limit exit:**
@@ -250,7 +266,7 @@ exit_price = close of last valid bar in effective bar sequence
 ### Dead position
 
 Occurs only when session_end exit price cannot be determined
-(15:59 halt + no after-market data) and 60 valid bars not exhausted.
+(15:59 halt + no after-market data).
 
 ```
 Lookup next trading day via trading_calendar:
@@ -422,6 +438,8 @@ backtest:
 - Session close (15:59 bar) triggers immediate exit — takes priority over time-limit
 - After-market data used only as fallback when 15:59 bar is halt/no_data
 - Dead position: only when session_end fallback also fails
+- Cooldown applied continuously across full time axis regardless of session boundaries;
+  no cooldown reset at pre-market/regular session boundary in "combined" mode
 - `entry_bar` and `exit_bar` stored as int via `int(hour_str)` (utils.hour_to_int)
 - `trades_by_signal` and `trades_by_exit` JSON-serialized before writing to `experiment_log`
 - Dead position trades included in winning_rate denominator

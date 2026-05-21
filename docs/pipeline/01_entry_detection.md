@@ -8,7 +8,7 @@
 ## Role
 
 Identify candidate entry points from historical 1-minute bar data.
-Each candidate is a `(ticker, date, t)` tuple where `t` is the bar index of the **reference bar (t-1 bar)** — the last fully closed bar before the entry moment.
+Each candidate is a `(ticker, date, t)` tuple where `t` is the bar index at which the entry detector fires.
 
 The output of this module is the input to the Preprocessor pipeline.
 
@@ -25,6 +25,27 @@ Entry execution is always at the next bar open + 5s (t bar open + 5s).
 
 This convention is identical in both training data and live inference.
 → No train-serve skew. Do not change this.
+```
+
+---
+
+## scan() vs detect() — Role Separation
+
+```
+scan():   Training only.
+          Accepts full multi-date bars DataFrame including t bar.
+          Iterates over bars, calls detect() at each t-1 bar position,
+          and retrieves p_entry from bars[i+1]["open"] (t bar open price).
+          If t bar does not exist (last bar in DataFrame), skip that entry point.
+          Saves results to DuckDB entry_points table via Preprocessor.
+          Must NOT be called in live inference mode.
+
+detect(): Training and live inference.
+          Evaluates composite filter conditions against t-1 bar and earlier only.
+          Returns bool — does not access or return p_entry.
+          In live inference, Inferencer calls detect() directly.
+          p_entry is obtained from external real-time feed by Inferencer,
+          not from bars DataFrame.
 ```
 
 ---
@@ -225,24 +246,39 @@ class EntryPointDetector:
 
     def detect(
         self,
-        bars: pd.DataFrame,           # all bars up to and including t-1
+        bars: pd.DataFrame,           # strictly bars t-N ... t-1 (t bar excluded)
         date: str,                    # current trading date 'YYYYMMDD'
         shares_outstanding: int,      # from stock_meta
     ) -> bool:
         """
         Evaluate composite expression and return True if entry candidate.
         Expression and thresholds are read from pipeline_config.yaml.
+
+        Training and live inference compatible.
+        Does not access or return p_entry — caller is responsible for
+        obtaining t bar open price from appropriate source:
+            Training:      bars[i+1]["open"] in scan()
+            Live inference: external real-time feed in Inferencer
         """
         ...
 
     def scan(
         self,
-        bars: pd.DataFrame,           # full date range, multiple dates
+        bars: pd.DataFrame,           # full date range including t bar
         ticker: str,
         meta: dict,                   # stock_meta row for this ticker
     ) -> pd.DataFrame:
         """
-        Scan all bars for a ticker and return all detected entry points.
+        Training only. Scan all bars for a ticker and return all detected
+        entry points.
+
+        bars must include the t bar for each detected entry point so that
+        p_entry = bars[i+1]["open"] can be retrieved. If t bar does not
+        exist (last bar in DataFrame), that entry point is skipped.
+
+        Must NOT be called in live inference mode.
+        In live inference, Inferencer calls detect() directly and obtains
+        p_entry from external real-time feed.
 
         Exclusion order applied inside scan():
           1. After-market entry points (hour > 155900) always excluded
@@ -268,7 +304,7 @@ pd.DataFrame(columns=[
     "ticker",    # str
     "date",      # 'YYYYMMDD'
     "hour",      # 'HHMMSS' — t bar open time (NOT t-1 bar)
-    "p_entry",   # float — t bar open price
+    "p_entry",   # float — t bar open price (bars[i+1]["open"] in training)
 ])
 ```
 
@@ -277,7 +313,8 @@ Note: `hour` in the output refers to the **t bar** (entry execution bar), not th
 ```
 detection fires at close of bar with hour = H
 → output hour = next bar open = H + 1 minute
-→ p_entry = open price of that next bar
+→ p_entry = open price of that next bar (bars[i+1]["open"])
+→ if bars[i+1] does not exist → skip (last bar edge case)
 ```
 
 ---
@@ -345,7 +382,9 @@ entry_detector:
 
 - Each filter method must be independently testable (no cross-dependencies between filters)
 - `detect()` must parse and evaluate `expression` from config — do not hardcode the boolean logic
-- All bars passed in must already be filtered to `t-1 bar` and earlier — this module does not enforce the data boundary itself, but the caller (`scan()`) must guarantee it
+- `detect()` receives bars strictly up to t-1; caller guarantees this boundary
+- `scan()` receives bars including t bar; retrieves p_entry from bars[i+1]["open"]
+- `scan()` is training only — must not be called in live inference
 - `shares_outstanding` must never be computed inside this module — always passed in from stock_meta
 - Filter F returns `False` (not an error) when no prior bars exist for the day (first bar of session edge case)
 - After-market entry points (hour > 155900) must never be returned from `scan()`
@@ -372,3 +411,4 @@ entry_detector:
 | max_entry_hour = "150000", t bar hour = "150100" | scan() excludes from output |
 | max_entry_hour = "150000", t bar hour = "150000" | scan() includes (boundary inclusive) |
 | max_entry_hour = null | no late-day exclusion applied |
+| t bar missing (last bar in DataFrame) | scan() skips that entry point |

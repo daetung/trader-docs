@@ -22,7 +22,9 @@ test:  pd.DataFrame    # unbalanced test split
 # all splits contain [...features..., label_up5, label_up3, label_sw, label_dn3, label_dn5]
 
 feature_names:      list[str]         # from FeatureExtractor.get_feature_names()
-categorical_cols:   list[str] | None  # ["sector_code"] — passed to LightGBM; None if not applicable
+categorical_cols:   list[str] | None  # ["sector_code", "day_of_week", "halt_reason_code"]
+                                      # derived from FeatureExtractor.get_feature_schema()
+                                      # None if not applicable
 sample_weight_col:  str | None        # column name for per-sample weights; None = uniform weights
 ```
 
@@ -76,6 +78,28 @@ Else:
 Val and test sets always use uniform weights regardless of sample_weight_col.
 ```
 
+**Interaction between `is_unbalance=True` and `sample_weight_col`:**
+```
+LightGBM applies is_unbalance by computing a class-level weight from the
+positive/negative ratio, then multiplying it into each sample's gradient.
+
+When sample_weight_col is also provided, LightGBM multiplies the class-level
+weight (from is_unbalance) with the per-sample weight. The effective weight
+for each sample is:
+
+    effective_weight = class_weight(is_unbalance) × per_sample_weight
+
+For ambiguous samples with per_sample_weight=0.5, this means their
+influence is halved relative to non-ambiguous samples of the same class.
+The intended behavior (reduced influence of ambiguous samples) is achieved,
+though the absolute scale depends on is_unbalance's class ratio calculation.
+
+ClassBalancer already applies downsampling before training, partially
+addressing class imbalance. is_unbalance=True provides additional correction
+for residual imbalance after downsampling (max_ratio=3.0 cap leaves some
+imbalance). Both mechanisms are intentionally combined.
+```
+
 **Intended use case — ambiguous samples:**
 ```
 is_ambiguous=True rows may be assigned a reduced weight (e.g. 0.5)
@@ -87,7 +111,7 @@ LGBMPipeline only reads the column if provided — no weight logic here.
 ```
 
 `sample_weight_col` is `None` by default. When not provided, all samples
-receive equal weight (standard LightGBM behavior).
+receive equal weight (standard LightGBM behavior with is_unbalance correction).
 
 ---
 
@@ -252,9 +276,11 @@ Initial values: entry_threshold=0.5, suppress_threshold=0.5.
 
 - Five classifiers trained independently — no shared weights or joint loss
 - `feature_names` order must match FeatureExtractor.get_feature_names() exactly
+- `categorical_cols` derived from FeatureExtractor.get_feature_schema() by caller
 - Early stopping patience (50 rounds) is fixed; not exposed to optimizer in phase 1
 - Model artifacts must include `feature_names`, `categorical_cols`, and config snapshot for full reproducibility
 - `predict()` returns probabilities, not binary labels — thresholding done by caller via `utils.resolve_signal()`
 - `sample_weight_col` applied to train only — val and test always use uniform weights
 - Weight column must exist in train DataFrame if `sample_weight_col` is not None — caller is responsible
+- `is_unbalance=True` and `sample_weight_col` may be used simultaneously; effective weight = class_weight × per_sample_weight
 - `run_id` generated via `utils.generate_run_id()`
