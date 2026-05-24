@@ -20,6 +20,7 @@ train: pd.DataFrame    # balanced training split
 val:   pd.DataFrame    # validation split
 feature_names: list[str]
 categorical_cols: list[str] | None   # None if model does not require categorical handling
+sample_weight_col: str | None        # weight column name in train DataFrame; None = uniform
 ```
 
 **Output:**
@@ -55,6 +56,7 @@ class BaseModel(ABC, Generic[M]):
         val: pd.DataFrame,
         feature_names: list[str],
         categorical_cols: list[str] | None = None,
+        sample_weight_col: str | None = None,
     ) -> M:
         """
         Train model and return artifacts.
@@ -63,9 +65,22 @@ class BaseModel(ABC, Generic[M]):
         subclasses must implement _train_impl() only.
         Callers must treat the return value as opaque and pass it only to
         evaluate(), predict(), save(), feature_importance() of the same instance.
+
+        sample_weight_col: name of weight column in train DataFrame.
+            Applied to training split only — val and test always use uniform weights.
+            Non-LightGBM implementations may ignore this parameter.
+            Column must exist in train if not None — caller is responsible.
         """
         ...
-    def _train_impl(self, train, val, feature_names, categorical_cols) -> M: ...
+
+    def _train_impl(
+        self,
+        train: pd.DataFrame,
+        val: pd.DataFrame,
+        feature_names: list[str],
+        categorical_cols: list[str] | None,
+        sample_weight_col: str | None = None,
+    ) -> M: ...
 
     def evaluate(self, models: M, test: pd.DataFrame, feature_names: list[str]) -> dict[str, Any]: ...
     def _evaluate_impl(self, models: M, test: pd.DataFrame, feature_names: list[str]) -> dict[str, Any]: ...
@@ -92,8 +107,6 @@ class BaseModel(ABC, Generic[M]):
     def list_run_ids(self) -> list[str]:
         """
         Return list of run_ids saved under {model_dir}/{model_type}/.
-        Scans subdirectory names under the artifact path constructed from
-        config["model"]["model_dir"] and self.model_type.
         Utility method for CLI inspection and debugging.
         Not called by pipeline scripts.
         """
@@ -142,6 +155,8 @@ Creates the directory automatically on init.
   all customization goes into the corresponding `_impl` methods
 - `model_type` and `model_version` properties must be defined by subclass
 - `categorical_cols=None` default allows non-LightGBM models to omit categorical handling
+- `sample_weight_col=None` default — non-LightGBM implementations may ignore it;
+  LGBMPipeline applies it to training split only
 - Constructor accepts a `config` dict (see Config Keys above)
 - Model instantiation is handled by `src/models/factory.py` via registry pattern —
   `BaseModel` has no knowledge of its subclasses
@@ -149,8 +164,7 @@ Creates the directory automatically on init.
   e.g. `class LGBMPipeline(BaseModel[dict[str, lgb.Booster]])`
 - `M` is resolved at subclass declaration; erased to `Any` at factory call site.
   Callers must never pass `models` to a different BaseModel instance.
-- `list_run_ids()` scans `{model_dir}/{model_type}/` using `self.model_type` —
-  utility method for debugging, not called by pipeline scripts
+- `list_run_ids()` scans `{model_dir}/{model_type}/` — utility method for debugging only
 
 ---
 
@@ -164,9 +178,3 @@ Creates the directory automatically on init.
 | `mlp` | `MLPPipeline` (planned) | `nn.Module` |
 
 `run_train.py` instantiates models exclusively via `create_model(config) -> BaseModel[Any]`.
-
-Note: `create_model()` returns `BaseModel[Any]` — the concrete artifacts type M is
-resolved at subclass declaration and is available when the subclass is used directly
-(e.g. in tests). At the factory call site, M is erased to Any; callers must treat
-the `models` return value of `train()` as opaque and pass it only to `evaluate()`,
-`predict()`, `save()`, `feature_importance()` of the same instance.

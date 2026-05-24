@@ -1,71 +1,43 @@
 # Data Boundary Rules
 
-> **All modules must follow these rules without exception.**
-> Any code that violates these boundaries introduces data leakage and invalidates model results.
+> **Read this document before implementing any pipeline module.**
+> These rules define what data is permitted as input to each stage.
+> Violating these rules introduces data leakage and invalidates all results.
 
 ---
 
-## Entry Point Definition
-
-An entry point is defined by a tuple `(ticker, date, t)` where `t` is the 1-minute bar index at which the entry detector fires.
-
-The detector fires **after `t-1` bar closes**, meaning the `t` bar has just opened but is not yet complete.
-
-## Reference Bar Convention (Confirmed Design Decision)
+## Entry Point Convention
 
 ```
-Reference bar = t-1 bar, fixed in both training data and live inference.
+t bar    = the 1-minute bar at which entry is executed
+t-1 bar  = the last fully closed bar before entry (last bar visible to detector)
 
-Training data:  detection runs after t-1 bar close is recorded in historical data.
-Live inference: even though the t bar is actively forming, detection still uses
-                t-1 bar close as the reference. t bar real-time values are NOT used.
-
-Entry execution: always at t bar open + 5s (next bar after detection fires).
-
-Rationale:
-  - Identical detection logic in training and inference → no train-serve skew
-  - t bar real-time values cannot be reproduced from historical 1-min data
-  - Slippage is bounded to t bar open vs t+5s fill price difference only
-  - Do not change this convention without updating all dependent modules.
+Detection fires after t-1 bar closes.
+Entry execution is at t bar open + 5s.
+P_entry = t bar open price (reference price for labels and backtest).
 ```
-
----
-
-## Reference Price: P_entry
-
-```
-P_entry = open price of the t bar
-```
-
-**Role of P_entry:**
-
-| Usage | Included | Reason |
-|---|---|---|
-| Feature input | NO | t bar is not a fully closed OHLCV bar |
-| Label reference price | YES | Starting point for ±pp threshold calculation |
-| Label search range start | YES | t bar open marks the entry moment |
-| Backtest fill price reference | YES | Compared against t+5s estimated fill |
-| Parquet identifier column | YES | Stored alongside ticker/date/hour for BacktestEngine use |
-
-P_entry is stored in parquet files as an identifier column alongside `ticker`, `date`, `hour`.
-It must never appear in `FeatureExtractor.get_feature_names()` output.
 
 ---
 
 ## Feature Input Boundary
 
 ```
-Allowed:   bars t-1, t-2, t-3, ..., t-N   (fully closed bars, OHLCV all confirmed)
-           may include pre-market and after-market bars within lookback window
-Forbidden: t bar open, high, low, close, volume
-Forbidden: any bar beyond t (t+1, t+2, ...)
+PERMITTED as feature input:
+    Bars t-1, t-2, ..., t-N     (fully closed OHLCV bars)
+    tick_10 with timestamp < t bar open
+    entry.hour (t bar open time) — temporal features only, not OHLCV
+
+FORBIDDEN as feature input:
+    t bar high / low / close / volume
+    P_entry (t bar open price) — identifier column only, never a feature
+    Any bar after t bar
 ```
 
-A "fully closed bar" means all five fields (open, high, low, close, volume) are finalized.
-The t bar does not satisfy this condition at entry detection time.
+P_entry is the execution reference price. It is stored as an identifier column
+in parquet output and used by Labeler and BacktestEngine. It must never appear
+as a feature column.
 
-**Temporal features** use `entry.hour` (t bar open time) as their reference.
-This is the clock time at which detection fired — it is not t bar OHLCV data
+`entry.hour` is the clock time at which detection fired — it is not t bar OHLCV data
 and does not constitute data leakage.
 
 **Lookback window (default):** last 5 trading days of 1min bars = ~1950 bars (390 min/day × 5).
@@ -114,16 +86,26 @@ Example: {"Hour": "093000", "Date": "20250714", ...}
 
 tick_10 `hour` field represents the **last tick** timestamp of each 10-tick bundle (second precision).
 
-10-tick data is used for two purposes only:
+10-tick data is used for three purposes:
 
-1. **Auxiliary indicator input** — TPM, avg_vol_per_tick, and derived features. Computed from ticks with timestamp < t bar open only.
+1. **Auxiliary indicator input** — TPM, avg_vol_per_tick, and derived features.
+   Computed from ticks with timestamp < t bar open only.
 
-2. **Backtest slippage estimation** — ticks within and around the t bar and exit bar are used to approximate fill prices. Backtest-only; must not feed into the feature pipeline.
+2. **Label breach detection** — ticks from t bar onward used by Labeler via
+   `utils.track_label_breach()` to detect ±3pp/±5pp breaches at sub-minute precision.
+   Provides finer-grained ambiguity detection (bundle level vs. bar level).
+
+3. **Backtest slippage estimation** — ticks within and around the t bar and exit bar
+   used to approximate fill prices and simulate partial exit fills.
+   Backtest-only; must not feed into the feature pipeline.
 
 ```
-10-tick allowed for features:  ticks with timestamp < t bar open
-10-tick allowed for backtest:  ticks within t bar (entry slippage)
-                                ticks within exit bar (exit slippage, if exit_interpolation=true)
+10-tick allowed for features:         ticks with timestamp < t bar open
+10-tick allowed for label calculation: ticks from t bar onward (breach detection via
+                                        track_label_breach(); fill_second = t open + 5s;
+                                        tracking starts after fill_bundle)
+10-tick allowed for backtest:         ticks from t bar onward (entry slippage,
+                                        exit tracking, partial fill simulation)
 ```
 
 ---
@@ -156,8 +138,8 @@ Session mode filtering is applied at the training stage — preprocessing runs f
 | Bars t+1 … session close (H/L) | NO | YES (threshold check) | — |
 | After-market bars | NO | Fallback only | Fallback only |
 | 10-tick before t bar | YES | — | — |
-| 10-tick within t bar | NO | NO | YES (entry slippage) |
-| 10-tick within exit bar | NO | NO | YES (exit slippage, optional) |
+| 10-tick within t bar | NO | YES (track_label_breach) | YES (entry slippage) |
+| 10-tick within exit bar | NO | YES (track_label_breach) | YES (exit slippage) |
 
 ---
 
@@ -173,4 +155,5 @@ Before submitting any module, verify:
 - [ ] Label search exits at 15:59 bar before exhausting 60 valid bars
 - [ ] After-market used only as fallback for 15:59 halt/no_data
 - [ ] 10-tick data used in features is strictly filtered to before t bar open
-- [ ] Backtest slippage uses only 10-tick data from within the t bar or exit bar
+- [ ] Labeler uses track_label_breach() with fill_second = t bar open + 5s
+- [ ] Backtest slippage uses 10-tick data from within the t bar (search_limit = t open + 100s)

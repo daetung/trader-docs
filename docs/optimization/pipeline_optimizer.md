@@ -49,7 +49,6 @@ enabled, then aggregating results via frequency voting.
 ```
 - feature set: full (all feature groups enabled) — fixed
 - DimensionalityReducer: enabled per fold
-- SHAP: uses shap_subsample_n for speed (see reducer config)
 - Execution: one pass through all folds from generate_folds()
 - Frequency voting: selected_features collected across all folds
   → features selected in >= vote_threshold fraction of folds → confirmed set
@@ -57,22 +56,24 @@ enabled, then aggregating results via frequency voting.
   → per-fold selections and importance_scores saved to
     configs/feature_selection_log.json for audit
 - train_log: one row per fold (fold_idx, fold_train_end populated)
-- No trial search loop — feature_config is fixed at full
+- trial_idx: always 0 (single implicit trial, no search loop)
 - No backtest — AUC and selected_features reported per fold only
-- auc_std recorded on the row with the highest fold_idx
-  (last fold row = summary of the selection run)
+- auc_std recorded on fold_run_ids[-1] row via UPDATE
 ```
 
-This phase is a single selection run, not a repeated search.
-"One pass through folds" means generate_folds() is exhausted once.
-Re-running the selection phase with new data simply produces a new
-selection run — there is no loop or convergence criterion within a single run.
-
-**Frequency voting logic:**
 ```python
-feature_votes: dict[str, int] = {}
-feature_selection_log: list[dict] = []
-fold_aucs: list[float] = []
+optimizer_run_id = utils.generate_run_id()
+
+preprocessor = Preprocessor(config, db_conn)
+full_labeled_df = preprocessor.run(return_data=True)
+
+balancer = ClassBalancer(config)
+trainer  = Trainer(config, db_conn, optimizer_run_id=optimizer_run_id)
+
+feature_votes:          dict[str, int] = {}
+feature_selection_log:  list[dict]     = []
+fold_aucs:              list[float]    = []
+fold_run_ids:           list[str]      = []
 total_folds = 0
 
 for train, val, test, fold_meta in balancer.generate_folds(
@@ -80,20 +81,19 @@ for train, val, test, fold_meta in balancer.generate_folds(
     balance=config["class_balancer"]["apply_balance"],
     session_mode=config["entry_detector"]["session_mode"],
 ):
-    # generate_folds() yields folds in ascending fold_idx order (0, 1, 2, ...)
-    # fold_run_ids[-1] is guaranteed to be the MAX(fold_idx) row
-
     run_id = utils.generate_run_id()
     result = trainer.run(
         train, val, test,
         run_id=run_id,
         fold_idx=fold_meta["fold_idx"],
         fold_train_end=fold_meta["fold_train_end"],
-        feature_config=None,       # full feature set
-        feature_names=None,        # all features from FeatureExtractor
+        feature_config=None,
+        feature_names=None,
         run_reducer=True,
         phase="selection",
+        trial_idx=0,
     )
+    fold_run_ids.append(run_id)
     for feature in result["selected_features"]:
         feature_votes[feature] = feature_votes.get(feature, 0) + 1
     feature_selection_log.append({
@@ -106,29 +106,18 @@ for train, val, test, fold_meta in balancer.generate_folds(
     fold_aucs.append(result["auc_mean"])
     total_folds += 1
 
-# Frequency voting
-vote_threshold = config["optimizer"]["selection"]["vote_threshold"]
+vote_threshold    = config["optimizer"]["selection"]["vote_threshold"]
 selected_features = sorted([
     f for f, count in feature_votes.items()
     if count / total_folds >= vote_threshold
 ])
 
-# auc_std UPDATE on last fold row (fold_idx = total_folds - 1)
-# generate_folds() guarantees ascending fold_idx order, so the last
-# yielded fold always has the highest fold_idx.
+# auc_std UPDATE on last fold row (fold_run_ids[-1] = MAX fold_idx)
 auc_std = std(fold_aucs)
-UPDATE train_log SET auc_std = auc_std
-WHERE optimizer_run_id = optimizer_run_id
-  AND fold_idx = (SELECT MAX(fold_idx) FROM train_log WHERE optimizer_run_id = ...)
+UPDATE train_log SET auc_std = auc_std WHERE run_id = fold_run_ids[-1]
 
-# Persist results
 save_json(selected_features,     config["optimizer"]["selected_features_path"])
 save_json(feature_selection_log, config["optimizer"]["feature_selection_log_path"])
-
-print(f"Selection complete: {len(selected_features)} features confirmed "
-      f"from {total_folds} folds (vote_threshold={vote_threshold})")
-print(f"Fold AUC: mean={mean(fold_aucs):.4f}, std={auc_std:.4f}")
-print("Update optimizer.phase to 'exploitation' to proceed.")
 ```
 
 ### Phase: "exploitation"
@@ -141,161 +130,31 @@ Each trial runs all rolling folds with the fixed selected feature set.
 - feature set: loaded from configs/selected_features.json — fixed per run
 - DimensionalityReducer: disabled (run_reducer=False)
 - Execution: trial loop over search_space; each trial runs all folds
-- generate_folds() yields folds in ascending fold_idx order;
-  fold_run_ids[-1] always corresponds to MAX(fold_idx) for that trial
-- AUC aggregation per trial: mean ± std across folds
-  → auc_std stored on the row with the highest fold_idx for that trial
-    (last fold row, identified by fold_run_ids[-1])
+- trial_idx: 0-based per optimizer_run_id; written to train_log per fold
+- auc_std stored on fold_run_ids[-1] row after each trial completes
 - Backtest: executed for best trial using last fold's model and test set
 - train_log: one row per fold per trial
 ```
 
-### Phase: "full"
-
-**Objective:** Run pipeline with full feature set and no dimensionality reduction.
-Intended for baseline measurement and debugging before selection phase.
-
-```
-- feature set: full (all feature groups enabled) — fixed
-- DimensionalityReducer: disabled (run_reducer=False)
-- Execution: one pass through all folds (same structure as selection phase
-             but without reducer — not a trial search loop)
-- generate_folds() yields folds in ascending fold_idx order
-- Backtest: executed after fold pass completes
-- train_log: one row per fold
-- auc_std recorded on last fold row (highest fold_idx)
-```
-
-**Phase transition is always manual** — user edits `optimizer.phase` in config.
-Automatic transition is intentionally avoided to maintain experiment reproducibility
-and clear separation between selection and exploitation results in train_log.
-
----
-
-## auc_std Recording Rule
-
-`auc_std` represents the standard deviation of AUC across all folds in a run
-(selection/full) or trial (exploitation). It is a measure of temporal stability.
-
-```
-Recording:
-  After all folds complete for a given run or trial:
-  1. Compute auc_std = std(fold_aucs)
-  2. UPDATE train_log SET auc_std = <value>
-     WHERE run_id = fold_run_ids[-1]
-     # fold_run_ids[-1] is guaranteed to be MAX(fold_idx) because
-     # generate_folds() always yields in ascending fold_idx order
-
-  All other fold rows retain auc_std = NULL.
-
-Interpretation:
-  Selection/Full phase: auc_std measures temporal stability of the full feature model
-  Exploitation phase:   auc_std measures temporal stability of a specific feature_config trial
-```
-
----
-
-## Scope of Automation
-
-```
-AUTOMATED (this module):
-    Feature group ON/OFF combinations (exploitation phase trial loop only)
-    Vectorizer method variants per indicator group
-    importance_averaging strategy ("uniform" | "sample_weighted")
-    session_mode ("regular" | "pre" | "combined")
-      passed to ClassBalancer.generate_folds()
-
-MANUAL (edit pipeline_config.yaml directly):
-    Individual indicator parameters
-    Entry detection thresholds
-    LightGBM hyperparameters
-    Backtest settings
-    Class balancer ratios
-    Rolling fold parameters (window_weeks, step_weeks, etc.)
-    Phase transition (selection → exploitation → full)
-```
-
----
-
-## Search Space Definition
-
-```yaml
-optimizer:
-  phase: "selection"            # "selection" | "exploitation" | "full"
-  auc_threshold: 0.65           # exploitation phase: minimum mean fold AUC to stop early
-  max_trials: 50                # exploitation phase: maximum trial count
-  random_state: 42
-  min_features: 5
-  strategy: "grid"              # "grid" | "random" (exploitation phase only)
-
-  selected_features_path:       "configs/selected_features.json"
-  feature_selection_log_path:   "configs/feature_selection_log.json"
-
-  selection:
-    vote_threshold: 0.70        # fraction of folds that must select a feature
-
-  search_space:                 # used by exploitation phase trial loop only
-    session_mode:
-      options:
-        - "regular"
-        - "pre"
-        - "combined"
-
-    feature_groups:
-      - name: price_indicators
-        options: [on, off]
-      - name: volume_indicators
-        options: [on, off]
-      - name: tick_indicators
-        options: [on, off]
-      - name: sr_levels
-        options: [on, off]
-      - name: meta_features
-        options: [on, off]
-      - name: temporal_features
-        options: [on, off]
-      - name: fibonacci
-        options: [on, off]
-      - name: pivot_points
-        options: [on, off]
-
-    vectorizer_methods:
-      price_close:
-        options:
-          - [rate_of_change]
-          - [rate_of_change, linear_trend]
-          - [rate_of_change, shape_features]
-      volume:
-        options:
-          - [window_comparison]
-          - [window_comparison, statistical_summary]
-
-    dimensionality_reducer:
-      importance_averaging:
-        options:
-          - "uniform"
-          - "sample_weighted"
-```
-
----
-
-## Full Experiment Cycle (Exploitation Phase)
-
-```
+```python
 optimizer_run_id = utils.generate_run_id()
 
-preprocessor = Preprocessor(config, db_conn)
+preprocessor    = Preprocessor(config, db_conn)
 full_labeled_df = preprocessor.run(return_data=True)
 
 selected_features = load_json(config["optimizer"]["selected_features_path"])
 
 balancer = ClassBalancer(config)
-best_fold_run_ids   = []    # run_ids of all folds in the best trial
-best_trial_auc_mean = 0.0
-best_feature_config = None
-best_config_override = None
 
-for feature_config in search_space:
+best_fold_run_ids    = []
+best_trial_auc_mean  = 0.0
+best_feature_config  = None
+best_config_override = None
+best_train           = None
+best_val             = None
+best_fold_test       = None
+
+for trial_idx, feature_config in enumerate(search_space):
 
     config_override = utils.apply_overrides(base_config, feature_config)
     trainer = Trainer(config_override, db_conn, optimizer_run_id=optimizer_run_id)
@@ -308,7 +167,6 @@ for feature_config in search_space:
         balance=config_override["class_balancer"]["apply_balance"],
         session_mode=config_override["entry_detector"]["session_mode"],
     ):
-        # generate_folds() yields folds in ascending fold_idx order (0, 1, 2, ...)
         run_id = utils.generate_run_id()
         result = trainer.run(
             train, val, test,
@@ -319,6 +177,7 @@ for feature_config in search_space:
             feature_names=selected_features,
             run_reducer=False,
             phase="exploitation",
+            trial_idx=trial_idx,
         )
         fold_run_ids.append(run_id)
         fold_aucs.append(result["auc_mean"])
@@ -326,34 +185,49 @@ for feature_config in search_space:
     trial_auc_mean = mean(fold_aucs)
     trial_auc_std  = std(fold_aucs)
 
-    # fold_run_ids[-1] is MAX(fold_idx) row — guaranteed by generate_folds() order
-    UPDATE train_log SET auc_std = trial_auc_std
-    WHERE run_id = fold_run_ids[-1]
+    # UPDATE auc_std on last fold row (fold_run_ids[-1] = MAX fold_idx)
+    UPDATE train_log SET auc_std = trial_auc_std WHERE run_id = fold_run_ids[-1]
 
     if trial_auc_mean > best_trial_auc_mean:
-        best_trial_auc_mean = trial_auc_mean
-        best_fold_run_ids   = fold_run_ids
-        best_feature_config = feature_config
+        best_trial_auc_mean  = trial_auc_mean
+        best_fold_run_ids    = fold_run_ids
+        best_feature_config  = feature_config
         best_config_override = config_override
+        best_train           = train    # last fold's train split of this trial
+        best_val             = val      # last fold's val split of this trial
+        best_fold_test       = test     # last fold's test split of this trial
 
     if trial_auc_mean >= auc_threshold:
-        break   # early exit if threshold met
+        break
 
 # Mark best trial's last fold row
-# fold_run_ids[-1] is guaranteed to be MAX(fold_idx) for that trial
-UPDATE train_log SET best_of_loop = TRUE
-WHERE run_id = best_fold_run_ids[-1]
+UPDATE train_log SET best_of_loop = TRUE WHERE run_id = best_fold_run_ids[-1]
 
-# Backtest using last fold model (most recent data)
-best_run_id    = best_fold_run_ids[-1]
-last_fold_test = last fold's test DataFrame (retained from loop)
+best_run_id = best_fold_run_ids[-1]
 
 backtester = Backtester(best_config_override, db_conn, optimizer_run_id=optimizer_run_id)
-summary = backtester.run(last_fold_test, run_id=best_run_id)
+summary    = backtester.run(best_fold_test, run_id=best_run_id)
 
 # Save preprocessed data for best trial's last fold
-preprocessor.save(train, val, last_fold_test, run_id=best_run_id)
+preprocessor.save(best_train, best_val, best_fold_test, run_id=best_run_id)
 ```
+
+### Phase: "full"
+
+**Objective:** Run pipeline with full feature set and no dimensionality reduction.
+Intended for baseline measurement and debugging before selection phase.
+
+```
+- feature set: full (all feature groups enabled) — fixed
+- DimensionalityReducer: disabled (run_reducer=False)
+- Execution: one pass through all folds (no trial loop)
+- trial_idx: always 0 (single implicit trial)
+- Backtest: executed after fold pass completes
+- train_log: one row per fold
+- auc_std recorded on last fold row
+```
+
+**Phase transition is always manual** — user edits `optimizer.phase` in config.
 
 ---
 
@@ -361,10 +235,27 @@ preprocessor.save(train, val, last_fold_test, run_id=best_run_id)
 
 ```
 Loop exits when any of the following:
-
 1. trial_auc_mean >= auc_threshold   → proceed to backtest immediately
 2. max_trials exceeded               → use best trial for backtest
 3. Search space fully exhausted      → use best trial for backtest
+```
+
+---
+
+## auc_std Recording Rule
+
+```
+After all folds complete for a given run or trial:
+1. Compute auc_std = std(fold_aucs)
+2. UPDATE train_log SET auc_std = <value> WHERE run_id = fold_run_ids[-1]
+   # fold_run_ids[-1] is guaranteed to be MAX(fold_idx) because
+   # generate_folds() always yields in ascending fold_idx order
+
+All other fold rows retain auc_std = NULL.
+
+Interpretation:
+  Selection/Full: temporal stability of the full feature model
+  Exploitation:   temporal stability of a specific feature_config trial
 ```
 
 ---
@@ -436,7 +327,83 @@ config_override = utils.apply_overrides(base_config, feature_config)
 {"entry_detector.session_mode": "pre"}
 ```
 
-This propagates automatically to `ClassBalancer.generate_folds()`.
+---
+
+## Search Space Definition
+
+```yaml
+optimizer:
+  phase: "selection"
+  auc_threshold: 0.65
+  max_trials: 50
+  random_state: 42
+  min_features: 5
+  strategy: "grid"              # "grid" | "random"
+
+  selected_features_path:       "configs/selected_features.json"
+  feature_selection_log_path:   "configs/feature_selection_log.json"
+
+  selection:
+    vote_threshold: 0.70
+
+  search_space:
+    session_mode:
+      options: ["regular", "pre", "combined"]
+
+    feature_groups:
+      - name: price_indicators
+        options: [on, off]
+      - name: volume_indicators
+        options: [on, off]
+      - name: tick_indicators
+        options: [on, off]
+      - name: sr_levels
+        options: [on, off]
+      - name: meta_features
+        options: [on, off]
+      - name: temporal_features
+        options: [on, off]
+      - name: fibonacci
+        options: [on, off]
+      - name: pivot_points
+        options: [on, off]
+
+    vectorizer_methods:
+      price_close:
+        options:
+          - [rate_of_change]
+          - [rate_of_change, linear_trend]
+          - [rate_of_change, shape_features]
+      volume:
+        options:
+          - [window_comparison]
+          - [window_comparison, statistical_summary]
+
+    dimensionality_reducer:
+      importance_averaging:
+        options: ["uniform", "sample_weighted"]
+```
+
+---
+
+## Scope of Automation
+
+```
+AUTOMATED (this module):
+    Feature group ON/OFF combinations (exploitation phase trial loop only)
+    Vectorizer method variants per indicator group
+    importance_averaging strategy ("uniform" | "sample_weighted")
+    session_mode ("regular" | "pre" | "combined")
+
+MANUAL (edit pipeline_config.yaml directly):
+    Individual indicator parameters
+    Entry detection thresholds
+    LightGBM hyperparameters
+    Backtest settings (including sell_rate_tp, sell_rate_sl)
+    Class balancer ratios
+    Rolling fold parameters
+    Phase transition (selection → exploitation → full)
+```
 
 ---
 
@@ -445,21 +412,19 @@ This propagates automatically to `ClassBalancer.generate_folds()`.
 - Each fold independently reproducible given feature_config and random_state
 - All results written to DuckDB immediately after each fold — crash-safe
 - Optimizer does NOT modify `pipeline_config.yaml`
-- `run_single()` callable standalone from CLI for manual one-off experiments
 - `train_log` written by Trainer per fold; `experiment_log` written by Backtester
 - `best_of_loop` set TRUE on the last fold row of the best trial via UPDATE
-- `auc_std` set on fold_run_ids[-1] (MAX fold_idx, guaranteed by generate_folds() order)
-  via UPDATE — all other fold rows retain auc_std = NULL
+- `auc_std` set on `fold_run_ids[-1]` via UPDATE — all other fold rows retain NULL
 - `feature_selection_log.json` includes per-fold `importance_scores` from `reduction_report`
 - Preprocessed parquet saved only for best trial's last fold via `preprocessor.save()`
+- `best_train`, `best_val`, `best_fold_test` captured at best-trial update time;
+  not sourced from loop-end variables (which may belong to a different trial)
 - `optimizer_run_id` format: `YYYYMMDD_HHMMSS` (generated once per optimizer run)
 - `"random"` strategy uses `random_state` for reproducible non-replacement sampling
 - Phase transition is manual — no automatic switching between phases
 - Selection phase does not run backtest — one fold pass only
 - Full phase runs backtest after fold pass completes
-- `selected_features_path` and `feature_selection_log_path` are single top-level keys
-  shared across selection and exploitation phases — not duplicated per phase
-- Backtest in exploitation/full phase uses last fold's model and test set (most recent data)
-- `session_mode` is a first-class search variable in exploitation phase search_space —
-  each value produces a model trained on a different session's entry points;
-  results across session_modes are not cross-comparable by AUC
+- `session_mode` is a first-class search variable — results across session_modes
+  are not cross-comparable by AUC
+- `trial_idx` is 0-based per `optimizer_run_id` in exploitation;
+  always 0 for selection/full/standalone — written to train_log per fold row
