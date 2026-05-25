@@ -1,15 +1,4 @@
-# Stock Auto-Scalping System — Architecture Overview
-
-## Project Summary
-
-- **Goal**: Predict short-term price direction at scalping entry points using a LightGBM-based supervised classification pipeline
-- **Primary deliverable**: Preprocessor–model pipeline with optimal winning rate
-- **Data**: US market, multi-month history, 1min OHLCV + 10tick per ticker (all sessions)
-- **Model**: LightGBM (5 independent binary classifiers) → MLP comparison in later phase
-
-For detailed design rules, refer to the per-module docs listed in the [Docs Index](#docs-index) below.
-
----
+# Architecture
 
 ## System Pipeline
 
@@ -65,7 +54,9 @@ Training endpoint:   PipelineOptimizer
                          └── Preprocessor → Trainer (loop) → Backtester
 
 Live inference endpoint: Inferencer  (interface defined; implementation deferred)
-                         └── Preprocessor(live_mode=True) → model.load() → resolve_signal()
+                         └── EntryPointDetector.detect()
+                         └── FeatureExtractor.extract()   ← direct call (no Preprocessor)
+                         └── model.load() → resolve_signal()
 
 Standalone scripts:
     run_preprocess.py  ← Preprocessor wrapper (CLI)
@@ -86,13 +77,13 @@ Standalone scripts:
 | `pipeline/03_vectorizer.md` | Time-series → vector transformation methods |
 | `pipeline/04_feature_extractor.md` | Integration entrypoint, extract_batch strategy, parquet column structure |
 | `pipeline/05_labeler.md` | 5-class binary labeling, session-close exit, dead position |
-| `pipeline/06_class_balancer.md` | Downsampling strategy, split() as single entry point |
+| `pipeline/06_class_balancer.md` | Downsampling strategy, split() and generate_folds() |
 | `pipeline/07_lgbm_pipeline.md` | LightGBM 5-classifier structure and evaluation |
 | `pipeline/08_dimensionality_reducer.md` | ImportanceProvider pattern, model-agnostic reduction |
 | `pipeline/09_backtest_engine.md` | DB-direct backtest, tick_10 slippage, dead position handling |
 | `models/base_model.md` | Abstract base class for model trainers |
-| `optimization/pipeline_optimizer.md` | Training endpoint, AUC loop, experiment cycle |
-| `scripts/run_preprocess.md` | Preprocessor class, return_data, live_mode |
+| `optimization/pipeline_optimizer.md` | Training endpoint, nested validation, successive halving, regime holdout |
+| `scripts/run_preprocess.md` | Preprocessor class, return_data, training pipeline only |
 | `scripts/run_train.md` | Trainer class, session_mode filter, train_log |
 | `scripts/run_backtest.md` | Backtester class, sole experiment_log writer |
 | `utils/utils.md` | Shared utilities: bar_sequence, signal, hour conversion, run_id, config, encoding maps |
