@@ -146,7 +146,12 @@ Benchmark results are NOT written to `experiment_log` (that table is for model r
 
 ## Constraints
 
-- Must not modify any DuckDB table — read-only access to `ohlcv_1min`, `stock_meta`
+- Must not modify any DuckDB table — read-only access to:
+  `ohlcv_1min`, `stock_meta`, `tick_10`, `trading_halts`,
+  `trading_calendar`, `ticker_data_coverage`
 - Labeling logic must call `Labeler` directly (reuse, do not reimplement)
+- `Labeler.label()` requires `ticks_df`, `halts_df`, `trading_calendar`,
+  and `ticker_data_coverage` — all must be loaded from DuckDB before calling
 - `--override` applies in-memory only — config file is never modified
 - SQL-based detection is mandatory for performance; Python-loop fallback only for unsupported conditions
+- Benchmark results saved to `tools/benchmark_results/` — not to `experiment_log`

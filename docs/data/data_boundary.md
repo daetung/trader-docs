@@ -69,6 +69,30 @@ max_down(i) = ( P_entry - min(Low of bars t..t+i)  ) / P_entry
 
 ---
 
+## Label vs. Backtest Reference Price
+
+Labeler and BacktestEngine use the same P_entry definition but apply it to
+different reference points. This separation is intentional:
+
+```
+Labeler:        threshold computed relative to P_entry (t bar open price)
+                → measures signal quality independent of execution
+                → labels reflect directional price movement from the ideal fill
+
+BacktestEngine: threshold computed relative to fill_price (P_entry ± slippage)
+                → measures realized P&L including execution friction
+                → winning_rate in experiment_log reflects execution reality
+
+Consequence:
+    A trade labelled label_up5 (signal quality: good) may still produce
+    a losing backtest result if slippage is large enough to push fill_price
+    above the effective take-profit trigger.
+    This is expected and desirable — it separates model quality from
+    execution quality for diagnostic purposes.
+```
+
+---
+
 ## 1-Minute Bar Timestamp Convention
 
 Raw JSON uses `Hour` field in `HHMMSS` format representing the **bar open time**.
@@ -100,11 +124,11 @@ tick_10 `hour` field represents the **last tick** timestamp of each 10-tick bund
    Backtest-only; must not feed into the feature pipeline.
 
 ```
-10-tick allowed for features:         ticks with timestamp < t bar open
+10-tick allowed for features:          ticks with timestamp < t bar open
 10-tick allowed for label calculation: ticks from t bar onward (breach detection via
                                         track_label_breach(); fill_second = t open + 5s;
                                         tracking starts after fill_bundle)
-10-tick allowed for backtest:         ticks from t bar onward (entry slippage,
+10-tick allowed for backtest:          ticks from t bar onward (entry slippage,
                                         exit tracking, partial fill simulation)
 ```
 

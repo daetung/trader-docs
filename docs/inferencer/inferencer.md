@@ -20,11 +20,15 @@ and returns entry signals for live trading decisions.
 Live inference endpoint: Inferencer
     └── EntryPointDetector.detect()            ← signal detection (not scan())
     └── [entry_points INSERT to DuckDB]        ← Inferencer responsibility
-    └── Preprocessor.run(live_mode=True)       ← feature extraction only (no labeling)
+    └── FeatureExtractor.extract()             ← direct call (no Preprocessor)
     └── model.load(run_id)                     ← load trained artifacts
     └── model.predict(models, X)               ← probability output
     └── utils.resolve_signal(row, threshold, suppress_threshold) ← entry decision
 ```
+
+Inferencer does NOT use Preprocessor. Live inference uses `FeatureExtractor.extract()`
+directly, sharing the same feature extraction code path as training without going through
+the full preprocessing pipeline (no labeling, no DB bulk loads).
 
 ---
 
@@ -72,65 +76,110 @@ InferenceResult(
 ## Processing Flow
 
 ```
-1. EntryPointDetector.detect(bars, date, shares_outstanding)
-       → if not a candidate entry point: return None immediately
+infer(bars, ticks, meta, entry):
 
-2. Obtain p_entry from external real-time feed
-       → p_entry = t bar open price from real-time data source
-       → NOT derived from bars DataFrame
+1. Session mode filter (Inferencer-side):
+       session_mode = config["entry_detector"]["session_mode"]
+       hour = entry["hour"]
 
-3. Insert entry point to DuckDB entry_points table:
+       if hour > "155900":
+           return None          # after-market always suppressed
+
+       if session_mode == "regular" and not ("093000" <= hour <= "155900"):
+           return None
+       if session_mode == "pre" and not ("040000" <= hour <= "092900"):
+           return None
+       # "combined" passes both pre-market and regular
+
+2. max_entry_hour filter (Inferencer-side):
+       max_entry_hour = config["entry_detector"].get("max_entry_hour")
+       if max_entry_hour is not None and hour > max_entry_hour:
+           return None          # > operator, consistent with scan() exclusion
+
+3. EntryPointDetector.detect(bars, date=entry["date"],
+                              shares_outstanding=meta["shares_outstanding"])
+       if not detected: return None
+
+4. Insert entry point to DuckDB:
        INSERT OR IGNORE INTO entry_points (ticker, date, hour, p_entry)
 
-4. Preprocessor.run(live_mode=True)
-       → halts_df = db_conn.execute(
-             "SELECT * FROM trading_halts WHERE ticker = ? AND date = ?"
-         ).df()
-       → FeatureExtractor.extract(bars, ticks, meta, entry, halts_df) → feature_vector
-       (Encoding maps loaded internally by FeatureExtractor via utils.load_encoding_map())
+5. Load halts_df (Inferencer-side DB query):
+       halts_df = db_conn.execute(
+           "SELECT * FROM trading_halts WHERE ticker = ? AND date = ?",
+           [entry["ticker"], entry["date"]]
+       ).df()
 
-5. model.predict(models, X) → probability scores
+6. FeatureExtractor.extract(bars, ticks, meta, entry, halts_df)
+       → feature_vector dict[str, float]
+       (Encoding maps loaded internally by FeatureExtractor)
 
-6. utils.resolve_signal(row, threshold, suppress_threshold) → signal
+7. X = pd.DataFrame([feature_vector])[feature_names]
+   probs_df = model.predict(models, X)
+   row = probs_df.iloc[0]
 
-7. Return InferenceResult
+8. Signal resolution:
+       signal = utils.resolve_signal(row, threshold, suppress_threshold)
+       suppressed = (
+           signal is None
+           and suppress_threshold is not None
+           and (row["prob_dn5"] >= suppress_threshold
+                or row["prob_dn3"] >= suppress_threshold)
+       )
+
+9. Return InferenceResult(
+       ticker=entry["ticker"], date=entry["date"], hour=entry["hour"],
+       p_entry=entry["p_entry"], signal=signal,
+       prob_up5=row["prob_up5"], prob_up3=row["prob_up3"], prob_sw=row["prob_sw"],
+       prob_dn3=row["prob_dn3"], prob_dn5=row["prob_dn5"],
+       suppressed=suppressed, run_id=self.run_id,
+   )
 ```
-
-live_mode excludes:
-- scan() (not called — detect() used instead)
-- Labeler (future prices unknown)
-- ClassBalancer (training-only)
 
 ---
 
-## Signal Resolution
+## infer_batch()
 
 ```python
-from utils import resolve_signal
+def infer_batch(
+    candidates:      list[dict],
+    bars_by_ticker:  dict[str, pd.DataFrame],
+    ticks_by_ticker: dict[str, pd.DataFrame],
+    meta_by_ticker:  dict[str, dict],
+) -> list[InferenceResult]:
+    """
+    Process multiple candidates efficiently.
+    halts_df loaded once per (ticker, date) pair — not per candidate.
+    Candidates failing session/max_entry_hour/detect() are silently dropped.
+    """
+    halts_cache: dict[tuple[str, str], pd.DataFrame] = {}
 
-threshold          = config["backtest"]["entry_threshold"]
-suppress_threshold = config["backtest"]["suppress_threshold"]  # None = disabled
-
-signal = resolve_signal(row, threshold, suppress_threshold)
-suppressed = (signal is None and suppress_threshold is not None and (
-    row["prob_dn5"] >= suppress_threshold or
-    row["prob_dn3"] >= suppress_threshold
-))
+    for entry in candidates:
+        ticker, date = entry["ticker"], entry["date"]
+        cache_key = (ticker, date)
+        if cache_key not in halts_cache:
+            halts_cache[cache_key] = db_conn.execute(
+                "SELECT * FROM trading_halts WHERE ticker = ? AND date = ?",
+                [ticker, date]
+            ).df()
+        result = self._infer_single(
+            bars_by_ticker[ticker],
+            ticks_by_ticker[ticker],
+            meta_by_ticker[ticker],
+            entry,
+            halts_cache[cache_key],
+        )
+        if result is not None:
+            results.append(result)
+    return results
 ```
+
+`_infer_single()` performs steps 1–9 of `infer()` with pre-loaded `halts_df`.
+`infer()` loads `halts_df` then delegates to `_infer_single()`.
 
 ---
 
-## Session Mode in Live Inference
+## Late-Day Exclusion
 
-```
-"regular"  : only fire signals during regular session (093000~155900)
-"pre"      : only fire signals during pre-market (040000~092900)
-"combined" : fire signals during pre-market and regular session
-```
-
-After-market signals (hour > 155900) suppressed in all modes.
-
-Late-day exclusion applies in live inference:
 ```
 max_entry_hour: if set, signals with t bar open time > max_entry_hour are not fired,
                 consistent with scan() exclusion logic (> operator, boundary inclusive)
@@ -212,10 +261,12 @@ class Inferencer:
 - `utils.resolve_signal()` used for signal thresholding — same function as BacktestEngine
 - `suppress_threshold` read from `config["backtest"]["suppress_threshold"]`
 - No data leakage: t bar OHLCV must not be used as feature input
-- `live_mode=True` passed to Preprocessor — Labeler never instantiated
-- After-market entry points suppressed regardless of session_mode
+- Preprocessor is NOT used in live inference — FeatureExtractor.extract() called directly
+- After-market entry points suppressed regardless of session_mode (hour > "155900")
+- Session mode and max_entry_hour filters applied by Inferencer before detect()
 - `max_entry_hour`: signals with t bar open time > max_entry_hour are not fired
   (> operator consistent with scan() exclusion logic; boundary is inclusive)
 - `halts_df` queried from trading_halts table via db_conn at inference time;
   passed explicitly to FeatureExtractor.extract()
+- `infer_batch()` caches halts_df per (ticker, date) — not per candidate
 - Full implementation deferred; this spec defines the interface contract only

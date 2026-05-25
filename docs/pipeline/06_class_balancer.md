@@ -90,49 +90,28 @@ Before balancing is applied to the train split, optional filters are applied
 to remove samples that may introduce training bias.
 
 ```
-Filter 1 — Dead position Case C exclusion (optional):
-    if exclude_dead_position_case_c = true:
-        remove rows where dead_position_case == "C" from train only
-        val and test retain Case C rows (backtest realism)
-    Rationale: Case C represents dataset boundary conditions
-               (no next-day data), not genuine overnight holds.
-               Including them in training introduces a -50% pnl artifact
-               that is not representative of real trading outcomes.
+Filters applied to train split only — val and test are never filtered.
 
-Filter 2 — Ambiguous sample exclusion (optional):
-    if ambiguous_sample_action = "exclude":
-        remove rows where is_ambiguous == True from train only
-    if ambiguous_sample_action = "keep" (default):
-        retain ambiguous samples with no modification
-    val and test always retain ambiguous samples.
-    Rationale: ambiguous samples have uncertain labels due to same-bar
-               breach. Excluding them from training reduces label noise.
+1. Dead position Case C exclusion (configurable):
+       Remove rows where dead_position_case == "C"
+       Reason: Case C entries hit the dataset boundary — label is forced label_sw
+               regardless of actual price movement. Including them biases the model.
+       Config: class_balancer.exclude_case_c: true | false
 
-    Note: "weight" handling for ambiguous samples is NOT done here.
-    Sample weighting is the responsibility of Trainer, configured
-    separately under trainer.use_ambiguous_sample_weight.
-    ClassBalancer only decides include/exclude — not weight values.
+2. Ambiguous sample exclusion (configurable):
+       Remove rows where is_ambiguous == True
+       Reason: simultaneous bundle-level breach makes the label direction uncertain.
+       Config: class_balancer.ambiguous_sample_action: "exclude" | "keep"
+               "exclude" → remove from train
+               "keep"    → pass to Trainer with reduced weight (sample_weight_col)
 ```
-
-Filter order: Case C exclusion → ambiguous handling → balancing.
-All filters applied to train split only. Val and test are never filtered.
 
 ---
 
-## Split Modes
+## Mode 1: Temporal Split (split)
 
-### split_method config scope
-
-`split_method` config key applies **only in the PipelineOptimizer context**:
-- PipelineOptimizer reads `split_method` to decide whether to call `split()` or `generate_folds()`
-- Standalone CLI (`run_preprocess.py`) always calls `split()` regardless of `split_method` config
-- `split()` and `generate_folds()` are independently callable methods with no internal
-  enforcement of `split_method` — the caller determines which to use
-
-### Mode 1: Temporal Split
-
-Single split based on date ordering. Replaces random split to prevent
-future data leakage into training.
+Single-pass split into train, val, test by date order.
+Replaces random split to prevent future data leakage into training.
 
 ```
 Split order:
@@ -152,16 +131,22 @@ Embargo gap:
     prevents information leakage from bars near split boundaries
 ```
 
-### Mode 2: Rolling Walk-Forward (generate_folds)
+---
+
+## Mode 2: Rolling Walk-Forward (generate_folds)
 
 Walk-forward fold generation for robust out-of-sample evaluation.
 Each fold represents an independent train/val/test window advancing
 through time by step_weeks.
 
+Fold parameters can be overridden explicitly by the caller (e.g., PipelineOptimizer
+passing different values for outer vs. inner folds). If override parameters are None,
+values are read from `config["class_balancer"]`.
+
 ```
 Fold structure (fixed window):
     train: window_weeks of data ending at fold boundary
-    val:   val_weeks immediately after train (with embargo)
+    val:   val_weeks immediately after train (with embargo); empty if val_weeks=0
     test:  test_weeks immediately after val (with embargo)
 
 Rolling:
@@ -175,11 +160,12 @@ Rolling:
     Partial weeks at dataset boundaries are included if >= 3 trading days.
 
 Per fold:
-    1. Apply session_mode filter
+    1. Apply session_mode filter (if session_mode is not None)
     2. Slice train/val/test by date ranges
-    3. Apply pre-balance filters to train
-    4. Apply downsampling to train if balance=True
-    5. Yield (train_balanced, val, test, fold_meta)
+    3. Apply embargo gap (trading days)
+    4. Apply pre-balance filters to train
+    5. Apply downsampling to train if balance=True
+    6. Yield (train_balanced, val, test, fold_meta)
 
 fold_meta contents:
     fold_idx:        0-based integer index of this fold
@@ -195,19 +181,29 @@ Yield order:
 Termination:
     Stop when remaining data after train end is insufficient
     to fill val + test windows (accounting for embargo).
+    If max_folds is set, stop after that many folds regardless.
 ```
 
-**Recommended parameters for 10-month dataset (~210 trading days):**
+**Recommended parameters for inner folds (10-month dataset, ~210 trading days):**
 ```
-window_weeks: 10   → ~50 trading days, ~12,500 raw train samples
-val_weeks:    2    → ~10 trading days, ~2,500 samples
-test_weeks:   2    → ~10 trading days, ~2,500 samples
-step_weeks:   2    → ~14 folds from 10-month data
-embargo_days: 5    → 1 trading week buffer (trading days)
+window_weeks: 8    → ~40 trading days
+val_weeks:    2    → ~10 trading days
+test_weeks:   2    → ~10 trading days
+step_weeks:   2    → ~14–17 folds from 10-month data
+embargo_days: 5    → 1 trading week buffer
+max_folds:    4    → cap inner folds for nested validation efficiency
 ```
 
-These yield ~14 folds covering ~65% of the dataset as out-of-sample.
-As data accumulates, fold count increases automatically with no config change.
+**Recommended parameters for outer folds (nested validation):**
+```
+window_weeks: 16   → ~80 trading days (consistent, recent history)
+val_weeks:    0    → no val at outer level; val generated separately from outer_train
+test_weeks:   6    → ~30 trading days (enough trades for backtest evaluation)
+step_weeks:   6    → non-overlapping outer_test windows
+embargo_days: 5    → 1 trading week buffer
+```
+
+With 10-month (~43 weeks) data, outer fold config yields approximately 3–4 outer folds.
 
 ---
 
@@ -259,14 +255,29 @@ class ClassBalancer:
 
     def generate_folds(
         self,
-        labeled_df: pd.DataFrame,
-        balance: bool = True,
+        labeled_df:   pd.DataFrame,
+        balance:      bool = True,
         session_mode: str | None = None,
+        max_folds:    int | None = None,
+        # Explicit fold parameter overrides — if None, read from config["class_balancer"]
+        window_weeks: int | None = None,
+        val_weeks:    int | None = None,
+        test_weeks:   int | None = None,
+        step_weeks:   int | None = None,
+        embargo_days: int | None = None,
     ) -> Iterator[tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]]:
         """
         Walk-forward fold generator.
         Yields (train_balanced, val, test, fold_meta) per fold.
         Folds are always yielded in ascending fold_idx order (0, 1, 2, ...).
+
+        If val_weeks=0 (or override val_weeks=0), val is returned as an
+        empty DataFrame. Caller is responsible for ignoring it.
+
+        Explicit override parameters take precedence over config values.
+        This allows PipelineOptimizer to reuse the same method for both
+        inner folds (inner_fold config) and outer folds (outer_fold config)
+        without ClassBalancer needing to distinguish between them.
 
         fold_meta dict keys:
             fold_idx        (int)  : 0-based fold index
@@ -275,22 +286,13 @@ class ClassBalancer:
             fold_test_end   (str)  : 'YYYYMMDD' last date of test window
 
         Order of operations per fold:
-          1. session_mode filter on full df
-          2. Compute fold date boundaries (window/val/test/step/embargo)
+          1. session_mode filter on full df (skipped if session_mode is None)
+          2. Compute fold date boundaries using resolved parameters
           3. Slice train/val/test
           4. Apply pre-balance filters to train (Case C, ambiguous)
           5. Apply downsampling to train if balance=True
           6. Yield (train_balanced, val, test, fold_meta)
-
-        Args:
-            labeled_df:   full labeled feature matrix (all sessions)
-            balance:      whether to apply downsampling to train split
-            session_mode: "regular" | "pre" | "combined" | None
         """
-        ...
-
-    def report(self, df: pd.DataFrame) -> dict[str, int]:
-        """Return class counts for logging."""
         ...
 ```
 
@@ -300,63 +302,45 @@ class ClassBalancer:
 
 ```yaml
 class_balancer:
-  apply_balance: true       # passed to split()/generate_folds() as balance argument
-  max_ratio: 3.0            # max multiple of minority class count
+  max_ratio: 3.0
   random_state: 42
+  apply_balance: true
+  exclude_case_c: true
+  ambiguous_sample_action: "exclude"   # "exclude" | "keep"
+  embargo_days: 5                      # default; overridable per call
 
-  split_method: "rolling"   # "temporal" | "rolling"
-                            # Applies only in PipelineOptimizer context:
-                            #   "temporal" → PipelineOptimizer calls split()
-                            #   "rolling"  → PipelineOptimizer calls generate_folds()
-                            # Standalone CLI (run_preprocess.py) always uses split()
-                            # regardless of this setting.
+  # Inner fold parameters (used by selection/full phases and inner loop of nested validation)
+  inner_fold:
+    window_weeks: 8
+    val_weeks:    2
+    test_weeks:   2
+    step_weeks:   2
+    embargo_days: 5
+    max_folds:    4    # cap for nested validation inner loop
 
-  # Temporal split parameters (used when PipelineOptimizer uses split_method = "temporal")
-  temporal:
-    train_pct: 0.70
-    val_pct:   0.15
-    test_pct:  0.15
-    embargo_days: 5         # trading days
-
-  # Rolling fold parameters (used when PipelineOptimizer uses split_method = "rolling")
-  rolling:
-    window_weeks: 10        # fixed train window size
-    val_weeks:    2         # validation window per fold
-    test_weeks:   2         # test window per fold
-    step_weeks:   2         # fold advance step
-    embargo_days: 5         # trading days excluded at split boundaries
-
-  # Pre-balance filters (applied to train split only)
-  exclude_dead_position_case_c: true   # exclude dataset-boundary dead positions from train
-  ambiguous_sample_action: "keep"      # "keep" | "exclude"
-                                       # "keep":    retain ambiguous samples (default)
-                                       # "exclude": remove is_ambiguous=True from train
-                                       # Note: sample weighting for ambiguous samples
-                                       #       is configured separately under trainer.*
-
-entry_detector:
-  session_mode: "regular"   # read by caller, passed to split()/generate_folds()
+  # Outer fold parameters (used by outer loop of nested validation only)
+  outer_fold:
+    window_weeks: 16
+    val_weeks:    0    # no val at outer level; val generated separately from outer_train
+    test_weeks:   6
+    step_weeks:   6
+    embargo_days: 5
 ```
 
 ---
 
 ## Constraints
 
-- Temporal ordering must be preserved: train always precedes val, val always precedes test
-- Embargo gap applied at both train/val and val/test boundaries (unit: trading days)
 - Pre-balance filters applied to train split only — val and test are never filtered
-- Balancing applied to train split only — val and test untouched by downsampling
-- `split_method` config is enforced only by PipelineOptimizer — `split()` and `generate_folds()` are always callable independently
-- `balance()` is available as a standalone method for reporting and testing — not called directly in pipeline
-- `session_mode=None` disables session filtering — all sessions retained (used for testing)
-- No SMOTE or synthetic oversampling
-- Random state must be fixed for reproducibility
-- `report()` must be called and logged before and after balancing
-- Week boundaries aligned to calendar weeks (Monday); partial weeks >= 3 trading days are included
-- Rolling fold count is determined automatically from data length — not configurable directly
-- `generate_folds()` always yields folds in ascending fold_idx order — this is a hard guarantee
-- `generate_folds()` yields fold_meta as the fourth element of every tuple —
-  callers must unpack all four values: `for train, val, test, fold_meta in balancer.generate_folds(...)`
-- `ambiguous_sample_action` controls only include/exclude in ClassBalancer;
-  sample weight reduction for ambiguous samples is handled by Trainer
-  and configured under `trainer.use_ambiguous_sample_weight`
+- session_mode filter applied before split — no cross-session contamination
+- Downsampling uses random sampling without replacement (random_state from config)
+- `generate_folds()` always yields in ascending fold_idx order — callers may rely on this
+- Explicit override parameters in `generate_folds()` take precedence over config values
+- `val_weeks=0` results in empty val DataFrame — caller must handle
+- `max_folds` limits total fold count; None = no limit
+- `session_mode=None` skips session filter — all entry points included (used for outer folds
+  where session_mode is a search variable resolved by the inner trial)
+- ClassBalancer has no knowledge of "outer" vs. "inner" fold semantics —
+  distinction is managed entirely by the caller (PipelineOptimizer)
+- `generate_folds()` does NOT accept `holdout_dates` — holdout filtering is the
+  caller's responsibility before passing labeled_df

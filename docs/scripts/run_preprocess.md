@@ -7,12 +7,13 @@
 ## Role
 
 CLI entry point that orchestrates the full preprocessing pipeline.
-Supports three execution modes:
+Supports two execution modes:
 - **Standalone**: full pipeline, saves parquet to disk
 - **Optimizer (in-memory)**: returns full labeled DataFrame without splitting or saving
-- **Live (live_mode)**: runs EntryPointDetector.detect() + FeatureExtractor only
 
-Preprocessor is responsible for feature extraction and labeling only.
+Preprocessor is a training-only component. Live inference uses
+`FeatureExtractor.extract()` directly via Inferencer — not Preprocessor.
+
 Session_mode filtering, temporal splitting, and rolling fold generation
 are handled entirely by ClassBalancer.
 
@@ -23,11 +24,11 @@ are handled entirely by ClassBalancer.
 **Input:**
 ```python
 # From DuckDB:
-ohlcv_1min: pd.DataFrame       # all sessions (no time filter)
-tick_10: pd.DataFrame          # all sessions — full day per ticker/date
-stock_meta: pd.DataFrame
-trading_halts: pd.DataFrame
-trading_calendar: pd.DataFrame
+ohlcv_1min:           pd.DataFrame   # all sessions (no time filter)
+tick_10:              pd.DataFrame   # all sessions — full day per ticker/date
+stock_meta:           pd.DataFrame
+trading_halts:        pd.DataFrame
+trading_calendar:     pd.DataFrame
 ticker_data_coverage: pd.DataFrame
 ```
 
@@ -44,11 +45,6 @@ test_features.parquet
 pd.DataFrame  # full labeled feature matrix, unsplit
 ```
 
-**Output (live_mode=True):**
-```python
-pd.DataFrame  # feature matrix for current entry points (no labels)
-```
-
 ---
 
 ## Pipeline Steps
@@ -57,12 +53,12 @@ pd.DataFrame  # feature matrix for current entry points (no labels)
 [Standard / In-memory mode]
 
 1. Connect to DuckDB and load all data:
-       ohlcv_df       = SELECT * FROM ohlcv_1min   ORDER BY ticker, date, hour
-       ticks_df       = SELECT * FROM tick_10       ORDER BY ticker, date, hour, seq_id
-       meta_df        = SELECT * FROM stock_meta
-       halts_df       = SELECT * FROM trading_halts
-       calendar_df    = SELECT * FROM trading_calendar
-       coverage_df    = SELECT * FROM ticker_data_coverage
+       ohlcv_df    = SELECT * FROM ohlcv_1min   ORDER BY ticker, date, hour
+       ticks_df    = SELECT * FROM tick_10       ORDER BY ticker, date, hour, seq_id
+       meta_df     = SELECT * FROM stock_meta
+       halts_df    = SELECT * FROM trading_halts
+       calendar_df = SELECT * FROM trading_calendar
+       coverage_df = SELECT * FROM ticker_data_coverage
 
 2. EntryPointDetector.scan() for each ticker → entry_points (all sessions)
    max_entry_hour exclusion applied inside scan()
@@ -75,7 +71,10 @@ pd.DataFrame  # feature matrix for current entry points (no labels)
            ohlcv_future_td = ohlcv_df filtered to (ticker, date, hour >= t_hour)
            ticks_td        = ticks_df filtered to (ticker, date), full day
            halts_td        = halts_df filtered to (ticker, date)
-       labeler.label(entry_points_td, ohlcv_future_td, ticks_td, halts_td, calendar_df)
+       labeler.label(
+           entry_points_td, ohlcv_future_td, ticks_td, halts_td,
+           calendar_df, coverage_df
+       )
        (includes is_dead_position, dead_position_case, is_ambiguous)
 
 5. Save labeled_samples to DuckDB labeled_samples table (INSERT OR IGNORE)
@@ -102,15 +101,6 @@ pd.DataFrame  # feature matrix for current entry points (no labels)
            session_mode=config["entry_detector"]["session_mode"]
        ) → (train_balanced, val, test)
     → save parquet files to data/processed/
-
-[Live mode — live_mode=True]
-
-1. Connect to DuckDB and load recent OHLCV, ticks, meta
-   halts_df = SELECT * FROM trading_halts WHERE ticker = ? AND date = ?
-2. EntryPointDetector.detect() called per candidate bar
-   scan() is NOT called in live mode
-3. FeatureExtractor.extract(bars, ticks, meta, entry, halts_df) → feature vector
-4. Return feature matrix directly (no parquet save, no labeling)
 ```
 
 ---
@@ -124,19 +114,15 @@ class Preprocessor:
     def run(
         self,
         return_data: bool = False,
-        live_mode: bool = False,
     ) -> pd.DataFrame | None:
         """
-        return_data=False, live_mode=False : split via ClassBalancer.split(),
-                                             save parquet, return None.
-                                             DB tables always saved (INSERT OR IGNORE).
-        return_data=True,  live_mode=False : return full_labeled_df (unsplit),
-                                             no ClassBalancer call, no parquet save.
-                                             DB tables always saved (INSERT OR IGNORE).
-        live_mode=True                     : return feature matrix only (no labels).
-                                             scan() not called; detect() used instead.
-                                             entry_points DB insertion handled by Inferencer.
-                                             No DB table writes in Preprocessor.
+        return_data=False : split via ClassBalancer.split(), save parquet, return None.
+                            DB tables always written (INSERT OR IGNORE).
+        return_data=True  : return full_labeled_df (unsplit), no parquet save.
+                            DB tables always written (INSERT OR IGNORE).
+
+        Training mode only. Live inference uses FeatureExtractor.extract() directly
+        via Inferencer — Preprocessor is not involved in live inference.
         """
         ...
 
@@ -163,7 +149,7 @@ class Preprocessor:
 python scripts/run_preprocess.py [--config CONFIG]
 ```
 
-CLI always runs in standalone mode (`return_data=False`, `live_mode=False`).
+CLI always runs in standalone mode (`return_data=False`).
 
 ---
 
@@ -190,14 +176,14 @@ misc.lookback_bars
   - Labeler receives full day (hour >= t_hour filtered internally per entry point)
   - FeatureExtractor receives ticks before t bar only (hour < t_hour)
 - `halts_df` loaded per ticker/date and passed explicitly to both Labeler and FeatureExtractor
+- `coverage_df` loaded once at step 1 and passed explicitly to Labeler.label()
 - `extract_batch()` called per ticker — no Python loop over `extract()` per entry point
 - Empty DataFrames handled gracefully (saves _empty.parquet)
 - `ClassBalancer.split()` called only in standalone mode
 - `ClassBalancer.generate_folds()` is never called inside Preprocessor
 - `p_entry` included in parquet as identifier column, not feature
 - `is_dead_position`, `dead_position_case`, `is_ambiguous` stored as metadata columns
-- In live_mode: `halts_df` loaded per ticker/date and passed to FeatureExtractor.extract()
-- In live_mode: Labeler and ClassBalancer are not instantiated
 - entry_points and labeled_samples DB saves use INSERT OR IGNORE for idempotency
 - `max_entry_hour` exclusion applied inside EntryPointDetector.scan()
 - Standalone CLI always calls split() — split_method config enforced by PipelineOptimizer only
+- live_mode is NOT supported — Preprocessor is training-only
