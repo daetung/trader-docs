@@ -9,14 +9,12 @@
 
 Training endpoint for the auto-scalping pipeline.
 Manages the full preprocess → train → AUC evaluation → backtest cycle.
-Supports nested validation for unbiased hyperparameter selection,
-Successive Halving for efficient trial pruning, and volatility-based
-regime holdout for robustness evaluation.
+Searches feature combinations to find the pipeline configuration with the best winning rate.
 All results logged to DuckDB.
 
 Supports three operational phases with distinct objectives:
 - **Selection phase**: identify stable feature subset via one rolling fold pass + DimensionalityReducer
-- **Exploitation phase**: optimize hyperparameters via nested validation with Successive Halving
+- **Exploitation phase**: optimize model with confirmed feature subset via trial search loop
 - **Full phase**: reducer disabled entirely; all features used as-is
 
 ---
@@ -25,20 +23,17 @@ Supports three operational phases with distinct objectives:
 
 ```
 Training endpoint:  PipelineOptimizer
-    └── Preprocessor.run(return_data=True)    ← returns full_labeled_df (unsplit)
-    └── utils.compute_vol_regime_holdout()    ← regime holdout dates
-    └── ClassBalancer.generate_folds()        ← outer and inner rolling folds
-    └── Trainer.run(...)                      ← per-fold train (dry_run in workers)
-    └── Coordinator DB flush                  ← sequential train_log INSERT
+    └── Preprocessor.run(return_data=True)   ← returns full_labeled_df (unsplit)
+    └── ClassBalancer.generate_folds()        ← rolling walk-forward folds
+    └── Trainer.run(...)                      ← per-fold train, writes train_log
     └── Backtester.run(...)                   ← writes experiment_log
 
 Live inference endpoint: Inferencer (separate module)
-    └── EntryPointDetector.detect()
-    └── FeatureExtractor.extract()            ← direct call (no Preprocessor)
+    └── Preprocessor.run(live_mode=True)
     └── model.load() → resolve_signal()
 ```
 
-PipelineOptimizer imports and calls `Preprocessor`, `Trainer`, `Backtester` directly.
+PipelineOptimizer imports and calls `Preprocessor`, `Trainer`, `Backtester` classes directly.
 It does not invoke run scripts as subprocesses.
 
 ---
@@ -52,76 +47,94 @@ by running one complete pass through all rolling folds with DimensionalityReduce
 enabled, then aggregating results via frequency voting.
 
 ```
-- feature set: full (all feature groups enabled)
-- DimensionalityReducer: enabled (run_reducer=True)
-- Execution: one pass through all inner rolling folds (no trial loop)
-- trial_idx: always 0 (single implicit trial)
-- fold_idx: 0-based inner fold index; outer_fold_idx: -1 (non-nested)
-- No backtest — returns empty DataFrame
-- train_log: one row per fold
-- auc_std recorded on fold_run_ids[-1] after all folds complete
+- feature set: full (all feature groups enabled) — fixed
+- DimensionalityReducer: enabled per fold
+- Execution: one pass through all folds from generate_folds()
+- Frequency voting: selected_features collected across all folds
+  → features selected in >= vote_threshold fraction of folds → confirmed set
+  → saved to configs/selected_features.json
+  → per-fold selections and importance_scores saved to
+    configs/feature_selection_log.json for audit
+- train_log: one row per fold (fold_idx, fold_train_end populated)
+- trial_idx: always 0 (single implicit trial, no search loop)
+- No backtest — AUC and selected_features reported per fold only
+- auc_std recorded on fold_run_ids[-1] row via UPDATE
 ```
 
 ```python
 optimizer_run_id = utils.generate_run_id()
 
-preprocessor    = Preprocessor(config, db_conn)
+preprocessor = Preprocessor(config, db_conn)
 full_labeled_df = preprocessor.run(return_data=True)
 
 balancer = ClassBalancer(config)
 trainer  = Trainer(config, db_conn, optimizer_run_id=optimizer_run_id)
 
-inner_cfg = config["class_balancer"]["inner_fold"]
-
-fold_run_ids      = []
-fold_aucs         = []
-reduction_reports = []
+feature_votes:          dict[str, int] = {}
+feature_selection_log:  list[dict]     = []
+fold_aucs:              list[float]    = []
+fold_run_ids:           list[str]      = []
+total_folds = 0
 
 for train, val, test, fold_meta in balancer.generate_folds(
     full_labeled_df,
     balance=config["class_balancer"]["apply_balance"],
     session_mode=config["entry_detector"]["session_mode"],
-    window_weeks=inner_cfg["window_weeks"],
-    val_weeks=inner_cfg["val_weeks"],
-    test_weeks=inner_cfg["test_weeks"],
-    step_weeks=inner_cfg["step_weeks"],
-    embargo_days=inner_cfg["embargo_days"],
 ):
     run_id = utils.generate_run_id()
     result = trainer.run(
         train, val, test,
         run_id=run_id,
         fold_idx=fold_meta["fold_idx"],
-        outer_fold_idx=-1,
         fold_train_end=fold_meta["fold_train_end"],
+        feature_config=None,
+        feature_names=None,
         run_reducer=True,
         phase="selection",
         trial_idx=0,
     )
     fold_run_ids.append(run_id)
+    for feature in result["selected_features"]:
+        feature_votes[feature] = feature_votes.get(feature, 0) + 1
+    feature_selection_log.append({
+        "fold_idx":          fold_meta["fold_idx"],
+        "fold_train_end":    fold_meta["fold_train_end"],
+        "selected_features": result["selected_features"],
+        "importance_scores": result["reduction_report"]["importance_scores"].to_dict(),
+        "auc_mean":          result["auc_mean"],
+    })
     fold_aucs.append(result["auc_mean"])
-    reduction_reports.append(result["reduction_report"])
+    total_folds += 1
 
+vote_threshold    = config["optimizer"]["selection"]["vote_threshold"]
+selected_features = sorted([
+    f for f, count in feature_votes.items()
+    if count / total_folds >= vote_threshold
+])
+
+# auc_std UPDATE on last fold row (fold_run_ids[-1] = MAX fold_idx)
 auc_std = std(fold_aucs)
 UPDATE train_log SET auc_std = auc_std WHERE run_id = fold_run_ids[-1]
 
-# Frequency voting across folds
-selected_features = frequency_vote(reduction_reports,
-    threshold=config["dimensionality_reducer"]["vote_threshold"])
-save_json(selected_features, config["optimizer"]["selected_features_path"])
-save_json({"fold_reports": reduction_reports},
-          "configs/feature_selection_log.json")
+save_json(selected_features,     config["optimizer"]["selected_features_path"])
+save_json(feature_selection_log, config["optimizer"]["feature_selection_log_path"])
 ```
-
----
 
 ### Phase: "exploitation"
 
-**Objective:** Search over LightGBM hyperparameters to find the best configuration
-using nested walk-forward validation (outer fold × inner fold × Successive Halving).
-Outer fold evaluation is unbiased — never seen during inner trial search.
+**Objective:** Maximize winning rate using the confirmed feature subset
+by searching over feature_config combinations via a trial loop.
+Each trial runs all rolling folds with the fixed selected feature set.
 
-#### Data Preparation
+```
+- feature set: loaded from configs/selected_features.json — fixed per run
+- DimensionalityReducer: disabled (run_reducer=False)
+- Execution: trial loop over search_space; each trial runs all folds
+- trial_idx: 0-based per optimizer_run_id; written to train_log per fold
+- auc_std stored on fold_run_ids[-1] row after each trial completes
+- Backtest: executed for best trial using last fold's model and test set
+- train_log: one row per fold per trial
+```
 
 ```python
 optimizer_run_id = utils.generate_run_id()
@@ -131,363 +144,100 @@ full_labeled_df = preprocessor.run(return_data=True)
 
 selected_features = load_json(config["optimizer"]["selected_features_path"])
 
-# Regime holdout — remove high-volatility dates before any fold generation
-holdout_cfg   = config["optimizer"]["regime_holdout"]
-holdout_dates = utils.compute_vol_regime_holdout(
-    db_conn,
-    vol_percentile=holdout_cfg["vol_holdout_percentile"],
-    window_days=holdout_cfg["vol_window_days"],
-    vol_metric=holdout_cfg["vol_metric"],
-) if holdout_cfg["enabled"] else set()
-
-remaining_df = full_labeled_df[~full_labeled_df["date"].isin(holdout_dates)]
-holdout_df   = full_labeled_df[full_labeled_df["date"].isin(holdout_dates)]
-
 balancer = ClassBalancer(config)
-```
 
-#### Hyperparameter Search Space
+best_fold_run_ids    = []
+best_trial_auc_mean  = 0.0
+best_feature_config  = None
+best_config_override = None
+best_train           = None
+best_val             = None
+best_fold_test       = None
 
-```yaml
-optimizer:
-  hyperparameter_search:
-    max_trials: 30
-    strategy: "random"
-    random_state: 42
-    search_space:
-      lgbm_params:
-        num_leaves:       [31, 63, 127]
-        min_data_in_leaf: [50, 100, 200]
-        feature_fraction: [0.5, 0.7, 0.9]
-        lambda_l1:        [0.0, 0.1, 1.0]
-      entry_detector:
-        session_mode:     ["regular", "pre", "combined"]
-```
+for trial_idx, feature_config in enumerate(search_space):
 
-#### Nested Validation — Outer Fold Loop
+    config_override = utils.apply_overrides(base_config, feature_config)
+    trainer = Trainer(config_override, db_conn, optimizer_run_id=optimizer_run_id)
 
-```python
-outer_cfg  = config["class_balancer"]["outer_fold"]
-inner_cfg  = config["class_balancer"]["inner_fold"]
-eta        = config["optimizer"]["successive_halving"]["eta"]
-max_trials = config["optimizer"]["hyperparameter_search"]["max_trials"]
-n_parallel = config["optimizer"]["parallelism"]["n_parallel_trials"]
+    fold_run_ids = []
+    fold_aucs    = []
 
-# Physical cores per worker (avoid HyperThreading cache contention)
-import psutil
-effective_num_threads = max(
-    1,
-    psutil.cpu_count(logical=False) // n_parallel
-)
-
-outer_best_configs   = []
-outer_scores         = []
-
-for outer_train_df, _, outer_test_df, outer_fold_meta in balancer.generate_folds(
-    remaining_df,
-    balance=False,
-    session_mode=None,
-    window_weeks=outer_cfg["window_weeks"],
-    val_weeks=0,
-    test_weeks=outer_cfg["test_weeks"],
-    step_weeks=outer_cfg["step_weeks"],
-    embargo_days=outer_cfg["embargo_days"],
-):
-    outer_fold_idx = outer_fold_meta["fold_idx"]
-
-    best_config    = None
-    best_inner_auc = 0.0
-
-    # --- Successive Halving across inner trial loop ---
-    search_space   = sample_hyperparams(config, max_trials)
-    active_trials  = list(enumerate(search_space))
-    trial_auc_history: dict[int, list[float]] = {i: [] for i in range(len(active_trials))}
-    max_inner_folds = inner_cfg.get("max_folds", 4)
-
-    for round_idx in range(max_inner_folds):
-
-        # Coordinator pre-generates run_ids (avoid collision in parallel workers)
-        round_run_ids = {
-            trial_idx: f"{optimizer_run_id}_o{outer_fold_idx}_t{trial_idx}_f{round_idx}"
-            for trial_idx, _ in active_trials
-        }
-
-        # Dispatch parallel workers
-        round_results = _run_round_parallel(
-            active_trials=active_trials,
-            round_idx=round_idx,
-            outer_train_df=outer_train_df,
-            outer_fold_idx=outer_fold_idx,
-            round_run_ids=round_run_ids,
-            selected_features=selected_features,
-            config=config,
-            effective_num_threads=effective_num_threads,
-            optimizer_run_id=optimizer_run_id,
-            db_path=config["data_paths"]["db_path"],
+    for train, val, test, fold_meta in balancer.generate_folds(
+        full_labeled_df,
+        balance=config_override["class_balancer"]["apply_balance"],
+        session_mode=config_override["entry_detector"]["session_mode"],
+    ):
+        run_id = utils.generate_run_id()
+        result = trainer.run(
+            train, val, test,
+            run_id=run_id,
+            fold_idx=fold_meta["fold_idx"],
+            fold_train_end=fold_meta["fold_train_end"],
+            feature_config=feature_config,
+            feature_names=selected_features,
+            run_reducer=False,
+            phase="exploitation",
+            trial_idx=trial_idx,
         )
+        fold_run_ids.append(run_id)
+        fold_aucs.append(result["auc_mean"])
 
-        # Coordinator: sequential DB flush (single write connection)
-        with duckdb.connect(config["data_paths"]["db_path"]) as write_conn:
-            for r in round_results:
-                write_conn.execute("INSERT INTO train_log ...", r["train_log_row"])
+    trial_auc_mean = mean(fold_aucs)
+    trial_auc_std  = std(fold_aucs)
 
-        # Update AUC history
-        for r in round_results:
-            trial_auc_history[r["trial_idx"]].append(r["auc_mean"])
+    # UPDATE auc_std on last fold row (fold_run_ids[-1] = MAX fold_idx)
+    UPDATE train_log SET auc_std = trial_auc_std WHERE run_id = fold_run_ids[-1]
 
-        # Successive Halving pruning (not on final round)
-        if round_idx < max_inner_folds - 1 and len(active_trials) > 1:
-            trial_means = {
-                idx: mean(trial_auc_history[idx])
-                for idx, _ in active_trials
-                if trial_auc_history[idx]
-            }
-            sorted_trials  = sorted(trial_means.items(), key=lambda x: x[1], reverse=True)
-            n_survive      = max(1, len(sorted_trials) // eta)
-            surviving_idx  = {idx for idx, _ in sorted_trials[:n_survive]}
-            pruned_idx     = {idx for idx, _ in sorted_trials[n_survive:]}
+    if trial_auc_mean > best_trial_auc_mean:
+        best_trial_auc_mean  = trial_auc_mean
+        best_fold_run_ids    = fold_run_ids
+        best_feature_config  = feature_config
+        best_config_override = config_override
+        best_train           = train    # last fold's train split of this trial
+        best_val             = val      # last fold's val split of this trial
+        best_fold_test       = test     # last fold's test split of this trial
 
-            # Mark pruned trial rows
-            with duckdb.connect(config["data_paths"]["db_path"]) as write_conn:
-                for r in round_results:
-                    if r["trial_idx"] in pruned_idx:
-                        write_conn.execute(
-                            "UPDATE train_log SET is_pruned = TRUE WHERE run_id = ?",
-                            [r["run_id"]]
-                        )
+    if trial_auc_mean >= auc_threshold:
+        break
 
-            active_trials = [(idx, hp) for idx, hp in active_trials if idx in surviving_idx]
+# Mark best trial's last fold row
+UPDATE train_log SET best_of_loop = TRUE WHERE run_id = best_fold_run_ids[-1]
 
-    # Final round: set auc_std and best_of_loop for completed trials
-    completed_trial_means = {
-        idx: mean(trial_auc_history[idx])
-        for idx, _ in active_trials
-    }
-    best_trial_idx = max(completed_trial_means, key=completed_trial_means.get)
-    best_config    = search_space[best_trial_idx]
+best_run_id = best_fold_run_ids[-1]
 
-    with duckdb.connect(config["data_paths"]["db_path"]) as write_conn:
-        for idx, _ in active_trials:
-            last_run_id = round_run_ids[idx]   # last completed round run_id
-            aucs        = trial_auc_history[idx]
-            write_conn.execute(
-                "UPDATE train_log SET auc_std = ? WHERE run_id = ?",
-                [std(aucs) if len(aucs) > 1 else 0.0, last_run_id]
-            )
-        write_conn.execute(
-            "UPDATE train_log SET best_of_loop = TRUE WHERE run_id = ?",
-            [round_run_ids[best_trial_idx]]
-        )
+backtester = Backtester(best_config_override, db_conn, optimizer_run_id=optimizer_run_id)
+summary    = backtester.run(best_fold_test, run_id=best_run_id)
 
-    # --- Outer eval: train best_config on outer_train, backtest on outer_test ---
-    outer_train_split, outer_val_split = utils.temporal_split_simple(
-        outer_train_df,
-        session_mode=best_config.get("entry_detector.session_mode"),
-        val_fraction=0.15,
-        embargo_days=outer_cfg["embargo_days"],
-    )
-
-    outer_run_id    = utils.generate_run_id()
-    config_override = utils.apply_overrides(config, best_config)
-    config_override["lgbm_params"]["num_threads"] = effective_num_threads
-
-    outer_trainer = Trainer(config_override, db_conn, optimizer_run_id=optimizer_run_id)
-    outer_trainer.run(
-        outer_train_split, outer_val_split, outer_test_df,
-        run_id=outer_run_id,
-        fold_idx=-1,
-        outer_fold_idx=outer_fold_idx,
-        fold_train_end=outer_fold_meta["fold_train_end"],
-        feature_config=best_config,
-        feature_names=selected_features,
-        run_reducer=False,
-        phase="exploitation",
-        trial_idx=-1,          # outer eval row — not part of inner trial loop
-        dry_run=False,
-    )
-
-    backtester = Backtester(config_override, db_conn, optimizer_run_id=optimizer_run_id)
-    outer_summary = backtester.run(
-        outer_test_df,
-        run_id=outer_run_id,
-        fold_idx=-1,
-        outer_fold_idx=outer_fold_idx,
-        fold_test_start=outer_fold_meta["fold_test_start"],
-        fold_test_end=outer_fold_meta["fold_test_end"],
-        eval_type="outer_validation",
-    )
-
-    outer_best_configs.append(best_config)
-    outer_scores.append(outer_summary["winning_rate"])
-
-# --- Consensus config → final model ---
-consensus_config = utils.compute_consensus_config(
-    outer_best_configs,
-    config["optimizer"]["hyperparameter_search"]["search_space"],
-)
-final_config_override = utils.apply_overrides(config, consensus_config)
-
-final_train_split, final_val_split = utils.temporal_split_simple(
-    remaining_df,
-    session_mode=consensus_config.get("entry_detector.session_mode"),
-    val_fraction=0.15,
-)
-final_run_id = utils.generate_run_id()
-final_trainer = Trainer(final_config_override, db_conn, optimizer_run_id=optimizer_run_id)
-final_trainer.run(
-    final_train_split, final_val_split, remaining_df,
-    run_id=final_run_id,
-    fold_idx=-1,
-    outer_fold_idx=-1,
-    feature_config=consensus_config,
-    feature_names=selected_features,
-    run_reducer=False,
-    phase="exploitation",
-    trial_idx=0,
-    dry_run=False,
-)
-
-# --- Regime holdout robustness check ---
-if holdout_cfg["enabled"] and len(holdout_df) > 0:
-    regime_backtester = Backtester(
-        final_config_override, db_conn, optimizer_run_id=optimizer_run_id
-    )
-    regime_backtester.run(
-        holdout_df,
-        run_id=final_run_id,
-        fold_idx=-1,
-        outer_fold_idx=-1,
-        eval_type="regime_holdout",
-    )
+# Save preprocessed data for best trial's last fold
+preprocessor.save(best_train, best_val, best_fold_test, run_id=best_run_id)
 ```
-
----
 
 ### Phase: "full"
 
 **Objective:** Run pipeline with full feature set and no dimensionality reduction.
-Intended for baseline measurement and debugging.
+Intended for baseline measurement and debugging before selection phase.
 
 ```
-- feature set: full (all feature groups enabled)
+- feature set: full (all feature groups enabled) — fixed
 - DimensionalityReducer: disabled (run_reducer=False)
-- Execution: one pass through all inner rolling folds (no trial loop)
-- trial_idx: always 0; fold_idx: 0-based; outer_fold_idx: -1
+- Execution: one pass through all folds (no trial loop)
+- trial_idx: always 0 (single implicit trial)
 - Backtest: executed after fold pass completes
-- auc_std recorded on fold_run_ids[-1]
+- train_log: one row per fold
+- auc_std recorded on last fold row
 ```
+
+**Phase transition is always manual** — user edits `optimizer.phase` in config.
 
 ---
 
-## Multiprocessing Design
+## Trial Loop Termination Conditions (Exploitation Phase)
 
-### Worker Function
-
-```python
-def run_trial_round(
-    trial_idx:        int,
-    hyperparams:      dict,
-    outer_train_df:   pd.DataFrame,  # Linux/WSL: CoW shared via fork
-    outer_train_path: str | None,    # Windows spawn: parquet path instead
-    inner_fold_idx:   int,
-    run_id:           str,           # pre-generated by coordinator
-    selected_features: list[str],
-    config:           dict,
-    effective_num_threads: int,
-    optimizer_run_id: str,
-    outer_fold_idx:   int,
-    db_path:          str,
-) -> dict | None:
-    """
-    Worker function. Runs one (trial, inner_fold) pair.
-    Opens its own DuckDB read-only connection (no write).
-    Returns result dict — train_log INSERT deferred to coordinator.
-    db_conn=None passed to Trainer (dry_run=True).
-    """
-    import duckdb, sys
-    db_conn = duckdb.connect(db_path, read_only=True)
-
-    # Windows spawn: load outer_train_df from parquet
-    if sys.platform == "win32" and outer_train_path is not None:
-        outer_train_df = pd.read_parquet(outer_train_path)
-
-    config_override = utils.apply_overrides(config, hyperparams)
-    config_override["lgbm_params"]["num_threads"] = effective_num_threads
-
-    inner_cfg = config["class_balancer"]["inner_fold"]
-    inner_balancer = ClassBalancer(config_override)
-    folds = list(inner_balancer.generate_folds(
-        outer_train_df,
-        balance=config_override["class_balancer"]["apply_balance"],
-        session_mode=config_override["entry_detector"].get("session_mode"),
-        window_weeks=inner_cfg["window_weeks"],
-        val_weeks=inner_cfg["val_weeks"],
-        test_weeks=inner_cfg["test_weeks"],
-        step_weeks=inner_cfg["step_weeks"],
-        embargo_days=inner_cfg["embargo_days"],
-        max_folds=inner_cfg.get("max_folds"),
-    ))
-
-    if inner_fold_idx >= len(folds):
-        return None
-
-    train, val, test, fold_meta = folds[inner_fold_idx]
-
-    trainer = Trainer(config_override, db_conn=None, optimizer_run_id=optimizer_run_id)
-    result  = trainer.run(
-        train, val, test,
-        run_id=run_id,
-        fold_idx=inner_fold_idx,
-        outer_fold_idx=outer_fold_idx,
-        fold_train_end=fold_meta["fold_train_end"],
-        feature_config=hyperparams,
-        feature_names=selected_features,
-        run_reducer=False,
-        phase="exploitation",
-        trial_idx=trial_idx,
-        dry_run=True,
-    )
-
-    db_conn.close()
-    return {
-        "trial_idx":     trial_idx,
-        "run_id":        run_id,
-        "auc_mean":      result["auc_mean"],
-        "train_log_row": result["train_log_row"],
-    }
 ```
-
-### Platform Conditional — fork vs spawn
-
-```python
-import sys, multiprocessing as mp
-
-if sys.platform == "win32":
-    mp.set_start_method("spawn", force=True)
-    # outer_train_df written to temp parquet; workers receive path
-    import tempfile
-    from pathlib import Path
-    tmp_path = Path(tempfile.mktemp(suffix=".parquet"))
-    outer_train_df.to_parquet(tmp_path)
-    worker_data_kwarg = {"outer_train_path": str(tmp_path), "outer_train_df": None}
-else:
-    mp.set_start_method("fork", force=True)
-    # outer_train_df shared via CoW — no serialization
-    worker_data_kwarg = {"outer_train_path": None, "outer_train_df": outer_train_df}
-    # Windows: cleanup tmp_path after outer fold completes
-```
-
-### Thread Allocation
-
-```python
-import psutil
-effective_num_threads = max(
-    1,
-    psutil.cpu_count(logical=False) // n_parallel_trials
-)
-# Physical cores only — HyperThreading excluded per LightGBM documentation.
-# HT cores share L1/L2 cache; LightGBM histogram construction is cache-intensive,
-# making HT threads slower rather than faster for this workload.
+Loop exits when any of the following:
+1. trial_auc_mean >= auc_threshold   → proceed to backtest immediately
+2. max_trials exceeded               → use best trial for backtest
+3. Search space fully exhausted      → use best trial for backtest
 ```
 
 ---
@@ -495,18 +245,17 @@ effective_num_threads = max(
 ## auc_std Recording Rule
 
 ```
-Completed trials (all Successive Halving rounds finished):
-    auc_std = std(trial_auc_history[trial_idx])
-    UPDATE train_log SET auc_std = <value> WHERE run_id = fold_run_ids[-1]
-    fold_run_ids[-1] = last completed round's run_id for that trial
+After all folds complete for a given run or trial:
+1. Compute auc_std = std(fold_aucs)
+2. UPDATE train_log SET auc_std = <value> WHERE run_id = fold_run_ids[-1]
+   # fold_run_ids[-1] is guaranteed to be MAX(fold_idx) because
+   # generate_folds() always yields in ascending fold_idx order
 
-Pruned trials:
-    auc_std remains NULL
-    is_pruned = TRUE set on fold_run_ids[-1] (last submitted round)
+All other fold rows retain auc_std = NULL.
 
-Sequential mode (selection/full): fold_run_ids[-1] = MAX fold_idx,
-    guaranteed by generate_folds() ascending order.
-Nested/parallel mode: fold_run_ids[-1] = last Successive Halving round completed.
+Interpretation:
+  Selection/Full: temporal stability of the full feature model
+  Exploitation:   temporal stability of a specific feature_config trial
 ```
 
 ---
@@ -535,9 +284,8 @@ class PipelineOptimizer:
         Execute phase-appropriate cycle:
           - "selection":    one fold pass, frequency voting, save selected_features
                             returns empty DataFrame (no backtest)
-          - "exploitation": nested validation with Successive Halving,
-                            outer fold evaluation, consensus config, regime holdout
-                            returns experiment_log rows (outer_validation + regime_holdout)
+          - "exploitation": trial search loop with rolling folds, backtest best trial
+                            returns experiment_log rows sorted by winning_rate desc
           - "full":         one fold pass, no reducer, backtest
                             returns experiment_log rows
         """
@@ -565,91 +313,118 @@ class PipelineOptimizer:
 
 ---
 
-## Config Keys
+## Config Override Mechanism
+
+PipelineOptimizer applies feature_config overrides to config in-memory.
+`pipeline_config.yaml` is never modified.
+
+```python
+config_override = utils.apply_overrides(base_config, feature_config)
+```
+
+`session_mode` override applied via dot-notation:
+```python
+{"entry_detector.session_mode": "pre"}
+```
+
+---
+
+## Search Space Definition
 
 ```yaml
 optimizer:
-  phase: "exploitation"     # "selection" | "exploitation" | "full"
-  selected_features_path: "configs/selected_features.json"
-  auc_threshold: 0.72
+  phase: "selection"
+  auc_threshold: 0.65
+  max_trials: 50
+  random_state: 42
+  min_features: 5
+  strategy: "grid"              # "grid" | "random"
 
-  hyperparameter_search:
-    max_trials: 30
-    strategy: "random"
-    random_state: 42
-    search_space:
-      lgbm_params:
-        num_leaves:       [31, 63, 127]
-        min_data_in_leaf: [50, 100, 200]
-        feature_fraction: [0.5, 0.7, 0.9]
-        lambda_l1:        [0.0, 0.1, 1.0]
-      entry_detector:
-        session_mode:     ["regular", "pre", "combined"]
+  selected_features_path:       "configs/selected_features.json"
+  feature_selection_log_path:   "configs/feature_selection_log.json"
 
-  successive_halving:
-    enabled: true
-    eta: 3                  # top 1/eta fraction survives each round
+  selection:
+    vote_threshold: 0.70
 
-  parallelism:
-    n_parallel_trials: 4    # ProcessPoolExecutor max_workers
+  search_space:
+    session_mode:
+      options: ["regular", "pre", "combined"]
 
-  regime_holdout:
-    enabled: true
-    vol_holdout_percentile: 0.80   # top 20% most volatile dates excluded
-    vol_window_days: 30
-    vol_metric: "avg_intraday_range"
+    feature_groups:
+      - name: price_indicators
+        options: [on, off]
+      - name: volume_indicators
+        options: [on, off]
+      - name: tick_indicators
+        options: [on, off]
+      - name: sr_levels
+        options: [on, off]
+      - name: meta_features
+        options: [on, off]
+      - name: temporal_features
+        options: [on, off]
+      - name: fibonacci
+        options: [on, off]
+      - name: pivot_points
+        options: [on, off]
 
-class_balancer:
-  outer_fold:
-    window_weeks: 16
-    val_weeks:    0
-    test_weeks:   6
-    step_weeks:   6
-    embargo_days: 5
-  inner_fold:
-    window_weeks: 8
-    val_weeks:    2
-    test_weeks:   2
-    step_weeks:   2
-    embargo_days: 5
-    max_folds:    4
+    vectorizer_methods:
+      price_close:
+        options:
+          - [rate_of_change]
+          - [rate_of_change, linear_trend]
+          - [rate_of_change, shape_features]
+      volume:
+        options:
+          - [window_comparison]
+          - [window_comparison, statistical_summary]
+
+    dimensionality_reducer:
+      importance_averaging:
+        options: ["uniform", "sample_weighted"]
+```
+
+---
+
+## Scope of Automation
+
+```
+AUTOMATED (this module):
+    Feature group ON/OFF combinations (exploitation phase trial loop only)
+    Vectorizer method variants per indicator group
+    importance_averaging strategy ("uniform" | "sample_weighted")
+    session_mode ("regular" | "pre" | "combined")
+
+MANUAL (edit pipeline_config.yaml directly):
+    Individual indicator parameters
+    Entry detection thresholds
+    LightGBM hyperparameters
+    Backtest settings (including sell_rate_tp, sell_rate_sl)
+    Class balancer ratios
+    Rolling fold parameters
+    Phase transition (selection → exploitation → full)
 ```
 
 ---
 
 ## Constraints
 
+- Each fold independently reproducible given feature_config and random_state
+- All results written to DuckDB immediately after each fold — crash-safe
+- Optimizer does NOT modify `pipeline_config.yaml`
 - `train_log` written by Trainer per fold; `experiment_log` written by Backtester
-- In nested validation: workers use `dry_run=True`; coordinator performs all DB INSERTs
-- `best_of_loop` set TRUE on the last round row of the winning inner trial per outer fold
-- `auc_std` set on `fold_run_ids[-1]` via UPDATE — completed trials only;
-  pruned trials retain NULL with is_pruned = TRUE
-- Coordinator must NOT call `lgb.train()` before forking workers;
-  LightGBM OpenMP initialization in parent process causes fork hang
-- Platform-conditional multiprocessing:
-  Linux/WSL: fork start method; outer_train_df passed in-memory (CoW)
-  Windows: spawn start method; outer_train_df written to temp parquet,
-           path passed to workers; file cleaned up after outer fold
-- `if __name__ == "__main__":` guard required for Windows spawn compatibility
-- `psutil.cpu_count(logical=False)` used for num_threads allocation;
-  HyperThreading excluded per LightGBM documentation (cache contention)
-- run_ids for inner trial workers: coordinator pre-generates structured IDs
-  as "{optimizer_run_id}_o{outer_fold_idx}_t{trial_idx}_f{inner_fold_idx}";
-  generate_run_id() not called inside workers
-- Outer eval run_ids: standard utils.generate_run_id() format (sequential, no collision)
+- `best_of_loop` set TRUE on the last fold row of the best trial via UPDATE
+- `auc_std` set on `fold_run_ids[-1]` via UPDATE — all other fold rows retain NULL
+- `feature_selection_log.json` includes per-fold `importance_scores` from `reduction_report`
+- Preprocessed parquet saved only for best trial's last fold via `preprocessor.save()`
+- `best_train`, `best_val`, `best_fold_test` captured at best-trial update time;
+  not sourced from loop-end variables (which may belong to a different trial)
+- `optimizer_run_id` format: `YYYYMMDD_HHMMSS` (generated once per optimizer run)
+- `"random"` strategy uses `random_state` for reproducible non-replacement sampling
 - Phase transition is manual — no automatic switching between phases
-- Selection phase does not run backtest — frequency voting only
+- Selection phase does not run backtest — one fold pass only
 - Full phase runs backtest after fold pass completes
-- `session_mode` is a first-class search variable — inner balancer applies session_mode
-  per trial from config_override; outer fold generator uses session_mode=None
-- Regime holdout: dates removed from remaining_df BEFORE outer fold generation;
-  holdout_df used only for regime_holdout backtest after final model training
-- `compute_vol_regime_holdout()` uses ohlcv_1min regular session bars only
-- `compute_consensus_config()` aggregates outer fold best_configs;
-  continuous params → median → nearest grid value; categorical → mode
-- `temporal_split_simple()` used for early stopping val in outer eval and final model;
-  no balancing applied
-- `best_train`, `best_val`, `best_fold_test` patterns from non-nested exploitation removed;
-  outer eval uses outer_train_split / outer_val_split / outer_test_df directly
-- optimizer_run_id format: YYYYMMDD_HHMMSS (generated once per optimizer run)
-- "random" strategy uses random_state for reproducible non-replacement sampling
+- `session_mode` is a first-class search variable — results across session_modes
+  are not cross-comparable by AUC
+- `trial_idx` is 0-based per `optimizer_run_id` in exploitation;
+  always 0 for selection/full/standalone — written to train_log per fold row

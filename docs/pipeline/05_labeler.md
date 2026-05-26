@@ -35,12 +35,6 @@ halts_df: pd.DataFrame
 trading_calendar: pd.DataFrame
     columns: [date, is_trading_day, has_data]
     # used for dead position next-day lookup
-
-ticker_data_coverage: pd.DataFrame
-    columns: [ticker, date, has_1min, has_tick]
-    # used for dead position Case A vs Case B determination
-    # Case A: ticker found in coverage for next trading day (data available)
-    # Case B: ticker not found in coverage for next trading day (possible delisting)
 ```
 
 **Output:**
@@ -96,20 +90,101 @@ these samples from training, or by Trainer to apply reduced sample weight.
 
 ---
 
-## Dead Position Cases
+## Core Logic
 
 ```
-Case A: next trading day is_trading_day=True AND has_data=True
-        AND ticker found in ticker_data_coverage for that date
-        → next-day open available; apply dead_position_penalty_pct
+P_entry      = t bar open price (from entry_points.p_entry)
+fill_second  = utils.hour_add_seconds(t_hour, 5)
+ticks_from_t = ticks_df filtered to hour >= t_hour, sorted by (hour, seq_id)
 
-Case B: next trading day is_trading_day=True AND has_data=True
-        AND ticker NOT found in ticker_data_coverage for that date
-        → possible delisting; label_sw assigned (cannot determine direction)
+--- Step 1: Build effective bar sequence ---
 
-Case C: next trading day not available in dataset (boundary condition)
-        → label_sw assigned; excluded from training (see ClassBalancer config)
+Use build_effective_bar_sequence() from utils.py.
+Collect bars from t onward for this (ticker, date).
+Collection stops at 15:59 bar — after-market bars are NOT included.
+Halt classification applies across all time periods (pre/regular/after-market).
+
+For each missing bar slot up to 15:59:
+    if slot overlaps halt interval in halts_df → "halt" (excluded from valid count)
+    else                                        → "no_trade" (OHLC = prior close, volume=0)
+
+Target: 60 valid (non-halt) bars, within regular session boundary (≤ 15:59).
+
+--- Step 2: Breach detection via track_label_breach() ---
+
+label_direction, is_ambiguous = utils.track_label_breach(
+    ohlcv_future       = effective_bars,          # from Step 1
+    ticks_future       = ticks_from_t,
+    P_entry            = P_entry,
+    fill_second        = fill_second,
+    threshold_3pp      = config["labeler"]["threshold_3pp"],
+    threshold_5pp      = config["labeler"]["threshold_5pp"],
+    exit_interpolation = config["labeler"]["exit_interpolation"],
+    ambiguity_priority = config["labeler"]["ambiguity_priority"],
+)
+
+if label_direction is not None:
+    assign label from {"up5", "up3", "dn3", "dn5"}
+    → proceed to output (skip Steps 3 and 4)
+
+else:
+    → No ±3pp breach within effective bar sequence
+    → Proceed to Step 3 (session close / time limit exit)
+
+--- Step 3: Session close exit ---
+
+Triggered when track_label_breach() returns None (no ±3pp breach):
+
+    exit_price = 15:59 bar close
+
+    if 15:59 bar is halt or no_data:
+        fallback: first tick_10 row with hour > "155900" (after-market)
+        if no after-market tick: → Dead position (Step 4)
+
+    pnl = (exit_price - P_entry) / P_entry
+    apply label:
+        pnl >= +threshold_5pp  → label_up5
+        pnl >= +threshold_3pp  → label_up3
+        -threshold_3pp < pnl < +threshold_3pp → label_sw
+        pnl <= -threshold_5pp  → label_dn5
+        pnl <= -threshold_3pp  → label_dn3
+
+--- Step 4: Dead position ---
+
+Dead position occurs only when:
+    - Session close exit price cannot be determined (15:59 halt + no after-market data)
+
+Note: build_effective_bar_sequence() collects bars up to 15:59 only.
+60 valid bars exhausted before reaching 15:59 is not a separate exit case —
+the scan always proceeds to 15:59 or until a ±3pp breach occurs.
+
+In this case:
+    Lookup next trading day via trading_calendar table.
+
+    Case A — next trading day has_data=True AND ticker exists in ticker_data_coverage:
+        exit_price = next day pre-market first tick
+                     fallback: next day ohlcv_1min first bar open
+        exit_price *= (1 - dead_position_penalty_pct)
+        is_dead_position = True
+        dead_position_case = "A"
+
+    Case B — next trading day has_data=True AND ticker not in ticker_data_coverage:
+        pnl = -1.0  (full loss — possible delisting)
+        exit_price = 0
+        is_dead_position = True
+        dead_position_case = "B"
+
+    Case C — next trading day is future or not in dataset:
+        exit_price = P_entry * (1 - 0.5)
+        is_dead_position = True
+        dead_position_case = "C"
+        Note: Case C typically indicates a dataset boundary condition.
+              ClassBalancer can optionally exclude Case C samples from training.
+
+    assign label by pnl threshold (same as Step 3)
 ```
+
+**Key invariant:** Exactly one label equals 1 per entry point. All others are 0.
 
 ---
 
@@ -117,19 +192,17 @@ Case C: next trading day not available in dataset (boundary condition)
 
 ```python
 class Labeler:
-    def __init__(self, config: dict): ...
-
     def label(
         self,
-        entry_points:         pd.DataFrame,
-        ohlcv_future:         pd.DataFrame,
-        ticks_df:             pd.DataFrame,
-        halts_df:             pd.DataFrame,
-        trading_calendar:     pd.DataFrame,
-        ticker_data_coverage: pd.DataFrame,
+        entry_points:     pd.DataFrame,
+        ohlcv_future:     pd.DataFrame,
+        ticks_df:         pd.DataFrame,
+        halts_df:         pd.DataFrame,
+        trading_calendar: pd.DataFrame,
     ) -> pd.DataFrame:
         """
-        Generate label matrix for all entry points.
+        Returns label_matrix with 5 binary label columns,
+        is_dead_position, dead_position_case, and is_ambiguous.
         One and only one label column is 1 per row.
         dead_position_case is None for non-dead-position rows.
         is_ambiguous reflects bundle-level simultaneous breach in Stage 1 only.
@@ -160,8 +233,6 @@ Note: `build_effective_bar_sequence()` is an internal delegation to
 - `ticks_df` must be pre-loaded for the full day and passed explicitly;
   Labeler filters internally per entry point (hour >= t_hour)
 - `exit_interpolation` passed through to `track_label_breach()` — read from config
-- `ticker_data_coverage` must be pre-loaded and passed explicitly;
-  used for dead position Case A vs Case B determination only
 
 ---
 
@@ -189,9 +260,16 @@ labeler:
 | +3pp hit at bar 10, -3pp hit at bar 15 (before +5pp) | label_up3 |
 | -3pp hit first, -5pp reached | label_dn5 |
 | -3pp hit first, +3pp cuts off before -5pp | label_dn3 |
-| Neither ±3pp breached, 15:59 exit | label_sw |
-| Ambiguous bundle (both ±3pp in same bundle), priority="up" | label_up3/up5, is_ambiguous=True |
-| Dead position Case A (ticker in coverage next day) | is_dead_position=True, case="A" |
-| Dead position Case B (ticker missing from coverage next day) | is_dead_position=True, case="B", label_sw |
-| Dead position Case C (dataset boundary) | is_dead_position=True, case="C", label_sw |
-| Halt bar skipped in 60-bar count | label assigned after halt |
+| Scan reaches 15:59 bar, pnl = +2pp | label_sw |
+| Scan reaches 15:59 bar, pnl = +4pp | label_up3 |
+| 15:59 bar is halt, after-market tick available | label assigned from after-market tick |
+| 15:59 bar is halt, no after-market data | dead position Case A or C |
+| 5-bar halt mid-session, breach occurs at valid bar 61 | correct label (extended search within session) |
+| bundle.high >= +3pp AND bundle.low <= -3pp simultaneously, priority=up | label_up3, is_ambiguous=True |
+| bundle.high >= +3pp AND bundle.low <= -3pp simultaneously, priority=down | label_dn3, is_ambiguous=True |
+| bar-level high/low spans both thresholds but no single bundle does | is_ambiguous=False |
+| Normal breach (no simultaneous bundle span) | is_ambiguous=False |
+| Dead position, next day data available for ticker | is_dead_position=True, dead_position_case="A" |
+| Dead position, next day exists but ticker missing | is_dead_position=True, dead_position_case="B", pnl=-1.0 |
+| Dead position, next day not in dataset | is_dead_position=True, dead_position_case="C" |
+| Non-dead-position row | dead_position_case=None |

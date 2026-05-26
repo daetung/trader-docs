@@ -102,6 +102,7 @@ def hour_to_int(hour: str) -> int:
     """
     Convert HHMMSS string to integer.
     Used for trade_log entry_bar / exit_bar storage.
+
     Example: "093000" → 93000
     """
     return int(hour)
@@ -111,6 +112,7 @@ def hour_to_minutes(hour: str) -> int:
     """
     Convert HHMMSS string to total minutes from midnight.
     Used for cooldown calculation in BacktestEngine.
+
     Example: "093000" → 570  (9*60 + 30)
     """
     return int(hour[:2]) * 60 + int(hour[2:4])
@@ -120,6 +122,7 @@ def hour_add_seconds(hour: str, seconds: int) -> str:
     """
     Add seconds to an HHMMSS string. Returns HHMMSS string.
     Used for t+5s target computation in entry slippage.
+
     Example: hour_add_seconds("093000", 5) → "093005"
     Does not handle day rollover (not needed within trading day).
     """
@@ -141,22 +144,14 @@ def hour_add_seconds(hour: str, seconds: int) -> str:
 def generate_run_id() -> str:
     """
     Generate a unique run identifier in YYYYMMDD_HHMMSS format.
-    Used by run_train.py, run_backtest.py, and PipelineOptimizer (sequential contexts).
+    Used by run_train.py, run_backtest.py, and PipelineOptimizer.
 
     Format: YYYYMMDD_HHMMSS
     Example: "20250715_143022"
 
-    Uniqueness guaranteed by 1-second granularity for sequential callers.
-
-    In nested validation (parallel workers via ProcessPoolExecutor), the coordinator
-    pre-generates structured run_ids BEFORE dispatching workers to avoid collision:
-
-        format:  {optimizer_run_id}_o{outer_fold_idx}_t{trial_idx}_f{inner_fold_idx}
-        example: "20250715_143022_o1_t4_f2"
-
-    Workers receive run_id as an explicit argument; generate_run_id() is NOT called
-    inside worker functions. The standard YYYYMMDD_HHMMSS format is used only in
-    sequential contexts (standalone, selection, full phase, outer eval trainings).
+    Uniqueness guaranteed by 1-second granularity.
+    PipelineOptimizer trials are separated by >> 1 second per trial,
+    so collision probability is negligible.
     """
     from datetime import datetime
     return datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -185,7 +180,7 @@ def apply_overrides(config: dict, overrides: dict) -> dict:
         {"entry_detector.G_min_ratio": 3.0}
         → config["entry_detector"]["G_min_ratio"] = 3.0
 
-    Used by PipelineOptimizer (hyperparameter config override)
+    Used by PipelineOptimizer (feature config override)
     and detection_benchmark.py (--override CLI flag).
     """
     ...
@@ -281,13 +276,14 @@ def find_fill_bundle(
     by definition of tick_10.hour as the last tick timestamp of the bundle.
 
     Args:
-        ticks:       tick_10 rows, sorted by (hour, seq_id)
-        fill_second: HHMMSS — target fill time (t bar open + 5s)
+        ticks:       tick_10 DataFrame, sorted by (hour, seq_id)
+        fill_second: HHMMSS — target timestamp (e.g. t bar open + 5s)
 
     Returns:
-        fill_idx:    iloc index of fill_bundle in ticks (-1 if not found)
-        prev_bundle: pd.Series of the bundle before fill_bundle; None if fill_bundle is first
-        fill_bundle: pd.Series of the first bundle at or after fill_second; None if not found
+        fill_idx:    iloc index of fill_bundle in ticks; -1 if not found
+        prev_bundle: pd.Series of the bundle immediately before fill_bundle;
+                     None if fill_bundle is the first row or not found
+        fill_bundle: pd.Series of fill_bundle; None if not found
     """
     ...
 
@@ -299,7 +295,7 @@ def interpolate_bundle_price(
 ) -> float:
     """
     Estimate price at target_second using piecewise linear interpolation
-    with typical price midpoint.
+    across three anchors, clamped to the bundle's observed price range.
 
     Anchors:
         t_prev → prev_bundle.close          (last tick of prev bundle)
@@ -355,37 +351,112 @@ def track_price_breach(
     Detect the first tp/sl threshold breach from fill_second onward.
     Used directly by BacktestEngine (single threshold pair, immediate exit).
 
-    Phase 1 — tick-level scan within t bar:
-        Iterate tick bundles from fill_bundle_idx+1 onward within the t bar.
+    Args:
+        ohlcv_future:       1-minute bars from t bar onward (inclusive), sorted by hour
+        ticks_future:       tick_10 from t bar onward (inclusive), sorted by (hour, seq_id)
+        fill_price:         slippage-adjusted entry price
+        fill_second:        HHMMSS — t bar open + 5s (fill execution time)
+        threshold_up:       take-profit threshold (e.g. 0.03 or 0.05)
+        threshold_dn:       stop-loss threshold (e.g. 0.03)
+        exit_interpolation: True = tick-level tracking; False = 1-minute bar only
+        ambiguity_priority: "up" | "dn" — direction assigned on simultaneous bundle breach
+
+    Returns:
+        direction:   "up" | "dn" | None (neither threshold reached within supplied bars)
+        exit_price:  estimated price at breach point
+        exit_hour:   HHMMSS of the bar/bundle where breach occurred
+        is_ambiguous: True if tp and sl thresholds were simultaneously satisfied
+                      within the same 10-tick bundle (exit_interpolation=True)
+                      or the same 1-minute bar (exit_interpolation=False)
+
+    ---
+
+    exit_interpolation=False:
+        Scan 1-minute bars only.
+        take-profit: bars t+1 onward (t bar excluded — fill precedes bar high)
+        stop-loss:   bars t onward   (t bar included — immediate adverse move valid)
+        exit_price   = target_price (fixed, no interpolation)
+        is_ambiguous = True if a single bar's high >= tp_target AND low <= sl_target
+
+    exit_interpolation=True  [default]:
+
         tp_target = fill_price * (1 + threshold_up)
         sl_target = fill_price * (1 - threshold_dn)
 
-        Per bundle:
-            if bundle.high >= tp_target AND bundle.low <= sl_target:
-                is_ambiguous = True; direction = ambiguity_priority
-                exit_price = interpolate_bundle_price(prev, bundle, bundle.hour)
-                → return (direction, exit_price, bundle.hour, True)
-            elif bundle.high >= tp_target:
-                → return ("up", interpolated_price, bundle.hour, False)
-            elif bundle.low <= sl_target:
-                → return ("dn", interpolated_price, bundle.hour, False)
+        [Phase 1 — within t bar, tick-level]
 
-    Phase 2 — bar-level scan (t+1 bar onward), with tick refinement on hit:
-        For each 1-minute bar in order:
-            up_hit = bar.high >= tp_target; dn_hit = bar.low <= sl_target
-            if both: retrieve bundles, iterate same as Phase 1
-            if up: locate first bundle where high >= tp_target
-            if dn: locate first bundle where low  <= sl_target
+        find_fill_bundle() → fill_idx, prev_bundle, fill_bundle
+        Iterate bundles from fill_idx+1 onward within t bar (hour < t_bar_close_hour):
 
-    Note on asymmetry (exit_interpolation=False):
-        Phase 1 (t bar): sl breach detected (exit_interpolation has no effect on Phase 1)
-        Phase 2 (post-t bar): if exit_interpolation=False, tp uses t+1 bar open;
-                               sl still uses tick interpolation
-        Asymmetry is intentional — exit_interpolation=False is for sl-only interpolation mode.
+            For each bundle b (with prev_b = preceding bundle):
+                up_hit = b.high >= tp_target
+                dn_hit = b.low  <= sl_target
 
-    Returns:
-        (direction, exit_price, exit_hour, is_ambiguous)
-        direction: "up" | "dn" | None (no breach in supplied bars)
+                if up_hit AND dn_hit (simultaneous):
+                    is_ambiguous = True
+                    direction    = ambiguity_priority
+                    exit_price   = interpolate_bundle_price(prev_b, b, b.hour)
+                    exit_hour    = b.hour
+                    return
+
+                if up_hit:
+                    direction  = "up"
+                    exit_price = interpolate_bundle_price(prev_b, b, b.hour)
+                    exit_hour  = b.hour
+                    return
+
+                if dn_hit:
+                    direction  = "dn"
+                    exit_price = interpolate_bundle_price(prev_b, b, b.hour)
+                    exit_hour  = b.hour
+                    return
+
+        No breach within t bar → proceed to Phase 2.
+
+        [Phase 2 — bars after t bar, 1-minute scan with tick refinement]
+
+        For each 1-minute bar i (hour > t_bar_hour), in order:
+
+            up_hit = bar_i.high >= tp_target
+            dn_hit = bar_i.low  <= sl_target
+
+            if up_hit AND dn_hit:
+                Retrieve tick bundles for bar_i from ticks_future.
+                Iterate bundles within bar_i in (hour, seq_id) order:
+                    Apply same per-bundle logic as Phase 1.
+                    If breach found → return with is_ambiguous as appropriate.
+                If no tick data for bar_i:
+                    is_ambiguous = True
+                    direction    = ambiguity_priority
+                    exit_price   = tp_target if direction == "up" else sl_target
+                    exit_hour    = bar_i.hour
+                    return
+
+            elif up_hit:
+                Locate first bundle in bar_i where high >= tp_target.
+                exit_price = interpolate_bundle_price(prev_b, breach_b, breach_b.hour)
+                exit_hour  = bar_i.hour
+                direction  = "up"
+                return
+
+            elif dn_hit:
+                Locate first bundle in bar_i where low <= sl_target.
+                exit_price = interpolate_bundle_price(prev_b, breach_b, breach_b.hour)
+                exit_hour  = bar_i.hour
+                direction  = "dn"
+                return
+
+        return (None, fill_price, fill_second, False)   # no breach in supplied bars
+
+    Constraints:
+        - Tracking starts from fill_bundle_idx+1; fill_bundle itself excluded
+          (fill_bundle contains the fill execution time — prices before fill_second
+          within that bundle are excluded to avoid look-ahead)
+        - Session close (15:59) and time-limit exits are caller's responsibility;
+          track_price_breach() returns (None, ...) when neither threshold is reached
+        - Caller must supply ohlcv_future including t bar as first row
+          when exit_interpolation=True
+        - ticks_future must be pre-filtered to the relevant ticker/date
     """
     ...
 
@@ -405,39 +476,57 @@ def track_label_breach(
     Used exclusively by Labeler. Wraps track_price_breach() twice.
 
     Stage 1 — detect first ±3pp breach:
-        track_price_breach(fill_price=P_entry, threshold_up=threshold_3pp,
-                           threshold_dn=threshold_3pp, ...)
+        Calls track_price_breach(
+            fill_price=P_entry,
+            threshold_up=threshold_3pp,
+            threshold_dn=threshold_3pp,
+            ...
+        )
         → direction_1, exit_price_1, exit_hour_1, is_ambiguous
 
     If direction_1 is None:
-        → Return (None, False). Caller handles session-close / time-limit / dead-position.
+        → No ±3pp breach within supplied bars.
+        → Return (None, False).
+        → Caller proceeds to session-close / time-limit / dead-position path.
 
-    Stage 2 — detect ±5pp extension (from exit_hour_1 onward):
-        fill_second_2 = exit_hour_1 (bundles at Stage 1 breach excluded)
+    Stage 2 — resolve up3/up5 or dn3/dn5:
+        Inputs derived from Stage 1 result:
+            ohlcv_future filtered to hour >= exit_hour_1
+            ticks_future filtered to hour >= exit_hour_1
+            fill_second  = exit_hour_1   (skip bundles at or before breach point)
+            fill_price   = P_entry       (thresholds always relative to original P_entry)
+
         if direction_1 == "up":
-            track_price_breach(fill_price=P_entry, threshold_up=threshold_5pp,
-                               threshold_dn=threshold_3pp, ...)
-            up hit → label_up5; dn hit → label_up3
+            Calls track_price_breach(threshold_up=threshold_5pp, threshold_dn=threshold_3pp)
+            direction_2 == "up"  → label = "up5"  (+5pp reached before -3pp cutoff)
+            direction_2 != "up"  → label = "up3"  (-3pp cutoff or no further breach)
+
         if direction_1 == "dn":
-            track_price_breach(fill_price=P_entry, threshold_up=threshold_3pp,
-                               threshold_dn=threshold_5pp, ...)
-            dn hit → label_dn5; up hit → label_dn3
+            Calls track_price_breach(threshold_up=threshold_3pp, threshold_dn=threshold_5pp)
+            direction_2 == "dn"  → label = "dn5"  (-5pp reached before +3pp cutoff)
+            direction_2 != "dn"  → label = "dn3"  (+3pp cutoff or no further breach)
 
     Args:
-        threshold_3pp:      initial breach threshold (e.g. 0.03)
+        ohlcv_future:       1-minute bars from t bar onward (inclusive)
+        ticks_future:       tick_10 from t bar onward (inclusive)
+        P_entry:            t bar open price (label thresholds always relative to P_entry)
+        fill_second:        HHMMSS — t bar open + 5s
+        threshold_3pp:      first-breach threshold (e.g. 0.03)
         threshold_5pp:      extension threshold (e.g. 0.05)
         exit_interpolation: passed through to track_price_breach()
         ambiguity_priority: "up" | "dn" — consistent with labeler config
 
     Returns:
         label_direction: "up5" | "up3" | "dn3" | "dn5" | None
-        is_ambiguous:    True if Stage 1 detected simultaneous bundle-level breach
+        is_ambiguous:    True if Stage 1 detected simultaneous bundle-level breach;
+                         Stage 2 ambiguity does NOT affect this flag
 
     Constraints:
         - is_ambiguous sourced from Stage 1 only
         - Stage 2 fill_second = exit_hour_1 — bundles at breach point are excluded
         - All thresholds in Stage 2 remain relative to original P_entry, not breach price
-        - Does not handle session-close, time-limit, or dead-position exits
+        - This function does not handle session-close, time-limit, or dead-position exits;
+          those are the caller's responsibility when label_direction is None
     """
     ...
 
@@ -456,121 +545,68 @@ def simulate_exit_fill(
     Continues through session close into after-market until position is fully
     closed or all ticks are exhausted.
 
-    Used exclusively by BacktestEngine after track_price_breach() confirms direction.
-    Caller selects sell_rate based on exit direction:
-        sell_rate_tp for take-profit; sell_rate_sl for stop-loss.
+    Used exclusively by BacktestEngine after track_price_breach() confirms a
+    tp/sl direction. Caller selects sell_rate based on exit direction
+    (sell_rate_tp for take-profit, sell_rate_sl for stop-loss).
 
     Per-bundle fill logic (from breach_bundle_idx onward):
         if bundle overlaps halt interval in halts_df → skip
         per_tick_vol = bundle.volume / 10
         sellable     = floor(per_tick_vol * sell_rate)
-        if sellable == 0 → skip
+        if sellable == 0 → skip  (rare edge case; volume/10 * sell_rate < 1)
         filled_qty   = min(remaining, sellable)
         fill_price   = interpolate_bundle_price(prev_bundle, bundle, bundle.hour)
         total_value += fill_price * filled_qty
         total_filled += filled_qty
+        remaining   -= filled_qty
+        if remaining == 0 → break
 
     Breach bundle handling:
-        fill_price = breach_price (computed by caller via interpolate_bundle_price).
+        First fill opportunity is the breach bundle itself.
+        fill_price = breach_price (already computed by caller via interpolate_bundle_price).
         sellable   = floor((breach_bundle.volume / 10) * sell_rate)
         if sellable == 0 → skip breach bundle, start from breach_bundle_idx + 1.
 
-    Session close: no forced liquidation; after-market ticks processed identically.
-    Ticks exhausted with remaining > 0: unfilled_quantity = remaining.
+    Session close (155900 bar open):
+        No forced liquidation — simulation continues into after-market ticks seamlessly.
+        After-market ticks processed with identical per-bundle logic.
+
+    Ticks exhausted with remaining > 0:
+        unfilled_quantity = remaining
+        Caller treats as dead-position equivalent (applies dead_position_penalty_pct).
 
     weighted_avg_exit_price:
-        Σ(fill_price_i * qty_i) / Σ(qty_i) if total_filled > 0 else breach_price.
+        if total_filled > 0: Σ(fill_price_i * qty_i) / Σ(qty_i)
+        else: breach_price  (extreme edge case — no fills executed)
 
     Args:
-        ticks_exit:        tick_10 from breach_bundle_idx onward (full day, after-market included)
+        ticks_exit:        tick_10 from breach_bundle_idx onward, full day
+                           including after-market, sorted by (hour, seq_id)
         ohlcv_exit:        1-minute bars from breach bar onward (halt detection)
         position_size:     total shares to exit
         breach_bundle_idx: iloc index of breach bundle in ticks_exit
         breach_price:      estimated price at breach bundle
-        sell_rate:         fraction of per-tick volume available (sell_rate_tp or sell_rate_sl)
+                           (from interpolate_bundle_price(), computed by caller)
+        sell_rate:         fraction of per-tick volume available per tick
+                           caller selects: sell_rate_tp or sell_rate_sl per direction
         halts_df:          trading_halts rows for this ticker/date
 
     Returns:
-        (weighted_avg_exit_price, total_filled, unfilled_quantity, final_exit_hour)
-    """
-    ...
-```
+        weighted_avg_exit_price: float   — volume-weighted average fill price
+        total_filled:            int     — shares actually filled
+        unfilled_quantity:       int     — remaining shares (0 = fully closed)
+        final_exit_hour:         str     — HHMMSS of last partial fill bundle
 
----
-
-### Optimizer Support Utilities
-
-```python
-def compute_vol_regime_holdout(
-    db_conn: duckdb.DuckDBPyConnection,
-    vol_percentile: float,
-    window_days: int = 30,
-    vol_metric: str = "avg_intraday_range",
-) -> set[str]:
-    """
-    Compute holdout dates based on rolling volatility percentile.
-    Uses regular session bars only (093000–155900) from ohlcv_1min.
-
-    vol_metric = "avg_intraday_range":
-        per date = mean of (high - low) / open across all tickers
-
-    Rolling window: window_days calendar days.
-    Holdout: dates with rolling_vol >= quantile(vol_percentile).
-    Example: vol_percentile=0.80 → top 20% most volatile dates excluded.
-
-    Returns set of 'YYYYMMDD' date strings to exclude from training.
-    These dates are removed from labeled_df BEFORE outer fold generation:
-        remaining_df = full_labeled_df[~full_labeled_df["date"].isin(holdout_dates)]
-    """
-    ...
-
-
-def compute_consensus_config(
-    best_configs: list[dict],
-    search_space: dict,
-) -> dict:
-    """
-    Aggregate per-outer-fold best hyperparameter configs into a single deployable config.
-
-    Continuous / ordinal parameters (num_leaves, min_data_in_leaf,
-    feature_fraction, lambda_l1):
-        → median across outer folds → rounded to nearest valid grid value
-
-    Categorical parameters (session_mode):
-        → mode across outer folds
-        → tiebreak: "combined" > "regular" > "pre" (data coverage priority)
-
-    Args:
-        best_configs: list of hyperparameter dicts, one per outer fold
-        search_space: valid grid values per parameter (for rounding)
-
-    Returns:
-        consensus hyperparameter dict
-    """
-    ...
-
-
-def temporal_split_simple(
-    labeled_df:   pd.DataFrame,
-    session_mode: str | None,
-    val_fraction: float = 0.15,
-    embargo_days: int = 5,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Simple date-based train/val split without a test set.
-    Used by PipelineOptimizer for outer fold final model training
-    (val split for LightGBM early stopping only).
-
-    Order of operations:
-        1. Apply session_mode filter (if not None)
-        2. Sort by date ascending
-        3. Compute split boundary:
-             val_dates = last val_fraction of unique dates
-             train_dates = remaining (with embargo_days gap to val)
-        4. Return (train_df, val_df) without balancing
-
-    No downsampling applied — caller is responsible if needed.
-    Returns (train_df, val_df) as plain DataFrames.
+    Constraints:
+        - sell_rate is direction-aware: caller passes sell_rate_tp or sell_rate_sl
+          (sell_rate_tp > sell_rate_sl: take-profit exits in rising markets have
+           more available buy-side depth than stop-loss exits in falling markets)
+        - sellable = 0 treated as skip — expected to be rare since bundle.volume >= 10
+          and typical sell_rate values (0.15~0.30) yield sellable >= 1 for most bundles
+        - halt bundles skipped: volume unavailable during trading halt
+        - session close does not interrupt simulation; after-market ticks processed
+        - unfilled_quantity > 0 only when all ticks exhausted before full exit
+        - all fill prices computed via interpolate_bundle_price() for consistency
     """
     ...
 ```
@@ -600,9 +636,4 @@ def temporal_split_simple(
 - `track_label_breach()` is the high-level wrapper for two-stage label detection (Labeler only)
 - `simulate_exit_fill()` is called after track_price_breach() confirms direction;
   sell_rate selection (tp vs sl) is the caller's responsibility
-- `generate_run_id()` not called inside parallel workers — coordinator pre-generates
-  structured run_ids for nested validation context
-- `compute_vol_regime_holdout()` uses regular session bars only (093000–155900)
-- `compute_consensus_config()` grid-rounding uses nearest valid value from search_space
-- `temporal_split_simple()` applies no balancing — training-only utility for early stopping val
 - No pipeline business logic in this module — utility functions only
