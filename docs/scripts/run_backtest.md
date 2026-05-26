@@ -11,8 +11,8 @@ Loads test data, applies model predictions, runs BacktestEngine,
 writes results to trade_log and experiment_log tables.
 
 `run_backtest.py` is the **sole writer** of the `experiment_log` table.
-Called by PipelineOptimizer after the exploitation/full phase fold pass completes
-and the best trial is selected. Also runnable standalone.
+Called by PipelineOptimizer after the exploitation/full phase completes
+and the best trial or consensus config is selected. Also runnable standalone.
 
 ---
 
@@ -40,8 +40,6 @@ model_dir: Path | None  # directory containing trained model artifacts (optional
 #   - experiment_log table: summary row (sole writer)
 ```
 
----
-
 ## Pipeline Steps
 
 ```
@@ -65,7 +63,8 @@ model_dir: Path | None  # directory containing trained model artifacts (optional
 10. Write trade_log to DuckDB trade_log table
 11. Write experiment_log row to DuckDB:
         run_id, optimizer_run_id, run_at,
-        fold_idx, fold_test_start, fold_test_end,
+        fold_idx, outer_fold_idx, eval_type,
+        fold_test_start, fold_test_end,
         winning_rate, total_trades, winning_trades,
         avg_pnl_pct, total_pnl_abs, avg_slippage_pct,
         dead_position_count, dead_position_rate,
@@ -88,12 +87,14 @@ class Backtester:
 
     def run(
         self,
-        test_df: pd.DataFrame,
-        run_id: str,
-        model_dir: Path | None = None,
-        fold_idx: int | None = None,
+        test_df:         pd.DataFrame,
+        run_id:          str,
+        model_dir:       Path | None = None,
+        fold_idx:        int = -1,
+        outer_fold_idx:  int = -1,
         fold_test_start: str | None = None,
-        fold_test_end: str | None = None,
+        fold_test_end:   str | None = None,
+        eval_type:       str | None = None,
     ) -> dict:
         """
         Run backtest, write trade_log and experiment_log.
@@ -103,9 +104,17 @@ class Backtester:
             test_df:         test split DataFrame
             run_id:          matches the train_log run_id for this backtest
             model_dir:       directory containing model artifacts (optional)
-            fold_idx:        fold index if called from rolling context; None for standalone
-            fold_test_start: first date of test window ('YYYYMMDD'); None for standalone
-            fold_test_end:   last date of test window ('YYYYMMDD'); None for standalone
+            fold_idx:        inner rolling fold index (0-based); -1 for standalone/outer eval
+            outer_fold_idx:  outer fold index for nested validation (0-based);
+                             -1 for non-nested runs
+            fold_test_start: first date of test window ('YYYYMMDD');
+                             None for standalone (derived from test_df date range)
+            fold_test_end:   last date of test window ('YYYYMMDD');
+                             None for standalone (derived from test_df date range)
+            eval_type:       None          → standard backtest (standalone or old exploitation)
+                             "outer_validation" → nested validation outer fold evaluation
+                             "regime_holdout"   → regime holdout robustness check
+                             "final"            → consensus_config final model backtest
 
         optimizer_run_id passed via constructor (None for standalone).
         """
@@ -126,7 +135,11 @@ Options:
     --run-id            Explicit run ID (default: YYYYMMDD_HHMMSS via utils.generate_run_id())
 ```
 
-CLI always runs with `optimizer_run_id=None`, `fold_idx=None` (standalone mode).
+CLI always runs with:
+```
+optimizer_run_id=None, fold_idx=-1, outer_fold_idx=-1,
+eval_type=None (standalone mode)
+```
 
 ---
 
@@ -140,9 +153,12 @@ experiment_log_row = {
     "run_id":               run_id,
     "optimizer_run_id":     optimizer_run_id,    # None if standalone
     "run_at":               run_at,
-    "fold_idx":             fold_idx,            # None if standalone
-    "fold_test_start":      fold_test_start,     # None if standalone
-    "fold_test_end":        fold_test_end,        # None if standalone
+    "fold_idx":             fold_idx,            # -1 if standalone/outer eval
+    "outer_fold_idx":       outer_fold_idx,      # -1 if non-nested
+    "eval_type":            eval_type,           # None | "outer_validation" |
+                                                 # "regime_holdout" | "final"
+    "fold_test_start":      fold_test_start,     # None → derived from test_df.date.min()
+    "fold_test_end":        fold_test_end,       # None → derived from test_df.date.max()
     "winning_rate":         summary["winning_rate"],
     "total_trades":         summary["total_trades"],
     "winning_trades":       summary["winning_trades"],
@@ -204,7 +220,7 @@ Suppressed entries:  45
   Case C (dataset boundary):         2
 
 Run ID: 20250715_143022
-Fold:   13 (2025-09-01 ~ 2025-09-14)
+Fold:   -1 (standalone)
 Elapsed: 45.2s
 ```
 
@@ -220,7 +236,9 @@ Elapsed: 45.2s
 - Dead position case distribution computed from `test_df` directly
 - `optimizer_run_id` passed via constructor; `None` for standalone CLI runs
 - `run_id` generated via `utils.generate_run_id()` if not explicitly provided
-- `fold_idx`, `fold_test_start`, `fold_test_end` are None for standalone CLI runs
+- `fold_idx` default -1 for standalone CLI runs; 0-based for rolling inner folds
+- `outer_fold_idx` default -1 for non-nested runs; 0-based for nested outer folds
+- `eval_type` default None for standalone; set explicitly by PipelineOptimizer
 - In standalone mode, `fold_test_start`/`fold_test_end` derived from test_df date range
 - `suppressed_count` sourced from BacktestEngine summary — must always be present
 - Metadata columns (`is_dead_position`, `dead_position_case`, `is_ambiguous`) must not

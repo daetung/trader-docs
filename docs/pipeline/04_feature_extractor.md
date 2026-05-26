@@ -10,6 +10,7 @@
 Central integration entrypoint for all feature generation.
 Orchestrates IndicatorCalculator → Vectorizer → MetaFeatures → TemporalFeatures
 and outputs a single fixed-length feature vector per entry point.
+Also exposes a structured intermediate output interface for the Visualization tool.
 
 ---
 
@@ -28,6 +29,9 @@ config: dict
 **Output:**
 ```python
 feature_vector: dict[str, float]
+    # flat dict of all scalar features
+    # key format: "{indicator}_{transform}_{stat}"
+    # e.g. "rsi_stats_mean", "volume_window_ratio", "dist_r1_pct"
 ```
 
 ---
@@ -37,17 +41,19 @@ feature_vector: dict[str, float]
 ```
 bars (t-N ... t-1)
     │
-    ├─► MissingBarClassifier
+    ├─► MissingBarClassifier          (pre-processing step)
     │       classify gaps as halt / no_trade (using halts_df)
     │       forward-fill no_trade bars; keep halt bars as NaN
+    │       covers all time periods (pre/regular/after-market)
     │       output: cleaned bars + market_structure_features dict
     │
     ├─► IndicatorCalculator
     │       run all enabled indicators per config
-    │       output: dict[str → pd.DataFrame]
+    │       output: dict[str → pd.DataFrame]  (time-series per indicator)
     │
     ├─► Vectorizer
     │       for each indicator series, apply mapped transform method(s)
+    │       sr_levels: call vectorizer.sr_distance() directly (not via transform())
     │       output: dict[str, float]
     │
     ├─► MetaFeatureExtractor  (inline)
@@ -67,12 +73,17 @@ bars (t-N ... t-1)
 
 ## extract_batch() Implementation Strategy
 
+`extract_batch()` must not recompute indicators per entry point.
+The correct strategy is:
+
 ```
 1. Compute all indicators once for the full ticker bars DataFrame
+   → dict[str, pd.DataFrame]  (time-series per indicator, full date range)
 
 2. For each entry point in entry_points:
-   a. Slice indicator time-series up to t-1 bar
-   b. Apply Vectorizer → feature vector
+   a. Slice indicator time-series up to t-1 bar (by hour index)
+   b. Apply Vectorizer to sliced series → feature vector
+      (sr_levels: call vectorizer.sr_distance() directly)
    c. Append meta and temporal features
 
 3. Concatenate all feature vectors → feature matrix (pd.DataFrame)
@@ -116,11 +127,17 @@ class FeatureExtractor:
         Single entry point feature extraction.
         Used in live inference (Inferencer) and visualization.
         halts_df passed explicitly — consistent with extract_batch() pattern.
+        When return_intermediate=True, returns (feature_vector, intermediate_dict)
+        where intermediate_dict contains per-stage outputs for visualization.
         """
         ...
 
     def get_feature_names(self) -> list[str]:
-        """Return ordered list of all feature column names (excluding identifiers)."""
+        """
+        Return ordered list of all active feature column names.
+        Excludes identifier columns (ticker, date, hour, p_entry) and
+        metadata columns (is_dead_position, dead_position_case, is_ambiguous).
+        """
         ...
 
     def get_feature_schema(self) -> dict[str, str]:
@@ -131,6 +148,26 @@ class FeatureExtractor:
         """
         ...
 ```
+
+---
+
+## Meta Features
+
+```python
+meta_features = {
+    "log_market_cap":          float,   # log(market_cap); raw value in stock_meta
+    "log_shares_outstanding":  float,   # log(shares_outstanding)
+    "log_price_52h":           float,   # log(price_52h)
+    "log_price_52l":           float,   # log(price_52l)
+    "sector_code":             int,     # encoded via sector_map.json
+                                        # unknown sector → 0
+                                        # known sectors → 1, 2, 3, ...
+                                        # registered as LightGBM categorical
+}
+```
+
+Monetary fields are log-transformed at feature extraction time.
+Raw values are stored in `stock_meta` — not transformed in DB.
 
 ---
 
@@ -146,8 +183,16 @@ temporal_features = {
 }
 ```
 
-`entry.hour` is the clock time at which detection fired — not t bar OHLCV.
+`entry.hour` is the clock time at which detection fired — not t bar OHLCV data,
+and its use as a temporal feature does not constitute data leakage.
+
 Holiday calendar sourced from `us_holidays` table in DuckDB.
+`day_of_week` encoding map loaded via `utils.load_encoding_map("day_of_week_map")`.
+`is_monday` and `is_friday` binary features must NOT be generated (subsumed by `day_of_week`).
+
+Note on scaling: LightGBM is tree-based and invariant to monotonic transforms.
+`minute_of_session` is kept as raw integer.
+Scaling will be applied at MLP comparison stage only.
 
 ---
 
@@ -155,17 +200,74 @@ Holiday calendar sourced from `us_holidays` table in DuckDB.
 
 ```python
 market_structure_features = {
-    "had_halt_today":            int,    # 1 if any halt before t-1 bar
-    "bars_since_last_halt":      int,    # NaN if no halt today
-    "halt_reason_code":          int,    # encoded via halt_reason_code_map; 0 = no halt
-    "halt_count_today":          int,
-    "missing_bar_count":         int,
-    "synthetic_bar_ratio":       float,
-    "consecutive_synthetic_max": int,
+    # Halt-related
+    "had_halt_today":            int,    # 1 if any halt before t-1 bar else 0
+    "bars_since_last_halt":      int,    # bars since last halt ended; NaN if no halt today
+    "halt_reason_code":          int,    # encoded via halt_reason_code_map.json
+                                         # 0 = no halt today ("no_halt" entry in map)
+                                         # registered as LightGBM categorical
+                                         # always an integer — never NaN
+    "halt_count_today":          int,    # total halts before t-1 bar
+
+    # Missing bar composition
+    "missing_bar_count":         int,    # total no_trade gap bars in lookback window
+
+    # Synthetic bar quality indicators
+    "synthetic_bar_ratio":       float,  # no_trade_bars / total_bars_in_window [0.0, 1.0]
+    "consecutive_synthetic_max": int,    # longest run of consecutive no_trade bars
 }
 ```
 
 Halt data sourced from `halts_df` (passed explicitly — not fetched internally).
+
+**halt_reason_code encoding:**
+```
+Loaded via utils.load_encoding_map("halt_reason_code_map").
+Map file: configs/halt_reason_code_map.json
+
+Reserved entry:
+    "no_halt": 0   ← used when had_halt_today == 0
+Known NYSE reason codes start from 1 (e.g. "T1": 1, "T6": 2, "LUDP": 3, ...)
+Unknown reason codes: map to -1 at runtime (not stored in map file)
+
+When had_halt_today == 0:
+    halt_reason_code = 0   ("no_halt")
+    bars_since_last_halt = NaN
+    halt_count_today = 0
+```
+
+**synthetic_bar_ratio computation:**
+```
+lookback_bars = all bars in the t-N...t-1 window passed to IndicatorCalculator
+no_trade_bars = bars classified as no_trade by MissingBarClassifier
+                (halt bars excluded — they are NaN, not forward-filled)
+
+synthetic_bar_ratio = len(no_trade_bars) / len(lookback_bars)
+```
+
+**consecutive_synthetic_max computation (FeatureExtractor responsibility):**
+```
+From classify_missing_bars() output:
+    classification: dict[HHMMSS → "halt" | "no_trade"]
+
+Steps:
+    1. Sort classification keys (HHMMSS strings) in ascending order
+    2. Iterate sorted keys; count consecutive "no_trade" runs
+    3. consecutive_synthetic_max = max run length observed
+    4. If no no_trade bars exist → consecutive_synthetic_max = 0
+```
+
+---
+
+## Identifier and Metadata Columns
+
+`p_entry` is stored as an identifier column — not a feature.
+It must never appear in `get_feature_names()` output.
+It is required by BacktestEngine for fill price calculation.
+
+`is_dead_position`, `dead_position_case`, `is_ambiguous` are stored as
+metadata columns — not features. They must not appear in `get_feature_names()`.
+They are used by ClassBalancer for pre-balance filtering.
 
 ---
 
@@ -173,7 +275,7 @@ Halt data sourced from `halts_df` (passed explicitly — not fetched internally)
 
 - Feature column names must be deterministic and stable across runs
 - `extract_batch()` computes indicators once per ticker — not once per entry point
-- Disabled feature groups produce no columns
+- Disabled feature groups (per config) produce no columns
 - `sector_code`, `day_of_week`, `halt_reason_code` must be passed as categoricals to LightGBM
 - NaN values permitted in continuous features — do not impute
 - `p_entry` must never appear as a feature column
@@ -182,12 +284,16 @@ Halt data sourced from `halts_df` (passed explicitly — not fetched internally)
 - Halt bars (NaN) propagate naturally into indicator NaN — do not suppress
 - Temporal features use `entry.hour` (t bar open time) as reference — not data leakage
 - Encoding maps (`sector_map`, `day_of_week_map`, `halt_reason_code_map`) loaded via
-  `utils.load_encoding_map()` internally — Inferencer does not inject maps
-- `sector_code` unknown → 0; known sectors → 1, 2, 3, ...
-- `halt_reason_code` no halt → 0; known codes → 1, 2, ...; unknown codes → -1
-- All "categorical" typed features are guaranteed integers, never NaN
+  `utils.load_encoding_map()` internally — Inferencer does not load or inject maps
+- `sector_code` unknown → 0 (not -1); known sectors → 1, 2, 3, ...
+- `halt_reason_code` no halt → 0 ("no_halt" in map); known codes → 1, 2, ...; unknown codes → -1
+- All "categorical" typed features in `get_feature_schema()` are guaranteed integers, never NaN
 - `halts_df` passed explicitly to both `extract_batch()` and `extract()`;
   consistent with Labeler and BacktestEngine patterns (no internal DB queries)
+- `consecutive_synthetic_max`: computed by FeatureExtractor from `classify_missing_bars()`
+  classification dict, sorted by HHMMSS key ascending
 - `sr_distance()` called directly by FeatureExtractor — never via `transform()`
+- `synthetic_bar_ratio` and `consecutive_synthetic_max` computed from MissingBarClassifier
+  output — no changes to IndicatorCalculator or Vectorizer required
 - `is_dead_position`, `dead_position_case`, `is_ambiguous` passed through from Labeler —
   not computed by FeatureExtractor

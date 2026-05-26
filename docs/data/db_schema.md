@@ -150,7 +150,7 @@ CREATE TABLE entry_points (
 );
 
 -- Labeled samples (output of Labeler)
--- dead_position_case: "A" (next-day data available, ticker found) |
+-- dead_position_case: "A" (next-day data available, ticker found in coverage) |
 --                     "B" (next-day exists, ticker missing — possible delisting) |
 --                     "C" (dataset boundary — next day not in dataset) |
 --                     NULL (not a dead position)
@@ -174,17 +174,25 @@ CREATE TABLE labeled_samples (
     PRIMARY KEY (ticker, date, hour)
 );
 
--- Train log (output of run_train.py — one row per fold)
--- trial_idx: 0-based counter per optimizer_run_id in exploitation phase;
---            always 0 for selection/full/standalone (single implicit trial).
---            NOT NULL DEFAULT 0 — schema consistent across all phases.
--- fold_idx:  NULL for standalone; 0-based integer for rolling folds.
+-- Train log (output of run_train.py — one row per training run or fold)
+-- trial_idx:      -1  = outer evaluation row (not part of inner trial search)
+--                  0  = standalone / selection / full (single implicit trial)
+--                 >=0 = exploitation inner trial (0-based per optimizer_run_id)
+-- fold_idx:       -1  = standalone / outer eval (no rolling fold structure)
+--                 >=0 = rolling inner fold index (0-based)
+-- outer_fold_idx: -1  = non-nested run (standalone, selection, full, non-nested exploitation)
+--                 >=0 = nested validation outer fold index (0-based)
 -- fold_train_end: last date of train window ('YYYYMMDD'); NULL for standalone.
--- auc_std:   std of AUC across all folds in the same run or trial.
---            NULL at write time — populated via UPDATE by PipelineOptimizer
---            on fold_run_ids[-1] (MAX fold_idx row, guaranteed by generate_folds() order).
--- phase:     "selection" | "exploitation" | "full" | NULL (standalone)
--- feature_config: JSON of active feature group config (optimizer trials) or
+-- auc_std:        std of AUC across all folds in the same run or trial.
+--                 NULL at write time — populated via UPDATE by PipelineOptimizer
+--                 on fold_run_ids[-1] (last completed round's run_id for that trial).
+--                 Pruned trials retain auc_std = NULL; is_pruned = TRUE on fold_run_ids[-1].
+--                 Sequential mode: fold_run_ids[-1] = MAX fold_idx (guaranteed by
+--                 generate_folds() ascending order). Nested/parallel mode: fold_run_ids[-1]
+--                 = last Successive Halving round completed.
+-- phase:          "selection" | "exploitation" | "full" | NULL (standalone)
+-- is_pruned:      TRUE if this row is the last round of a Successive Halving pruned trial
+-- feature_config: JSON of active hyperparameter config (optimizer trials) or
 --                 full config snapshot (standalone). Never NULL.
 CREATE TABLE train_log (
     run_id              VARCHAR      NOT NULL,
@@ -192,9 +200,8 @@ CREATE TABLE train_log (
     run_at              VARCHAR      NOT NULL,
     phase               VARCHAR,                 -- "selection"|"exploitation"|"full"|NULL
     trial_idx           INTEGER      NOT NULL DEFAULT 0,
-                                                 -- exploitation: 0-based per optimizer_run_id
-                                                 -- selection/full/standalone: always 0
-    fold_idx            INTEGER,                 -- NULL for standalone; 0-based for rolling
+    fold_idx            INTEGER      NOT NULL DEFAULT -1,
+    outer_fold_idx      INTEGER      NOT NULL DEFAULT -1,
     fold_train_end      VARCHAR,                 -- 'YYYYMMDD'; NULL for standalone
     feature_config      VARCHAR      NOT NULL,
     n_features          INTEGER,
@@ -205,62 +212,70 @@ CREATE TABLE train_log (
     auc_dn3             DOUBLE,
     auc_dn5             DOUBLE,
     auc_mean            DOUBLE,
-    auc_std             DOUBLE,                  -- NULL until UPDATE by PipelineOptimizer
-                                                 -- set on fold_run_ids[-1] only
+    auc_std             DOUBLE,                  -- NULL until UPDATE; NULL for pruned trials
     auc_reduced_mean    DOUBLE,
     best_of_loop        BOOLEAN,
+    is_pruned           BOOLEAN      NOT NULL DEFAULT FALSE,
     notes               VARCHAR,
     PRIMARY KEY (run_id)
 );
 
 -- Experiment log (output of run_backtest.py — one row per completed backtest)
+-- fold_idx:        -1  = standalone / outer eval (not a rolling inner fold)
+--                  >=0 = rolling inner fold index
+-- outer_fold_idx:  -1  = non-nested run; >=0 = nested outer fold index
+-- eval_type:       NULL              = standard backtest (standalone or non-nested exploitation)
+--                  "outer_validation"= nested validation outer fold evaluation
+--                  "regime_holdout"  = regime holdout robustness check
+--                  "final"           = consensus_config final model backtest
 -- fold_test_start, fold_test_end:
---   Optimizer context: derived from fold metadata.
+--   Optimizer context: derived from fold_meta["fold_test_start/end"].
 --   Standalone mode:   derived from test_df["date"].min() and .max() (never NULL).
 -- suppressed_count: entries blocked by suppress_threshold during backtest.
 CREATE TABLE experiment_log (
-    run_id              VARCHAR      NOT NULL,
-    optimizer_run_id    VARCHAR,
-    run_at              VARCHAR      NOT NULL,
-    fold_idx            INTEGER,
-    fold_test_start     VARCHAR,                 -- 'YYYYMMDD'; derived from test_df in standalone
-    fold_test_end       VARCHAR,                 -- 'YYYYMMDD'; derived from test_df in standalone
-    winning_rate        DOUBLE,
-    total_trades        INTEGER,
-    winning_trades      INTEGER,
-    avg_pnl_pct         DOUBLE,
-    total_pnl_abs       DOUBLE,
-    avg_slippage_pct    DOUBLE,
-    dead_position_count INTEGER,
-    dead_position_rate  DOUBLE,
-    suppressed_count    INTEGER,
-    trades_by_signal    VARCHAR,                 -- JSON
-    trades_by_exit      VARCHAR,                 -- JSON
+    run_id               VARCHAR      NOT NULL,
+    optimizer_run_id     VARCHAR,
+    run_at               VARCHAR      NOT NULL,
+    fold_idx             INTEGER      NOT NULL DEFAULT -1,
+    outer_fold_idx       INTEGER      NOT NULL DEFAULT -1,
+    eval_type            VARCHAR,                -- NULL | "outer_validation" |
+                                                 -- "regime_holdout" | "final"
+    fold_test_start      VARCHAR,                -- 'YYYYMMDD'
+    fold_test_end        VARCHAR,                -- 'YYYYMMDD'
+    winning_rate         DOUBLE,
+    total_trades         INTEGER,
+    winning_trades       INTEGER,
+    avg_pnl_pct          DOUBLE,
+    total_pnl_abs        DOUBLE,
+    avg_slippage_pct     DOUBLE,
+    dead_position_count  INTEGER,
+    dead_position_rate   DOUBLE,
+    suppressed_count     INTEGER,
+    trades_by_signal     VARCHAR,                -- JSON
+    trades_by_exit       VARCHAR,                -- JSON
     PRIMARY KEY (run_id)
 );
 
 -- Trade log (output of BacktestEngine — one row per executed trade)
 CREATE TABLE trade_log (
-    trade_id                VARCHAR      NOT NULL,
     run_id                  VARCHAR      NOT NULL,
     ticker                  VARCHAR      NOT NULL,
     date                    VARCHAR      NOT NULL,
-    entry_bar               INTEGER      NOT NULL,  -- int(HHMMSS)
-    exit_bar                INTEGER,
-    signal                  VARCHAR,                -- "up5" | "up3"
-    fill_price              DOUBLE,
-    weighted_avg_exit_price DOUBLE,                 -- volume-weighted across partial fills
+    entry_bar               INTEGER      NOT NULL,  -- HHMMSS as integer
+    exit_bar                INTEGER      NOT NULL,
+    signal                  VARCHAR      NOT NULL,  -- "up5" | "up3"
+    fill_price              DOUBLE       NOT NULL,
+    exit_price              DOUBLE,
+    weighted_avg_exit_price DOUBLE,
     pnl_pct                 DOUBLE,
-    quantity                INTEGER,
-    total_filled            INTEGER,                -- shares actually exited
-    unfilled_quantity       INTEGER,                -- 0 = fully closed
-    partial_fills_count     INTEGER,                -- tick bundles used for exit
-    exit_reason             VARCHAR,                -- "take_profit"|"stop_loss"|"session_end"|
-                                                    -- "time_limit"|"dead_position"|...
+    exit_reason             VARCHAR,
+    is_dead_position        BOOLEAN      NOT NULL DEFAULT FALSE,
     slippage_pct            DOUBLE,
-    is_ambiguous            BOOLEAN,                -- simultaneous bundle-level tp/sl breach
-    is_dead_position        BOOLEAN,
-    PRIMARY KEY (trade_id)
+    quantity                INTEGER,
+    partial_fills_count     INTEGER,
+    unfilled_quantity       INTEGER,
+    is_ambiguous            BOOLEAN      NOT NULL DEFAULT FALSE,
+    PRIMARY KEY (run_id, ticker, date, entry_bar)
 );
 ```
 
@@ -269,11 +284,11 @@ CREATE TABLE trade_log (
 ## Common Query Patterns
 
 ```python
-# Load 1-minute bars for a ticker date range
+# Load OHLCV for a specific ticker and date range
 bars = con.execute("""
     SELECT * FROM ohlcv_1min
     WHERE ticker = ?
-    AND date >= ? AND date <= ?
+      AND date >= ? AND date <= ?
     ORDER BY date, hour
 """, ["AAPL", "20250101", "20250630"]).df()
 
@@ -306,13 +321,14 @@ next_day = con.execute("""
     ORDER BY date LIMIT 1
 """, ["20250714"]).fetchone()
 
-# Rolling fold summary — AUC by trial and fold for a given optimizer run
+# Rolling fold summary — inner trial AUC by trial and fold for a given optimizer run
 fold_summary = con.execute("""
-    SELECT trial_idx, fold_idx, fold_train_end, auc_mean, auc_std, n_features, phase
+    SELECT trial_idx, fold_idx, outer_fold_idx, fold_train_end,
+           auc_mean, auc_std, is_pruned, n_features, phase
     FROM train_log
     WHERE optimizer_run_id = ?
-      AND fold_idx IS NOT NULL
-    ORDER BY trial_idx, fold_idx
+      AND fold_idx >= 0
+    ORDER BY outer_fold_idx, trial_idx, fold_idx
 """, ["20250519_143022"]).df()
 
 # Retrieve auc_std for a completed selection/full run (single run_id)
@@ -322,22 +338,65 @@ run_auc_std = con.execute("""
     WHERE run_id = ?
 """, ["<fold_run_ids[-1]>"]).fetchone()
 
-# Retrieve auc_std per trial for exploitation phase
+# Retrieve auc_std per completed trial for exploitation (excludes pruned)
 trial_auc_std = con.execute("""
-    SELECT trial_idx, auc_std, auc_mean
+    SELECT trial_idx, outer_fold_idx, auc_std, auc_mean
     FROM train_log
     WHERE optimizer_run_id = ?
       AND auc_std IS NOT NULL
-    ORDER BY trial_idx
+      AND is_pruned = FALSE
+    ORDER BY outer_fold_idx, trial_idx
 """, ["20250519_143022"]).df()
 
-# Experiment log with fold period for rolling backtest
+# Best trial per outer fold
+best_per_outer = con.execute("""
+    SELECT outer_fold_idx, trial_idx, auc_mean, auc_std, feature_config
+    FROM train_log
+    WHERE optimizer_run_id = ?
+      AND best_of_loop = TRUE
+      AND trial_idx >= 0
+    ORDER BY outer_fold_idx
+""", ["20250519_143022"]).df()
+
+# Successive Halving pruning statistics per outer fold
+pruning_stats = con.execute("""
+    SELECT outer_fold_idx,
+           COUNT(*) FILTER (WHERE is_pruned = TRUE)          AS pruned_trials,
+           COUNT(*) FILTER (WHERE is_pruned = FALSE
+                              AND trial_idx >= 0)            AS completed_trials
+    FROM train_log
+    WHERE optimizer_run_id = ?
+      AND fold_idx >= 0
+    GROUP BY outer_fold_idx
+    ORDER BY outer_fold_idx
+""", ["20250519_143022"]).df()
+
+# Nested validation outer fold results
+outer_results = con.execute("""
+    SELECT outer_fold_idx, fold_test_start, fold_test_end,
+           winning_rate, total_trades, eval_type
+    FROM experiment_log
+    WHERE optimizer_run_id = ?
+      AND eval_type = 'outer_validation'
+    ORDER BY outer_fold_idx
+""", ["20250519_143022"]).df()
+
+# Regime holdout and final model results
+robustness = con.execute("""
+    SELECT eval_type, winning_rate, total_trades, avg_pnl_pct
+    FROM experiment_log
+    WHERE optimizer_run_id = ?
+      AND eval_type IN ('final', 'regime_holdout')
+""", ["20250519_143022"]).df()
+
+# Experiment log for standard backtest results (inner fold or standalone)
 exp_results = con.execute("""
     SELECT run_id, fold_idx, fold_test_start, fold_test_end,
            winning_rate, total_trades, suppressed_count
     FROM experiment_log
     WHERE optimizer_run_id = ?
-    ORDER BY fold_idx NULLS LAST
+      AND (eval_type IS NULL OR eval_type NOT IN ('outer_validation', 'regime_holdout', 'final'))
+    ORDER BY fold_idx
 """, ["20250519_143022"]).df()
 
 # Ambiguous sample rate in labeled_samples

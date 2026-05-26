@@ -1,4 +1,15 @@
-# Architecture
+# Stock Auto-Scalping System — Architecture Overview
+
+## Project Summary
+
+- **Goal**: Predict short-term price direction at scalping entry points using a LightGBM-based supervised classification pipeline
+- **Primary deliverable**: Preprocessor–model pipeline with optimal winning rate
+- **Data**: US market, multi-month history, 1min OHLCV + 10tick per ticker (all sessions)
+- **Model**: LightGBM (5 independent binary classifiers) → MLP comparison in later phase
+
+For detailed design rules, refer to the per-module docs listed in the [Docs Index](#docs-index) below.
+
+---
 
 ## System Pipeline
 

@@ -21,7 +21,7 @@ class Trainer:
     def __init__(
         self,
         config: dict,
-        db_conn: duckdb.DuckDBPyConnection,
+        db_conn: duckdb.DuckDBPyConnection | None,
         optimizer_run_id: str | None = None,
     ): ...
 
@@ -31,13 +31,15 @@ class Trainer:
         val_df:         pd.DataFrame,
         test_df:        pd.DataFrame,
         run_id:         str | None = None,
-        fold_idx:       int | None = None,
+        fold_idx:       int = -1,
+        outer_fold_idx: int = -1,
         fold_train_end: str | None = None,
         feature_config: dict | None = None,
         feature_names:  list[str] | None = None,
         run_reducer:    bool = False,
         phase:          str | None = None,
         trial_idx:      int = 0,
+        dry_run:        bool = False,
     ) -> dict:
         """
         Train model, evaluate, optionally run reducer, write train_log, save artifact.
@@ -47,13 +49,19 @@ class Trainer:
                 Preprocessed DataFrames (balanced train, val, test splits).
             run_id:
                 Explicit run ID. If None, generated via utils.generate_run_id().
+                In nested validation context, coordinator pre-generates run_id
+                as "{optimizer_run_id}_o{outer_fold_idx}_t{trial_idx}_f{fold_idx}"
+                and passes it here; generate_run_id() is NOT called inside workers.
             fold_idx:
-                Rolling fold index (0-based). None for standalone.
+                Rolling inner fold index (0-based). Default -1 for standalone/outer eval.
+            outer_fold_idx:
+                Outer fold index for nested validation (0-based). Default -1 for
+                non-nested runs (standalone, selection, full, non-nested exploitation).
             fold_train_end:
                 Last date of train window ('YYYYMMDD'). None for standalone.
                 Sourced from fold_meta["fold_train_end"] — not computed independently.
             feature_config:
-                Active feature group config dict for this trial.
+                Active hyperparameter config dict for this trial.
                 None in standalone mode — full config snapshot used instead.
             feature_names:
                 Explicit feature list (exploitation phase, selected_features).
@@ -67,9 +75,24 @@ class Trainer:
                 "selection" | "exploitation" | "full" | None (standalone).
                 Recorded in train_log for diagnostics.
             trial_idx:
-                0-based trial counter within this optimizer_run_id.
-                Always 0 for standalone/selection/full (single implicit trial).
-                Written to train_log per fold row.
+                0-based trial counter within the inner trial loop.
+                -1 for outer evaluation rows (not part of inner trial search).
+                0 for standalone/selection/full (single implicit trial).
+            dry_run:
+                True = train and evaluate normally, but skip train_log INSERT
+                       and model artifact save. Returns train_log_row in result dict.
+                       Used by parallel workers in nested validation — coordinator
+                       performs all DB writes after collecting worker results.
+                False = write train_log INSERT and save artifact (default).
+                db_conn may be None when dry_run=True.
+
+        Returns:
+            dict with keys:
+                "auc_mean":          float   — mean test AUC across 5 classifiers
+                "auc_std":           None    — populated by optimizer via UPDATE
+                "reduction_report":  dict | None  — non-None when run_reducer=True
+                "selected_features": list[str] | None  — non-None when run_reducer=True
+                "train_log_row":     dict    — always present; coordinator uses when dry_run=True
         """
         ...
 ```
@@ -91,8 +114,11 @@ Options:
     --features      Path to selected_features.json (load pre-selected feature list)
 ```
 
-CLI always runs with `optimizer_run_id=None`, `fold_idx=None`, `fold_train_end=None`,
-`trial_idx=0` (standalone mode).
+CLI always runs with:
+```
+optimizer_run_id=None, fold_idx=-1, outer_fold_idx=-1,
+fold_train_end=None, trial_idx=0, dry_run=False
+```
 
 ---
 
@@ -104,9 +130,10 @@ train_log_row = {
     "optimizer_run_id":    optimizer_run_id,        # None for standalone
     "run_at":              run_at,
     "phase":               phase,                   # "selection"|"exploitation"|"full"|None
-    "trial_idx":           trial_idx,               # 0 for standalone/selection/full;
-                                                    # 0-based for exploitation
-    "fold_idx":            fold_idx,                # None for standalone
+    "trial_idx":           trial_idx,               # -1 for outer eval; 0 for standalone;
+                                                    # 0-based for exploitation inner trials
+    "fold_idx":            fold_idx,                # -1 for standalone/outer eval
+    "outer_fold_idx":      outer_fold_idx,          # -1 for non-nested runs
     "fold_train_end":      fold_train_end,          # None for standalone
     "feature_config":      json.dumps(feature_config)
                            if feature_config is not None
@@ -120,12 +147,17 @@ train_log_row = {
     "auc_dn5":             eval_result["dn5"]["test_auc"],
     "auc_mean":            eval_result["mean_test_auc"],
     "auc_std":             None,    # set by PipelineOptimizer via UPDATE
-                                    # on fold_run_ids[-1] after all folds complete
+                                    # on fold_run_ids[-1] after trial completes
+                                    # pruned trials retain NULL
     "auc_reduced_mean":    None,    # set only when --reduce CLI flag used
     "best_of_loop":        False,   # set by PipelineOptimizer via UPDATE
+    "is_pruned":           False,   # set TRUE by Coordinator via UPDATE for pruned trials
     "notes":               None,
 }
 ```
+
+When `dry_run=True`, this dict is included in the return value under `result["train_log_row"]`.
+The coordinator performs the actual INSERT. When `dry_run=False`, Trainer performs INSERT directly.
 
 ---
 
@@ -150,12 +182,17 @@ trainer:
 - Must print summary results even if dimensionality reduction is run
 - Model artifacts must include config snapshot for reproducibility
 - Must handle empty DataFrames gracefully (exit with error message)
-- `run_id` generated via `utils.generate_run_id()`
+- `run_id` generated via `utils.generate_run_id()` only when run_id argument is None
+- In nested validation, coordinator pre-generates run_id and passes it explicitly —
+  workers must NOT call generate_run_id() internally
 - `experiment_log` is NOT written by run_train.py — only train_log
 - `best_of_loop` updated by PipelineOptimizer via UPDATE, not by Trainer itself
+- `is_pruned` updated by PipelineOptimizer Coordinator via UPDATE, not by Trainer
 - `auc_std` updated by PipelineOptimizer via UPDATE on `fold_run_ids[-1]`
-- `trial_idx` always written to train_log; default 0 for non-exploitation phases
-- `fold_idx` and `fold_train_end` are None for standalone CLI runs
+- `fold_idx` default -1 for standalone (no rolling fold); 0-based for rolling folds
+- `outer_fold_idx` default -1 for non-nested runs; 0-based for nested outer folds
+- `trial_idx` default 0 for standalone/selection/full; -1 for outer eval rows;
+  0-based for exploitation inner trials
 - `fold_train_end` sourced from fold_meta["fold_train_end"] — Trainer does not compute it
 - Sample weight column (`__sample_weight__`) generated inside Trainer when
   `use_ambiguous_sample_weight=True`; must not appear in feature_names
@@ -165,3 +202,5 @@ trainer:
   is called by PipelineOptimizer
 - Session_mode filtering applied upstream by ClassBalancer — Trainer does not re-apply it
 - `is_ambiguous` column used for weight assignment only — never appears in feature_names
+- `dry_run=True`: db_conn may be None; no INSERT, no artifact save; train_log_row in result
+- `dry_run=False`: db_conn must be valid; performs INSERT and artifact save

@@ -63,7 +63,7 @@ SELECT * FROM trading_halts
 WHERE ticker = ? AND date = ?
 ```
 Loaded once per ticker/date alongside OHLCV and tick data.
-Passed explicitly to internal methods.
+Passed explicitly to all internal methods.
 
 ### Trading calendar (for dead position resolution)
 ```sql
@@ -75,6 +75,48 @@ WHERE date > ? ORDER BY date LIMIT 1
 ```sql
 SELECT 1 FROM ticker_data_coverage
 WHERE ticker = ? AND date = ?
+```
+
+For each (ticker, date) group, the following data is loaded from DuckDB once
+and passed down to internal methods:
+
+```python
+# Loaded once per ticker
+ohlcv_ticker = db_conn.execute("""
+    SELECT * FROM ohlcv_1min
+    WHERE ticker = ? AND date IN (?)
+    ORDER BY date, hour
+""", [ticker, *dates]).df()
+
+# Loaded once per ticker/date
+ticks_td = db_conn.execute("""
+    SELECT * FROM tick_10 WHERE ticker = ? AND date = ?
+    ORDER BY hour, seq_id
+""", [ticker, date]).df()
+
+halts_td = db_conn.execute("""
+    SELECT * FROM trading_halts WHERE ticker = ? AND date = ?
+""", [ticker, date]).df()
+
+# halts_td passed explicitly to all internal methods
+fill_second  = utils.hour_add_seconds(entry_hour, 5)
+search_limit = utils.hour_add_seconds(entry_hour, 100)
+ticks_entry  = ticks_td[(ticks_td["hour"] >= entry_hour) &
+                         (ticks_td["hour"] < search_limit)]
+
+fill_idx, prev_bundle, fill_bundle = utils.find_fill_bundle(ticks_entry, fill_second)
+fill_price = utils.interpolate_bundle_price(prev_bundle, fill_bundle, fill_second) \
+             if fill_bundle is not None else p_entry
+
+direction, exit_price, exit_hour, is_ambiguous = utils.track_price_breach(
+    ohlcv_future=bars_from_t,
+    ticks_future=ticks_td[ticks_td["hour"] >= entry_hour],
+    fill_price=fill_price,
+    fill_second=fill_second,
+    threshold_up=tp_pct,
+    threshold_dn=config["backtest"]["stop_loss_pct"],
+    exit_interpolation=config["backtest"]["exit_interpolation"],
+)
 ```
 
 ---
@@ -146,8 +188,8 @@ Entry executed only if signal is not None AND cooldown check passes.
 **Suppression behavior:**
 - If `prob_dn5 >= suppress_threshold` or `prob_dn3 >= suppress_threshold`,
   signal is None regardless of upside probabilities.
-- `suppress_threshold: null` in config disables suppression (original behavior).
-- Suppressed entries are not logged to trade_log (treated same as no-signal).
+- `suppress_threshold: null` disables suppression.
+- Suppressed entries are not logged to trade_log.
 
 ### Cooldown guard
 ```python
@@ -185,7 +227,7 @@ tp_pct = config["backtest"]["take_profit_up3"] if signal == "up3" \
 
 direction, exit_price, exit_hour, is_ambiguous = utils.track_price_breach(
     ohlcv_future       = bars from t bar onward (inclusive), sorted by hour,
-    ticks_future       = ticks_full_day filtered to hour >= entry_hour,
+    ticks_future       = ticks_td filtered to hour >= entry_hour,
     fill_price         = fill_price,
     fill_second        = fill_second,
     threshold_up       = tp_pct,
@@ -198,21 +240,20 @@ if direction is not None:
     sell_rate = config["backtest"]["sell_rate_tp"] if direction == "up" \
                 else config["backtest"]["sell_rate_sl"]
 
-    breach_bundle_idx = iloc index of exit_hour bundle in ticks_full_day
+    breach_bundle_idx = iloc index of exit_hour bundle in ticks_td
 
     weighted_avg_exit_price, total_filled, unfilled_qty, final_exit_hour =
         utils.simulate_exit_fill(
-            ticks_exit        = ticks_full_day from breach_bundle_idx onward,
+            ticks_exit        = ticks_td from breach_bundle_idx onward,
             ohlcv_exit        = ohlcv from exit_hour onward,
             position_size     = quantity,
             breach_bundle_idx = breach_bundle_idx,
             breach_price      = exit_price,
             sell_rate         = sell_rate,
-            halts_df          = halts_df,
+            halts_df          = halts_td,
         )
 
     if unfilled_qty > 0:
-        # Treat unfilled remainder as dead-position equivalent
         pnl_filled   = (weighted_avg_exit_price - fill_price) / fill_price
         pnl_unfilled = -config["backtest"]["dead_position_penalty_pct"]
         pnl = (pnl_filled * total_filled + pnl_unfilled * unfilled_qty) / quantity
@@ -220,7 +261,6 @@ if direction is not None:
         pnl = (weighted_avg_exit_price - fill_price) / fill_price
 
     exit_reason = "take_profit" if direction == "up" else "stop_loss"
-    is_ambiguous recorded in trade_log.is_ambiguous
 
 else:
     → proceed to session_close / time_limit check
@@ -229,12 +269,6 @@ else:
 **sell_rate rationale:**
 - take_profit exit (rising market): more buyers available → higher sell_rate
 - stop_loss exit (falling market): fewer buyers available → lower sell_rate
-- Values calibrated empirically; initial defaults: sell_rate_tp=0.30, sell_rate_sl=0.15
-
-**is_ambiguous:**
-- True if tp and sl thresholds simultaneously satisfied within the same 10-tick bundle
-- Sourced from track_price_breach() return value
-- Recorded in trade_log for post-hoc analysis
 
 ### Session close exit (priority over time-limit)
 
@@ -247,7 +281,7 @@ if current bar hour == "155900":
         if none: → dead position
 ```
 
-Note: `simulate_exit_fill()` is NOT called for session_end exits —
+`simulate_exit_fill()` is NOT called for session_end exits —
 exit_price is the bar close (or after-market tick fallback).
 
 ### Time-limit exit
@@ -272,11 +306,31 @@ Recorded in `trade_log.is_ambiguous` for post-hoc analysis.
 
 ## Dead Position
 
-Occurs only when session_end exit price cannot be determined
-(15:59 halt + no after-market data), or when `simulate_exit_fill()` exhausts
-all available ticks with remaining unfilled quantity.
+Occurs when:
+1. Session_end exit price cannot be determined (15:59 halt + no after-market data), or
+2. `simulate_exit_fill()` exhausts all available ticks with remaining unfilled quantity.
 
-Case classification (A/B/C) same as Labeler dead position logic.
+```
+Case A — next trading day has_data=True AND ticker exists in ticker_data_coverage:
+    exit_price = next day pre-market first tick
+                 fallback: next day ohlcv_1min first bar open
+    exit_price *= (1 - dead_position_penalty_pct)
+    exit_reason = "dead_position"
+    is_dead_position = True
+
+Case B — next trading day has_data=True AND ticker NOT in ticker_data_coverage:
+    pnl = -1.0  (full loss — possible delisting)
+    exit_price = 0
+    exit_reason = "dead_position_delisted"
+    is_dead_position = True
+
+Case C — next trading day not in dataset (dataset boundary):
+    exit_price = p_entry * (1 - 0.5)
+    exit_reason = "dead_position_no_data"
+    is_dead_position = True
+```
+
+Dead position trades are included in the winning_rate denominator.
 
 ---
 
@@ -320,7 +374,7 @@ is_ambiguous             BOOLEAN,   -- True if simultaneous bundle-level tp/sl b
 - `db_conn` injected via constructor for testability (mock DB in tests)
 - OHLCV loaded once per ticker for all its entry dates
 - Tick data loaded once per ticker/date (full day); filtered in memory by range
-- `halts_df` passed explicitly to internal methods — no internal DB queries after initial load
+- `halts_td` passed explicitly to all internal methods — no internal DB queries after initial load
 - Session close (15:59 bar) triggers immediate exit — takes priority over time-limit
 - `simulate_exit_fill()` not called for session_end exits (bar close used directly)
 - After-market data used only as fallback when 15:59 bar is halt/no_data
