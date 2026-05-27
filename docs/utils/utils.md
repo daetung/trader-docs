@@ -164,9 +164,16 @@ def generate_run_id() -> str:
         format:  {optimizer_run_id}_o{outer_fold_idx}_t{trial_idx}_f{inner_fold_idx}
         example: "20250715_143022_o1_t4_f2"
 
+    In sequential selection/full phase fold loops, the coordinator similarly
+    pre-generates structured run_ids to avoid collision between folds
+    (fold processing may complete in under 1 second on small datasets):
+
+        format:  {optimizer_run_id}_f{fold_idx}
+        example: "20250715_143022_f2"
+
     Workers receive run_id as an explicit argument; generate_run_id() is NOT called
-    inside worker functions. The standard YYYYMMDD_HHMMSS format is used only in
-    sequential contexts (standalone, selection, full phase, outer eval trainings).
+    inside worker functions or fold loops. The standard YYYYMMDD_HHMMSS format is
+    used only in standalone contexts (standalone CLI, outer eval trainings).
     """
     from datetime import datetime
     return datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -261,22 +268,15 @@ def populate_ticker_coverage(
 ) -> int:
     """
     Populate or refresh ticker_data_coverage table.
-    Derives has_1min from ohlcv_1min, has_tick from tick_10.
+    Groups ohlcv_1min and tick_10 by (ticker, date) to set has_1min, has_tick.
+    Safe to re-run (upsert).
     """
     ...
 ```
 
 ---
 
-### Tick Price Tracking Utilities
-
-These functions support fine-grained price tracking using tick_10 data.
-Used by BacktestEngine (entry slippage, exit tracking) and Labeler (breach detection).
-
-```
-tick_10.hour = last tick timestamp of each 10-tick bundle (second precision)
-bundle time range = (prev_bundle.hour, curr_bundle.hour]
-```
+### Tick and Price Utilities
 
 ```python
 def find_fill_bundle(
@@ -284,20 +284,14 @@ def find_fill_bundle(
     fill_second: str,
 ) -> tuple[int, pd.Series | None, pd.Series | None]:
     """
-    Identify the fill_bundle (first bundle whose hour >= fill_second)
-    and its immediately preceding bundle (prev_bundle).
+    Find the tick bundle containing fill_second.
+    Returns (fill_idx, prev_bundle, fill_bundle).
 
-    fill_second falls within the range (prev_bundle.hour, fill_bundle.hour]
-    by definition of tick_10.hour as the last tick timestamp of the bundle.
+    fill_bundle: first bundle with hour >= fill_second.
+    prev_bundle: bundle immediately before fill_bundle (None if fill_bundle is first).
+    fill_idx:    iloc index of fill_bundle in ticks DataFrame.
 
-    Args:
-        ticks:       tick_10 rows, sorted by (hour, seq_id)
-        fill_second: HHMMSS — target fill time (t bar open + 5s)
-
-    Returns:
-        fill_idx:    iloc index of fill_bundle in ticks (-1 if not found)
-        prev_bundle: pd.Series of the bundle before fill_bundle; None if fill_bundle is first
-        fill_bundle: pd.Series of the first bundle at or after fill_second; None if not found
+    If no bundle satisfies hour >= fill_second, returns (-1, None, None).
     """
     ...
 
@@ -308,8 +302,7 @@ def interpolate_bundle_price(
     target_second: str,
 ) -> float:
     """
-    Estimate price at target_second using piecewise linear interpolation
-    with typical price midpoint.
+    Estimate the price at target_second within curr_bundle using linear interpolation.
 
     Anchors:
         t_prev → prev_bundle.close          (last tick of prev bundle)
@@ -367,35 +360,20 @@ def track_price_breach(
 
     Phase 1 — tick-level scan within t bar:
         Iterate tick bundles from fill_bundle_idx+1 onward within the t bar.
-        tp_target = fill_price * (1 + threshold_up)
-        sl_target = fill_price * (1 - threshold_dn)
+        For each bundle: check if high >= tp_target or low <= sl_target.
+        Ambiguity: if both thresholds satisfied within the same bundle,
+            use ambiguity_priority to break the tie.
+        On breach: interpolate price at breach_second; record direction.
 
-        Per bundle:
-            if bundle.high >= tp_target AND bundle.low <= sl_target:
-                is_ambiguous = True; direction = ambiguity_priority
-                exit_price = interpolate_bundle_price(prev, bundle, bundle.hour)
-                → return (direction, exit_price, bundle.hour, True)
-            elif bundle.high >= tp_target:
-                → return ("up", interpolated_price, bundle.hour, False)
-            elif bundle.low <= sl_target:
-                → return ("dn", interpolated_price, bundle.hour, False)
-
-    Phase 2 — bar-level scan (t+1 bar onward), with tick refinement on hit:
-        For each 1-minute bar in order:
-            up_hit = bar.high >= tp_target; dn_hit = bar.low <= sl_target
-            if both: retrieve bundles, iterate same as Phase 1
-            if up: locate first bundle where high >= tp_target
-            if dn: locate first bundle where low  <= sl_target
-
-    Note on asymmetry (exit_interpolation=False):
-        Phase 1 (t bar): sl breach detected (exit_interpolation has no effect on Phase 1)
-        Phase 2 (post-t bar): if exit_interpolation=False, tp uses t+1 bar open;
-                               sl still uses tick interpolation
-        Asymmetry is intentional — exit_interpolation=False is for sl-only interpolation mode.
+    Phase 2 — bar-level scan (t+1 bar onward):
+        For each 1-minute bar: check high/low against thresholds.
+        If exit_interpolation=True: use tick data for sub-minute price estimation.
+        If exit_interpolation=False: use bar open as breach price (asymmetric).
 
     Returns:
-        (direction, exit_price, exit_hour, is_ambiguous)
-        direction: "up" | "dn" | None (no breach in supplied bars)
+        (direction, breach_price, breach_hour, is_ambiguous)
+        direction: "up" | "dn" | None
+        is_ambiguous: True if simultaneous bundle-level breach in Phase 1
     """
     ...
 
@@ -403,15 +381,15 @@ def track_price_breach(
 def track_label_breach(
     ohlcv_future: pd.DataFrame,
     ticks_future: pd.DataFrame,
-    P_entry: float,
+    fill_price: float,
     fill_second: str,
     threshold_3pp: float,
     threshold_5pp: float,
     exit_interpolation: bool,
-    ambiguity_priority: str,
+    ambiguity_priority: str = "up",
 ) -> tuple[str | None, bool]:
     """
-    Two-stage breach detection for label assignment.
+    Two-stage label breach detection.
     Used exclusively by Labeler. Wraps track_price_breach() twice.
 
     Stage 1 — detect first ±3pp breach:
@@ -610,8 +588,8 @@ def temporal_split_simple(
 - `track_label_breach()` is the high-level wrapper for two-stage label detection (Labeler only)
 - `simulate_exit_fill()` is called after track_price_breach() confirms direction;
   sell_rate selection (tp vs sl) is the caller's responsibility
-- `generate_run_id()` not called inside parallel workers — coordinator pre-generates
-  structured run_ids for nested validation context
+- `generate_run_id()` not called inside parallel workers or sequential fold loops —
+  coordinator pre-generates structured run_ids in all optimizer contexts
 - `compute_vol_regime_holdout()` uses regular session bars only (093000–155900)
 - `compute_consensus_config()` grid-rounding uses nearest valid value from search_space
 - `temporal_split_simple()` applies no balancing — training-only utility for early stopping val

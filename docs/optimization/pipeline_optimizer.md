@@ -25,7 +25,7 @@ Supports three operational phases with distinct objectives:
 
 ```
 Training endpoint:  PipelineOptimizer
-    └── Preprocessor.run(return_data=True)    ← returns full_labeled_df (unsplit)
+    └── Preprocessor.run(return_data=True)    ← returns full_labeled_df (unsplit), called once
     └── utils.compute_vol_regime_holdout()    ← regime holdout dates
     └── ClassBalancer.generate_folds()        ← outer and inner rolling folds
     └── Trainer.run(...)                      ← per-fold train (dry_run in workers)
@@ -87,11 +87,12 @@ for train, val, test, fold_meta in balancer.generate_folds(
     step_weeks=inner_cfg["step_weeks"],
     embargo_days=inner_cfg["embargo_days"],
 ):
-    run_id = utils.generate_run_id()
-    result = trainer.run(
+    fold_idx = fold_meta["fold_idx"]
+    run_id   = f"{optimizer_run_id}_f{fold_idx}"   # structured ID — no collision risk
+    result   = trainer.run(
         train, val, test,
         run_id=run_id,
-        fold_idx=fold_meta["fold_idx"],
+        fold_idx=fold_idx,
         outer_fold_idx=-1,
         fold_train_end=fold_meta["fold_train_end"],
         run_reducer=True,
@@ -331,11 +332,22 @@ final_train_split, final_val_split = utils.temporal_split_simple(
     remaining_df,
     session_mode=consensus_config.get("entry_detector.session_mode"),
     val_fraction=0.15,
+    embargo_days=outer_cfg["embargo_days"],
 )
 final_run_id = utils.generate_run_id()
 final_trainer = Trainer(final_config_override, db_conn, optimizer_run_id=optimizer_run_id)
+
+# test_df: holdout_df (completely unseen, preferred) when holdout is enabled and non-empty;
+#          final_val_split as fallback when holdout is disabled (val is next-best available).
+#          Note: val_split is used by LightGBM early stopping but does not overlap with train.
+final_test_df = (
+    holdout_df
+    if holdout_cfg["enabled"] and len(holdout_df) > 0
+    else final_val_split
+)
+
 final_trainer.run(
-    final_train_split, final_val_split, remaining_df,
+    final_train_split, final_val_split, final_test_df,
     run_id=final_run_id,
     fold_idx=-1,
     outer_fold_idx=-1,
@@ -375,6 +387,25 @@ Intended for baseline measurement and debugging.
 - trial_idx: always 0; fold_idx: 0-based; outer_fold_idx: -1
 - Backtest: executed after fold pass completes
 - auc_std recorded on fold_run_ids[-1]
+```
+
+```python
+# (full phase fold loop — same structure as selection, with run_reducer=False)
+for train, val, test, fold_meta in balancer.generate_folds(...):
+    fold_idx = fold_meta["fold_idx"]
+    run_id   = f"{optimizer_run_id}_f{fold_idx}"   # structured ID — no collision risk
+    result   = trainer.run(
+        train, val, test,
+        run_id=run_id,
+        fold_idx=fold_idx,
+        outer_fold_idx=-1,
+        fold_train_end=fold_meta["fold_train_end"],
+        run_reducer=False,
+        phase="full",
+        trial_idx=0,
+    )
+    fold_run_ids.append(run_id)
+    fold_aucs.append(result["auc_mean"])
 ```
 
 ---
@@ -474,7 +505,12 @@ else:
     mp.set_start_method("fork", force=True)
     # outer_train_df shared via CoW — no serialization
     worker_data_kwarg = {"outer_train_path": None, "outer_train_df": outer_train_df}
-    # Windows: cleanup tmp_path after outer fold completes
+
+# ... outer fold loop (generate_folds) ...
+
+# Windows: cleanup temp parquet after outer fold completes
+if sys.platform == "win32":
+    tmp_path.unlink(missing_ok=True)
 ```
 
 ### Thread Allocation
@@ -506,6 +542,7 @@ Pruned trials:
 
 Sequential mode (selection/full): fold_run_ids[-1] = MAX fold_idx,
     guaranteed by generate_folds() ascending order.
+    run_id format: {optimizer_run_id}_f{fold_idx} — no collision risk.
 Nested/parallel mode: fold_run_ids[-1] = last Successive Halving round completed.
 ```
 
@@ -537,21 +574,10 @@ class PipelineOptimizer:
                             returns empty DataFrame (no backtest)
           - "exploitation": nested validation with Successive Halving,
                             outer fold evaluation, consensus config, regime holdout
-                            returns experiment_log rows (outer_validation + regime_holdout)
+                            returns experiment_log rows (outer_validation + regime_holdout
+                            if holdout enabled)
           - "full":         one fold pass, no reducer, backtest
                             returns experiment_log rows
-        """
-        ...
-
-    def run_single(
-        self,
-        feature_config: dict,
-        run_id: str | None = None,
-    ) -> dict:
-        """
-        Run one complete fold pass for a given feature_config.
-        Executes all rolling folds.
-        Returns summary dict (also written to experiment_log if backtest runs).
         """
         ...
 
@@ -571,7 +597,6 @@ class PipelineOptimizer:
 optimizer:
   phase: "exploitation"     # "selection" | "exploitation" | "full"
   selected_features_path: "configs/selected_features.json"
-  auc_threshold: 0.72
 
   hyperparameter_search:
     max_trials: 30
@@ -629,13 +654,16 @@ class_balancer:
 - Platform-conditional multiprocessing:
   Linux/WSL: fork start method; outer_train_df passed in-memory (CoW)
   Windows: spawn start method; outer_train_df written to temp parquet,
-           path passed to workers; file cleaned up after outer fold
+           path passed to workers; file deleted via `tmp_path.unlink(missing_ok=True)`
+           after outer fold loop completes
 - `if __name__ == "__main__":` guard required for Windows spawn compatibility
 - `psutil.cpu_count(logical=False)` used for num_threads allocation;
   HyperThreading excluded per LightGBM documentation (cache contention)
 - run_ids for inner trial workers: coordinator pre-generates structured IDs
   as "{optimizer_run_id}_o{outer_fold_idx}_t{trial_idx}_f{inner_fold_idx}";
   generate_run_id() not called inside workers
+- run_ids for sequential selection/full phase folds: structured as
+  "{optimizer_run_id}_f{fold_idx}"; generate_run_id() not called inside fold loop
 - Outer eval run_ids: standard utils.generate_run_id() format (sequential, no collision)
 - Phase transition is manual — no automatic switching between phases
 - Selection phase does not run backtest — frequency voting only
@@ -643,12 +671,14 @@ class_balancer:
 - `session_mode` is a first-class search variable — inner balancer applies session_mode
   per trial from config_override; outer fold generator uses session_mode=None
 - Regime holdout: dates removed from remaining_df BEFORE outer fold generation;
-  holdout_df used only for regime_holdout backtest after final model training
+  holdout_df used for both final model test_df (train_log AUC) and regime_holdout backtest
+- final model test_df: holdout_df (primary, completely unseen) when holdout enabled and
+  non-empty; final_val_split (fallback) when holdout disabled
 - `compute_vol_regime_holdout()` uses ohlcv_1min regular session bars only
 - `compute_consensus_config()` aggregates outer fold best_configs;
   continuous params → median → nearest grid value; categorical → mode
 - `temporal_split_simple()` used for early stopping val in outer eval and final model;
-  no balancing applied
+  no balancing applied; embargo_days=outer_cfg["embargo_days"] always passed explicitly
 - `best_train`, `best_val`, `best_fold_test` patterns from non-nested exploitation removed;
   outer eval uses outer_train_split / outer_val_split / outer_test_df directly
 - optimizer_run_id format: YYYYMMDD_HHMMSS (generated once per optimizer run)

@@ -30,23 +30,28 @@ Raw JSON (1min / 10tick, all sessions)
  Vectorizer                   Time-series → fixed-length feature vectors
         │
         ▼
- FeatureExtractor             Combine vectorized indicators + meta + temporal
-        │                     extract_batch(): indicators computed once per ticker
-        │  feature matrix [ticker, date, hour, p_entry, features..., labels...]
-        ▼
  Labeler                      5 independent binary labels per entry point
         │                     Exit at 15:59 bar; after-market fallback for halt only
         │                     is_dead_position flag for overnight hold cases
+        │  [labels, is_dead_position, dead_position_case, is_ambiguous]
+        │
+ FeatureExtractor             Combine vectorized indicators + meta + temporal
+        │                     extract_batch(): indicators computed once per ticker
+        │  [features...]
+        ▼
+      merge                   join on (ticker, date, hour)
+        │  feature matrix [ticker, date, hour, p_entry, features...,
+        │                  labels, is_dead_position, dead_position_case, is_ambiguous]
         ▼
  ClassBalancer                Downsampling via split(balance=config.apply_balance)
         │  train / validation / test
         ▼
  PipelineOptimizer            Training endpoint
-   ├── Preprocessor           in-memory preprocess per trial
-   ├── Trainer (AUC loop)     train until auc_threshold or max_trials
+   ├── Preprocessor           run once → full_labeled_df (return_data=True)
+   ├── Trainer                per-fold train
    │     └── LightGBM Pipeline    5 independent binary classifiers
    │     └── DimensionalityReducer  ImportanceProvider-based (model-agnostic)
-   └── Backtester             run after AUC loop converges
+   └── Backtester             writes experiment_log
         │
         ▼
  BacktestEngine               DB-direct price tracking, slippage via tick_10
@@ -62,7 +67,7 @@ Raw JSON (1min / 10tick, all sessions)
 
 ```
 Training endpoint:   PipelineOptimizer
-                         └── Preprocessor → Trainer (loop) → Backtester
+                         └── Preprocessor (once) → Trainer (per fold) → Backtester
 
 Live inference endpoint: Inferencer  (interface defined; implementation deferred)
                          └── EntryPointDetector.detect()

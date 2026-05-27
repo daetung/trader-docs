@@ -227,7 +227,6 @@ CREATE TABLE train_log (
 -- eval_type:       NULL              = standard backtest (standalone or non-nested exploitation)
 --                  "outer_validation"= nested validation outer fold evaluation
 --                  "regime_holdout"  = regime holdout robustness check
---                  "final"           = consensus_config final model backtest
 -- fold_test_start, fold_test_end:
 --   Optimizer context: derived from fold_meta["fold_test_start/end"].
 --   Standalone mode:   derived from test_df["date"].min() and .max() (never NULL).
@@ -239,7 +238,7 @@ CREATE TABLE experiment_log (
     fold_idx             INTEGER      NOT NULL DEFAULT -1,
     outer_fold_idx       INTEGER      NOT NULL DEFAULT -1,
     eval_type            VARCHAR,                -- NULL | "outer_validation" |
-                                                 -- "regime_holdout" | "final"
+                                                 -- "regime_holdout"
     fold_test_start      VARCHAR,                -- 'YYYYMMDD'
     fold_test_end        VARCHAR,                -- 'YYYYMMDD'
     winning_rate         DOUBLE,
@@ -381,12 +380,12 @@ outer_results = con.execute("""
     ORDER BY outer_fold_idx
 """, ["20250519_143022"]).df()
 
-# Regime holdout and final model results
+# Regime holdout robustness result
 robustness = con.execute("""
     SELECT eval_type, winning_rate, total_trades, avg_pnl_pct
     FROM experiment_log
     WHERE optimizer_run_id = ?
-      AND eval_type IN ('final', 'regime_holdout')
+      AND eval_type = 'regime_holdout'
 """, ["20250519_143022"]).df()
 
 # Experiment log for standard backtest results (inner fold or standalone)
@@ -395,7 +394,7 @@ exp_results = con.execute("""
            winning_rate, total_trades, suppressed_count
     FROM experiment_log
     WHERE optimizer_run_id = ?
-      AND (eval_type IS NULL OR eval_type NOT IN ('outer_validation', 'regime_holdout', 'final'))
+      AND (eval_type IS NULL OR eval_type NOT IN ('outer_validation', 'regime_holdout'))
     ORDER BY fold_idx
 """, ["20250519_143022"]).df()
 
