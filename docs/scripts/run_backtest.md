@@ -111,10 +111,9 @@ class Backtester:
                              None for standalone (derived from test_df date range)
             fold_test_end:   last date of test window ('YYYYMMDD');
                              None for standalone (derived from test_df date range)
-            eval_type:       None          → standard backtest (standalone or old exploitation)
+            eval_type:       None               → standard backtest (standalone or non-nested)
                              "outer_validation" → nested validation outer fold evaluation
                              "regime_holdout"   → regime holdout robustness check
-                             "final"            → consensus_config final model backtest
 
         optimizer_run_id passed via constructor (None for standalone).
         """
@@ -156,7 +155,7 @@ experiment_log_row = {
     "fold_idx":             fold_idx,            # -1 if standalone/outer eval
     "outer_fold_idx":       outer_fold_idx,      # -1 if non-nested
     "eval_type":            eval_type,           # None | "outer_validation" |
-                                                 # "regime_holdout" | "final"
+                                                 # "regime_holdout"
     "fold_test_start":      fold_test_start,     # None → derived from test_df.date.min()
     "fold_test_end":        fold_test_end,       # None → derived from test_df.date.max()
     "winning_rate":         summary["winning_rate"],

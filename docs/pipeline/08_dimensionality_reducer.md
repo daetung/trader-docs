@@ -30,7 +30,7 @@ feature_names: list[str]       # column names of X_train
 ```python
 selected_features: list[str]   # features surviving all active filters
 reduction_report: dict         # counts, removed feature names per stage,
-                               # and importance_scores used for selection
+                               # importance_scores, and selected_features list
 ```
 
 ---
@@ -252,6 +252,9 @@ Enabled automatically when feature count > shap_trigger_threshold (configurable)
 reduction_report: dict = {
     "importance_scores":      pd.Series,   # feature → importance score
                                            # used across correlation and importance filters
+    "selected_features":      list[str],   # feature names surviving all active filters
+                                           # mirrors run_all() first return value
+                                           # used by frequency_vote() in PipelineOptimizer
     "input_feature_count":    int,
     "output_feature_count":   int,
     "stages": {
@@ -276,6 +279,10 @@ reduction_report: dict = {
 - Audit trail of which importance values drove feature selection decisions
 - PipelineOptimizer to include per-fold importance in `feature_selection_log.json`
 - Post-hoc analysis of feature selection stability across folds
+
+`selected_features` is included in `reduction_report` to enable:
+- `frequency_vote()` to aggregate results across folds without a separate accumulation list
+- Consistent serialization of per-fold selection results in `feature_selection_log.json`
 
 ---
 
@@ -337,9 +344,53 @@ class DimensionalityReducer:
         for importance within this method.
 
         Returns (selected_features, reduction_report).
-        reduction_report includes importance_scores for audit/logging.
+        reduction_report includes importance_scores, selected_features,
+        and per-stage removal info for audit/logging.
+        selected_features is also stored in reduction_report["selected_features"]
+        for cross-fold aggregation via frequency_vote().
         """
         ...
+```
+
+---
+
+## frequency_vote()
+
+```python
+def frequency_vote(
+    reduction_reports: list[dict],
+    threshold: float,
+) -> list[str]:
+    """
+    Aggregate per-fold selected_features lists via frequency voting.
+    Used by PipelineOptimizer selection phase after all folds complete.
+
+    A feature is included in the result if it appears in the selected_features
+    of at least `threshold` fraction of folds.
+
+    Args:
+        reduction_reports: list of reduction_report dicts, one per fold.
+                           Each dict must contain "selected_features": list[str].
+        threshold:         minimum fraction of folds in which a feature must appear
+                           to be retained (e.g. 0.5 = majority vote).
+                           Read from config["dimensionality_reducer"]["vote_threshold"].
+
+    Logic:
+        feature_counts = Counter of appearances across all folds' selected_features
+        total_folds    = len(reduction_reports)
+        result         = [f for f, cnt in feature_counts.items()
+                          if cnt / total_folds >= threshold]
+        result sorted by descending frequency, then alphabetical tiebreak.
+
+    Returns:
+        list[str] — feature names surviving the vote threshold.
+        Empty list if no features survive (raises warning).
+
+    Note: called only from PipelineOptimizer selection phase.
+          Not a general-purpose utility — input schema is tightly coupled
+          to reduction_report["selected_features"] from run_all().
+    """
+    ...
 ```
 
 ---
@@ -353,11 +404,13 @@ For each fold in generate_folds():
     1. Train model on full feature set              → fold model
     2. create_importance_provider(...)              → provider
     3. reducer.run_all(X_train, X_valid, provider)  → selected_features, reduction_report
-    4. Accumulate selected_features in frequency vote
+       (reduction_report["selected_features"] populated automatically)
+    4. Accumulate reduction_reports list
     5. Include reduction_report["importance_scores"] in feature_selection_log
 
 After all folds:
-    6. Apply vote_threshold → confirmed selected_features
+    6. frequency_vote(reduction_reports, threshold=vote_threshold)
+       → confirmed selected_features
     7. Save to configs/selected_features.json
     8. Save feature_selection_log.json (includes per-fold importance_scores)
     (No per-fold retraining on selected features)
@@ -374,6 +427,10 @@ Exploitation phase (PipelineOptimizer):
 dimensionality_reducer:
   importance_averaging: "uniform"   # "uniform" | "sample_weighted"
                                     # searchable by PipelineOptimizer
+  vote_threshold: 0.5               # fraction of folds a feature must appear in
+                                    # to be included in selected_features
+                                    # used by PipelineOptimizer frequency_vote()
+                                    # range: (0.0, 1.0]; 0.5 = majority vote
   correlation_filter:
     enabled: true
     threshold: 0.95
@@ -403,7 +460,8 @@ dimensionality_reducer:
 - The caller is responsible for subsetting X_train/X_valid after receiving `selected_features`
 - `run_all()` calls `provider.get_importance()` exactly once; result passed to all filter stages
 - `correlation_filter()` and `importance_filter()` receive `importance_scores` as a parameter — not the provider
-- `reduction_report` must include `importance_scores`, input/output counts, and removed features per stage
+- `reduction_report` must include `importance_scores`, `selected_features`, input/output counts,
+  and removed features per stage
 - `train_labels` is required when `importance_averaging == "sample_weighted"`;
   `create_importance_provider()` must raise `ValueError` if not provided in that case
 - `MLPImportanceProvider` implementation is deferred to MLP phase;
@@ -413,3 +471,7 @@ dimensionality_reducer:
 - `shap_subsample_n: null` disables subsampling; full X_train passed to provider
 - Random state for SHAP subsampling sourced from `config["class_balancer"]["random_state"]`
   for reproducibility consistency across pipeline
+- `vote_threshold` read from `config["dimensionality_reducer"]["vote_threshold"]`
+  by PipelineOptimizer; not used by DimensionalityReducer itself
+- `frequency_vote()` called only from PipelineOptimizer selection phase —
+  input schema is tightly coupled to reduction_report["selected_features"]

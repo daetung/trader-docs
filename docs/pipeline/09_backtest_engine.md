@@ -254,6 +254,10 @@ if direction is not None:
         )
 
     if unfilled_qty > 0:
+        # Partial fill: ticks exhausted before full position exit.
+        # Not a dead position — all available ticks (including after-market) were used.
+        # Unfilled portion penalized at flat dead_position_penalty_pct.
+        # Diagnostic: trade_log.unfilled_quantity / quantity gives unfill ratio.
         pnl_filled   = (weighted_avg_exit_price - fill_price) / fill_price
         pnl_unfilled = -config["backtest"]["dead_position_penalty_pct"]
         pnl = (pnl_filled * total_filled + pnl_unfilled * unfilled_qty) / quantity
@@ -261,6 +265,7 @@ if direction is not None:
         pnl = (weighted_avg_exit_price - fill_price) / fill_price
 
     exit_reason = "take_profit" if direction == "up" else "stop_loss"
+    # is_dead_position remains False — partial fill exhaustion is not an overnight hold
 
 else:
     → proceed to session_close / time_limit check
@@ -307,8 +312,7 @@ Recorded in `trade_log.is_ambiguous` for post-hoc analysis.
 ## Dead Position
 
 Occurs when:
-1. Session_end exit price cannot be determined (15:59 halt + no after-market data), or
-2. `simulate_exit_fill()` exhausts all available ticks with remaining unfilled quantity.
+1. Session_end exit price cannot be determined (15:59 halt + no after-market data).
 
 ```
 Case A — next trading day has_data=True AND ticker exists in ticker_data_coverage:
@@ -331,6 +335,12 @@ Case C — next trading day not in dataset (dataset boundary):
 ```
 
 Dead position trades are included in the winning_rate denominator.
+
+Note: `simulate_exit_fill()` exhausting all available ticks with remaining unfilled
+quantity is **not** a dead position — the position is partially closed and does not
+require an overnight hold. This case is handled in the tp/sl exit path (see above)
+using a blended PnL with flat penalty for the unfilled portion. Diagnostic analysis
+via `trade_log.unfilled_quantity / quantity`.
 
 ---
 
@@ -378,7 +388,9 @@ is_ambiguous             BOOLEAN,   -- True if simultaneous bundle-level tp/sl b
 - Session close (15:59 bar) triggers immediate exit — takes priority over time-limit
 - `simulate_exit_fill()` not called for session_end exits (bar close used directly)
 - After-market data used only as fallback when 15:59 bar is halt/no_data
-- Dead position: session_end fallback fails, OR simulate_exit_fill exhausts ticks
+- Dead position: session_end fallback fails only (15:59 halt + no after-market data)
+- `simulate_exit_fill()` ticks exhaustion (unfilled_qty > 0) is partial fill — not dead position;
+  `is_dead_position` remains False; diagnostic via `trade_log.unfilled_quantity`
 - sell_rate_tp > sell_rate_sl: rising-market exits have more available buy-side depth
 - Entry slippage search window: entry_hour to entry_hour + 100s (not limited to 1-minute t bar)
 - Cooldown applied continuously across full time axis; no reset at session boundaries

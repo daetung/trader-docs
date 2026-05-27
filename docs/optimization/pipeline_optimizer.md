@@ -86,6 +86,7 @@ for train, val, test, fold_meta in balancer.generate_folds(
     test_weeks=inner_cfg["test_weeks"],
     step_weeks=inner_cfg["step_weeks"],
     embargo_days=inner_cfg["embargo_days"],
+    max_folds=None,          # override config cap — selection phase uses all available folds
 ):
     fold_idx = fold_meta["fold_idx"]
     run_id   = f"{optimizer_run_id}_f{fold_idx}"   # structured ID — no collision risk
@@ -288,7 +289,7 @@ for outer_train_df, _, outer_test_df, outer_fold_meta in balancer.generate_folds
         embargo_days=outer_cfg["embargo_days"],
     )
 
-    outer_run_id    = utils.generate_run_id()
+    outer_run_id    = f"{optimizer_run_id}_o{outer_fold_idx}_eval"
     config_override = utils.apply_overrides(config, best_config)
     config_override["lgbm_params"]["num_threads"] = effective_num_threads
 
@@ -390,8 +391,18 @@ Intended for baseline measurement and debugging.
 ```
 
 ```python
-# (full phase fold loop — same structure as selection, with run_reducer=False)
-for train, val, test, fold_meta in balancer.generate_folds(...):
+# (full phase fold loop — same structure as selection, with run_reducer=False and max_folds=None)
+for train, val, test, fold_meta in balancer.generate_folds(
+    full_labeled_df,
+    balance=config["class_balancer"]["apply_balance"],
+    session_mode=config["entry_detector"]["session_mode"],
+    window_weeks=inner_cfg["window_weeks"],
+    val_weeks=inner_cfg["val_weeks"],
+    test_weeks=inner_cfg["test_weeks"],
+    step_weeks=inner_cfg["step_weeks"],
+    embargo_days=inner_cfg["embargo_days"],
+    max_folds=None,          # override config cap — full phase uses all available folds
+):
     fold_idx = fold_meta["fold_idx"]
     run_id   = f"{optimizer_run_id}_f{fold_idx}"   # structured ID — no collision risk
     result   = trainer.run(
@@ -406,6 +417,22 @@ for train, val, test, fold_meta in balancer.generate_folds(...):
     )
     fold_run_ids.append(run_id)
     fold_aucs.append(result["auc_mean"])
+
+auc_std = std(fold_aucs) if len(fold_aucs) > 1 else 0.0
+db_conn.execute(
+    "UPDATE train_log SET auc_std = ? WHERE run_id = ?",
+    [auc_std, fold_run_ids[-1]]
+)
+
+# Backtest on last fold's test split (baseline measurement)
+backtester = Backtester(config, db_conn, optimizer_run_id=optimizer_run_id)
+backtester.run(
+    test,                    # last fold's test split (loop variable after exit)
+    run_id=fold_run_ids[-1],
+    fold_idx=-1,
+    outer_fold_idx=-1,
+    eval_type=None,
+)
 ```
 
 ---
@@ -519,9 +546,10 @@ if sys.platform == "win32":
 import psutil
 effective_num_threads = max(
     1,
-    psutil.cpu_count(logical=False) // n_parallel_trials
+    psutil.cpu_count(logical=False) // n_parallel
 )
 # Physical cores only — HyperThreading excluded per LightGBM documentation.
+# n_parallel = config["optimizer"]["parallelism"]["n_parallel_trials"]
 # HT cores share L1/L2 cache; LightGBM histogram construction is cache-intensive,
 # making HT threads slower rather than faster for this workload.
 ```
@@ -637,7 +665,8 @@ class_balancer:
     test_weeks:   2
     step_weeks:   2
     embargo_days: 5
-    max_folds:    4
+    max_folds:    4    # cap for nested validation inner loop only;
+                       # selection and full phases use max_folds=None
 ```
 
 ---
@@ -664,10 +693,13 @@ class_balancer:
   generate_run_id() not called inside workers
 - run_ids for sequential selection/full phase folds: structured as
   "{optimizer_run_id}_f{fold_idx}"; generate_run_id() not called inside fold loop
-- Outer eval run_ids: standard utils.generate_run_id() format (sequential, no collision)
+- Outer eval run_ids: structured format {optimizer_run_id}_o{outer_fold_idx}_eval;
+  generate_run_id() not called inside the outer fold loop
 - Phase transition is manual — no automatic switching between phases
 - Selection phase does not run backtest — frequency voting only
-- Full phase runs backtest after fold pass completes
+- Full phase runs backtest after fold pass completes on last fold's test split
+- Selection and full phases use max_folds=None in generate_folds() —
+  overrides inner_fold.max_folds config cap (which is intended for exploitation inner loop only)
 - `session_mode` is a first-class search variable — inner balancer applies session_mode
   per trial from config_override; outer fold generator uses session_mode=None
 - Regime holdout: dates removed from remaining_df BEFORE outer fold generation;

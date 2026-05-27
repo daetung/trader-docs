@@ -140,7 +140,7 @@ the scan always proceeds to 15:59 or until a ±3pp breach occurs.
 label_direction, is_ambiguous = utils.track_label_breach(
     ohlcv_future       = effective_bars,          # from Step 1
     ticks_future       = ticks_from_t,
-    P_entry            = P_entry,
+    fill_price         = P_entry,                 # P_entry is the reference fill price for Labeler
     fill_second        = fill_second,
     threshold_3pp      = config["labeler"]["threshold_3pp"],
     threshold_5pp      = config["labeler"]["threshold_5pp"],
@@ -208,7 +208,7 @@ In this case:
 
 ---
 
-
+## Interface
 
 ```python
 class Labeler:
