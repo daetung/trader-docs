@@ -83,7 +83,11 @@ Priority:
   2. 15:59 bar reached → exit at 15:59 close, assign label by pnl
   3. 60 valid bars exhausted → exit at last valid bar close, assign label by pnl
 
-After-market data used only as fallback when 15:59 bar is halt/no_data.
+Priority 2 and 3 are mutually exclusive — whichever condition is reached first determines
+the exit. After-market fallback and dead position apply to priority 2 only.
+Priority 3 exits at the last valid bar close directly, with no fallback needed.
+
+After-market data used only as fallback when 15:59 bar is halt/no_data (priority 2 only).
 Dead position (overnight hold) only when after-market fallback also unavailable.
 No overnight holds in normal flow.
 ```
@@ -191,7 +195,7 @@ Session mode filtering is applied at the training stage — preprocessing runs f
 | t bar open price (P_entry) | NO (identifier only) | Reference price | Fill reference |
 | t bar H/L/C/V | NO | NO | NO |
 | Bars t+1 … session close (H/L) | NO | YES (threshold check) | — |
-| After-market bars | NO | Fallback only | Fallback only |
+| After-market bars | NO | Fallback only (session-end exit) | Fallback only |
 | 10-tick before t bar | YES | — | — |
 | 10-tick within t bar | NO | YES (track_label_breach) | YES (entry slippage) |
 | 10-tick within exit bar | NO | YES (track_label_breach) | YES (exit slippage) |
@@ -207,8 +211,11 @@ Before submitting any module, verify:
 - [ ] P_entry is present as an identifier column in parquet output
 - [ ] Temporal features use entry.hour (clock time only) — not t bar OHLCV
 - [ ] Label calculation starts from t bar open as the zero reference
-- [ ] Label search exits at 15:59 bar before exhausting 60 valid bars
-- [ ] After-market used only as fallback for 15:59 halt/no_data
+- [ ] When no ±3pp breach: if 60 valid bars collected before 15:59 → exit at last valid bar close
+       (time-limit; no after-market fallback, no dead position);
+       if 15:59 reached within 60 valid bars → exit at 15:59 close
+       (session-end; with after-market fallback and dead position as last resort)
+- [ ] After-market used only as fallback for 15:59 halt/no_data (session-end path only)
 - [ ] 10-tick data used in features is strictly filtered to before t bar open
 - [ ] Labeler uses track_label_breach() with fill_second = t bar open + 5s;
        tracking starts strictly after fill_bundle (fill_bundle excluded)

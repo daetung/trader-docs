@@ -39,8 +39,8 @@ trading_calendar: pd.DataFrame
 ticker_data_coverage: pd.DataFrame
     columns: [ticker, date, has_1min, has_tick]
     # used for dead position Case A vs Case B determination
-    # Case A: ticker found in coverage for next trading day (data available)
-    # Case B: ticker not found in coverage for next trading day (possible delisting)
+    # Case A: ticker found in coverage for next day with has_data=True (data available)
+    # Case B: ticker not found in coverage for next day with has_data=True (possible delisting)
 ```
 
 **Output:**
@@ -99,15 +99,13 @@ these samples from training, or by Trainer to apply reduced sample weight.
 ## Dead Position Cases
 
 ```
-Case A: next trading day is_trading_day=True AND has_data=True
-        AND ticker found in ticker_data_coverage for that date
+Case A: next day has_data=True AND ticker found in ticker_data_coverage for that date
         → next-day open available; apply dead_position_penalty_pct
 
-Case B: next trading day is_trading_day=True AND has_data=True
-        AND ticker NOT found in ticker_data_coverage for that date
+Case B: next day has_data=True AND ticker NOT found in ticker_data_coverage for that date
         → possible delisting; label_sw assigned directly (cannot determine direction)
 
-Case C: next trading day not available in dataset (boundary condition)
+Case C: no next day with has_data=True in dataset (boundary condition)
         → label_sw assigned directly; excluded from training (see ClassBalancer config)
 ```
 
@@ -124,16 +122,16 @@ ticks_from_t = ticks_df filtered to hour >= t_hour, sorted by (hour, seq_id)
 
 Use build_effective_bar_sequence() from utils.py.
 Collect bars from t onward for this (ticker, date).
-Collection stops at 15:59 bar — after-market bars are NOT included.
+Collection stops at whichever comes first:
+    - 60 valid (non-halt) bars collected, or
+    - 15:59 bar reached
+After-market bars (hour > "155900") are never included.
+
 Halt classification applies across all time periods (pre/regular/after-market).
 
 For each missing bar slot up to 15:59:
     if slot overlaps halt interval in halts_df → "halt" (excluded from valid count)
     else                                        → "no_trade" (OHLC = prior close, volume=0)
-
-Target: 60 valid (non-halt) bars, within session boundary (≤ 15:59).
-60 valid bars exhausted before reaching 15:59 is not a separate exit case —
-the scan always proceeds to 15:59 or until a ±3pp breach occurs.
 
 --- Step 2: Breach detection via track_label_breach() ---
 
@@ -154,35 +152,44 @@ if label_direction is not None:
 
 else:
     → No ±3pp breach within effective bar sequence
-    → Proceed to Step 3 (session close exit)
+    → Proceed to Step 3
 
---- Step 3: Session close exit ---
+--- Step 3: Time-limit / Session close exit ---
 
-Triggered when track_label_breach() returns None (no ±3pp breach):
+Triggered when track_label_breach() returns None (no ±3pp breach).
+Exit path determined by which condition terminated Step 1:
 
-    exit_price = 15:59 bar close
+    Case A — time-limit exit (60 valid bars collected before 15:59 bar reached):
+        exit_price = close of last valid bar in effective_bars
+        pnl = (exit_price - P_entry) / P_entry
+        apply label by pnl threshold (same rules as Case B below)
+        → no after-market fallback; no dead position
 
-    if 15:59 bar is halt or no_data:
-        fallback: first tick_10 row with hour > "155900" (after-market)
-        if no after-market tick: → Dead position (Step 4)
+    Case B — session close exit (15:59 bar reached within 60 valid bars):
+        exit_price = 15:59 bar close
 
-    pnl = (exit_price - P_entry) / P_entry
-    apply label:
-        pnl >= +threshold_5pp                        → label_up5
-        threshold_3pp <= pnl < threshold_5pp         → label_up3
-        -threshold_3pp < pnl < +threshold_3pp        → label_sw
-        -threshold_5pp < pnl <= -threshold_3pp       → label_dn3
-        pnl <= -threshold_5pp                        → label_dn5
+        if 15:59 bar is halt or no_data:
+            fallback: first tick_10 row with hour > "155900" (after-market)
+            if no after-market tick: → Dead position (Step 4)
+
+        pnl = (exit_price - P_entry) / P_entry
+        apply label:
+            pnl >= +threshold_5pp                        → label_up5
+            threshold_3pp <= pnl < threshold_5pp         → label_up3
+            -threshold_3pp < pnl < +threshold_3pp        → label_sw
+            -threshold_5pp < pnl <= -threshold_3pp       → label_dn3
+            pnl <= -threshold_5pp                        → label_dn5
 
 --- Step 4: Dead position ---
 
 Dead position occurs only when:
     - Session close exit price cannot be determined (15:59 halt + no after-market data)
+    - Triggered from Step 3 Case B only — time-limit exit never leads to dead position
 
 In this case:
-    Lookup next trading day via trading_calendar table.
+    Lookup next day with has_data=True via trading_calendar table.
 
-    Case A — next trading day has_data=True AND ticker exists in ticker_data_coverage:
+    Case A — has_data=True AND ticker exists in ticker_data_coverage:
         exit_price = next day pre-market first tick
                      fallback: next day ohlcv_1min first bar open
         exit_price *= (1 - dead_position_penalty_pct)
@@ -191,13 +198,13 @@ In this case:
         pnl = (exit_price - P_entry) / P_entry
         apply label by pnl threshold (same rules as Step 3)
 
-    Case B — next trading day has_data=True AND ticker NOT in ticker_data_coverage:
+    Case B — has_data=True AND ticker NOT in ticker_data_coverage:
         is_dead_position = True
         dead_position_case = "B"
         assign label_sw directly
         (direction cannot be determined — possible delisting)
 
-    Case C — next trading day not in dataset (boundary condition):
+    Case C — no next day with has_data=True in dataset (boundary condition):
         is_dead_position = True
         dead_position_case = "C"
         assign label_sw directly
@@ -242,8 +249,12 @@ Note: `build_effective_bar_sequence()` is an internal delegation to
 
 - t bar high/low/close/volume must NOT be used — only t bar open (P_entry) is permitted as reference
 - Halt bars are excluded from the 60-bar valid count — search extends to compensate
-- Regular session close (15:59 bar) triggers exit when track_label_breach() returns None
-- After-market data usage is limited to 15:59 bar halt/no_data fallback only
+- Time-limit exit (Step 3 Case A): triggered when 60 valid bars collected before 15:59;
+  exit_price = last valid bar close; no after-market fallback; no dead position
+- Session close exit (Step 3 Case B): triggered when 15:59 bar reached within 60 valid bars;
+  after-market fallback applies when 15:59 bar is halt/no_data
+- Dead position triggered from Step 3 Case B only — time-limit exit never leads to dead position
+- After-market data usage limited to 15:59 halt/no_data fallback only (Step 3 Case B)
 - build_effective_bar_sequence() collects bars up to 15:59 only — after-market bars never included
 - Dead position is the only case where after-market and next-day data are used
 - Threshold values (threshold_3pp, threshold_5pp) must be read from config, not hardcoded
@@ -288,9 +299,11 @@ labeler:
 | +3pp hit at bar 10, -3pp hit at bar 15 (before +5pp) | label_up3 |
 | -3pp hit first, -5pp reached | label_dn5 |
 | -3pp hit first, +3pp cuts off before -5pp | label_dn3 |
-| Neither ±3pp breached, 15:59 exit | label_sw |
+| Neither ±3pp breached, 15:59 reached within 60 bars | label_sw (session close exit) |
+| Neither ±3pp breached, 60 valid bars collected before 15:59 | label_sw (time-limit exit, last valid bar close) |
 | Ambiguous bundle (both ±3pp in same bundle), priority="up" | label_up3/up5, is_ambiguous=True |
-| Dead position Case A (ticker in coverage next day) | is_dead_position=True, case="A", label by pnl threshold |
-| Dead position Case B (ticker missing from coverage next day) | is_dead_position=True, case="B", label_sw |
-| Dead position Case C (dataset boundary) | is_dead_position=True, case="C", label_sw |
+| Dead position Case A (ticker in coverage, has_data=True next day) | is_dead_position=True, case="A", label by pnl threshold |
+| Dead position Case B (ticker missing, has_data=True next day) | is_dead_position=True, case="B", label_sw |
+| Dead position Case C (no next day with has_data=True) | is_dead_position=True, case="C", label_sw |
 | Halt bar skipped in 60-bar count | label assigned after halt |
+| Time-limit exit: 60 valid bars collected, 15:59 bar not yet reached | exit at last valid bar close, no dead position |

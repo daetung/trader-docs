@@ -150,9 +150,9 @@ CREATE TABLE entry_points (
 );
 
 -- Labeled samples (output of Labeler)
--- dead_position_case: "A" (next-day data available, ticker found in coverage) |
---                     "B" (next-day exists, ticker missing — possible delisting) |
---                     "C" (dataset boundary — next day not in dataset) |
+-- dead_position_case: "A" (next day has_data=True, ticker found in coverage) |
+--                     "B" (next day has_data=True, ticker missing — possible delisting) |
+--                     "C" (no next day with has_data=True — dataset boundary) |
 --                     NULL (not a dead position)
 -- is_ambiguous: TRUE if tp and sl thresholds simultaneously satisfied within the same
 --               10-tick bundle during Stage 1 of track_label_breach().
@@ -313,10 +313,10 @@ ticks_full = con.execute("""
     ORDER BY hour, seq_id
 """, ["AAPL", "20250714"]).df()
 
-# Find next trading day for dead position resolution
+# Find next day with has_data=True for dead position resolution
 next_day = con.execute("""
     SELECT date, has_data FROM trading_calendar
-    WHERE date > ? AND is_trading_day = TRUE
+    WHERE date > ? AND has_data = TRUE
     ORDER BY date LIMIT 1
 """, ["20250714"]).fetchone()
 

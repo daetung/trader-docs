@@ -270,7 +270,6 @@ avg_vol_per_tick(ticks, bars)
 | Pivot outputs | `pp`, `r1`..`r3`, `s1`..`s3` | absolute prices |
 | Fibonacci outputs | `fib_0`, `fib_236`, `fib_382`, `fib_500`, `fib_618`, `fib_786`, `fib_1000` | absolute prices |
 | S/R raw | `price_r{n}`, `bars_since_r{n}`, `prominence_r{n}`, `price_s{n}`, `bars_since_s{n}`, `prominence_s{n}` | `price_r1`, `bars_since_r1` |
-| S/R features (Vectorizer output) | `dist_r{n}_pct`, `dist_s{n}_pct`, `prominence_r{n}` | `dist_r1_pct` |
 
 **VR disambiguation:** `vr_volume` = volume surge ratio. `vr_volatility` = ATR-normalized volatility. Never use bare `vr` as a column name.
 

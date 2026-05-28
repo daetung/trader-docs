@@ -37,9 +37,11 @@ Do not load other module docs unless checking an interface boundary.
 Feature input:       bars t-1, t-2, ..., t-N  (fully closed OHLCV bars only)
 P_entry:             t bar open  →  reference value only, NOT a feature
 Forbidden as input:  t bar high / low / close / volume
-Label search range:  t bar open → t+59 bar close  (max 60 min)
+Label search range:  t bar open → 15:59 close or 60th valid bar close (whichever first)
 10-tick for features: ticks with timestamp < t bar open only
-10-tick for backtest: ticks within t bar (slippage estimation only)
+10-tick for backtest: ticks from t bar onward
+                      (entry slippage: entry_hour ~ entry_hour+100s;
+                       exit tracking: full day incl. after-market)
 ```
 
 ---

@@ -23,42 +23,40 @@ Raw JSON (1min / 10tick, all sessions)
  EntryPointDetector           Candidate entry point selection (fixed logic)
         │                     All sessions processed; session_mode filter at training stage
         │  (ticker, date, t)
-        ▼
- IndicatorCalculator          All indicator calculations → time-series DataFrames
-        │                     Input: bars [..., t-2, t-1] (fully closed bars only)
-        ▼
- Vectorizer                   Time-series → fixed-length feature vectors
         │
-        ▼
- Labeler                      5 independent binary labels per entry point
-        │                     Exit at 15:59 bar; after-market fallback for halt only
-        │                     is_dead_position flag for overnight hold cases
-        │  [labels, is_dead_position, dead_position_case, is_ambiguous]
-        │
- FeatureExtractor             Combine vectorized indicators + meta + temporal
-        │                     extract_batch(): indicators computed once per ticker
-        │  [features...]
-        ▼
-      merge                   join on (ticker, date, hour)
-        │  feature matrix [ticker, date, hour, p_entry, features...,
-        │                  labels, is_dead_position, dead_position_case, is_ambiguous]
-        ▼
- ClassBalancer                Downsampling via split(balance=config.apply_balance)
-        │  train / validation / test
-        ▼
- PipelineOptimizer            Training endpoint
-   ├── Preprocessor           run once → full_labeled_df (return_data=True)
-   ├── Trainer                per-fold train
-   │     └── LightGBM Pipeline    5 independent binary classifiers
-   │     └── DimensionalityReducer  ImportanceProvider-based (model-agnostic)
-   └── Backtester             writes experiment_log
-        │
-        ▼
- BacktestEngine               DB-direct price tracking, slippage via tick_10
-        │                     Session-close priority exit, dead position handling
-        ▼
- experiment_log (DuckDB)      Written by Backtester only
- train_log (DuckDB)           Written by Trainer per trial
+        ├─────────────────────────────────────────┐
+        │                                         │
+        ▼                                         ▼
+ FeatureExtractor                              Labeler
+   (internally calls:                    5 independent binary labels per entry point
+    IndicatorCalculator                  Exit at 15:59 or 60-bar time limit;
+    → Vectorizer                         after-market fallback for session-end halt only
+    + MetaFeatures                       is_dead_position flag for overnight hold cases
+    + TemporalFeatures)                  [labels, is_dead_position,
+   [features...]                          dead_position_case, is_ambiguous]
+        │                                         │
+        └──────────────────┬──────────────────────┘
+                           ▼
+                         merge                   join on (ticker, date, hour)
+                           │  feature matrix [ticker, date, hour, p_entry, features...,
+                           │                  labels, is_dead_position, dead_position_case, is_ambiguous]
+                           ▼
+                    ClassBalancer                Downsampling via split(balance=config.apply_balance)
+                           │  train / validation / test
+                           ▼
+                   PipelineOptimizer            Training endpoint
+                     ├── Preprocessor           run once → full_labeled_df (return_data=True)
+                     ├── Trainer                per-fold train
+                     │     └── LightGBM Pipeline    5 independent binary classifiers
+                     │     └── DimensionalityReducer  ImportanceProvider-based (model-agnostic)
+                     └── Backtester             writes experiment_log
+                           │
+                           ▼
+                    BacktestEngine               DB-direct price tracking, slippage via tick_10
+                           │                     Session-close priority exit, dead position handling
+                           ▼
+                    experiment_log (DuckDB)      Written by Backtester only
+                    train_log (DuckDB)           Written by Trainer per trial
 ```
 
 ---
@@ -92,7 +90,7 @@ Standalone scripts:
 | `pipeline/02_indicator_calculator.md` | All indicator methods, VWAP reset_mode, missing bar classification |
 | `pipeline/03_vectorizer.md` | Time-series → vector transformation methods |
 | `pipeline/04_feature_extractor.md` | Integration entrypoint, extract_batch strategy, parquet column structure |
-| `pipeline/05_labeler.md` | 5-class binary labeling, session-close exit, dead position |
+| `pipeline/05_labeler.md` | 5-class binary labeling, session-close exit, time-limit exit, dead position |
 | `pipeline/06_class_balancer.md` | Downsampling strategy, split() and generate_folds() |
 | `pipeline/07_lgbm_pipeline.md` | LightGBM 5-classifier structure and evaluation |
 | `pipeline/08_dimensionality_reducer.md` | ImportanceProvider pattern, model-agnostic reduction |
@@ -108,6 +106,15 @@ Standalone scripts:
 | `tools/detection_benchmark.md` | Entry detection threshold tuning + timing benchmark |
 | `tools/metadata_crawler.md` | Daily metadata fetch + new data ingestion |
 | `visualization/viz_connector.md` | Abstract base class for visualization backends |
+
+---
+
+## Open Items
+
+| Item | When to resolve |
+|---|---|
+| MLPImportanceProvider implementation | MLP phase |
+| Inferencer full implementation | After training pipeline stabilizes |
 
 ---
 
@@ -199,16 +206,3 @@ stock-scalping/
 │   └── secrets.yaml               # gitignored
 └── experiment_log.csv             # legacy; authoritative store is DuckDB
 ```
-
----
-
-## Open Items
-
-| Item | When to resolve |
-|---|---|
-| Full feature indicator list | Before implementing IndicatorCalculator |
-| Per-indicator vectorizer method mapping | During vectorizer design |
-| LightGBM hyperparameter search range | After initial model implementation |
-| Visualization tool spec | Separate design phase |
-| MLPImportanceProvider implementation | MLP phase |
-| Inferencer full implementation | After training pipeline stabilizes |
