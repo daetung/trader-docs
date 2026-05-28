@@ -135,8 +135,8 @@ class Preprocessor:
     ) -> None:
         """
         Save parquet files to data/processed/.
+        Called internally by run() in standalone mode (return_data=False).
         If run_id provided, saves to data/processed/{run_id}/ for trial isolation.
-        Called explicitly by PipelineOptimizer after best trial is selected.
         """
         ...
 ```

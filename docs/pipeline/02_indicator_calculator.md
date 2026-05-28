@@ -159,6 +159,8 @@ pivot_points(bars)
     → S3  = prev_low - 2 * (prev_high - PP)
     → output: constant value per session bar (step function)
     → "previous session" = previous date's regular session (093000~155900)
+    → output columns: pp, r1, r2, r3, s1, s2, s3 (absolute prices)
+    → distance features derived in Vectorizer via level_distance()
 
 fibonacci_retracement(bars, window_bars)
     → Identify swing high and swing low within window
@@ -170,27 +172,29 @@ fibonacci_retracement(bars, window_bars)
          level_618  = swing_low + 0.618 * (swing_high - swing_low)
          level_786  = swing_low + 0.786 * (swing_high - swing_low)
          level_1000 = swing_high
-    → Also output distance from P_entry to nearest level above/below (%)
+    → output columns: fib_0, fib_236, fib_382, fib_500, fib_618, fib_786, fib_1000
+      (absolute prices — constant over window)
+    → distance features derived in Vectorizer via level_distance()
     → window_bars default: 390 (1 trading session)
 ```
 
 ### Support / Resistance (Multi-level, Dynamic)
 ```
-sr_levels(bars, n_levels, window_bars, reference_price)
+sr_levels(bars, n_levels, window_bars)
     → Identify top-N local maxima and minima by scipy prominence score
     → For each of top-N resistance levels (local maxima):
-         dist_rN_pct    : (local_max_N - reference_price) / reference_price
-         bars_since_rN  : bars elapsed since local_max_N
-         prominence_rN  : scipy prominence score
+         price_rN      : absolute price of local maximum
+         bars_since_rN : bars elapsed since local_max_N
+                         (relative to last bar in passed window = t-1)
+         prominence_rN : scipy prominence score
     → For each of top-N support levels (local minima):
-         dist_sN_pct    : (reference_price - local_min_N) / reference_price
-         bars_since_sN  : bars elapsed since local_min_N
-         prominence_sN  : scipy prominence score
-    → Composite features:
-         nearest_resistance_dist : min(dist_r1..rN)
-         resistance_density      : mean(dist_r1..rN)
-         nearest_support_dist    : min(dist_s1..sN)
-         sr_asymmetry            : nearest_resistance_dist - nearest_support_dist
+         price_sN      : absolute price of local minimum
+         bars_since_sN : bars elapsed since local_min_N
+                         (relative to last bar in passed window = t-1)
+         prominence_sN : scipy prominence score
+    → Raw level data only — distance features (dist_rN_pct, dist_sN_pct,
+      nearest_resistance_dist, sr_asymmetry, etc.) are computed by
+      Vectorizer.sr_distance() using P_entry per entry point
     → Pad missing levels with NaN if fewer than n_levels extrema found
     → default: n_levels=3, window_bars=480 (~2 trading days)
 ```
@@ -263,9 +267,10 @@ avg_vol_per_tick(ticks, bars)
 | ADX/DMI outputs | `adx`, `dmi_plus`, `dmi_minus` | — |
 | SAR outputs | `sar`, `sar_trend` | — |
 | Volume Ratio | `vr_volume` | distinct from `vr_volatility` |
-| Pivot outputs | `pp`, `r1`..`r3`, `s1`..`s3` | — |
-| Fibonacci outputs | `fib_0`, `fib_236`, `fib_382`, `fib_500`, `fib_618`, `fib_786`, `fib_1000` | — |
-| S/R dynamic | `dist_r{n}_pct`, `bars_since_r{n}`, `prominence_r{n}` | `dist_r1_pct` |
+| Pivot outputs | `pp`, `r1`..`r3`, `s1`..`s3` | absolute prices |
+| Fibonacci outputs | `fib_0`, `fib_236`, `fib_382`, `fib_500`, `fib_618`, `fib_786`, `fib_1000` | absolute prices |
+| S/R raw | `price_r{n}`, `bars_since_r{n}`, `prominence_r{n}`, `price_s{n}`, `bars_since_s{n}`, `prominence_s{n}` | `price_r1`, `bars_since_r1` |
+| S/R features (Vectorizer output) | `dist_r{n}_pct`, `dist_s{n}_pct`, `prominence_r{n}` | `dist_r1_pct` |
 
 **VR disambiguation:** `vr_volume` = volume surge ratio. `vr_volatility` = ATR-normalized volatility. Never use bare `vr` as a column name.
 
@@ -279,7 +284,9 @@ avg_vol_per_tick(ticks, bars)
 - NaN handling: return NaN for warm-up period rows; do not forward-fill silently
 - `dmi()` must not duplicate the calculation logic of `adx()` — call or delegate internally
 - VWAP reset behavior is controlled by `reset_mode` argument — caller (FeatureExtractor) reads from config and passes explicitly
-- `fibonacci_retracement()` and `pivot_points()` output level values as absolute prices, not distances — distance features are derived in Vectorizer
+- `fibonacci_retracement()` and `pivot_points()` output level values as absolute prices, not distances — distance features are derived in Vectorizer via `level_distance()`
+- `sr_levels()` outputs raw level data only (`price_rN`, `bars_since_rN`, `prominence_rN`) — P_entry is never passed to this method; distance features derived in Vectorizer via `sr_distance()`
+- `bars_since_rN` is computed relative to the last bar in the passed window (always t-1) — it is a raw temporal measurement, not a derived feature
 - `classify_missing_bars()` applies halt classification across all time periods — halts_df is the authoritative source regardless of hour
 
 ---
@@ -354,7 +361,7 @@ class IndicatorCalculator:
     def fibonacci_retracement(self, bars: pd.DataFrame,
                                window_bars: int) -> pd.DataFrame: ...
     def sr_levels(self, bars: pd.DataFrame, n_levels: int,
-                  window_bars: int, reference_price: float) -> pd.DataFrame: ...
+                  window_bars: int) -> pd.DataFrame: ...
 
     # Spread / Market Microstructure
     def lee_ready(self, ticks: pd.DataFrame, bars: pd.DataFrame,

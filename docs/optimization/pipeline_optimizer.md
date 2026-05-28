@@ -104,8 +104,11 @@ for train, val, test, fold_meta in balancer.generate_folds(
     fold_aucs.append(result["auc_mean"])
     reduction_reports.append(result["reduction_report"])
 
-auc_std = std(fold_aucs)
-UPDATE train_log SET auc_std = auc_std WHERE run_id = fold_run_ids[-1]
+auc_std = std(fold_aucs) if len(fold_aucs) > 1 else 0.0
+db_conn.execute(
+    "UPDATE train_log SET auc_std = ? WHERE run_id = ?",
+    [auc_std, fold_run_ids[-1]]
+)
 
 # Frequency voting across folds
 selected_features = frequency_vote(reduction_reports,
@@ -560,8 +563,9 @@ effective_num_threads = max(
 
 ```
 Completed trials (all Successive Halving rounds finished):
-    auc_std = std(trial_auc_history[trial_idx])
-    UPDATE train_log SET auc_std = <value> WHERE run_id = fold_run_ids[-1]
+    auc_std = std(trial_auc_history[trial_idx]) if len > 1 else 0.0
+    db_conn.execute("UPDATE train_log SET auc_std = ? WHERE run_id = ?",
+                    [auc_std, fold_run_ids[-1]])
     fold_run_ids[-1] = last completed round's run_id for that trial
 
 Pruned trials:

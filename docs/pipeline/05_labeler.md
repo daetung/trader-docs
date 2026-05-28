@@ -105,10 +105,10 @@ Case A: next trading day is_trading_day=True AND has_data=True
 
 Case B: next trading day is_trading_day=True AND has_data=True
         AND ticker NOT found in ticker_data_coverage for that date
-        → possible delisting; label_sw assigned (cannot determine direction)
+        → possible delisting; label_sw assigned directly (cannot determine direction)
 
 Case C: next trading day not available in dataset (boundary condition)
-        → label_sw assigned; excluded from training (see ClassBalancer config)
+        → label_sw assigned directly; excluded from training (see ClassBalancer config)
 ```
 
 ---
@@ -188,20 +188,21 @@ In this case:
         exit_price *= (1 - dead_position_penalty_pct)
         is_dead_position = True
         dead_position_case = "A"
+        pnl = (exit_price - P_entry) / P_entry
+        apply label by pnl threshold (same rules as Step 3)
 
     Case B — next trading day has_data=True AND ticker NOT in ticker_data_coverage:
-        pnl = -1.0  (full loss — possible delisting)
-        exit_price = 0
         is_dead_position = True
         dead_position_case = "B"
+        assign label_sw directly
+        (direction cannot be determined — possible delisting)
 
     Case C — next trading day not in dataset (boundary condition):
-        pnl = -0.5
         is_dead_position = True
         dead_position_case = "C"
+        assign label_sw directly
+        (dataset boundary — actual price movement unknown)
         Note: ClassBalancer can optionally exclude Case C from training.
-
-    assign label by pnl threshold (same rules as Step 3)
 ```
 
 **Key invariant:** Exactly one label equals 1 per entry point. All others are 0.
@@ -257,6 +258,9 @@ Note: `build_effective_bar_sequence()` is an internal delegation to
 - `exit_interpolation` passed through to `track_label_breach()` — read from config
 - `ticker_data_coverage` must be pre-loaded and passed explicitly;
   used for dead position Case A vs Case B determination only
+- Dead position Case A: pnl computed from next-day exit_price; label assigned by threshold
+- Dead position Case B: label_sw assigned directly — no pnl threshold applied
+- Dead position Case C: label_sw assigned directly — no pnl threshold applied
 
 ---
 
@@ -286,7 +290,7 @@ labeler:
 | -3pp hit first, +3pp cuts off before -5pp | label_dn3 |
 | Neither ±3pp breached, 15:59 exit | label_sw |
 | Ambiguous bundle (both ±3pp in same bundle), priority="up" | label_up3/up5, is_ambiguous=True |
-| Dead position Case A (ticker in coverage next day) | is_dead_position=True, case="A" |
+| Dead position Case A (ticker in coverage next day) | is_dead_position=True, case="A", label by pnl threshold |
 | Dead position Case B (ticker missing from coverage next day) | is_dead_position=True, case="B", label_sw |
 | Dead position Case C (dataset boundary) | is_dead_position=True, case="C", label_sw |
 | Halt bar skipped in 60-bar count | label assigned after halt |

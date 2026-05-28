@@ -84,7 +84,25 @@ Output keys:
     {name}_above_mean_ratio     ← fraction of bars above series mean
 ```
 
-### 6. Multi-level S/R Distance
+### 6. Level Distance
+```
+Applies to: fibonacci_retracement, pivot_points
+            (constant-value absolute price series, one column per level)
+Reference: P_entry (passed explicitly)
+
+Dispatched via transform() — standard pd.Series input interface.
+FeatureExtractor iterates over each level column and calls transform() per column.
+
+Output keys (per level column, e.g. "fib_618", "r1", "pp"):
+    {name}_dist_pct   ← (level_price - P_entry) / P_entry
+                        positive = level is above P_entry (resistance)
+                        negative = level is below P_entry (support)
+
+NaN padding: if level column is NaN (e.g. insufficient data for swing detection),
+             output {name}_dist_pct = NaN.
+```
+
+### 7. Multi-level S/R Distance
 ```
 Applies to: sr_levels output from IndicatorCalculator
 Reference: P_entry (passed explicitly)
@@ -93,14 +111,18 @@ This method is NOT dispatched via transform().
 FeatureExtractor calls sr_distance() directly on the Vectorizer instance.
 See "sr_distance dispatch" note below.
 
-Output keys (per level N = 1..n_levels):
-    dist_rN_pct              ← (local_max_N - P_entry) / P_entry
-    bars_since_rN            ← bars elapsed since local_max_N
-    prominence_rN            ← scipy prominence score
+Input: sr_df (pd.DataFrame) with columns:
+    price_rN, bars_since_rN, prominence_rN   (for N = 1..n_levels)
+    price_sN, bars_since_sN, prominence_sN
 
-    dist_sN_pct              ← (P_entry - local_min_N) / P_entry
-    bars_since_sN
-    prominence_sN
+Output keys (per level N = 1..n_levels):
+    dist_rN_pct              ← (price_rN - P_entry) / P_entry
+    bars_since_rN            ← passed through from IndicatorCalculator output
+    prominence_rN            ← passed through from IndicatorCalculator output
+
+    dist_sN_pct              ← (P_entry - price_sN) / P_entry
+    bars_since_sN            ← passed through from IndicatorCalculator output
+    prominence_sN            ← passed through from IndicatorCalculator output
 
 Composite:
     nearest_resistance_dist  ← min(dist_r1..rN)
@@ -126,6 +148,8 @@ Configured in `pipeline_config.yaml`. Default mapping:
 | TPM | window_comparison | statistical_summary |
 | avg_vol_per_tick | window_comparison | — |
 | MA, EMA, MACD | linear_trend | statistical_summary |
+| fibonacci_retracement | level_distance | — |
+| pivot_points | level_distance | — |
 | sr_levels | sr_distance | — |
 
 ---
@@ -139,6 +163,8 @@ class Vectorizer:
     def linear_trend(self, series: pd.Series, name: str) -> dict[str, float]: ...
     def window_comparison(self, series: pd.Series, name: str) -> dict[str, float]: ...
     def shape_features(self, series: pd.Series, name: str) -> dict[str, float]: ...
+    def level_distance(self, series: pd.Series, reference_price: float,
+                       name: str) -> dict[str, float]: ...
     def sr_distance(self, sr_df: pd.DataFrame, reference_price: float,
                     n_levels: int) -> dict[str, float]: ...
 
@@ -146,6 +172,12 @@ class Vectorizer:
                   name: str, **kwargs) -> dict[str, float]:
         """
         Dispatch to named method. Used by FeatureExtractor.
+
+        Supported methods via transform(): statistical_summary, rate_of_change,
+        linear_trend, window_comparison, shape_features, level_distance.
+
+        level_distance requires reference_price passed as kwarg:
+            transform(series, "level_distance", name, reference_price=P_entry)
 
         NOTE: sr_distance is explicitly excluded from transform() dispatch.
         sr_distance accepts pd.DataFrame (not pd.Series) and requires
@@ -167,3 +199,11 @@ class Vectorizer:
 - NaN values are allowed in output — LightGBM handles them natively
 - `transform()` must raise `ValueError` if method="sr_distance" is passed
 - `sr_distance()` is always called directly by FeatureExtractor, never via `transform()`
+- `level_distance()` is dispatched via `transform()` with `reference_price` as kwarg
+- `level_distance()` input is a pd.Series of a single level column (e.g. `fib_618`, `r1`)
+  — FeatureExtractor iterates over level columns individually
+- `sr_distance()` receives `bars_since_rN` and `prominence_rN` from IndicatorCalculator
+  output directly — no recomputation; pass-through to output dict
+- `dist_rN_pct` sign convention: positive = level above P_entry (resistance);
+  `dist_sN_pct` sign convention: positive = level below P_entry (support)
+- Same sign convention applies to `level_distance()`: positive = level above P_entry

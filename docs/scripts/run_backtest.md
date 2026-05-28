@@ -47,12 +47,20 @@ model_dir: Path | None  # directory containing trained model artifacts (optional
 2. Load test_features.parquet from data/processed/ (or accept in-memory DataFrame)
 3. Determine feature column names (exclude labels, identifiers, metadata columns)
    Metadata columns excluded from features: is_dead_position, dead_position_case, is_ambiguous
-4. If model_dir provided:
-   a. model = create_model(config); models, meta = model.load(run_id)
-   b. probs_df = model.predict(models, X_test)
-   c. Build predictions DataFrame (ticker, date, hour, p_entry, probs, labels)
-   Else:
-   a. Use test_df columns directly (prob_* and label_* must exist)
+4. Resolve model source and build predictions DataFrame:
+   a. If model_dir is explicitly provided (non-None):
+      → load from model_dir / run_id
+   b. Elif config["model"]["model_dir"] exists and is non-empty:
+      → model_dir = Path(config["model"]["model_dir"])
+      → load from config model_dir / run_id
+      (covers optimizer-called context where model_dir=None but artifacts were saved by Trainer)
+   c. Else (pre-computed probabilities — pure standalone path):
+      → Use test_df columns directly (prob_* and label_* must exist)
+
+   For paths (a) and (b):
+      model = create_model(config); models, meta = model.load(run_id)
+      probs_df = model.predict(models, X_test)
+      Build predictions DataFrame (ticker, date, hour, p_entry, probs, labels)
 5. Instantiate BacktestEngine(config, db_conn)
 6. trade_log, summary = engine.run(predictions)
 7. Compute label base rates from test_df:
@@ -103,7 +111,11 @@ class Backtester:
         Args:
             test_df:         test split DataFrame
             run_id:          matches the train_log run_id for this backtest
-            model_dir:       directory containing model artifacts (optional)
+            model_dir:       directory containing model artifacts.
+                             Resolution order:
+                               1. model_dir if explicitly provided (non-None)
+                               2. Path(config["model"]["model_dir"]) if set in config
+                               3. Use test_df prob_* columns directly (pre-computed)
             fold_idx:        inner rolling fold index (0-based); -1 for standalone/outer eval
             outer_fold_idx:  outer fold index for nested validation (0-based);
                              -1 for non-nested runs
@@ -242,3 +254,7 @@ Elapsed: 45.2s
 - `suppressed_count` sourced from BacktestEngine summary — must always be present
 - Metadata columns (`is_dead_position`, `dead_position_case`, `is_ambiguous`) must not
   be passed to model.predict() as features
+- `model_dir` resolution order: explicit arg → config["model"]["model_dir"] fallback →
+  pre-computed prob_* columns in test_df; path (c) requires prob_* columns to exist
+- PipelineOptimizer calls `backtester.run()` with `model_dir=None` — the config fallback
+  path (b) ensures artifacts saved by Trainer are correctly located at inference time

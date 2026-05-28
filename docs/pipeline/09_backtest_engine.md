@@ -33,6 +33,46 @@ OHLCV and tick data are fetched internally from DuckDB per ticker/date as needed
 
 ---
 
+## Class Interface
+
+```python
+class BacktestEngine:
+    def __init__(
+        self,
+        config: dict,
+        db_conn: duckdb.DuckDBPyConnection,
+    ): ...
+
+    def run(
+        self,
+        predictions: pd.DataFrame,
+    ) -> tuple[pd.DataFrame, dict]:
+        """
+        Run full backtest simulation.
+        Returns (trade_log_df, summary_dict).
+
+        trade_log_df: one row per executed trade — matches trade_log table schema.
+                      Written to DuckDB trade_log table by Backtester (run_backtest.py),
+                      not by BacktestEngine itself.
+
+        summary_dict keys:
+            winning_rate        : float  — winning_trades / total_trades
+            total_trades        : int
+            winning_trades      : int
+            avg_pnl_pct         : float
+            total_pnl_abs       : float
+            avg_slippage_pct    : float
+            dead_position_count : int
+            dead_position_rate  : float
+            suppressed_count    : int    — entries blocked by suppress_threshold
+            trades_by_signal    : dict   — {signal: {count, win_rate, avg_pnl}}
+            trades_by_exit      : dict   — {exit_reason: count}
+        """
+        ...
+```
+
+---
+
 ## DB Access Strategy
 
 ### OHLCV (per ticker)
@@ -219,42 +259,37 @@ Cash is deducted sequentially until exhausted.
 
 ## Exit Logic
 
-### tp/sl exit (track_price_breach + simulate_exit_fill)
+### Take-profit / Stop-loss exit
 
 ```python
-tp_pct = config["backtest"]["take_profit_up3"] if signal == "up3" \
-         else config["backtest"]["take_profit_up5"]
+tp_pct = config["backtest"]["take_profit_up5"] if signal == "up5" \
+         else config["backtest"]["take_profit_up3"]
 
 direction, exit_price, exit_hour, is_ambiguous = utils.track_price_breach(
-    ohlcv_future       = bars from t bar onward (inclusive), sorted by hour,
-    ticks_future       = ticks_td filtered to hour >= entry_hour,
-    fill_price         = fill_price,
-    fill_second        = fill_second,
-    threshold_up       = tp_pct,
-    threshold_dn       = config["backtest"]["stop_loss_pct"],
-    exit_interpolation = config["backtest"]["exit_interpolation"],
-    ambiguity_priority = config["labeler"]["ambiguity_priority"],
+    ohlcv_future=bars_from_t,
+    ticks_future=ticks_td[ticks_td["hour"] >= entry_hour],
+    fill_price=fill_price,
+    fill_second=fill_second,
+    threshold_up=tp_pct,
+    threshold_dn=config["backtest"]["stop_loss_pct"],
+    exit_interpolation=config["backtest"]["exit_interpolation"],
 )
 
 if direction is not None:
     sell_rate = config["backtest"]["sell_rate_tp"] if direction == "up" \
                 else config["backtest"]["sell_rate_sl"]
 
-    breach_bundle_idx = iloc index of exit_hour bundle in ticks_td
-
-    weighted_avg_exit_price, total_filled, unfilled_qty, final_exit_hour =
-        utils.simulate_exit_fill(
-            ticks_exit        = ticks_td from breach_bundle_idx onward,
-            ohlcv_exit        = ohlcv from exit_hour onward,
-            position_size     = quantity,
-            breach_bundle_idx = breach_bundle_idx,
-            breach_price      = exit_price,
-            sell_rate         = sell_rate,
-            halts_df          = halts_td,
-        )
+    weighted_avg_exit_price, total_filled, unfilled_qty, _ = utils.simulate_exit_fill(
+        ticks_exit=ticks_td[ticks_td["hour"] >= exit_hour],
+        ohlcv_exit=ohlcv_ticker[ohlcv_ticker["hour"] >= exit_hour],
+        position_size=quantity,
+        breach_bundle_idx=breach_bundle_idx,
+        breach_price=exit_price,
+        sell_rate=sell_rate,
+        halts_df=halts_td,
+    )
 
     if unfilled_qty > 0:
-        # Partial fill: ticks exhausted before full position exit.
         # Not a dead position — all available ticks (including after-market) were used.
         # Unfilled portion penalized at flat dead_position_penalty_pct.
         # Diagnostic: trade_log.unfilled_quantity / quantity gives unfill ratio.
@@ -399,6 +434,9 @@ is_ambiguous             BOOLEAN,   -- True if simultaneous bundle-level tp/sl b
 - Dead position trades included in winning_rate denominator
 - Suppressed entries (suppress_threshold) not logged to trade_log
 - `suppressed_count` tracked in summary for diagnostics
+- `run()` returns `tuple[pd.DataFrame, dict]` — trade_log_df and summary_dict;
+  DB writes (trade_log INSERT, experiment_log INSERT) performed by Backtester (run_backtest.py),
+  not by BacktestEngine
 - `resolve_signal()`, `build_effective_bar_sequence()`, `track_price_breach()`,
   `simulate_exit_fill()`, `find_fill_bundle()`, `interpolate_bundle_price()`,
   `hour_to_int()`, `hour_to_minutes()`, `hour_add_seconds()` — all sourced from `utils.py`
