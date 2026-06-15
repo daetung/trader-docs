@@ -7,13 +7,15 @@
 
 ## Role
 
-Three responsibilities combined into one daily-run tool:
+Four responsibilities combined into one daily-run tool:
 
 1. **Metadata crawling** — fetch and upsert stock metadata (sector, market cap,
    shares outstanding, 52w high/low, avg volume) for all active tickers
 2. **New data ingestion** — ingest newly collected JSON files into DuckDB
 3. **Calendar and coverage update** — incrementally update `trading_calendar`
    and `ticker_data_coverage` for newly ingested dates
+4. **Session stats update** — compute and store `precomputed_session_stats`
+   for newly ingested dates (REFERENCE_SESSION baselines)
 
 ---
 
@@ -110,10 +112,37 @@ These functions are safe to call multiple times (upsert).
 
 ---
 
+## Session Stats Update (Daily)
+
+After calendar and coverage update, compute REFERENCE_SESSION baselines for
+the next trading day. This ensures session_stats are available before market open.
+
+```python
+from utils import populate_precomputed_session_stats
+
+# Compute baselines for tomorrow (as_of_date = next trading day)
+# so that LiveModeRunner can query them at session start.
+next_trading_day = get_next_trading_day(today, db_conn)
+
+populate_precomputed_session_stats(
+    db_conn=con,
+    dates=[next_trading_day],   # as_of_date for which we need baselines
+    n_sessions=20,
+)
+```
+
+`populate_precomputed_session_stats()`:
+- Computes per-bar averages for `as_of_date = next_trading_day` using
+  the prior 20 sessions' data (now available since today's data just ingested)
+- Safe to re-run (INSERT OR IGNORE)
+- Runs after ingestion — ensures today's data is included in the baseline
+
+---
+
 ## CLI Usage
 
 ```bash
-# Full daily run: metadata + ingest + calendar update
+# Full daily run: metadata + ingest + calendar update + session stats
 python tools/collect_daily.py \
     --db-path data/market.duckdb \
     --data-root /path/to/json/data \
@@ -124,12 +153,19 @@ python tools/collect_daily.py \
     --db-path data/market.duckdb \
     --metadata-only
 
-# Ingest only (includes calendar update)
+# Ingest only (includes calendar update and session stats)
 python tools/collect_daily.py \
     --db-path data/market.duckdb \
     --data-root /path/to/json/data \
     --ingest-only \
     --date 20250715
+
+# Skip session stats computation
+python tools/collect_daily.py \
+    --db-path data/market.duckdb \
+    --data-root /path/to/json/data \
+    --date today \
+    --skip-session-stats
 
 # Refresh metadata for specific tickers
 python tools/collect_daily.py \
@@ -185,9 +221,13 @@ Daily Collection — 20250715
     Duration          : 3m 41s
 
   [Calendar Update]
-    trading_calendar   : 1 date upserted
+    trading_calendar    : 1 date upserted
     ticker_data_coverage: 11,847 rows upserted
-    Duration           : 0m 12s
+    Duration            : 0m 12s
+
+  [Session Stats — next trading day: 20250716]
+    precomputed_session_stats: 11,847 tickers × 390 bars × 8 metrics computed
+    Duration            : 1m 48s
 ```
 
 ---
@@ -222,7 +262,8 @@ fmp_api_key: "your_key_here"
 - Metadata upsert uses `updated_at = today`
 - Ingestion logic delegates to `migrate_json_to_duckdb.py` — no duplicated logic
 - Calendar/coverage update always runs after ingestion — not optional
-- `populate_trading_calendar()` and `populate_ticker_coverage()` sourced from `utils.py`
+- Session stats update runs after calendar/coverage update — not optional unless --skip-session-stats
+- `populate_trading_calendar()`, `populate_ticker_coverage()`, and `populate_precomputed_session_stats()` sourced from `utils.py`
 - Must be safe to run multiple times on the same date (idempotent)
 - Failed metadata tickers do not block ingestion — two steps are independent
 - No session time filter on ingested data — all periods (040000~200000) stored

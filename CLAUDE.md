@@ -34,14 +34,17 @@ Do not load other module docs unless checking an interface boundary.
 ## Data Boundary Rules (Critical — Do Not Skip)
 
 ```
-Feature input:       bars t-1, t-2, ..., t-N  (fully closed OHLCV bars only)
-P_entry:             t bar open  →  reference value only, NOT a feature
-Forbidden as input:  t bar high / low / close / volume
-Label search range:  t bar open → 15:59 close or 60th valid bar close (whichever first)
-10-tick for features: ticks with timestamp < t bar open only
-10-tick for backtest: ticks from t bar onward
-                      (entry slippage: entry_hour ~ entry_hour+100s;
-                       exit tracking: full day incl. after-market)
+Feature input:         bars t-1, t-2, ..., t-N  (fully closed OHLCV bars only)
+P_entry:               t bar open  →  reference value only, NOT a feature
+Forbidden as input:    t bar high / low / close / volume
+Label search range:    t bar open → 15:59 close or 60th valid bar close (whichever first)
+10-tick for features:  ticks with timestamp < t bar open only
+10-tick for backtest:  ticks from t bar onward
+                       (entry slippage: entry_hour ~ entry_hour+100s;
+                        exit tracking: full day incl. after-market)
+REFERENCE_SESSION:     prior session baselines sourced from precomputed_session_stats
+                       (offline DB table) — NOT from bars feature window
+                       gap_percentile returns NaN for t="093000" or pre-market entries
 ```
 
 ---
@@ -66,11 +69,20 @@ Label search range:  t bar open → 15:59 close or 60th valid bar close (whichev
 - [x] loader.py — DuckDB schema creation and JSON ingestion script (48 tests, 97% coverage)
 - [x] entry_detector.py — EntryPointDetector (77 tests, 98% coverage)
 - [x] indicator_calculator.py — all indicator methods (130 tests, 95% coverage)
+  ↳ SPEC UPDATED: REFERENCE_SESSION indicators (rvol, rel_dvol, gap_percentile, intraday_seasonality),
+    fibonacci monotonic deque (O(N) single-pass), sr_levels pivot_hour_rN/sN columns,
+    precalculate_bars config per indicator — re-review required
 - [x] vectorizer.py — 6 transformation methods (38 tests, 96% coverage)
+  ↳ SPEC UPDATED: REFERENCE_SESSION indicators added to mapping table (rvol, rel_dvol,
+    intra_season → statistical_summary + window_comparison); gap_pct excluded from Vectorizer;
+    pivot_hour_rN not included in sr_distance output — re-review required
 - [x] labeler.py — 5-class binary labeling + unit tests (55 tests, 100% coverage)
   ↳ SPEC UPDATED: is_ambiguous (individual bar check), dead_position_case A/B/C — re-review required
 - [x] feature_extractor.py — 57 tests, 96% coverage
-  ↳ SPEC UPDATED: synthetic_bar_ratio, consecutive_synthetic_max features added — re-review required
+  ↳ SPEC UPDATED: DI constructor (calculator parameter), session_stats parameter,
+    extract_batch strategy A~E (fibonacci single-pass, sr_levels date당 1회, gap_pct inline),
+    calculate_required_history() simplified, init ConfigurationError for window constraint,
+    n_sessions independent of lookback_days — re-review required
 - [x] balancer.py — 35 tests, 94% coverage
   ↳ SPEC UPDATED: generate_folds() added (rolling walk-forward), fold_meta yield,
     temporal split, ambiguous_sample_action "exclude" option, Case C exclusion —
@@ -81,9 +93,12 @@ Label search range:  t bar open → 15:59 close or 60th valid bar close (whichev
 - [x] lgbm_pipeline.py — 52 tests, 92% coverage
   ↳ SPEC UPDATED: sample_weight_col parameter added — re-review required
 - [ ] engine.py — BacktestEngine (40 tests, 97% coverage)
+  ↳ SPEC UPDATED: dead position trading_calendar query changed to has_data=TRUE
+    (previously is_trading_day=TRUE — Issue V fix) — re-review required
 - [x] viz_connector.py — Abstract base class + factory (14 tests, 100% coverage)
 - [x] run_preprocess.py — full pipeline orchestrator (12 tests, 93% coverage)
-  ↳ SPEC UPDATED: return_data=True returns full_labeled_df (unsplit) — re-review required
+  ↳ SPEC UPDATED: session_stats loading (Step 1) from precomputed_session_stats,
+    session_stats passed to extract_batch() (Step 6) — re-review required
 - [ ] run_train.py — 28 tests, 99% coverage, APPROVED
   ↳ SPEC UPDATED: fold_idx/fold_train_end/phase params, run_reducer vs --reduce distinction,
     sample weight handling (trainer.* config) — implement with updated spec
@@ -91,10 +106,23 @@ Label search range:  t bar open → 15:59 close or 60th valid bar close (whichev
   ↳ SPEC UPDATED: suppressed_count, fold_idx/fold_test_start/fold_test_end in experiment_log —
     implement with updated spec
 - [x] migrate_json_to_duckdb.py — 12 tests, 96% coverage
+  ↳ SPEC UPDATED: Step 6 added — populate_precomputed_session_stats() after calendar/coverage init
+    — re-review required
 - [x] collect_daily.py — 50 tests, 99% coverage
+  ↳ SPEC UPDATED: Session Stats Update step added (compute next-day baselines via
+    populate_precomputed_session_stats() after ingestion) — re-review required
 - [x] detection_benchmark.py — 21 tests, 100% pass
+- [ ] utils.py — SPEC UPDATED: populate_precomputed_session_stats(), load_session_stats(),
+    hhmmss_to_minutes() added — implement new functions
 - [ ] optimizer.py — PipelineOptimizer (feature combination search, selection/exploitation/full phases,
     rolling fold loop, frequency voting)
+
+- [ ] inferencer.py — Live inference service object
+    (previously deferred; full spec now defined — implement with updated spec)
+- [ ] live_mode_runner.py — Live mode execution orchestrator
+    (new module: watchdog loop, position manager loop, session lifecycle, CachingCalculator management)
+- [ ] caching_calculator.py — CachingIndicatorCalculator for live mode
+    (new module: Layer 1/2 cache, fibonacci monotonic deque, sr_levels per-entry-point)
 
 ---
 

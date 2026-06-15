@@ -108,8 +108,10 @@ Passed explicitly to all internal methods.
 ### Trading calendar (for dead position resolution)
 ```sql
 SELECT * FROM trading_calendar
-WHERE date > ? ORDER BY date LIMIT 1
+WHERE date > ? AND has_data = TRUE
+ORDER BY date LIMIT 1
 ```
+Filters to next date where `has_data = TRUE` — consistent with Labeler dead position logic.
 
 ### Ticker data coverage (for dead position Case B)
 ```sql
@@ -292,7 +294,6 @@ if direction is not None:
     if unfilled_qty > 0:
         # Not a dead position — all available ticks (including after-market) were used.
         # Unfilled portion penalized at flat dead_position_penalty_pct.
-        # Diagnostic: trade_log.unfilled_quantity / quantity gives unfill ratio.
         pnl_filled   = (weighted_avg_exit_price - fill_price) / fill_price
         pnl_unfilled = -config["backtest"]["dead_position_penalty_pct"]
         pnl = (pnl_filled * total_filled + pnl_unfilled * unfilled_qty) / quantity
@@ -300,7 +301,6 @@ if direction is not None:
         pnl = (weighted_avg_exit_price - fill_price) / fill_price
 
     exit_reason = "take_profit" if direction == "up" else "stop_loss"
-    # is_dead_position remains False — partial fill exhaustion is not an overnight hold
 
 else:
     → proceed to session_close / time_limit check
@@ -373,9 +373,8 @@ Dead position trades are included in the winning_rate denominator.
 
 Note: `simulate_exit_fill()` exhausting all available ticks with remaining unfilled
 quantity is **not** a dead position — the position is partially closed and does not
-require an overnight hold. This case is handled in the tp/sl exit path (see above)
-using a blended PnL with flat penalty for the unfilled portion. Diagnostic analysis
-via `trade_log.unfilled_quantity / quantity`.
+require an overnight hold. This case is handled in the tp/sl exit path using a blended
+PnL with flat penalty for the unfilled portion. Diagnostic via `trade_log.unfilled_quantity / quantity`.
 
 ---
 
@@ -424,6 +423,7 @@ is_ambiguous             BOOLEAN,   -- True if simultaneous bundle-level tp/sl b
 - `simulate_exit_fill()` not called for session_end exits (bar close used directly)
 - After-market data used only as fallback when 15:59 bar is halt/no_data
 - Dead position: session_end fallback fails only (15:59 halt + no after-market data)
+- Dead position lookup uses `has_data = TRUE` filter (not `is_trading_day`) — consistent with Labeler
 - `simulate_exit_fill()` ticks exhaustion (unfilled_qty > 0) is partial fill — not dead position;
   `is_dead_position` remains False; diagnostic via `trade_log.unfilled_quantity`
 - sell_rate_tp > sell_rate_sl: rising-market exits have more available buy-side depth

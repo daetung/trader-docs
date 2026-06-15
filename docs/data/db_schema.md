@@ -184,12 +184,7 @@ CREATE TABLE labeled_samples (
 --                 >=0 = nested validation outer fold index (0-based)
 -- fold_train_end: last date of train window ('YYYYMMDD'); NULL for standalone.
 -- auc_std:        std of AUC across all folds in the same run or trial.
---                 NULL at write time — populated via UPDATE by PipelineOptimizer
---                 on fold_run_ids[-1] (last completed round's run_id for that trial).
 --                 Pruned trials retain auc_std = NULL; is_pruned = TRUE on fold_run_ids[-1].
---                 Sequential mode: fold_run_ids[-1] = MAX fold_idx (guaranteed by
---                 generate_folds() ascending order). Nested/parallel mode: fold_run_ids[-1]
---                 = last Successive Halving round completed.
 -- phase:          "selection" | "exploitation" | "full" | NULL (standalone)
 -- is_pruned:      TRUE if this row is the last round of a Successive Halving pruned trial
 -- feature_config: JSON of active hyperparameter config (optimizer trials) or
@@ -212,7 +207,7 @@ CREATE TABLE train_log (
     auc_dn3             DOUBLE,
     auc_dn5             DOUBLE,
     auc_mean            DOUBLE,
-    auc_std             DOUBLE,                  -- NULL until UPDATE; NULL for pruned trials
+    auc_std             DOUBLE,
     auc_reduced_mean    DOUBLE,
     best_of_loop        BOOLEAN,
     is_pruned           BOOLEAN      NOT NULL DEFAULT FALSE,
@@ -276,6 +271,58 @@ CREATE TABLE trade_log (
     is_ambiguous            BOOLEAN      NOT NULL DEFAULT FALSE,
     PRIMARY KEY (run_id, ticker, date, entry_bar)
 );
+
+-- Inference log (live mode inference events and preload failures)
+CREATE TABLE inference_log (
+    logged_at     VARCHAR  NOT NULL,   -- 'YYYYMMDD_HHMMSS'
+    ticker        VARCHAR  NOT NULL,
+    date          VARCHAR  NOT NULL,
+    hour          VARCHAR  NOT NULL,
+    event         VARCHAR  NOT NULL,
+    -- event values:
+    --   "signal_fired"   : inference completed, signal emitted (up5 or up3)
+    --   "no_signal"      : inference completed, no signal
+    --   "suppressed"     : signal suppressed by suppress_threshold
+    --   "preload_fail"   : insufficient bar history
+    --   "bars_trimmed"   : t bar or later detected and auto-trimmed from input
+    --   "no_detection"   : EntryPointDetector.detect() returned False
+    signal        VARCHAR,             -- "up5" | "up3" | NULL
+    prob_up5      DOUBLE,
+    prob_up3      DOUBLE,
+    prob_sw       DOUBLE,
+    prob_dn3      DOUBLE,
+    prob_dn5      DOUBLE,
+    required_bars INTEGER,             -- populated on preload_fail only
+    actual_bars   INTEGER,             -- populated on preload_fail only
+    fail_reason   VARCHAR,             -- populated on preload_fail / bars_trimmed
+    run_id        VARCHAR  NOT NULL,
+    PRIMARY KEY (logged_at, ticker, date, hour)
+);
+
+-- Precomputed session statistics (REFERENCE_SESSION baselines)
+-- Per-bar aggregated values from prior N sessions; delta smoothing applied at load time.
+CREATE TABLE precomputed_session_stats (
+    ticker      VARCHAR  NOT NULL,
+    as_of_date  VARCHAR  NOT NULL,   -- 'YYYYMMDD': baseline for this trading date
+    hour        VARCHAR  NOT NULL,   -- 'HHMMSS': time slot; '000000' for day-level metrics
+    metric      VARCHAR  NOT NULL,
+    -- metric values:
+    --   "rvol_baseline"        : prior N sessions avg cumulative volume at this hour
+    --   "rel_dvol_baseline"    : prior N sessions avg cumulative dollar volume at this hour
+    --   "intra_vol_baseline"   : prior N sessions avg volume at this hour slot
+    --   "intra_return_baseline": prior N sessions avg price_return at this hour slot
+    --   "intra_tpm_baseline"   : prior N sessions avg tpm at this hour slot
+    --   "buy_ratio_baseline"   : prior N sessions avg buy_ratio at this hour slot (tick-derived)
+    --   "gap_pct_mean"         : prior N sessions gap mean  (hour='000000')
+    --   "gap_pct_std"          : prior N sessions gap std   (hour='000000')
+    n_sessions  INTEGER  NOT NULL,
+    avg_value   DOUBLE   NOT NULL,   -- per-bar average over prior N sessions (no delta applied)
+    std_value   DOUBLE,              -- standard deviation (optional; used for gap_pct normalization)
+    count       INTEGER  NOT NULL,   -- actual sessions used (may be < n_sessions near dataset start)
+    PRIMARY KEY (ticker, as_of_date, hour, metric, n_sessions)
+);
+-- Note: delta_minutes smoothing is applied in-memory at session start (load_session_stats()),
+-- not stored in this table. Changing delta_minutes requires no DB recomputation.
 ```
 
 ---
@@ -314,11 +361,21 @@ ticks_full = con.execute("""
 """, ["AAPL", "20250714"]).df()
 
 # Find next day with has_data=True for dead position resolution
+# (used by Labeler and BacktestEngine — consistent filter)
 next_day = con.execute("""
     SELECT date, has_data FROM trading_calendar
     WHERE date > ? AND has_data = TRUE
     ORDER BY date LIMIT 1
 """, ["20250714"]).fetchone()
+
+# Load REFERENCE_SESSION baselines for a ticker on a given trading day
+session_stats_raw = con.execute("""
+    SELECT hour, metric, avg_value, std_value, count
+    FROM precomputed_session_stats
+    WHERE ticker = ? AND as_of_date = ? AND n_sessions = ?
+    ORDER BY metric, hour
+""", ["AAPL", "20250715", 20]).df()
+# After loading, apply delta_minutes smoothing in memory via load_session_stats()
 
 # Rolling fold summary — inner trial AUC by trial and fold for a given optimizer run
 fold_summary = con.execute("""
@@ -328,23 +385,6 @@ fold_summary = con.execute("""
     WHERE optimizer_run_id = ?
       AND fold_idx >= 0
     ORDER BY outer_fold_idx, trial_idx, fold_idx
-""", ["20250519_143022"]).df()
-
-# Retrieve auc_std for a completed selection/full run (single run_id)
-run_auc_std = con.execute("""
-    SELECT auc_std, auc_mean
-    FROM train_log
-    WHERE run_id = ?
-""", ["<fold_run_ids[-1]>"]).fetchone()
-
-# Retrieve auc_std per completed trial for exploitation (excludes pruned)
-trial_auc_std = con.execute("""
-    SELECT trial_idx, outer_fold_idx, auc_std, auc_mean
-    FROM train_log
-    WHERE optimizer_run_id = ?
-      AND auc_std IS NOT NULL
-      AND is_pruned = FALSE
-    ORDER BY outer_fold_idx, trial_idx
 """, ["20250519_143022"]).df()
 
 # Best trial per outer fold
@@ -388,16 +428,6 @@ robustness = con.execute("""
       AND eval_type = 'regime_holdout'
 """, ["20250519_143022"]).df()
 
-# Experiment log for standard backtest results (inner fold or standalone)
-exp_results = con.execute("""
-    SELECT run_id, fold_idx, fold_test_start, fold_test_end,
-           winning_rate, total_trades, suppressed_count
-    FROM experiment_log
-    WHERE optimizer_run_id = ?
-      AND (eval_type IS NULL OR eval_type NOT IN ('outer_validation', 'regime_holdout'))
-    ORDER BY fold_idx
-""", ["20250519_143022"]).df()
-
 # Ambiguous sample rate in labeled_samples
 ambig_rate = con.execute("""
     SELECT
@@ -434,6 +464,33 @@ trades_by_optimizer = con.execute("""
     JOIN experiment_log e ON t.run_id = e.run_id
     WHERE e.optimizer_run_id = ?
 """, ["20250519_143022"]).df()
+
+# Retrieve auc_std for a completed selection/full run (single run_id)
+run_auc_std = con.execute("""
+    SELECT auc_std, auc_mean
+    FROM train_log
+    WHERE run_id = ?
+""", ["<fold_run_ids[-1]>"]).fetchone()
+
+# Retrieve auc_std per completed trial for exploitation (excludes pruned)
+trial_auc_std = con.execute("""
+    SELECT trial_idx, outer_fold_idx, auc_std, auc_mean
+    FROM train_log
+    WHERE optimizer_run_id = ?
+      AND auc_std IS NOT NULL
+      AND is_pruned = FALSE
+    ORDER BY outer_fold_idx, trial_idx
+""", ["20250519_143022"]).df()
+
+# Experiment log for standard backtest results (inner fold or standalone)
+exp_results = con.execute("""
+    SELECT run_id, fold_idx, fold_test_start, fold_test_end,
+           winning_rate, total_trades, suppressed_count
+    FROM experiment_log
+    WHERE optimizer_run_id = ?
+      AND (eval_type IS NULL OR eval_type NOT IN ('outer_validation', 'regime_holdout'))
+    ORDER BY fold_idx
+""", ["20250519_143022"]).df()
 ```
 
 ---
@@ -447,3 +504,5 @@ trades_by_optimizer = con.execute("""
 - entry_points table: INSERT OR IGNORE — written by both Preprocessor (training) and Inferencer (live)
 - After ingestion: `trading_calendar` and `ticker_data_coverage` updated via
   `utils.populate_trading_calendar()` and `utils.populate_ticker_coverage()`
+- After calendar/coverage update: `precomputed_session_stats` updated via
+  `utils.populate_precomputed_session_stats()` for the next trading day

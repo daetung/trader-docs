@@ -73,6 +73,50 @@ Actual lookback per indicator is configured in `configs/pipeline_config.yaml`.
 
 ---
 
+## REFERENCE_SESSION Indicator Boundary
+
+REFERENCE_SESSION indicators (rvol, rel_dvol, gap_percentile, intraday_seasonality)
+use prior session data as a statistical baseline.
+
+```
+Prior session bars used as baseline:
+    Status: fully closed (all OHLCV confirmed), no data leakage
+    Source: precomputed_session_stats DuckDB table (pre-calculated offline)
+    Scope:  prior N sessions (n_sessions config; independent of lookback_days)
+
+Today's session bars used as the measured value:
+    Boundary: same as feature input boundary — bars t-N ... t-1 only
+    No future bars included
+
+Leakage check:
+    Prior session bars → raw price/volume (not model labels or predictions)
+    n_sessions may reference data within or beyond the rolling window training period
+    → NOT leakage (raw market data baseline, not label information)
+```
+
+**gap_percentile special rules:**
+
+```
+NaN conditions (must return NaN, not raise error):
+
+1. t bar = "093000" (first regular session bar):
+       today_open = open of 093000 bar = P_entry of this entry point
+       Using P_entry as a feature is FORBIDDEN (data boundary violation)
+       → return NaN
+
+2. t < "093000" (pre-market entry):
+       Regular session has not opened; today_open undefined
+       → return NaN
+
+3. Insufficient baseline data:
+       count < n_sessions / 2 in precomputed_session_stats
+       → return NaN
+
+In all NaN cases: gap_pct feature = NaN in feature vector (LightGBM handles natively)
+```
+
+---
+
 ## Label Search Boundary
 
 ```
@@ -103,17 +147,12 @@ max_down(i) = ( P_entry - min(Low of bars t..t+i)  ) / P_entry
 
 ## Label vs. Backtest Reference Price
 
-Labeler and BacktestEngine use the same P_entry definition but apply it to
-different reference points. This separation is intentional:
-
 ```
 Labeler:        threshold computed relative to P_entry (t bar open price)
                 → measures signal quality independent of execution
-                → labels reflect directional price movement from the ideal fill
 
 BacktestEngine: threshold computed relative to fill_price (P_entry ± slippage)
                 → measures realized P&L including execution friction
-                → winning_rate in experiment_log reflects execution reality
 
 Consequence:
     A trade labelled label_up5 (signal quality: good) may still produce
@@ -149,7 +188,6 @@ tick_10 `hour` field represents the **last tick** timestamp of each 10-tick bund
 
 2. **Label breach detection** — ticks from t bar onward used by Labeler via
    `utils.track_label_breach()` to detect ±3pp/±5pp breaches at sub-minute precision.
-   Provides finer-grained ambiguity detection (bundle level vs. bar level).
    Tracking starts after the fill_bundle (fill_second = t bar open + 5s).
    Backtest-only rule does NOT apply — label calculation requires tick precision.
 
@@ -157,14 +195,16 @@ tick_10 `hour` field represents the **last tick** timestamp of each 10-tick bund
    used to approximate fill prices and simulate partial exit fills.
    Backtest-only; must not feed into the feature pipeline.
 
+4. **REFERENCE_SESSION baseline (offline)** — prior session 10-tick data used by
+   `populate_precomputed_session_stats()` to compute buy_ratio_baseline and
+   intra_tpm_baseline via Lee-Ready classification.
+   Computed offline (migration/daily update); not computed at runtime.
+
 ```
 10-tick allowed for features:          ticks with timestamp < t bar open
-10-tick allowed for label calculation: ticks from t bar onward (breach detection via
-                                        track_label_breach(); fill_second = t open + 5s;
-                                        tracking starts after fill_bundle)
-10-tick allowed for backtest:          ticks from t bar onward (entry slippage search
-                                        window: entry_hour to entry_hour + 100s;
-                                        exit tracking and partial fill simulation)
+10-tick allowed for label calculation: ticks from t bar onward (breach detection)
+10-tick allowed for backtest:          ticks from t bar onward (slippage simulation)
+10-tick allowed for session stats:     all prior session ticks (offline computation only)
 ```
 
 ---
@@ -184,21 +224,32 @@ Session mode (`entry_detector.session_mode`) controls which entry points are use
 After-market entry points (hour > 155900) are excluded in all modes.
 Session mode filtering is applied at the training stage — preprocessing runs for all entry points.
 
+Session mode also controls which prior session bars are used in REFERENCE_SESSION baselines:
+```
+"regular"  : prior regular session bars only (093000~155900)
+"pre"      : prior pre-market bars only (040000~092900)
+"combined" : both pre-market and regular session bars
+```
+
+Applied in `load_session_stats()` at load time — not stored separately in precomputed_session_stats.
+
 ---
 
 ## Summary Table
 
-| Data | Feature Input | Label Calculation | Backtest Only |
-|---|---|---|---|
-| Bars t-N … t-1 (OHLCV, all sessions) | YES | — | — |
-| t bar open time (entry.hour) | YES (temporal only) | — | — |
-| t bar open price (P_entry) | NO (identifier only) | Reference price | Fill reference |
-| t bar H/L/C/V | NO | NO | NO |
-| Bars t+1 … session close (H/L) | NO | YES (threshold check) | — |
-| After-market bars | NO | Fallback only (session-end exit) | Fallback only |
-| 10-tick before t bar | YES | — | — |
-| 10-tick within t bar | NO | YES (track_label_breach) | YES (entry slippage) |
-| 10-tick within exit bar | NO | YES (track_label_breach) | YES (exit slippage) |
+| Data | Feature Input | Label Calculation | Backtest Only | Session Stats (offline) |
+|---|---|---|---|---|
+| Bars t-N … t-1 (OHLCV, all sessions) | YES | — | — | — |
+| t bar open time (entry.hour) | YES (temporal only) | — | — | — |
+| t bar open price (P_entry) | NO (identifier only) | Reference price | Fill reference | — |
+| t bar H/L/C/V | NO | NO | NO | — |
+| Bars t+1 … session close (H/L) | NO | YES (threshold check) | — | — |
+| After-market bars | NO | Fallback only | Fallback only | — |
+| 10-tick before t bar | YES | — | — | — |
+| 10-tick within t bar | NO | YES (track_label_breach) | YES (entry slippage) | — |
+| 10-tick within exit bar | NO | YES (track_label_breach) | YES (exit slippage) | — |
+| Prior session bars (all) | NO (not in bars input) | — | — | YES (baseline) |
+| Prior session 10-tick | NO | — | — | YES (buy_ratio, tpm) |
 
 ---
 
@@ -221,3 +272,6 @@ Before submitting any module, verify:
        tracking starts strictly after fill_bundle (fill_bundle excluded)
 - [ ] Backtest entry slippage uses 10-tick data with search window = entry_hour to entry_hour + 100s
 - [ ] Backtest exit slippage uses simulate_exit_fill() from breach bundle onward (full day ticks)
+- [ ] REFERENCE_SESSION baselines sourced from precomputed_session_stats — not from bars input
+- [ ] gap_percentile returns NaN for t="093000" or pre-market entries (not an error)
+- [ ] Dead position lookup uses has_data=TRUE filter (not is_trading_day)

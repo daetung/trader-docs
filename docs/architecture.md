@@ -19,6 +19,7 @@ Raw JSON (1min / 10tick, all sessions)
         ▼
    DataLoader                JSON → DuckDB / per-ticker DataFrame
         │                    trading_calendar + ticker_data_coverage populated
+        │                    precomputed_session_stats populated (REFERENCE_SESSION baselines)
         ▼
  EntryPointDetector           Candidate entry point selection (fixed logic)
         │                     All sessions processed; session_mode filter at training stage
@@ -52,8 +53,8 @@ Raw JSON (1min / 10tick, all sessions)
                      └── Backtester             writes experiment_log
                            │
                            ▼
-                    BacktestEngine               DB-direct price tracking, slippage via tick_10
-                           │                     Session-close priority exit, dead position handling
+                   BacktestEngine               DB-direct price tracking, slippage via tick_10
+                           │                   Session-close priority exit, dead position handling
                            ▼
                     experiment_log (DuckDB)      Written by Backtester only
                     train_log (DuckDB)           Written by Trainer per trial
@@ -67,10 +68,36 @@ Raw JSON (1min / 10tick, all sessions)
 Training endpoint:   PipelineOptimizer
                          └── Preprocessor (once) → Trainer (per fold) → Backtester
 
-Live inference endpoint: Inferencer  (interface defined; implementation deferred)
-                         └── EntryPointDetector.detect()
-                         └── FeatureExtractor.extract()   ← direct call (no Preprocessor)
-                         └── model.load() → resolve_signal()
+Live inference endpoint: LiveModeRunner (execution orchestrator)
+                         │
+                         ├── CachingIndicatorCalculator  (injected into FeatureExtractor)
+                         │       Layer 1: session_start_compute() — pivot_points, gap_pct
+                         │       Layer 2: precalculate + on_bar_close() incremental update
+                         │       fibonacci: monotonic deque O(1) per bar
+                         │       sr_levels: get_for_entry() per-entry-point recomputation
+                         │
+                         ├── FeatureExtractor.extract()  (DI: CachingIndicatorCalculator)
+                         │       session_stats from precomputed_session_stats (loaded at session start)
+                         │
+                         ├── Inferencer  (service object — called per entry point)
+                         │       _prepare_bars() auto-trim (t bar or later removed defensively)
+                         │       EntryPointDetector.detect()
+                         │       FeatureExtractor.extract()
+                         │       model.predict() → resolve_signal()
+                         │       inference_log writes (DuckDB)
+                         │
+                         ├── Watchdog polling loop  (1s interval)
+                         │       query watchdog service → ticker candidates
+                         │       trading API fetch (bars + ticks) → on_bar_close()
+                         │       detect → infer → buy order
+                         │
+                         └── Position manager loop  (independent interval)
+                                 monitor open positions → price check → sell order
+
+Data source unique to live mode:
+    precomputed_session_stats (DuckDB)  ← REFERENCE_SESSION baselines
+                                           loaded once at session start via load_session_stats()
+                                           delta smoothing applied in memory
 
 Standalone scripts:
     run_preprocess.py  ← Preprocessor wrapper (CLI)
@@ -84,27 +111,29 @@ Standalone scripts:
 
 | Document | Description |
 |---|---|
-| `data/data_boundary.md` | **Read before any module implementation.** Shared boundary rules, P_entry definition, leakage prevention |
-| `data/db_schema.md` | DuckDB schema and JSON ingestion logic |
+| `data/data_boundary.md` | **Read before any module implementation.** Shared boundary rules, P_entry definition, REFERENCE_SESSION boundary, leakage prevention |
+| `data/db_schema.md` | DuckDB schema, JSON ingestion logic, inference_log, precomputed_session_stats |
 | `pipeline/01_entry_detection.md` | EntryPointDetector logic, session_mode, volume_base_hour |
-| `pipeline/02_indicator_calculator.md` | All indicator methods, VWAP reset_mode, missing bar classification |
-| `pipeline/03_vectorizer.md` | Time-series → vector transformation methods |
-| `pipeline/04_feature_extractor.md` | Integration entrypoint, extract_batch strategy, parquet column structure |
+| `pipeline/02_indicator_calculator.md` | All indicator methods, REFERENCE_SESSION indicators, VWAP reset_mode, missing bar classification, precalculate_bars config |
+| `pipeline/03_vectorizer.md` | Time-series → vector transformation methods, REFERENCE_SESSION mapping |
+| `pipeline/04_feature_extractor.md` | Integration entrypoint, DI constructor, extract_batch strategy (A~E), REFERENCE_SESSION handling, parquet column structure |
 | `pipeline/05_labeler.md` | 5-class binary labeling, session-close exit, time-limit exit, dead position |
 | `pipeline/06_class_balancer.md` | Downsampling strategy, split() and generate_folds() |
 | `pipeline/07_lgbm_pipeline.md` | LightGBM 5-classifier structure and evaluation |
 | `pipeline/08_dimensionality_reducer.md` | ImportanceProvider pattern, model-agnostic reduction |
-| `pipeline/09_backtest_engine.md` | DB-direct backtest, tick_10 slippage, dead position handling |
+| `pipeline/09_backtest_engine.md` | DB-direct backtest, tick_10 slippage, dead position handling (has_data=TRUE) |
 | `models/base_model.md` | Abstract base class for model trainers |
 | `optimization/pipeline_optimizer.md` | Training endpoint, nested validation, successive halving, regime holdout |
 | `scripts/run_preprocess.md` | Preprocessor class, return_data, training pipeline only |
 | `scripts/run_train.md` | Trainer class, session_mode filter, train_log |
 | `scripts/run_backtest.md` | Backtester class, sole experiment_log writer |
-| `utils/utils.md` | Shared utilities: bar_sequence, signal, hour conversion, run_id, config, encoding maps |
-| `inferencer/inferencer.md` | Live inference endpoint interface |
-| `tools/migration_tool.md` | JSON → DuckDB migration, trading_calendar/coverage init |
+| `utils/utils.md` | Shared utilities: bar sequence, signal resolution, slippage/fill simulation, label breach detection, encoding maps, trading calendar, REFERENCE_SESSION stats (populate + load) |
+| `inferencer/inferencer.md` | Live inference service object — _prepare_bars, infer/infer_batch, inference_log |
+| `inferencer/live_mode_runner.md` | Live mode execution orchestrator — watchdog loop, position manager loop, session lifecycle |
+| `inferencer/caching_calculator.md` | CachingIndicatorCalculator — Layer 1/2 cache, fibonacci deque, sr_levels per-entry-point |
+| `tools/migration_tool.md` | JSON → DuckDB migration, trading_calendar/coverage init, precomputed_session_stats population |
 | `tools/detection_benchmark.md` | Entry detection threshold tuning + timing benchmark |
-| `tools/metadata_crawler.md` | Daily metadata fetch + new data ingestion |
+| `tools/metadata_crawler.md` | Daily metadata fetch, new data ingestion, session stats daily update |
 | `visualization/viz_connector.md` | Abstract base class for visualization backends |
 
 ---
@@ -114,7 +143,6 @@ Standalone scripts:
 | Item | When to resolve |
 |---|---|
 | MLPImportanceProvider implementation | MLP phase |
-| Inferencer full implementation | After training pipeline stabilizes |
 
 ---
 
@@ -149,7 +177,9 @@ stock-scalping/
 │   ├── utils/
 │   │   └── utils.md
 │   ├── inferencer/
-│   │   └── inferencer.md
+│   │   ├── inferencer.md
+│   │   ├── live_mode_runner.md
+│   │   └── caching_calculator.md
 │   ├── tools/
 │   │   ├── migration_tool.md
 │   │   ├── detection_benchmark.md
@@ -185,7 +215,9 @@ stock-scalping/
 │   ├── backtest/
 │   │   └── engine.py
 │   ├── inference/
-│   │   └── inferencer.py
+│   │   ├── inferencer.py
+│   │   ├── live_mode_runner.py
+│   │   └── caching_calculator.py
 │   ├── utils/
 │   │   └── utils.py
 │   └── visualization/

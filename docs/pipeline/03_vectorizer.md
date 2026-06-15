@@ -64,7 +64,7 @@ Output keys:
 
 ### 4. Window Comparison
 ```
-Applies to: volume, TPM, avg_vol_per_tick
+Applies to: volume, TPM, avg_vol_per_tick, REFERENCE_SESSION today series
 
 Split window into current_half and prev_half:
 Output keys:
@@ -112,8 +112,8 @@ FeatureExtractor calls sr_distance() directly on the Vectorizer instance.
 See "sr_distance dispatch" note below.
 
 Input: sr_df (pd.DataFrame) with columns:
-    price_rN, bars_since_rN, prominence_rN   (for N = 1..n_levels)
-    price_sN, bars_since_sN, prominence_sN
+    price_rN, pivot_hour_rN, bars_since_rN, prominence_rN   (for N = 1..n_levels)
+    price_sN, pivot_hour_sN, bars_since_sN, prominence_sN
 
 Output keys (per level N = 1..n_levels):
     dist_rN_pct              ← (price_rN - P_entry) / P_entry
@@ -129,6 +129,9 @@ Composite:
     resistance_density       ← mean(dist_r1..rN)
     nearest_support_dist     ← min(dist_s1..sN)
     sr_asymmetry             ← nearest_resistance_dist - nearest_support_dist
+
+Note: pivot_hour_rN / pivot_hour_sN are NOT included in output features —
+they are internal to IndicatorCalculator for bars_since recomputation.
 ```
 
 NaN padding rule: if fewer than n_levels extrema found, pad missing levels with NaN.
@@ -151,6 +154,13 @@ Configured in `pipeline_config.yaml`. Default mapping:
 | fibonacci_retracement | level_distance | — |
 | pivot_points | level_distance | — |
 | sr_levels | sr_distance | — |
+| **rvol** | **statistical_summary** | **window_comparison** |
+| **rel_dvol** | **statistical_summary** | **window_comparison** |
+| **intra_season_{metric}** | **statistical_summary** | **window_comparison** |
+| **gap_pct** | **(Vectorizer 미사용 — FeatureExtractor inline 처리)** | — |
+
+`gap_percentile` is excluded from Vectorizer dispatch. FeatureExtractor inserts
+the scalar value directly into the feature vector as `gap_pct`. No transform applied.
 
 ---
 
@@ -204,6 +214,8 @@ class Vectorizer:
   — FeatureExtractor iterates over level columns individually
 - `sr_distance()` receives `bars_since_rN` and `prominence_rN` from IndicatorCalculator
   output directly — no recomputation; pass-through to output dict
+- `pivot_hour_rN` / `pivot_hour_sN` from sr_levels output are NOT included in Vectorizer output
 - `dist_rN_pct` sign convention: positive = level above P_entry (resistance);
   `dist_sN_pct` sign convention: positive = level below P_entry (support)
 - Same sign convention applies to `level_distance()`: positive = level above P_entry
+- `gap_pct` is never passed to any Vectorizer method — FeatureExtractor inline only

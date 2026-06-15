@@ -46,11 +46,11 @@ def build_effective_bar_sequence(
     or 15:59 bar is reached (whichever comes first).
 
     Args:
-        ohlcv_future: bars from t_hour onward for (ticker, date)
-        halts_df:     trading_halts rows for (ticker, date)
-        date:         'YYYYMMDD'
-        t_hour:       'HHMMSS' — t bar open time (start of search)
-        target_valid_bars: number of valid bars to collect (default: 60)
+        ohlcv_future:       bars from t_hour onward for (ticker, date)
+        halts_df:           trading_halts rows for (ticker, date)
+        date:               'YYYYMMDD'
+        t_hour:             'HHMMSS' — t bar open time (start of search)
+        target_valid_bars:  number of valid bars to collect (default: 60)
 
     Returns:
         pd.DataFrame with columns [hour, open, high, low, close, volume, is_halt, is_valid]
@@ -97,179 +97,6 @@ def resolve_signal(
         if prob_up3 >= threshold:
             return "up3"
         return None
-    """
-    ...
-```
-
----
-
-### Hour String Utilities
-
-All functions operate on `HHMMSS` format strings (6-digit, zero-padded).
-
-```python
-def hour_to_int(hour: str) -> int:
-    """
-    Convert HHMMSS string to integer.
-    Used for trade_log entry_bar / exit_bar storage.
-    Example: "093000" → 93000
-    """
-    return int(hour)
-
-
-def hour_to_minutes(hour: str) -> int:
-    """
-    Convert HHMMSS string to total minutes from midnight.
-    Used for cooldown calculation in BacktestEngine.
-    Example: "093000" → 570  (9*60 + 30)
-    """
-    return int(hour[:2]) * 60 + int(hour[2:4])
-
-
-def hour_add_seconds(hour: str, seconds: int) -> str:
-    """
-    Add seconds to an HHMMSS string. Returns HHMMSS string.
-    Used for t+5s target computation in entry slippage.
-    Example: hour_add_seconds("093000", 5) → "093005"
-    Does not handle day rollover (not needed within trading day).
-    """
-    h = int(hour[:2])
-    m = int(hour[2:4])
-    s = int(hour[4:6]) + seconds
-    m += s // 60
-    s  = s % 60
-    h += m // 60
-    m  = m % 60
-    return f"{h:02d}{m:02d}{s:02d}"
-```
-
----
-
-### Run ID Generation
-
-```python
-def generate_run_id() -> str:
-    """
-    Generate a unique run identifier in YYYYMMDD_HHMMSS format.
-    Used by run_train.py, run_backtest.py, and PipelineOptimizer (sequential contexts).
-
-    Format: YYYYMMDD_HHMMSS
-    Example: "20250715_143022"
-
-    Uniqueness guaranteed by 1-second granularity for sequential callers.
-
-    In nested validation (parallel workers via ProcessPoolExecutor), the coordinator
-    pre-generates structured run_ids BEFORE dispatching workers to avoid collision:
-
-        format:  {optimizer_run_id}_o{outer_fold_idx}_t{trial_idx}_f{inner_fold_idx}
-        example: "20250715_143022_o1_t4_f2"
-
-    In sequential selection/full phase fold loops, the coordinator similarly
-    pre-generates structured run_ids to avoid collision between folds
-    (fold processing may complete in under 1 second on small datasets):
-
-        format:  {optimizer_run_id}_f{fold_idx}
-        example: "20250715_143022_f2"
-
-    Workers receive run_id as an explicit argument; generate_run_id() is NOT called
-    inside worker functions or fold loops. The standard YYYYMMDD_HHMMSS format is
-    used only in standalone contexts (standalone CLI, outer eval trainings).
-    """
-    from datetime import datetime
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
-```
-
----
-
-### Config Utilities
-
-```python
-def load_config(config_path: str) -> dict:
-    """
-    Load pipeline_config.yaml and return as dict.
-    """
-    import yaml
-    with open(config_path) as f:
-        return yaml.safe_load(f)
-
-
-def apply_overrides(config: dict, overrides: dict) -> dict:
-    """
-    Apply key-value overrides to config in-memory (deep copy).
-    Config file is never modified.
-
-    Supports dot-notation keys for nested override:
-        {"entry_detector.G_min_ratio": 3.0}
-        → config["entry_detector"]["G_min_ratio"] = 3.0
-
-    Used by PipelineOptimizer (hyperparameter config override)
-    and detection_benchmark.py (--override CLI flag).
-    """
-    ...
-```
-
----
-
-### Encoding Map Utilities
-
-Encoding maps persist categorical label → integer mappings across training and live inference.
-Maps are stored in `configs/` as JSON files.
-
-```python
-def load_encoding_map(map_name: str, configs_dir: str = "configs") -> dict:
-    """
-    Load a categorical encoding map from JSON.
-    Returns empty dict if file does not exist.
-
-    Used by FeatureExtractor for consistent encoding.
-    Inferencer does not load encoding maps directly —
-    maps are loaded internally by FeatureExtractor at inference time.
-    """
-    ...
-
-
-def save_encoding_map(map_name: str, mapping: dict, configs_dir: str = "configs") -> None:
-    """
-    Persist a categorical encoding map to JSON.
-    Overwrites existing file.
-    Called by FeatureExtractor when building maps for the first time.
-    """
-    ...
-```
-
-**Managed maps:**
-
-| File | Built by | Used by | Notes |
-|---|---|---|---|
-| `configs/sector_map.json` | FeatureExtractor (first run) | FeatureExtractor | unknown → 0; known → 1, 2, ... |
-| `configs/day_of_week_map.json` | FeatureExtractor (first run) | FeatureExtractor | always has value, no NaN |
-| `configs/halt_reason_code_map.json` | FeatureExtractor (first run) | FeatureExtractor | "no_halt" → 0; known codes → 1, 2, ...; unknown → -1 |
-
----
-
-### Trading Calendar Utilities
-
-```python
-def populate_trading_calendar(
-    db_conn: duckdb.DuckDBPyConnection,
-    date_range: list[str] | None = None,
-) -> int:
-    """
-    Populate or refresh trading_calendar table.
-    Uses pandas_market_calendars (NYSE) for is_trading_day / is_holiday.
-    Sets has_data=True for dates present in ohlcv_1min.
-    """
-    ...
-
-
-def populate_ticker_coverage(
-    db_conn: duckdb.DuckDBPyConnection,
-    dates: list[str] | None = None,
-) -> int:
-    """
-    Populate or refresh ticker_data_coverage table.
-    Groups ohlcv_1min and tick_10 by (ticker, date) to set has_1min, has_tick.
-    Safe to re-run (upsert).
     """
     ...
 ```
@@ -486,6 +313,256 @@ def simulate_exit_fill(
 
 ---
 
+### Hour String Utilities
+
+All functions operate on `HHMMSS` format strings (6-digit, zero-padded).
+
+```python
+def hour_to_int(hour: str) -> int:
+    """
+    Convert HHMMSS string to integer.
+    Used for trade_log entry_bar / exit_bar storage.
+    Example: "093000" → 93000
+    """
+    return int(hour)
+
+
+def hour_to_minutes(hour: str) -> int:
+    """
+    Convert HHMMSS string to total minutes from midnight.
+    Used for cooldown calculation in BacktestEngine.
+    Example: "093000" → 570  (9*60 + 30)
+    """
+    return int(hour[:2]) * 60 + int(hour[2:4])
+
+
+def hour_add_seconds(hour: str, seconds: int) -> str:
+    """
+    Add seconds to an HHMMSS string. Returns HHMMSS string.
+    Used for t+5s target computation in entry slippage.
+    Example: hour_add_seconds("093000", 5) → "093005"
+    Does not handle day rollover (not needed within trading day).
+    """
+    h = int(hour[:2])
+    m = int(hour[2:4])
+    s = int(hour[4:6]) + seconds
+    m += s // 60
+    s  = s % 60
+    h += m // 60
+    m  = m % 60
+    return f"{h:02d}{m:02d}{s:02d}"
+
+
+def hhmmss_to_minutes(hour: str) -> int:
+    """
+    Convert 'HHMMSS' string to minutes since midnight.
+    Used by load_session_stats() for delta smoothing window computation.
+    Example: '093000' → 570, '155900' → 959.
+    Alias for hour_to_minutes() with explicit name for clarity in session context.
+    """
+    return hour_to_minutes(hour)
+```
+
+---
+
+### Run ID Generation
+
+```python
+def generate_run_id() -> str:
+    """
+    Generate a unique run identifier in YYYYMMDD_HHMMSS format.
+    Used by run_train.py, run_backtest.py, and PipelineOptimizer (sequential contexts).
+
+    Format: YYYYMMDD_HHMMSS
+    Example: "20250715_143022"
+
+    Uniqueness guaranteed by 1-second granularity for sequential callers.
+
+    In nested validation (parallel workers via ProcessPoolExecutor), the coordinator
+    pre-generates structured run_ids BEFORE dispatching workers to avoid collision:
+
+        format:  {optimizer_run_id}_o{outer_fold_idx}_t{trial_idx}_f{inner_fold_idx}
+        example: "20250715_143022_o1_t4_f2"
+
+    In sequential selection/full phase fold loops, the coordinator similarly
+    pre-generates structured run_ids to avoid collision between folds
+    (fold processing may complete in under 1 second on small datasets):
+
+        format:  {optimizer_run_id}_f{fold_idx}
+        example: "20250715_143022_f2"
+
+    Workers receive run_id as an explicit argument; generate_run_id() is NOT called
+    inside worker functions or fold loops. The standard YYYYMMDD_HHMMSS format is
+    used only in standalone contexts (standalone CLI, outer eval trainings).
+    """
+    from datetime import datetime
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+```
+
+---
+
+### Config Utilities
+
+```python
+def load_config(config_path: str) -> dict:
+    """
+    Load pipeline_config.yaml and return as dict.
+    """
+    import yaml
+    with open(config_path) as f:
+        return yaml.safe_load(f)
+
+
+def apply_overrides(config: dict, overrides: dict) -> dict:
+    """
+    Apply key-value overrides to config in-memory (deep copy).
+    Config file is never modified.
+
+    Supports dot-notation keys for nested override:
+        {"entry_detector.G_min_ratio": 3.0}
+        → config["entry_detector"]["G_min_ratio"] = 3.0
+
+    Used by PipelineOptimizer (hyperparameter config override)
+    and detection_benchmark.py (--override CLI flag).
+    """
+    ...
+```
+
+---
+
+### Encoding Map Utilities
+
+Encoding maps persist categorical label → integer mappings across training and live inference.
+Maps are stored in `configs/` as JSON files.
+
+```python
+def load_encoding_map(map_name: str, configs_dir: str = "configs") -> dict:
+    """
+    Load a categorical encoding map from JSON.
+    Returns empty dict if file does not exist.
+
+    Used by FeatureExtractor for consistent encoding.
+    Inferencer does not load encoding maps directly —
+    maps are loaded internally by FeatureExtractor at inference time.
+    """
+    ...
+
+
+def save_encoding_map(map_name: str, mapping: dict, configs_dir: str = "configs") -> None:
+    """
+    Persist a categorical encoding map to JSON.
+    Overwrites existing file.
+    Called by FeatureExtractor when building maps for the first time.
+    """
+    ...
+```
+
+**Managed maps:**
+
+| File | Built by | Used by | Notes |
+|---|---|---|---|
+| `configs/sector_map.json` | FeatureExtractor (first run) | FeatureExtractor | unknown → 0; known → 1, 2, ... |
+| `configs/day_of_week_map.json` | FeatureExtractor (first run) | FeatureExtractor | always has value, no NaN |
+| `configs/halt_reason_code_map.json` | FeatureExtractor (first run) | FeatureExtractor | "no_halt" → 0; known codes → 1, 2, ...; unknown → -1 |
+
+---
+
+### Trading Calendar Utilities
+
+```python
+def populate_trading_calendar(
+    db_conn: duckdb.DuckDBPyConnection,
+    date_range: list[str] | None = None,
+) -> int:
+    """
+    Populate or refresh trading_calendar table.
+    Uses pandas_market_calendars (NYSE) for is_trading_day / is_holiday.
+    Sets has_data=True for dates present in ohlcv_1min.
+    Safe to re-run (upsert).
+    Returns: number of rows upserted.
+    """
+    ...
+
+
+def populate_ticker_coverage(
+    db_conn: duckdb.DuckDBPyConnection,
+    dates: list[str] | None = None,
+) -> int:
+    """
+    Populate or refresh ticker_data_coverage table.
+    Groups ohlcv_1min and tick_10 by (ticker, date) to set has_1min, has_tick.
+    Safe to re-run (upsert).
+    Returns: number of rows upserted.
+    """
+    ...
+```
+
+---
+
+### REFERENCE_SESSION Utilities
+
+```python
+def populate_precomputed_session_stats(
+    db_conn: duckdb.DuckDBPyConnection,
+    dates: list[str],
+    n_sessions: int = 20,
+) -> int:
+    """
+    Compute and store REFERENCE_SESSION baselines for given as_of_dates.
+
+    For each as_of_date in dates:
+        For each ticker with ohlcv_1min data:
+            Compute per-bar average over prior n_sessions regular sessions.
+
+    Metrics derived from ohlcv_1min:
+        rvol_baseline      : cumulative volume per HHMMSS slot
+        rel_dvol_baseline  : cumulative dollar volume per HHMMSS slot
+        intra_vol_baseline : per-bar volume per HHMMSS slot
+        intra_return_baseline: per-bar (close/prev_close - 1) per HHMMSS slot
+        gap_pct_mean/std   : (today_093000_open - prev_155900_close) / prev_close
+                             stored as mean and std (hour='000000')
+
+    Metrics derived from tick_10 (lee_ready):
+        buy_ratio_baseline : per-bar buyer_initiated_ratio per HHMMSS slot
+        intra_tpm_baseline : per-bar ticks-per-minute per HHMMSS slot
+
+    Stores: avg_value, std_value, count per (ticker, as_of_date, hour, metric, n_sessions)
+    Delta smoothing NOT applied here — applied at load time via load_session_stats().
+    Safe to re-run (INSERT OR IGNORE).
+    Returns: number of rows inserted.
+    """
+    ...
+
+
+def load_session_stats(
+    db_conn: duckdb.DuckDBPyConnection,
+    ticker: str,
+    as_of_date: str,
+    n_sessions: int,
+    delta_minutes: int,
+    session_mode: str,
+) -> dict:
+    """
+    Load and smooth precomputed_session_stats for a ticker on a given date.
+
+    Steps:
+        1. Query precomputed_session_stats WHERE ticker=?, as_of_date=?, n_sessions=?
+        2. Apply session_mode filter:
+               "regular":  keep hours 093000~155900 only
+               "pre":      keep hours 040000~092900 only
+               "combined": keep 040000~155900
+        3. Apply delta_minutes rolling average per metric:
+               For each hour H, smoothed_value[H] =
+                   mean(avg_value for hours in [H-delta, H+delta])
+        4. Return dict: {metric: {hour: smoothed_avg_value}}
+
+    Returns empty dict if no rows found (e.g. as_of_date before dataset start).
+    """
+    ...
+```
+
+---
+
 ### Optimizer Support Utilities
 
 ```python
@@ -593,4 +670,10 @@ def temporal_split_simple(
 - `compute_vol_regime_holdout()` uses regular session bars only (093000–155900)
 - `compute_consensus_config()` grid-rounding uses nearest valid value from search_space
 - `temporal_split_simple()` applies no balancing — training-only utility for early stopping val
+- `populate_precomputed_session_stats()` uses INSERT OR IGNORE — safe to re-run
+- `load_session_stats()` never modifies DB — read-only
+- `load_session_stats()` returns empty dict (not error) when no rows found
+- Delta smoothing in `load_session_stats()` is in-memory only — DB rows unchanged
+- `buy_ratio_baseline` and `intra_tpm_baseline` require tick_10 data — skipped if unavailable
+- `hhmmss_to_minutes()` is an alias for `hour_to_minutes()` with explicit naming for clarity
 - No pipeline business logic in this module — utility functions only

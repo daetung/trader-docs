@@ -9,7 +9,8 @@
 
 One-time (and incremental) migration of existing JSON files into DuckDB.
 Supports both directory and zip formats. Skips already-imported data.
-After migration, initializes `trading_calendar` and `ticker_data_coverage` tables.
+After migration, initializes `trading_calendar`, `ticker_data_coverage`,
+and `precomputed_session_stats` tables.
 
 ---
 
@@ -57,6 +58,12 @@ python tools/migrate_json_to_duckdb.py \
     --data-root /path/to/json/data \
     --db-path data/market.duckdb \
     --verbose
+
+# Skip session stats computation (for large migrations where stats will be run separately)
+python tools/migrate_json_to_duckdb.py \
+    --data-root /path/to/json/data \
+    --db-path data/market.duckdb \
+    --skip-session-stats
 ```
 
 ---
@@ -76,10 +83,22 @@ python tools/migrate_json_to_duckdb.py \
      f. Bulk insert into DuckDB (INSERT OR IGNORE)
 4. Log: files processed / skipped / failed
 
-5. Post-migration: initialize trading_calendar and ticker_data_coverage
+5. Post-migration: initialize calendar and coverage tables
      a. populate_trading_calendar(db_conn, all_ingested_dates)
      b. populate_ticker_coverage(db_conn, all_ingested_dates)
      (both functions sourced from utils.py)
+
+6. Post-migration: compute REFERENCE_SESSION baselines
+     a. populate_precomputed_session_stats(db_conn, all_ingested_dates,
+                                           n_sessions=20)
+     (function sourced from utils.py)
+     Computes per-bar prior-session averages for all tickers and dates.
+     Includes: rvol_baseline, rel_dvol_baseline, intra_vol_baseline,
+               intra_return_baseline, intra_tpm_baseline, buy_ratio_baseline,
+               gap_pct_mean, gap_pct_std.
+     buy_ratio_baseline requires tick_10 data (lee_ready classification).
+     Safe to re-run (INSERT OR IGNORE).
+     Note: Step 6 is skipped if --skip-session-stats flag is passed.
 ```
 
 **Zip handling:**
@@ -109,7 +128,6 @@ After all files are ingested, two tables are populated via shared utils function
 ```python
 from utils import populate_trading_calendar, populate_ticker_coverage
 
-# Build trading_calendar for all dates in ohlcv_1min
 ingested_dates = con.execute(
     "SELECT DISTINCT date FROM ohlcv_1min ORDER BY date"
 ).df()["date"].tolist()
@@ -129,6 +147,31 @@ populate_ticker_coverage(db_conn=con, dates=ingested_dates)
 
 ---
 
+## Post-Migration: Precomputed Session Stats
+
+```python
+from utils import populate_precomputed_session_stats
+
+populate_precomputed_session_stats(
+    db_conn=con,
+    dates=ingested_dates,
+    n_sessions=20,      # prior session count for baseline
+)
+```
+
+`populate_precomputed_session_stats()`:
+- For each (ticker, as_of_date): computes per-bar average over prior n_sessions
+- Metrics computed from ohlcv_1min: rvol_baseline, rel_dvol_baseline,
+  intra_vol_baseline, intra_return_baseline
+- Metrics computed from tick_10 (lee_ready): buy_ratio_baseline, intra_tpm_baseline
+- Day-level metrics (hour='000000'): gap_pct_mean, gap_pct_std
+- Stores avg_value, std_value, count per (ticker, as_of_date, hour, metric, n_sessions)
+- Delta smoothing is NOT applied here — applied at load time via load_session_stats()
+- Safe to re-run (INSERT OR IGNORE)
+- First n_sessions dates in the dataset will have count < n_sessions (uses available data)
+
+---
+
 ## Output / Logging
 
 ```
@@ -141,8 +184,10 @@ Migration summary:
   Rows inserted: ohlcv_1min=9,399,000 | tick_10=43,200,000
 
 Post-migration:
-  trading_calendar   : 1,260 dates populated
-  ticker_data_coverage: 11,847 tickers × dates populated
+  trading_calendar        : 1,260 dates populated
+  ticker_data_coverage    : 11,847 tickers × dates populated
+  precomputed_session_stats: 11,847 tickers × 1,240 dates × 390 bars × 8 metrics populated
+  Duration (session stats): 8m 14s
 ```
 
 Failed files are logged to `tools/migration_errors.log` with filename and exception.
@@ -157,4 +202,5 @@ Failed files are logged to `tools/migration_errors.log` with filename and except
 - Time range filter: `hour >= '040000' AND hour <= '200000'` (no session filtering)
 - Must handle malformed JSON files gracefully (log and continue, do not crash)
 - Post-migration calendar/coverage population is mandatory — not optional
-- `populate_trading_calendar()` and `populate_ticker_coverage()` sourced from `utils.py`
+- Post-migration session stats computation is mandatory unless --skip-session-stats passed
+- `populate_trading_calendar()`, `populate_ticker_coverage()`, and `populate_precomputed_session_stats()` sourced from `utils.py`

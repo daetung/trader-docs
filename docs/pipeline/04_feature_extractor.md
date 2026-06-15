@@ -36,6 +36,37 @@ feature_vector: dict[str, float]
 
 ---
 
+## Constructor — Dependency Injection
+
+```python
+class FeatureExtractor:
+    def __init__(
+        self,
+        config: dict,
+        db_conn: duckdb.DuckDBPyConnection,
+        calculator: IndicatorCalculator | None = None,
+    ):
+        """
+        calculator: injectable IndicatorCalculator instance.
+            Training:  IndicatorCalculator()  — stateless, default
+            Live mode: CachingIndicatorCalculator()  — cache-aware subclass
+            If None, defaults to IndicatorCalculator().
+
+        Init validates config constraints:
+            lookback_bars = config["indicators"]["lookback_days"] * 390
+            max_window = max(sr_levels.window_bars, fibonacci.window_bars)
+            if lookback_bars < max_window:
+                raise ConfigurationError(
+                    f"lookback_days*390={lookback_bars} < max indicator window={max_window}. "
+                    f"Set lookback_days >= {ceil(max_window/390)}."
+                )
+            n_sessions and lookback_days are independent — no constraint between them.
+        """
+        ...
+```
+
+---
+
 ## Processing Pipeline
 
 ```
@@ -47,13 +78,14 @@ bars (t-N ... t-1)
     │       covers all time periods (pre/regular/after-market)
     │       output: cleaned bars + market_structure_features dict
     │
-    ├─► IndicatorCalculator
+    ├─► IndicatorCalculator (or CachingIndicatorCalculator)
     │       run all enabled indicators per config
     │       output: dict[str → pd.DataFrame]  (time-series per indicator)
     │
     ├─► Vectorizer
     │       for each indicator series, apply mapped transform method(s)
     │       sr_levels: call vectorizer.sr_distance() directly (not via transform())
+    │       gap_pct: inline scalar — NOT passed to Vectorizer
     │       output: dict[str, float]
     │
     ├─► MetaFeatureExtractor  (inline)
@@ -73,23 +105,51 @@ bars (t-N ... t-1)
 
 ## extract_batch() Implementation Strategy
 
-`extract_batch()` must not recompute indicators per entry point.
-The correct strategy is:
+`extract_batch()` must not recompute indicators per entry point where avoidable.
+Different strategies apply per indicator category:
 
 ```
-1. Compute all indicators once for the full ticker bars DataFrame
-   → dict[str, pd.DataFrame]  (time-series per indicator, full date range)
+Strategy A — ticker당 1회 계산 (CONTINUOUS indicators):
+    1. Compute indicators once for the full ticker bars DataFrame
+       → dict[str, pd.DataFrame]  (time-series per indicator)
+    2. For each entry point in entry_points:
+       a. Slice indicator time-series up to t-1 bar (by hour index)
+       b. Apply Vectorizer to sliced series → feature vector
+    Applies to: ma, ema, macd, rsi, atr, bb, adx, dmi, sar, vr_volume,
+                obv, ad, vwap, roll_spread, hl_spread, lee_ready, tpm,
+                avg_vol_per_tick, rvol (today series), rel_dvol (today series),
+                intra_season_{metric} (today series)
 
-2. For each entry point in entry_points:
-   a. Slice indicator time-series up to t-1 bar (by hour index)
-   b. Apply Vectorizer to sliced series → feature vector
-      (sr_levels: call vectorizer.sr_distance() directly)
-   c. Append meta and temporal features
+Strategy B — ticker당 1회 (monotonic deque):
+    fibonacci_retracement: computed in a single O(N) pass over all ticker bars
+    via monotonic deque for sliding window max/min.
+    Result: time series with one fib level set per bar.
+    Sliced per entry point at t-1 (same as Strategy A).
 
-3. Concatenate all feature vectors → feature matrix (pd.DataFrame)
+Strategy C — date당 1회 (sr_levels only):
+    sr_levels uses scipy prominence — incremental computation not possible.
+    Computed once per date using bars up to that date's last entry point t-1.
+    All entry points within the same date share the same sr_levels (price_rN,
+    prominence_rN). bars_since_rN is recomputed per entry point from
+    pivot_hour_rN (cheap: count bars between pivot_hour and t-1).
+
+    if config["indicators"]["sr_levels"].get("exact_per_entry", False):
+        → per-entry-point: sr_levels(bars[:t-1_window], ...) per entry point
+    else (default):
+        → date당 1회 with bars_since recomputation
+
+Strategy D — date당 1회 스칼라 (gap_percentile only):
+    gap_percentile returns float — not a time series.
+    Computed once per date (same value for all entry points of the same date).
+    session_stats dict provides the baseline.
+    NaN for t="093000" or pre-market entries.
+    Inserted directly into feature vector as "gap_pct" (no Vectorizer step).
+
+Strategy E — session_stats lookup (REFERENCE_SESSION baselines):
+    rvol, rel_dvol, intraday_seasonality baselines loaded from
+    session_stats dict (pre-loaded from precomputed_session_stats table).
+    Baseline is pre-smoothed per delta_minutes at session_stats load time.
 ```
-
-Indicator calculation is performed **once per ticker**, not once per entry point.
 
 ---
 
@@ -97,7 +157,12 @@ Indicator calculation is performed **once per ticker**, not once per entry point
 
 ```python
 class FeatureExtractor:
-    def __init__(self, config: dict, db_conn: duckdb.DuckDBPyConnection): ...
+    def __init__(
+        self,
+        config: dict,
+        db_conn: duckdb.DuckDBPyConnection,
+        calculator: IndicatorCalculator | None = None,
+    ): ...
 
     def extract_batch(
         self,
@@ -106,11 +171,15 @@ class FeatureExtractor:
         ticks: pd.DataFrame,
         meta: dict,
         halts_df: pd.DataFrame,
+        session_stats: dict | None = None,
     ) -> pd.DataFrame:
         """
         Batch feature extraction for all entry points of a single ticker.
         bars and ticks must be strictly before t bar open (data boundary enforced by caller).
         halts_df passed explicitly for MissingBarClassifier and market_structure_features.
+        session_stats: pre-loaded REFERENCE_SESSION baselines from precomputed_session_stats.
+            Format: {metric: {hour: smoothed_avg_value}}
+            If None, REFERENCE_SESSION indicators return NaN for baseline-dependent values.
         """
         ...
 
@@ -122,11 +191,13 @@ class FeatureExtractor:
         entry: dict,
         halts_df: pd.DataFrame,
         return_intermediate: bool = False,
+        session_stats: dict | None = None,
     ) -> dict[str, float] | tuple[dict[str, float], dict]:
         """
         Single entry point feature extraction.
         Used in live inference (Inferencer) and visualization.
         halts_df passed explicitly — consistent with extract_batch() pattern.
+        session_stats: same as extract_batch(). In live mode, supplied by LiveModeRunner.
         When return_intermediate=True, returns (feature_vector, intermediate_dict)
         where intermediate_dict contains per-stage outputs for visualization.
         """
@@ -137,6 +208,7 @@ class FeatureExtractor:
         Return ordered list of all active feature column names.
         Excludes identifier columns (ticker, date, hour, p_entry) and
         metadata columns (is_dead_position, dead_position_case, is_ambiguous).
+        Includes gap_pct if reference_session indicators are enabled.
         """
         ...
 
@@ -147,6 +219,26 @@ class FeatureExtractor:
         Used by Trainer to derive categorical_cols for LightGBM.
         """
         ...
+
+    def calculate_required_history(self) -> dict:
+        """
+        Return minimum bars required for inference given current config.
+        Used by Inferencer for preload validation.
+
+        Returns:
+            {
+                "min_bars": int,           # lookback_days * 390
+                "min_trading_days": int,   # lookback_days
+            }
+
+        Simplified: lookback_days * 390 is guaranteed >= max(window_bars)
+        by init constraint. n_sessions is independent (baselines from
+        precomputed_session_stats, not from bars window).
+        """
+        return {
+            "min_bars": self.config["indicators"]["lookback_days"] * 390,
+            "min_trading_days": self.config["indicators"]["lookback_days"],
+        }
 ```
 
 ---
@@ -274,7 +366,9 @@ They are used by ClassBalancer for pre-balance filtering.
 ## Constraints
 
 - Feature column names must be deterministic and stable across runs
-- `extract_batch()` computes indicators once per ticker — not once per entry point
+- `extract_batch()` uses Strategy A/B (ticker당 1회) for CONTINUOUS indicators and fibonacci
+- `extract_batch()` uses Strategy C (date당 1회) for sr_levels by default
+- `extract_batch()` uses Strategy D (date당 1회 scalar) for gap_percentile
 - Disabled feature groups (per config) produce no columns
 - `sector_code`, `day_of_week`, `halt_reason_code` must be passed as categoricals to LightGBM
 - NaN values permitted in continuous features — do not impute
@@ -297,3 +391,11 @@ They are used by ClassBalancer for pre-balance filtering.
   output — no changes to IndicatorCalculator or Vectorizer required
 - `is_dead_position`, `dead_position_case`, `is_ambiguous` passed through from Labeler —
   not computed by FeatureExtractor
+- `gap_pct` scalar inserted directly into feature_vector — never passed to Vectorizer
+- `session_stats` is None during training if precomputed_session_stats not available —
+  REFERENCE_SESSION indicators return NaN in that case (not an error)
+- `calculator` DI: IndicatorCalculator for training (stateless); CachingIndicatorCalculator
+  for live mode (injected by LiveModeRunner)
+- Init ConfigurationError if `lookback_days * 390 < max(sr_levels.window_bars, fibonacci.window_bars)`
+- `n_sessions` and `lookback_days` are independent — no constraint between them
+  (REFERENCE_SESSION baselines come from precomputed_session_stats, not from bars window)

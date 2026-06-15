@@ -24,12 +24,14 @@ are handled entirely by ClassBalancer.
 **Input:**
 ```python
 # From DuckDB:
-ohlcv_1min:           pd.DataFrame   # all sessions (no time filter)
-tick_10:              pd.DataFrame   # all sessions — full day per ticker/date
-stock_meta:           pd.DataFrame
-trading_halts:        pd.DataFrame
-trading_calendar:     pd.DataFrame
-ticker_data_coverage: pd.DataFrame
+ohlcv_1min:                  pd.DataFrame   # all sessions (no time filter)
+tick_10:                     pd.DataFrame   # all sessions — full day per ticker/date
+stock_meta:                  pd.DataFrame
+trading_halts:               pd.DataFrame
+trading_calendar:            pd.DataFrame
+ticker_data_coverage:        pd.DataFrame
+precomputed_session_stats:   pd.DataFrame   # REFERENCE_SESSION baselines
+                                            # loaded per date range from DuckDB
 ```
 
 **Output (standalone mode):**
@@ -60,6 +62,22 @@ pd.DataFrame  # full labeled feature matrix, unsplit
        calendar_df = SELECT * FROM trading_calendar
        coverage_df = SELECT * FROM ticker_data_coverage
 
+       # REFERENCE_SESSION baselines — loaded once, shared across all tickers
+       session_stats_raw = SELECT * FROM precomputed_session_stats
+                           WHERE n_sessions = config["indicators"]["reference_session"]["n_sessions"]
+                           ORDER BY as_of_date, hour, metric
+
+       # Apply delta smoothing per (as_of_date, metric) in memory
+       # session_stats: dict[as_of_date → {metric: {hour: smoothed_avg_value}}]
+       session_stats = build_session_stats_dict(
+           session_stats_raw,
+           delta_minutes=config["indicators"]["reference_session"]["delta_minutes"],
+           session_mode=config["entry_detector"]["session_mode"],
+       )
+       # If precomputed_session_stats is empty (e.g., baseline not yet computed):
+       # session_stats = {}  → extract_batch() receives session_stats=None per ticker
+       # REFERENCE_SESSION indicators return NaN (not an error)
+
 2. EntryPointDetector.scan() for each ticker → entry_points (all sessions)
    max_entry_hour exclusion applied inside scan()
    scan() retrieves p_entry from bars[i+1]["open"] (t bar open price)
@@ -83,7 +101,20 @@ pd.DataFrame  # full labeled feature matrix, unsplit
        bars_td   = ohlcv_df filtered to (ticker, date, hour < t_hour)  [t-1 and earlier]
        ticks_td  = ticks_df filtered to (ticker, date, hour < t_hour)  [before t bar]
        halts_td  = halts_df filtered to (ticker, date)
-       extractor.extract_batch(entry_points_td, bars_td, ticks_td, meta_td, halts_td)
+
+       # Supply REFERENCE_SESSION baselines for this ticker's dates
+       ticker_dates = entry_points_td["date"].unique()
+       ticker_session_stats = {
+           date: session_stats.get(date)
+           for date in ticker_dates
+       }
+       # ticker_session_stats: dict[date → {metric: {hour: value}} | None]
+       # FeatureExtractor selects the appropriate as_of_date for each entry point
+
+       extractor.extract_batch(
+           entry_points_td, bars_td, ticks_td, meta_td, halts_td,
+           session_stats=ticker_session_stats,
+       )
 
 7. Merge features with labels on (ticker, date, hour)
    → labeled feature matrix:
@@ -158,7 +189,7 @@ CLI always runs in standalone mode (`return_data=False`).
 ```yaml
 data_paths.*
 entry_detector.*
-indicators.*
+indicators.*            # includes reference_session.n_sessions, reference_session.delta_minutes
 vectorizer.*
 labeler.*
 class_balancer.*
@@ -172,6 +203,9 @@ misc.lookback_bars
 - Preprocessor is responsible for feature extraction and labeling only
 - Session_mode filtering, splitting, and fold generation handled by ClassBalancer
 - All data loaded from DuckDB in bulk (no per-ticker DB queries during extraction)
+- `precomputed_session_stats` loaded once at Step 1 for all dates, not per ticker/date
+- `session_stats` dict built in memory after loading — delta smoothing applied at this stage
+- Empty `precomputed_session_stats` is not an error: `extract_batch()` receives `None`, REFERENCE_SESSION indicators return NaN
 - `ticks_df` loaded as full day per ticker/date:
   - Labeler receives full day (hour >= t_hour filtered internally per entry point)
   - FeatureExtractor receives ticks before t bar only (hour < t_hour)
