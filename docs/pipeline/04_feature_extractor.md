@@ -149,6 +149,8 @@ Strategy E — session_stats lookup (REFERENCE_SESSION baselines):
     rvol, rel_dvol, intraday_seasonality baselines loaded from
     session_stats dict (pre-loaded from precomputed_session_stats table).
     Baseline is pre-smoothed per delta_minutes at session_stats load time.
+    extract_batch() selects session_stats[entry_date] for each entry point,
+    then passes the flat {metric: {hour: value}} dict to IndicatorCalculator.
 ```
 
 ---
@@ -178,8 +180,11 @@ class FeatureExtractor:
         bars and ticks must be strictly before t bar open (data boundary enforced by caller).
         halts_df passed explicitly for MissingBarClassifier and market_structure_features.
         session_stats: pre-loaded REFERENCE_SESSION baselines from precomputed_session_stats.
-            Format: {metric: {hour: smoothed_avg_value}}
-            If None, REFERENCE_SESSION indicators return NaN for baseline-dependent values.
+            Format: {date_str: {metric: {hour: smoothed_avg_value}}} | None
+            Keys are as_of_date strings ('YYYYMMDD') mapping to single-ticker baseline dicts.
+            extract_batch() internally selects stats[entry_date] for each entry point,
+            then passes the flat {metric: {hour: value}} dict to IndicatorCalculator.
+            If None or entry date missing, REFERENCE_SESSION indicators return NaN.
         """
         ...
 
@@ -197,7 +202,10 @@ class FeatureExtractor:
         Single entry point feature extraction.
         Used in live inference (Inferencer) and visualization.
         halts_df passed explicitly — consistent with extract_batch() pattern.
-        session_stats: same as extract_batch(). In live mode, supplied by LiveModeRunner.
+        session_stats: flat single-date baseline for this entry point's ticker/date.
+            Format: {metric: {hour: smoothed_avg_value}} | None
+            In live mode, supplied by LiveModeRunner via CachingIndicatorCalculator._session_stats.
+            If None, REFERENCE_SESSION indicators return NaN.
         When return_intermediate=True, returns (feature_vector, intermediate_dict)
         where intermediate_dict contains per-stage outputs for visualization.
         """
@@ -369,6 +377,8 @@ They are used by ClassBalancer for pre-balance filtering.
 - `extract_batch()` uses Strategy A/B (ticker당 1회) for CONTINUOUS indicators and fibonacci
 - `extract_batch()` uses Strategy C (date당 1회) for sr_levels by default
 - `extract_batch()` uses Strategy D (date당 1회 scalar) for gap_percentile
+- `extract_batch()` internally dispatches session_stats[entry_date] per entry point before
+  passing flat {metric: {hour: value}} to IndicatorCalculator REFERENCE_SESSION methods
 - Disabled feature groups (per config) produce no columns
 - `sector_code`, `day_of_week`, `halt_reason_code` must be passed as categoricals to LightGBM
 - NaN values permitted in continuous features — do not impute

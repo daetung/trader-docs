@@ -139,6 +139,21 @@ CREATE TABLE ticker_data_coverage (
     PRIMARY KEY (ticker, date)
 );
 
+-- Corporate events (splits and reverse splits)
+-- Populated by metadata_crawler via yfinance splits history.
+-- US stock splits always take effect before market open — no intra-session splits occur.
+-- Used by populate_precomputed_session_stats() to exclude split-affected sessions
+-- from baseline calculations (planned — see Open Items in architecture.md).
+-- 'dividend' event_type is reserved for future use; not currently collected.
+CREATE TABLE corporate_events (
+    ticker      VARCHAR NOT NULL,
+    event_date  VARCHAR NOT NULL,   -- 'YYYYMMDD' (effective date, before market open)
+    event_type  VARCHAR NOT NULL,   -- 'split' | 'reverse_split'
+                                    -- 'dividend': reserved, not currently collected
+    ratio       DOUBLE  NOT NULL,   -- split: >1.0 (e.g. 2.0 for 2:1), reverse: <1.0 (e.g. 0.5)
+    PRIMARY KEY (ticker, event_date, event_type)
+);
+
 -- Entry points (output of EntryPointDetector)
 -- Written by Preprocessor (training) and Inferencer (live) via INSERT OR IGNORE
 CREATE TABLE entry_points (
@@ -267,7 +282,7 @@ CREATE TABLE trade_log (
     slippage_pct            DOUBLE,
     quantity                INTEGER,
     partial_fills_count     INTEGER,
-    unfilled_quantity       INTEGER,
+    unfilled_quantity        INTEGER,
     is_ambiguous            BOOLEAN      NOT NULL DEFAULT FALSE,
     PRIMARY KEY (run_id, ticker, date, entry_bar)
 );
@@ -301,6 +316,9 @@ CREATE TABLE inference_log (
 
 -- Precomputed session statistics (REFERENCE_SESSION baselines)
 -- Per-bar aggregated values from prior N sessions; delta smoothing applied at load time.
+-- as_of_date=D: baselines computed from sessions [D-1, D-2, ..., D-N], intended for use on D.
+--              Inserted by collect_daily.py the evening before D (after market close D-1).
+--              LiveModeRunner queries WHERE as_of_date = today at session_start.
 CREATE TABLE precomputed_session_stats (
     ticker      VARCHAR  NOT NULL,
     as_of_date  VARCHAR  NOT NULL,   -- 'YYYYMMDD': baseline for this trading date
@@ -318,11 +336,34 @@ CREATE TABLE precomputed_session_stats (
     n_sessions  INTEGER  NOT NULL,
     avg_value   DOUBLE   NOT NULL,   -- per-bar average over prior N sessions (no delta applied)
     std_value   DOUBLE,              -- standard deviation (optional; used for gap_pct normalization)
-    count       INTEGER  NOT NULL,   -- actual sessions used (may be < n_sessions near dataset start)
+    count       INTEGER  NOT NULL,   -- actual sessions contributing to this average.
+                                     -- May be < n_sessions for several reasons:
+                                     --   (a) near dataset start (insufficient history)
+                                     --   (b) halt bars reduce valid session count at
+                                     --       specific hour slots (per-bar metrics only)
+                                     --   (c) halt at 155900/093000 reduces gap_pct count
+                                     -- Granularity: per (ticker, as_of_date, hour, metric)
+                                     -- count may differ by hour slot within same ticker/date.
     PRIMARY KEY (ticker, as_of_date, hour, metric, n_sessions)
 );
--- Note: delta_minutes smoothing is applied in-memory at session start (load_session_stats()),
--- not stored in this table. Changing delta_minutes requires no DB recomputation.
+-- Note: delta_minutes smoothing is applied in-memory at load time
+-- (build_session_stats_dict() or load_session_stats()) — not stored in this table.
+-- Changing delta_minutes requires no DB recomputation.
+
+-- Indicator cache for live mode (used only when indicator_cache_mode = "db")
+-- Populated by CachingIndicatorCalculator.persist_to_db() at session_start.
+-- Loaded per-ticker on first watchdog event via load_from_db().
+-- session_stats are NOT stored here — sourced from precomputed_session_stats separately.
+-- Not created or queried when indicator_cache_mode = "memory" (default).
+CREATE TABLE indicator_cache (
+    session_date  VARCHAR  NOT NULL,   -- 'YYYYMMDD'
+    ticker        VARCHAR  NOT NULL,
+    layer         VARCHAR  NOT NULL,   -- 'layer1' | 'layer2'
+    indicator     VARCHAR  NOT NULL,   -- e.g. 'ema_9', 'pivot_points', 'fibonacci'
+    cache_data    BLOB     NOT NULL,   -- serialized numpy array / DataFrame (Arrow IPC or pickle)
+    PRIMARY KEY (session_date, ticker, layer, indicator)
+);
+-- Retention: current session_date only; prior session_date rows purged at each session_start.
 ```
 
 ---
@@ -376,6 +417,33 @@ session_stats_raw = con.execute("""
     ORDER BY metric, hour
 """, ["AAPL", "20250715", 20]).df()
 # After loading, apply delta_minutes smoothing in memory via load_session_stats()
+
+# Bulk load session_stats for ALL tickers — live Phase 1 (single date)
+session_stats_bulk = con.execute("""
+    SELECT ticker, as_of_date, hour, metric, avg_value, std_value, count
+    FROM precomputed_session_stats
+    WHERE as_of_date = ? AND n_sessions = ?
+    ORDER BY ticker, metric, hour
+""", ["20250715", 20]).df()
+# Pass to build_session_stats_dict(); access result[today_date] for ticker-keyed dict
+
+# Bulk load session_stats for ALL tickers and dates — training (all dates)
+session_stats_all = con.execute("""
+    SELECT ticker, as_of_date, hour, metric, avg_value, std_value, count
+    FROM precomputed_session_stats
+    WHERE n_sessions = ?
+    ORDER BY as_of_date, ticker, metric, hour
+""", [20]).df()
+# Pass to build_session_stats_dict(); access result[date][ticker] per entry point
+
+# Check for corporate events (splits) for a ticker
+events = con.execute("""
+    SELECT ticker, event_date, event_type, ratio
+    FROM corporate_events
+    WHERE ticker = ?
+      AND event_date >= ? AND event_date <= ?
+    ORDER BY event_date
+""", ["AAPL", "20250101", "20250715"]).df()
 
 # Rolling fold summary — inner trial AUC by trial and fold for a given optimizer run
 fold_summary = con.execute("""

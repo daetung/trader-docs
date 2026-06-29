@@ -62,13 +62,13 @@ pd.DataFrame  # full labeled feature matrix, unsplit
        calendar_df = SELECT * FROM trading_calendar
        coverage_df = SELECT * FROM ticker_data_coverage
 
-       # REFERENCE_SESSION baselines — loaded once, shared across all tickers
+       # REFERENCE_SESSION baselines — bulk load once, shared across all tickers/dates
        session_stats_raw = SELECT * FROM precomputed_session_stats
                            WHERE n_sessions = config["indicators"]["reference_session"]["n_sessions"]
-                           ORDER BY as_of_date, hour, metric
+                           ORDER BY as_of_date, ticker, hour, metric
 
-       # Apply delta smoothing per (as_of_date, metric) in memory
-       # session_stats: dict[as_of_date → {metric: {hour: smoothed_avg_value}}]
+       # Apply delta smoothing in memory
+       # session_stats: {as_of_date: {ticker: {metric: {hour: smoothed_avg_value}}}}
        session_stats = build_session_stats_dict(
            session_stats_raw,
            delta_minutes=config["indicators"]["reference_session"]["delta_minutes"],
@@ -103,13 +103,15 @@ pd.DataFrame  # full labeled feature matrix, unsplit
        halts_td  = halts_df filtered to (ticker, date)
 
        # Supply REFERENCE_SESSION baselines for this ticker's dates
+       # session_stats format: {as_of_date: {ticker: {metric: {hour: value}}}}
+       # Dispatch: select date and ticker dimensions for this specific ticker
        ticker_dates = entry_points_td["date"].unique()
        ticker_session_stats = {
-           date: session_stats.get(date)
+           date: session_stats.get(date, {}).get(ticker)
            for date in ticker_dates
        }
-       # ticker_session_stats: dict[date → {metric: {hour: value}} | None]
-       # FeatureExtractor selects the appropriate as_of_date for each entry point
+       # ticker_session_stats: {date: {metric: {hour: value}} | None}
+       # extract_batch() internally selects stats[entry_date] per entry point
 
        extractor.extract_batch(
            entry_points_td, bars_td, ticks_td, meta_td, halts_td,
@@ -203,8 +205,10 @@ misc.lookback_bars
 - Preprocessor is responsible for feature extraction and labeling only
 - Session_mode filtering, splitting, and fold generation handled by ClassBalancer
 - All data loaded from DuckDB in bulk (no per-ticker DB queries during extraction)
-- `precomputed_session_stats` loaded once at Step 1 for all dates, not per ticker/date
-- `session_stats` dict built in memory after loading — delta smoothing applied at this stage
+- `precomputed_session_stats` loaded once at Step 1 for all dates and tickers
+- `build_session_stats_dict()` returns `{as_of_date: {ticker: {metric: {hour: value}}}}`
+- Per-ticker session_stats dispatch at Step 6: `session_stats.get(date, {}).get(ticker)`
+  produces flat `{metric: {hour: value}}` passed to extract_batch() as date-keyed dict
 - Empty `precomputed_session_stats` is not an error: `extract_batch()` receives `None`, REFERENCE_SESSION indicators return NaN
 - `ticks_df` loaded as full day per ticker/date:
   - Labeler receives full day (hour >= t_hour filtered internally per entry point)

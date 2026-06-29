@@ -96,6 +96,10 @@ python tools/migrate_json_to_duckdb.py \
      Includes: rvol_baseline, rel_dvol_baseline, intra_vol_baseline,
                intra_return_baseline, intra_tpm_baseline, buy_ratio_baseline,
                gap_pct_mean, gap_pct_std.
+     Halt handling applied per metric type (see utils.md for details):
+       - Cumulative metrics: halt bars contribute volume=0; full-day no-data sessions excluded
+       - Per-bar metrics: halt slots excluded per hour slot; count may differ by hour
+       - gap_pct: nearest non-halt bar fallback for 155900/093000; session excluded if none
      buy_ratio_baseline requires tick_10 data (lee_ready classification).
      Safe to re-run (INSERT OR IGNORE).
      Note: Step 6 is skipped if --skip-session-stats flag is passed.
@@ -165,10 +169,49 @@ populate_precomputed_session_stats(
   intra_vol_baseline, intra_return_baseline
 - Metrics computed from tick_10 (lee_ready): buy_ratio_baseline, intra_tpm_baseline
 - Day-level metrics (hour='000000'): gap_pct_mean, gap_pct_std
+- Halt handling applied per metric type (see utils.md — populate_precomputed_session_stats)
 - Stores avg_value, std_value, count per (ticker, as_of_date, hour, metric, n_sessions)
 - Delta smoothing is NOT applied here — applied at load time via load_session_stats()
+  or build_session_stats_dict()
 - Safe to re-run (INSERT OR IGNORE)
 - First n_sessions dates in the dataset will have count < n_sessions (uses available data)
+
+---
+
+## Post-Migration Warning: First Live Session Preparation
+
+After migration completes, `precomputed_session_stats` is populated for all
+`ingested_dates`. However, the first live trading session requires baselines
+for `as_of_date = first_live_date` (the day after the last ingested date).
+
+**This entry is NOT created automatically by migration.**
+
+Before starting the first live session, run one of:
+
+```bash
+# Option A: Run collect_daily for the last ingested date (recommended)
+# This ingests that date's data (if not yet ingested) and populates
+# session_stats for the next trading day.
+python tools/collect_daily.py \
+    --db-path data/market.duckdb \
+    --data-root /path/to/json/data \
+    --date {last_ingested_date}
+
+# Option B: Manually populate session_stats for the first live date
+python - <<'EOF'
+import duckdb
+from utils import populate_precomputed_session_stats, get_next_trading_day
+con = duckdb.connect("data/market.duckdb")
+last_date = con.execute("SELECT MAX(date) FROM ohlcv_1min").fetchone()[0]
+first_live_date = get_next_trading_day(last_date, con)
+populate_precomputed_session_stats(con, dates=[first_live_date], n_sessions=20)
+print(f"Session stats populated for {first_live_date}")
+EOF
+```
+
+Failure to run this step will cause LiveModeRunner Phase 1 bulk load to return
+an empty DataFrame for `as_of_date = first_live_date`, resulting in all
+REFERENCE_SESSION indicators returning NaN for the first live session.
 
 ---
 

@@ -194,6 +194,55 @@ def set_session_stats(self, session_stats: dict) -> None:
     self._session_stats = session_stats
 ```
 
+### `persist_to_db(db_conn, session_date, ticker)`
+
+Serialize and store Layer 1 and Layer 2 to the `indicator_cache` table.
+Used only when `config["live_mode"]["indicator_cache_mode"] == "db"`.
+
+```python
+def persist_to_db(
+    self,
+    db_conn: duckdb.DuckDBPyConnection,
+    session_date: str,
+    ticker: str,
+) -> None:
+    """
+    Serializes self._fixed and self._cache to BLOBs and stores in indicator_cache.
+    session_stats (self._session_stats) is NOT persisted here —
+    it is reloaded separately via load_session_stats() when needed.
+
+    Call after session_start_compute() + set_session_stats() are both complete.
+    After this call, the instance may be released from RAM.
+    Purges prior session_date entries for this ticker before inserting.
+    """
+```
+
+### `load_from_db(db_conn, session_date, ticker)`
+
+Restore Layer 1 and Layer 2 from the `indicator_cache` table.
+Used only when `config["live_mode"]["indicator_cache_mode"] == "db"`.
+
+```python
+def load_from_db(
+    self,
+    db_conn: duckdb.DuckDBPyConnection,
+    session_date: str,
+    ticker: str,
+) -> None:
+    """
+    Restores self._fixed and self._cache from stored BLOBs.
+    Does NOT restore self._session_stats —
+    caller must call set_session_stats() separately after this method.
+
+    Expected call sequence (db mode, first watchdog event for ticker):
+        calc = CachingIndicatorCalculator(config)
+        calc.load_from_db(db_conn, today_date, ticker)
+        stats = load_session_stats(db_conn, ticker, today_date, ...)
+        calc.set_session_stats(stats)
+        # then replay today's intraday bars via on_bar_close()
+    """
+```
+
 ---
 
 ## Fibonacci Monotonic Deque
@@ -251,10 +300,20 @@ Indicators with `precalculate_bars: 0` (vwap, lee_ready, tpm, avg_vol_per_tick, 
 - `CachingIndicatorCalculator` preserves the full `IndicatorCalculator` interface
 - `IndicatorCalculator` remains stateless — used unchanged in training
 - CachingIndicatorCalculator is only instantiated by LiveModeRunner — never in training
+- LiveModeRunner maintains one CachingIndicatorCalculator instance per ticker in the
+  tradable universe (pool size = all tickers from trading API at session_start)
 - `session_start_compute()` must be called before any `get_for_entry()` call
 - `set_session_stats()` must be called before `on_regular_session_open()` or any REFERENCE_SESSION indicator call
 - `on_bar_close()` must be called in bar-close order (chronological) — no random access
 - `sr_levels` is always recomputed fresh in `get_for_entry()` — never stored in Layer 2 cache
 - `gap_pct` is stored as a scalar in Layer 1 after `on_regular_session_open()` — never in Layer 2
 - fibonacci deque state must be initialized from historical_bars in `session_start_compute()` before `on_bar_close()` is called
-- Thread safety of `_cache` and `_fixed` dicts is the responsibility of LiveModeRunner (single-threaded access recommended)
+- Thread safety of `_cache` and `_fixed` dicts is the responsibility of LiveModeRunner
+  (single-threaded access recommended; parallel session_start_compute() across tickers is safe
+  as instances share no state)
+- `persist_to_db()` / `load_from_db()`: used only when `indicator_cache_mode = "db"`
+  (default: `"memory"` — these methods not called in standard operation)
+- `persist_to_db()` does not persist `_session_stats`;
+  `load_from_db()` does not restore `_session_stats`
+- After `persist_to_db()`, instance may be released from RAM
+- After `load_from_db()`, `set_session_stats()` must be called before any use

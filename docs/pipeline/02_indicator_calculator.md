@@ -190,10 +190,7 @@ fibonacci_retracement(bars, window_bars)
         the output is a time series with one fib level set per bar,
         sliced per entry point at t-1. NaN for warm-up period (first
         window_bars-1 bars).
-```
 
-### Support / Resistance (Multi-level, Dynamic)
-```
 sr_levels(bars, n_levels, window_bars)
     → Identify top-N local maxima and minima by scipy prominence score
     → For each of top-N resistance levels (local maxima):
@@ -244,7 +241,6 @@ roll_spread(bars, n)
 hl_spread(bars)
     → Corwin-Schultz High-Low Spread estimator
     → Uses intraday high/low of each 1min bar
-    → each 1min bar
     → spread = 2*(exp(alpha) - 1) / (1 + exp(alpha))
       where alpha derived from rolling 2-bar H/L ratios
     → Output: hl_spread_pct per bar (normalized by close)
@@ -289,6 +285,7 @@ All computations reference only the passed `bars` DataFrame — no internal stat
 REFERENCE_SESSION baselines (prior session averages) are pre-computed and stored in
 `precomputed_session_stats` DuckDB table. At runtime, FeatureExtractor supplies
 the pre-loaded baseline dict to avoid repeated DB lookups.
+IndicatorCalculator does not query DuckDB directly.
 
 ### Session Policy
 ```
@@ -298,11 +295,12 @@ REFERENCE_SESSION: current session value normalized by prior session baseline
 ```
 
 ```
-rvol(bars, date, n_sessions, session_mode)
+rvol(bars, date, n_sessions, session_mode, session_stats)
     → Relative Volume: today's cumulative volume at time T
       divided by average cumulative volume at time T over prior N sessions
     → today_cumvol_at_T = sum(bars[date==today, hour<=T]["volume"])
-    → baseline = mean over prior N sessions of same cumulative window
+    → baseline = session_stats["rvol_baseline"][T]
+      (prior N sessions avg cumulative volume at hour T; precomputed and stored in DB)
     → session_mode: follows entry_detector.session_mode
          "regular": prior regular session bars only (093000~155900)
          "pre":     prior pre-market bars (040000~092900)
@@ -310,16 +308,18 @@ rvol(bars, date, n_sessions, session_mode)
     → output: per-bar ratio series (today session only; prior session bars → NaN)
     → output column: rvol
 
-rel_dvol(bars, date, n_sessions, session_mode)
+rel_dvol(bars, date, n_sessions, session_mode, session_stats)
     → Relative Dollar Volume: same as rvol but using close * volume (dollar volume)
+    → baseline = session_stats["rel_dvol_baseline"][T]
+      (prior N sessions avg cumulative dollar volume at hour T; precomputed and stored in DB)
     → output column: rel_dvol
 
-gap_percentile(bars, date, n_sessions)
+gap_percentile(bars, date, n_sessions, session_stats)
     → Today's gap = (today_regular_open - prev_close) / prev_close
       today_regular_open = open price of 093000 bar
       prev_close = close price of previous date's 155900 bar
     → Percentile rank of today's gap within prior N sessions' gap distribution
-      (baseline loaded from precomputed_session_stats)
+      baseline loaded from session_stats["gap_pct_mean"] and session_stats["gap_pct_std"]
     → Returns float (scalar) — NOT a DataFrame
     → NaN conditions:
          - t bar = "093000" (today's open = t bar open = P_entry → FORBIDDEN)
@@ -327,8 +327,8 @@ gap_percentile(bars, date, n_sessions)
          - baseline has insufficient data (count < n_sessions / 2)
     → output: float | NaN  (single scalar per entry point)
 
-intraday_seasonality(indicator_series, date, historical_bars,
-                     n_sessions, delta_minutes, session_mode, metric)
+intraday_seasonality(indicator_series, date, n_sessions,
+                     delta_minutes, session_mode, metric, session_stats)
     → Normalize a per-bar metric series against its prior-session baseline
       at the same time-of-day (±delta_minutes window)
     → indicator_series: pre-computed metric time series for today's bars
@@ -339,6 +339,11 @@ intraday_seasonality(indicator_series, date, historical_bars,
     → delta_minutes: ±window for time averaging of baseline (default: 5)
     → Baseline is loaded from FeatureExtractor-supplied session_stats dict
       (derived from precomputed_session_stats table, smoothed per delta_minutes)
+      session_stats key per metric:
+         "volume"         → session_stats["intra_vol_baseline"][T]
+         "price_return"   → session_stats["intra_return_baseline"][T]
+         "tpm"            → session_stats["intra_tpm_baseline"][T]
+         "buy_sell_ratio" → session_stats["buy_ratio_baseline"][T]
     → normalized_value[t_hour] = indicator_value[t_hour] / baseline[t_hour]
     → output: per-bar normalized series
     → output column: intra_season_{metric}  (e.g. intra_season_vol)
@@ -367,25 +372,6 @@ intraday_seasonality(indicator_series, date, historical_bars,
 
 **VR disambiguation:** `vr_volume` = volume surge ratio. `vr_volatility` = ATR-normalized volatility.
 Never use bare `vr` as a column name.
-
----
-
-## Design Constraints
-
-- All calculations must reference only the passed `bars` DataFrame — no internal state or global data access
-- No feature extraction or vectorization logic in this file — computation only
-- All window sizes and parameters must be accepted as arguments (not hardcoded)
-- NaN handling: return NaN for warm-up period rows; do not forward-fill silently
-- `dmi()` must not duplicate the calculation logic of `adx()` — call or delegate internally
-- VWAP reset behavior is controlled by `reset_mode` argument — caller (FeatureExtractor) reads from config and passes explicitly
-- `fibonacci_retracement()` and `pivot_points()` output level values as absolute prices, not distances — distance features are derived in Vectorizer via `level_distance()`
-- `sr_levels()` outputs raw level data only (`price_rN`, `pivot_hour_rN`, `bars_since_rN`, `prominence_rN`) — P_entry is never passed to this method; distance features derived in Vectorizer via `sr_distance()`
-- `bars_since_rN` is computed relative to the last bar in the passed window (always t-1) — it is a raw temporal measurement, not a derived feature
-- `classify_missing_bars()` applies halt classification across all time periods — halts_df is the authoritative source regardless of hour
-- `gap_percentile()` returns float, not DataFrame — FeatureExtractor handles inline (does not pass to Vectorizer)
-- REFERENCE_SESSION baseline data must be supplied by caller (FeatureExtractor) via `session_stats` dict — IndicatorCalculator does not query DuckDB directly
-- `intraday_seasonality()` takes a pre-computed indicator_series — does not internally call other indicator methods
-- `fibonacci_retracement()` uses monotonic deque for O(N) sliding window max/min when processing full ticker bars
 
 ---
 
@@ -451,11 +437,13 @@ class IndicatorCalculator:
     def rvol(
         self, bars: pd.DataFrame, date: str,
         n_sessions: int, session_mode: str,
+        session_stats: dict,          # reads session_stats["rvol_baseline"]
     ) -> pd.DataFrame: ...
 
     def rel_dvol(
         self, bars: pd.DataFrame, date: str,
         n_sessions: int, session_mode: str,
+        session_stats: dict,          # reads session_stats["rel_dvol_baseline"]
     ) -> pd.DataFrame: ...
 
     def gap_percentile(
@@ -529,3 +517,22 @@ indicators:
   #             cci, mfi, bollinger_bands, atr, vr_volatility, volume_ma, vr_volume,
   #             obv, ad, roll_spread, hl_spread
 ```
+
+---
+
+## Design Constraints
+
+- All calculations must reference only the passed `bars` DataFrame — no internal state or global data access
+- No feature extraction or vectorization logic in this file — computation only
+- All window sizes and parameters must be accepted as arguments (not hardcoded)
+- NaN handling: return NaN for warm-up period rows; do not forward-fill silently
+- `dmi()` must not duplicate the calculation logic of `adx()` — call or delegate internally
+- VWAP reset behavior is controlled by `reset_mode` argument — caller (FeatureExtractor) reads from config and passes explicitly
+- `fibonacci_retracement()` and `pivot_points()` output level values as absolute prices, not distances — distance features are derived in Vectorizer via `level_distance()`
+- `sr_levels()` outputs raw level data only (`price_rN`, `pivot_hour_rN`, `bars_since_rN`, `prominence_rN`) — P_entry is never passed to this method; distance features derived in Vectorizer via `sr_distance()`
+- `bars_since_rN` is computed relative to the last bar in the passed window (always t-1) — it is a raw temporal measurement, not a derived feature
+- `classify_missing_bars()` applies halt classification across all time periods — halts_df is the authoritative source regardless of hour
+- `gap_percentile()` returns float, not DataFrame — FeatureExtractor handles inline (does not pass to Vectorizer)
+- REFERENCE_SESSION baseline data must be supplied by caller (FeatureExtractor) via `session_stats` dict — IndicatorCalculator does not query DuckDB directly; `rvol` reads `session_stats["rvol_baseline"]`, `rel_dvol` reads `session_stats["rel_dvol_baseline"]`
+- `intraday_seasonality()` takes a pre-computed indicator_series and a `session_stats` dict (not historical_bars) — does not internally call other indicator methods
+- `fibonacci_retracement()` uses monotonic deque for O(N) sliding window max/min when processing full ticker bars

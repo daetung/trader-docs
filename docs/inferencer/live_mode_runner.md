@@ -19,8 +19,11 @@ and all other live-mode modules are service objects instantiated and owned by th
 
 ```
 LiveModeRunner
-    ├── CachingIndicatorCalculator    (injected into FeatureExtractor)
-    ├── FeatureExtractor              (uses CachingCalculator)
+    ├── calculators: dict[str, CachingIndicatorCalculator]
+    │       One instance per ticker in today's tradable universe.
+    │       Populated eagerly at session_start via parallel session_start_compute().
+    │       Active watchlist populated lazily as watchdog events arrive.
+    ├── FeatureExtractor              (uses CachingIndicatorCalculator via DI)
     ├── Inferencer                    (owns FeatureExtractor)
     ├── EntryPointDetector            (used internally by Inferencer)
     ├── [Watchdog polling loop]       (async / threaded)
@@ -34,23 +37,69 @@ LiveModeRunner
 ```
 LiveModeRunner.start_session(today_date):
 
-  1. Load historical bars from DuckDB (lookback_days from config)
-     bars_by_ticker = {ticker: ohlcv_1min rows for lookback window}
+  1. Fetch today's tradable ticker list from trading service API
+         all_tickers: list[str]
+         (tickers with prior-day data but no trading access today
+          are automatically excluded by the API response)
 
-  2. Load session_stats from DuckDB (precomputed_session_stats)
-     session_stats_raw = SELECT * WHERE as_of_date = today AND n_sessions = config_n
-     session_stats = load_session_stats(session_stats_raw, delta_minutes, session_mode)
-     # applies delta smoothing in memory
+  2. [Phase 1] Bulk load session_stats for ALL tickers from DuckDB
+         session_stats_raw = SELECT * FROM precomputed_session_stats
+                             WHERE as_of_date = today_date
+                               AND n_sessions = config_n_sessions
+         # as_of_date = today was inserted by collect_daily.py the previous evening
+         # and contains baselines from the prior N sessions.
 
-  3. CachingIndicatorCalculator.session_start_compute(historical_bars)
-     # Layer 1: pivot_points (fixed for session)
-     # Layer 2 precalculation: all CONTINUOUS indicators up to D-1
-     # per precalculate_bars config
+         all_stats_nested = build_session_stats_dict(
+             session_stats_raw,
+             delta_minutes=config["indicators"]["reference_session"]["delta_minutes"],
+             session_mode=config["entry_detector"]["session_mode"],
+         )
+         # all_stats_nested: {today_date: {ticker: {metric: {hour: smoothed_avg_value}}}}
+         session_stats_bulk = all_stats_nested[today_date]
+         # session_stats_bulk: {ticker: {metric: {hour: smoothed_avg_value}}}
 
-  4. Inferencer initializes (calculate_required_history, load model)
+  3. [Eager Pool] Parallel session_start_compute() for all tickers:
+         Using worker pool (config: live_mode.session_start_workers)
+
+         For each ticker in all_tickers (parallelized):
+             historical_bars = db_conn.execute("""
+                 SELECT * FROM ohlcv_1min
+                 WHERE ticker = ? AND date >= ?
+                 ORDER BY date, hour
+             """, [ticker, lookback_start_date]).df()
+
+             calc = CachingIndicatorCalculator(config)
+             calc.session_start_compute(historical_bars)
+             calc.set_session_stats(
+                 session_stats_bulk.get(ticker, {})
+             )
+
+             if config["live_mode"]["indicator_cache_mode"] == "db":
+                 calc.persist_to_db(db_conn, today_date, ticker)
+                 # RAM released; calc discarded after persist
+             else:  # "memory" (default)
+                 calculators[ticker] = calc  # retain in RAM
+
+         del session_stats_bulk   # Phase 1 RAM released after all tickers done
+
+  4. Inferencer init:
+         calculate_required_history() → self.required_bars
+         Load model artifacts (run_id from config)
 
   5. Start watchdog polling loop (async)
   6. Start position manager loop (async)
+```
+
+**Phase 1 memory profile:**
+```
+session_stats_bulk peak:  ~15,000 tickers × ~18KB ≈ ~270MB
+                          Released after Step 3 completes.
+
+calculators pool ("memory" mode):
+  ~15,000 tickers × ~790KB (Layer1 + Layer2 + session_stats) ≈ ~11.9GB sustained
+  Recommended server: 32GB+ RAM.
+  For memory-constrained environments: use indicator_cache_mode = "db"
+  (50~200ms per-ticker load latency on first watchdog event).
 ```
 
 ---
@@ -62,27 +111,64 @@ Polls external watchdog service at `poll_interval_seconds` (default: 1s).
 ```
 loop every poll_interval_seconds:
 
-  1. Query watchdog service → list of ticker candidates
+  1. Query watchdog service → list of ticker candidates for this bar
 
   2. For each ticker in candidates:
      a. Fetch current bars from trading API (1min chart up to now)
-        → update intraday bars in memory / DuckDB
-     b. Fetch current ticks from trading API (10-tick chart up to now)
-        → update intraday ticks in memory
+     b. Fetch current ticks from trading API (10-tick up to now)
+     c. Update intraday state in memory / DuckDB
 
-  3. CachingCalculator.on_bar_close(new_bar) if new 1min bar completed
-     # incremental update for all Layer 2 indicators
-     # on_regular_session_open() if 093000 bar just closed (gap_percentile)
+  3. If new 1min bar completed for ticker:
+         calculators[ticker].on_bar_close(new_bar, ticks_for_bar)
+         if 093000 bar just closed:
+             calculators[ticker].on_regular_session_open(bars_including_930)
 
-  4. For each ticker with completed bar:
+  4. If ticker appears in candidates for the first time this session
+     → see "First-Entry Watchlist Append" below
+
+  5. For each ticker with completed bar and active calc:
      a. Re-verify entry point candidate (detect())
-     b. If confirmed: Inferencer.infer(bars, ticks, meta, entry, session_stats)
+     b. If confirmed: Inferencer.infer(
+            bars, ticks, meta, entry,
+            session_stats=calculators[ticker]._session_stats
+        )
      c. If signal (up5 / up3): submit buy order via trading API
 ```
 
-**Bar completion detection:**
-A new 1min bar is considered complete when the API returns data for the bar
-immediately following the last known bar (i.e., bar at hour H+1 appears → bar H is final).
+---
+
+## First-Entry Watchlist Append
+
+Called when a ticker appears in watchdog candidates for the first time this session.
+
+```
+When ticker X first appears in candidates:
+
+  if indicator_cache_mode == "memory":
+      # calc_X already in calculators (eager pool) — no action needed
+      pass
+
+  elif indicator_cache_mode == "db":
+      # Restore from DB, reload session_stats, replay today's bars
+      calc_X = CachingIndicatorCalculator(config)
+      calc_X.load_from_db(db_conn, today_date, ticker_X)
+      stats_X = load_session_stats(
+          db_conn, ticker_X, today_date,
+          n_sessions=config_n_sessions,
+          delta_minutes=config_delta_minutes,
+          session_mode=config_session_mode,
+      )
+      calc_X.set_session_stats(stats_X)
+      calculators[ticker_X] = calc_X
+
+  # Replay today's intraday bars (session_start → current bar-1)
+  # (historical_bars in eager pool covers D-1 and earlier only)
+  today_bars_X = fetch_today_bars_from_api(ticker_X)
+  for bar in today_bars_X[:-1]:   # all completed bars except current
+      calculators[ticker_X].on_bar_close(bar, ticks_for(bar))
+  if regular_session_opened:
+      calculators[ticker_X].on_regular_session_open(today_bars_X)
+```
 
 ---
 
@@ -158,22 +244,45 @@ loop every position_check_interval_seconds (config, default: 5s):
 live_mode:
   poll_interval_seconds:          1
   position_check_interval_seconds: 5
-  max_positions:                  5      # concurrent position limit
-  stop_loss_pct:                  0.03   # 3% stop loss
-  max_hold_bars:                  60     # max hold in 1min bars
+  max_positions:                  5
+  stop_loss_pct:                  0.03
+  max_hold_bars:                  60
+  session_start_workers:          8      # parallel workers for session_start_compute()
+  indicator_cache_mode:           "memory"
+  # "memory" (default): all CachingCalculator state held in RAM after session_start_compute()
+  #                     Lowest latency; ~12GB sustained on 32GB+ server.
+  # "db":               Indicator cache persisted to indicator_cache table after
+  #                     session_start_compute(); RAM released; loaded per-ticker on
+  #                     first watchdog event (50~200ms overhead).
+  #                     Use for memory-constrained environments.
   watchdog_url:                   "http://watchdog-service/candidates"
   trading_api_url:                "http://trading-api"
+  trading_api_ticker_url:         "http://trading-api/tickers/today"
 ```
 
 ---
 
 ## Constraints
 
-- LiveModeRunner instantiates CachingIndicatorCalculator and injects it into FeatureExtractor
+- Ticker list is sourced from trading service API at session_start — not from DuckDB ohlcv_1min
+  (today's tradable tickers only; prior-day data for non-tradable tickers is irrelevant)
+- US stock splits always take effect before market open — no intra-session split handling needed
+- LiveModeRunner maintains one CachingIndicatorCalculator per ticker in the tradable universe
+  (eager pool initialized at session_start via parallel session_start_compute())
+- Active watchlist (calculators with pending entry signals) is empty at session_start;
+  tickers are appended as watchdog events arrive — not pre-populated
+- session_stats Phase 1 (bulk): loaded at session_start for ALL tickers from precomputed_session_stats
+  (WHERE as_of_date = today — inserted by collect_daily.py the previous evening);
+  used during session_start_compute(); released from RAM after eager pool initialization
+- session_stats Phase 2 ("db" mode only): loaded per-ticker from DB on first watchdog event
+  via load_session_stats(); in "memory" mode, session_stats retained in calc._session_stats
 - Inferencer is instantiated once per session with the DI FeatureExtractor
-- session_stats loaded once at session start; not reloaded intra-session
-- on_bar_close() is called by LiveModeRunner — not by IndicatorCalculator or FeatureExtractor
+- on_bar_close() called by LiveModeRunner for each ticker per bar — not by IndicatorCalculator
 - Position manager loop runs independently of watchdog polling loop
-- Trade execution (buy/sell API calls) is LiveModeRunner's responsibility — Inferencer only returns InferenceResult
+- Trade execution (buy/sell API calls) is LiveModeRunner's responsibility —
+  Inferencer only returns InferenceResult
 - All inference_log writes include the active run_id
 - LiveModeRunner does not modify DuckDB historical data — only reads for session init
+  (exception: inference_log and entry_points INSERT via Inferencer)
+- session_start_compute() parallelized across workers; thread-safety per-ticker guaranteed
+  (no shared state between CachingCalculator instances)

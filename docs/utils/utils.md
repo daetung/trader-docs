@@ -169,8 +169,11 @@ def interpolate_bundle_price(
         Estimated price (float), clamped to [curr_bundle.low, curr_bundle.high]
     """
     ...
+---
 
+### Price Breach Detection
 
+```python
 def track_price_breach(
     ohlcv_future: pd.DataFrame,
     ticks_future: pd.DataFrame,
@@ -255,8 +258,13 @@ def track_label_breach(
         - Does not handle session-close, time-limit, or dead-position exits
     """
     ...
+```
 
+---
 
+### Exit Fill Simulation
+
+```python
 def simulate_exit_fill(
     ticks_exit: pd.DataFrame,
     ohlcv_exit: pd.DataFrame,
@@ -356,7 +364,8 @@ def hour_add_seconds(hour: str, seconds: int) -> str:
 def hhmmss_to_minutes(hour: str) -> int:
     """
     Convert 'HHMMSS' string to minutes since midnight.
-    Used by load_session_stats() for delta smoothing window computation.
+    Used by load_session_stats() and build_session_stats_dict() for delta smoothing
+    window computation.
     Example: '093000' → 570, '155900' → 959.
     Alias for hour_to_minutes() with explicit name for clarity in session context.
     """
@@ -512,22 +521,56 @@ def populate_precomputed_session_stats(
 
     For each as_of_date in dates:
         For each ticker with ohlcv_1min data:
-            Compute per-bar average over prior n_sessions regular sessions.
+            Compute per-bar average over prior n_sessions trading sessions.
 
     Metrics derived from ohlcv_1min:
         rvol_baseline      : cumulative volume per HHMMSS slot
         rel_dvol_baseline  : cumulative dollar volume per HHMMSS slot
         intra_vol_baseline : per-bar volume per HHMMSS slot
         intra_return_baseline: per-bar (close/prev_close - 1) per HHMMSS slot
-        gap_pct_mean/std   : (today_093000_open - prev_155900_close) / prev_close
+        gap_pct_mean/std   : (today_regular_open - prev_close) / prev_close
                              stored as mean and std (hour='000000')
 
     Metrics derived from tick_10 (lee_ready):
         buy_ratio_baseline : per-bar buyer_initiated_ratio per HHMMSS slot
         intra_tpm_baseline : per-bar ticks-per-minute per HHMMSS slot
 
+    Halt handling per metric type:
+
+    A. Cumulative metrics (rvol_baseline, rel_dvol_baseline):
+        Halt bars within a session contribute volume=0 to that session's cumsum
+        (halt naturally interrupts volume flow — this is correct behavior).
+        Sessions with no ohlcv rows for that date (full-day no-data) are
+        excluded from count entirely.
+
+    B. Per-bar metrics (intra_vol_baseline, intra_return_baseline,
+                        intra_tpm_baseline, buy_ratio_baseline):
+        If bar H is a halt bar in session S (OHLC=NaN):
+            Session S is excluded from the average for hour H only.
+            count[H] reflects only sessions with non-halt bar at that slot.
+            Other hours of session S are unaffected.
+
+    C. Day-level metrics (gap_pct_mean, gap_pct_std), stored at hour='000000':
+        gap_pct = (today_regular_open - prev_close) / prev_close
+
+        prev_close determination (for each prior session D-k):
+            1. Try D-k 155900 bar close
+            2. If halt or missing: search backward for last non-halt bar
+               in D-k 093000~155900 (latest HHMMSS with non-NaN OHLC)
+            3. If no non-halt bar found in D-k regular session: exclude session
+
+        today_regular_open determination (for each prior session D-k):
+            1. Try D-k 093000 bar open
+            2. If halt or missing: search forward for first non-halt bar
+               in D-k 093000~100000 (earliest HHMMSS with non-NaN open)
+            3. If no non-halt bar found in first 60 minutes: exclude session
+
+        Sessions excluded from either determination reduce count.
+
     Stores: avg_value, std_value, count per (ticker, as_of_date, hour, metric, n_sessions)
-    Delta smoothing NOT applied here — applied at load time via load_session_stats().
+    count may differ by hour slot within the same ticker/as_of_date (per-bar metrics).
+    Delta smoothing NOT applied here — applied at load time via load_session_stats()
+    or build_session_stats_dict().
     Safe to re-run (INSERT OR IGNORE).
     Returns: number of rows inserted.
     """
@@ -554,11 +597,55 @@ def load_session_stats(
         3. Apply delta_minutes rolling average per metric:
                For each hour H, smoothed_value[H] =
                    mean(avg_value for hours in [H-delta, H+delta])
+               Uses hhmmss_to_minutes() for window arithmetic.
         4. Return dict: {metric: {hour: smoothed_avg_value}}
 
     Returns empty dict if no rows found (e.g. as_of_date before dataset start).
     """
     ...
+
+
+def build_session_stats_dict(
+    raw_df: pd.DataFrame,
+    delta_minutes: int,
+    session_mode: str,
+) -> dict:
+    """
+    Convert a bulk-loaded precomputed_session_stats DataFrame into a nested dict.
+
+    Input raw_df columns: ticker, as_of_date, hour, metric, avg_value, std_value, count
+    (typically loaded with a WHERE n_sessions = ? filter applied before calling this function)
+
+    Output format:
+        {as_of_date: {ticker: {metric: {hour: smoothed_avg_value}}}}
+
+    Processing:
+        1. Filter rows by session_mode (apply hour range filter per metric):
+               "regular":  include hours in 093000~155900 (bar-level metrics only)
+               "pre":      include hours in 040000~092900
+               "combined": include all hours
+               Day-level metrics (hour='000000') always included regardless of session_mode.
+        2. For each (as_of_date, ticker, metric):
+               Apply delta_minutes smoothing over the time dimension:
+               smoothed[H] = mean(avg_value for hours within ±delta_minutes of H)
+               Uses hhmmss_to_minutes() for window arithmetic.
+        3. Build nested dict structure.
+
+    Used by:
+        - run_preprocess.py Step 1 (training bulk load, multi-date):
+              raw_df = SELECT * FROM precomputed_session_stats WHERE n_sessions = ?
+              result: {as_of_date: {ticker: {metric: {hour: value}}}}
+              dispatch: result[date][ticker] per entry point
+
+        - live_mode_runner.py session_start Phase 1 (live bulk load, single date):
+              raw_df = SELECT * FROM precomputed_session_stats WHERE as_of_date = ? AND n_sessions = ?
+              result: {today_date: {ticker: {metric: {hour: value}}}}
+              access: session_stats_bulk = result[today_date]
+    """
+    ...
+```
+
+
 ```
 
 ---
@@ -623,8 +710,6 @@ def temporal_split_simple(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Simple date-based train/val split without a test set.
-    Used by PipelineOptimizer for outer fold final model training
-    (val split for LightGBM early stopping only).
 
     Order of operations:
         1. Apply session_mode filter (if not None)
@@ -671,9 +756,18 @@ def temporal_split_simple(
 - `compute_consensus_config()` grid-rounding uses nearest valid value from search_space
 - `temporal_split_simple()` applies no balancing — training-only utility for early stopping val
 - `populate_precomputed_session_stats()` uses INSERT OR IGNORE — safe to re-run
+- `populate_precomputed_session_stats()` halt handling must be applied per metric type:
+  cumulative metrics include halt bars as volume=0; per-bar metrics exclude halt slots per hour;
+  gap_pct uses nearest non-halt bar fallback (see function docstring for details)
+- `load_session_stats()` → single (ticker, as_of_date) DB query; output `{metric: {hour: value}}`
+  (flat, no ticker/date dimension); used for live mode Phase 2 (per-ticker on demand)
+- `build_session_stats_dict()` → bulk conversion of pre-loaded DataFrame;
+  output `{as_of_date: {ticker: {metric: {hour: value}}}}`; used for training bulk load
+  and live mode Phase 1 (session_start all-ticker bulk)
 - `load_session_stats()` never modifies DB — read-only
 - `load_session_stats()` returns empty dict (not error) when no rows found
-- Delta smoothing in `load_session_stats()` is in-memory only — DB rows unchanged
+- Delta smoothing in both `load_session_stats()` and `build_session_stats_dict()` is
+  in-memory only — DB rows unchanged
 - `buy_ratio_baseline` and `intra_tpm_baseline` require tick_10 data — skipped if unavailable
 - `hhmmss_to_minutes()` is an alias for `hour_to_minutes()` with explicit naming for clarity
 - No pipeline business logic in this module — utility functions only

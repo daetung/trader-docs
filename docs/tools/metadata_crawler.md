@@ -7,14 +7,16 @@
 
 ## Role
 
-Four responsibilities combined into one daily-run tool:
+Five responsibilities combined into one daily-run tool:
 
 1. **Metadata crawling** — fetch and upsert stock metadata (sector, market cap,
    shares outstanding, 52w high/low, avg volume) for all active tickers
-2. **New data ingestion** — ingest newly collected JSON files into DuckDB
-3. **Calendar and coverage update** — incrementally update `trading_calendar`
+2. **Corporate events crawling** — fetch and upsert split/reverse-split history
+   for all active tickers into `corporate_events` table
+3. **New data ingestion** — ingest newly collected JSON files into DuckDB
+4. **Calendar and coverage update** — incrementally update `trading_calendar`
    and `ticker_data_coverage` for newly ingested dates
-4. **Session stats update** — compute and store `precomputed_session_stats`
+5. **Session stats update** — compute and store `precomputed_session_stats`
    for newly ingested dates (REFERENCE_SESSION baselines)
 
 ---
@@ -42,6 +44,44 @@ GET https://data.sec.gov/submissions/CIK{cik}.json
 ```
 - No API key required; rate limit 10 req/s
 - CIK lookup table cached locally in `configs/cik_map.json`
+
+---
+
+## Data Sources for Corporate Events
+
+### yfinance splits history
+```python
+import yfinance as yf
+splits = yf.Ticker("AAPL").splits
+# Returns: pd.Series with DatetimeIndex → ratio (float)
+# Example: 2024-06-10 → 4.0 (4:1 split)
+# Reverse splits: ratio < 1.0 (e.g. 0.1 for 1:10 reverse split)
+```
+
+Corporate events collection runs alongside metadata crawling (same ticker batch).
+Upserts into `corporate_events` table (INSERT OR IGNORE).
+
+```python
+def crawl_corporate_events(ticker: str, db_conn) -> int:
+    """
+    Fetch split history from yfinance and upsert into corporate_events.
+    Determines event_type from ratio: >1.0 → 'split', <1.0 → 'reverse_split'.
+    Returns: number of new rows inserted.
+    """
+    splits = yf.Ticker(ticker).splits
+    for date, ratio in splits.items():
+        event_type = "split" if ratio > 1.0 else "reverse_split"
+        db_conn.execute("""
+            INSERT OR IGNORE INTO corporate_events (ticker, event_date, event_type, ratio)
+            VALUES (?, ?, ?, ?)
+        """, [ticker, date.strftime("%Y%m%d"), event_type, ratio])
+    return len(splits)
+```
+
+Notes:
+- `dividend` event_type is reserved in the schema but not currently collected
+- yfinance split history is comprehensive for US equities; no fallback needed
+- Safe to re-run (INSERT OR IGNORE)
 
 ---
 
@@ -134,6 +174,7 @@ populate_precomputed_session_stats(
 `populate_precomputed_session_stats()`:
 - Computes per-bar averages for `as_of_date = next_trading_day` using
   the prior 20 sessions' data (now available since today's data just ingested)
+- Halt handling applied per metric type (see utils.md for details)
 - Safe to re-run (INSERT OR IGNORE)
 - Runs after ingestion — ensures today's data is included in the baseline
 
@@ -142,13 +183,13 @@ populate_precomputed_session_stats(
 ## CLI Usage
 
 ```bash
-# Full daily run: metadata + ingest + calendar update + session stats
+# Full daily run: metadata + corporate events + ingest + calendar update + session stats
 python tools/collect_daily.py \
     --db-path data/market.duckdb \
     --data-root /path/to/json/data \
     --date today
 
-# Metadata only
+# Metadata only (includes corporate events)
 python tools/collect_daily.py \
     --db-path data/market.duckdb \
     --metadata-only
@@ -188,10 +229,12 @@ python tools/collect_daily.py \
    SELECT DISTINCT ticker FROM ohlcv_1min
 
 2. For each ticker (batched, 100 at a time):
-   a. Fetch from yfinance
+   a. Fetch metadata from yfinance
    b. If any required field is None → retry with FMP
    c. If shares_outstanding still None → query SEC EDGAR
    d. Upsert into stock_meta (INSERT OR REPLACE)
+   e. Fetch split history from yfinance → upsert into corporate_events
+      (INSERT OR IGNORE — safe to re-run; no fallback needed for splits)
 
 3. Log: fetched / failed / unchanged
 ```
@@ -207,10 +250,15 @@ Failed tickers logged to `tools/metadata_missing.log`.
 ```
 Daily Collection — 20250715
   [Metadata]
-    Tickers processed : 11,847
-    Updated           : 11,820
-    Failed (all srcs) : 27     → tools/metadata_missing.log
-    Duration          : 6m 14s
+    Tickers processed   : 11,847
+    Updated             : 11,820
+    Failed (all srcs)   : 27     → tools/metadata_missing.log
+    Duration            : 6m 14s
+
+  [Corporate Events]
+    Split events upserted : 3
+    Reverse splits        : 0
+    Duration              : included in metadata timing
 
   [Ingestion — 20250715]
     Files found       : 23,694
@@ -258,8 +306,9 @@ fmp_api_key: "your_key_here"
 ## Constraints
 
 - `secrets.yaml` must be in `.gitignore` — never commit API keys
-- yfinance is the primary source; FMP and EDGAR are fallbacks only
-- Metadata upsert uses `updated_at = today`
+- yfinance is the primary metadata source; FMP and EDGAR are fallbacks only
+- Corporate events (splits) fetched from yfinance only — no fallback needed
+- Metadata upsert uses `updated_at = today`; corporate_events uses INSERT OR IGNORE
 - Ingestion logic delegates to `migrate_json_to_duckdb.py` — no duplicated logic
 - Calendar/coverage update always runs after ingestion — not optional
 - Session stats update runs after calendar/coverage update — not optional unless --skip-session-stats
@@ -267,3 +316,4 @@ fmp_api_key: "your_key_here"
 - Must be safe to run multiple times on the same date (idempotent)
 - Failed metadata tickers do not block ingestion — two steps are independent
 - No session time filter on ingested data — all periods (040000~200000) stored
+- US stock splits always take effect before market open — no intra-session split handling needed
