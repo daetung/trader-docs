@@ -314,12 +314,22 @@ rel_dvol(bars, date, n_sessions, session_mode, session_stats)
       (prior N sessions avg cumulative dollar volume at hour T; precomputed and stored in DB)
     → output column: rel_dvol
 
-gap_percentile(bars, date, n_sessions, session_stats)
-    → Today's gap = (today_regular_open - prev_close) / prev_close
+gap_percentile(bars, date, n_sessions, session_stats, dividend_amount=0.0)
+    → Today's gap = (today_regular_open - adjusted_prev_close) / adjusted_prev_close
       today_regular_open = open price of 093000 bar
       prev_close = close price of previous date's 155900 bar
+      adjusted_prev_close = prev_close - dividend_amount
+      (split scale is already consistent — bars are pre-adjusted by the caller
+       via adjust_bars_for_corporate_events() before reaching this method;
+       only the ex-dividend cash-drop component needs correcting here)
+    → dividend_amount: cash dividend per share with ex-dividend date = today
+      (0.0 if none). Caller (FeatureExtractor) looks this up from
+      corporate_events for (ticker, today) and passes it in — this method
+      does not query DuckDB directly.
     → Percentile rank of today's gap within prior N sessions' gap distribution
       baseline loaded from session_stats["gap_pct_mean"] and session_stats["gap_pct_std"]
+      (baseline itself is already dividend/split-adjusted per-session at
+       populate_precomputed_session_stats() — see utils.md)
     → Returns float (scalar) — NOT a DataFrame
     → NaN conditions:
          - t bar = "093000" (today's open = t bar open = P_entry → FORBIDDEN)
@@ -372,6 +382,50 @@ intraday_seasonality(indicator_series, date, n_sessions,
 
 **VR disambiguation:** `vr_volume` = volume surge ratio. `vr_volatility` = ATR-normalized volatility.
 Never use bare `vr` as a column name.
+
+---
+
+## Corporate Event Scale Sensitivity (scale_type registry)
+
+Classifies each indicator by how a split (encountered inside a Strategy A/B
+loaded bars window) affects its value, for use by FeatureExtractor's per-entry
+rescale step (see `04_feature_extractor.md`, Strategy A). Bars passed into this
+module are pre-adjusted by the caller via `adjust_bars_for_corporate_events()`
+(anchored to the last date in the loaded window); this table determines
+whether a sliced indicator value needs a further scalar correction
+(`f_e = cum_split_ratio(entry_date, anchor_date)`) back to the entry's own
+native scale before being handed to the Vectorizer.
+
+Only indicators reachable via Strategy A/B (the single-pass, whole-range
+computation) are listed — REFERENCE_SESSION indicators are excluded here
+because their scale consistency is handled separately (today-series volume
+terms already share the same anchor as the baseline; see `rvol`/`rel_dvol`
+above and `utils.md` `populate_precomputed_session_stats()`).
+
+| scale_type | Slice-time correction | Indicators |
+|---|---|---|
+| `price` | × f_e | `ma`, `ema`, `macd`, `parabolic_sar`, `atr`, `bollinger_bands` (upper/middle/lower only), `vwap`, `fibonacci_retracement`, `pivot_points` |
+| `volume` | ÷ f_e | `volume_ma`, `vr_volume` numerator only (see note), `obv`, `ad`, `avg_vol_per_tick` |
+| `invariant` | none | `rsi`, `roc`, `stochastic`, `cci`, `mfi`, `bollinger_bands` (`pct_b`, `bandwidth` outputs only), `adx`, `dmi`, `vr_volatility`, `vr_volume` (ratio output — numerator and its own `volume_ma` denominator scale identically, cancels), `roll_spread` (`roll_spread_pct` output), `hl_spread` (`hl_spread_pct` output), `lee_ready` (`buyer_initiated_ratio`, `tick_direction_momentum` — both ratios), `tpm` (tick count, not volume) |
+
+Notes:
+- `bollinger_bands()` and `vr_volume()` straddle two scale_types depending on
+  *which* output column is read — the raw band levels / raw ratio numerator
+  need `price`/`volume` correction; the derived ratio outputs (`pct_b`,
+  `bandwidth`, the `vr_volume` ratio itself) do not. Apply the correction
+  before computing the ratio, not after, for the two straddling cases.
+- `roll_spread`, `hl_spread`, and `lee_ready` were previously misclassified /
+  omitted in earlier drafts of this table — all three are confirmed
+  `invariant` because their defined outputs are explicitly normalized
+  (`_pct` division by close, or a bounded ratio) rather than raw levels.
+- `obv`/`ad` are cumulative (no session reset) — if a split falls within the
+  Strategy A loaded range, the single-pass computation is only valid for
+  tickers/date-ranges with no split in range. When a split is present,
+  `extract_batch()` falls back to per-entry-date (or per-affected-date-range)
+  recomputation for `obv`/`ad` specifically, using bars re-adjusted to that
+  entry's own date — see `04_feature_extractor.md` Strategy A note.
+- `hl_spread` has no listed config parameters (bar-level calculation) and no
+  further scale interaction beyond the table above.
 
 ---
 
@@ -449,6 +503,7 @@ class IndicatorCalculator:
     def gap_percentile(
         self, bars: pd.DataFrame, date: str,
         n_sessions: int, session_stats: dict,
+        dividend_amount: float = 0.0,   # ex-dividend cash amount for (ticker, date); 0.0 if none
     ) -> float: ...
 
     def intraday_seasonality(
@@ -536,3 +591,5 @@ indicators:
 - REFERENCE_SESSION baseline data must be supplied by caller (FeatureExtractor) via `session_stats` dict — IndicatorCalculator does not query DuckDB directly; `rvol` reads `session_stats["rvol_baseline"]`, `rel_dvol` reads `session_stats["rel_dvol_baseline"]`
 - `intraday_seasonality()` takes a pre-computed indicator_series and a `session_stats` dict (not historical_bars) — does not internally call other indicator methods
 - `fibonacci_retracement()` uses monotonic deque for O(N) sliding window max/min when processing full ticker bars
+- `gap_percentile()`'s `dividend_amount` is a caller-supplied scalar (corporate_events lookup) — this method does not query DuckDB directly, consistent with the session_stats supply pattern
+- Raw bars passed into this module are assumed pre-adjusted for splits by the caller (`adjust_bars_for_corporate_events()`); this module has no corporate_events awareness beyond the `dividend_amount` scalar on `gap_percentile()` — see "Corporate Event Scale Sensitivity" table above for which outputs still need a caller-side scalar rescale after slicing

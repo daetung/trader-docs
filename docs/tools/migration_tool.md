@@ -88,6 +88,16 @@ python tools/migrate_json_to_duckdb.py \
      b. populate_ticker_coverage(db_conn, all_ingested_dates)
      (both functions sourced from utils.py)
 
+5b. Post-migration: crawl corporate events for all ingested tickers
+     a. crawl_corporate_events(ticker, db_conn) for each ticker in
+        all_ingested_tickers (function sourced from metadata_crawler.md;
+        splits, reverse splits, and dividends — see Item 1+2+3 design)
+     This step MUST run before Step 6 — populate_precomputed_session_stats()
+     reads corporate_events to adjust prior-session baselines for splits and
+     dividends (see utils.md), and an empty/incomplete corporate_events table
+     at that point would silently produce unadjusted baselines for the
+     entire historical backfill, not merely a partial gap.
+
 6. Post-migration: compute REFERENCE_SESSION baselines
      a. populate_precomputed_session_stats(db_conn, all_ingested_dates,
                                            n_sessions=20)
@@ -100,9 +110,12 @@ python tools/migrate_json_to_duckdb.py \
        - Cumulative metrics: halt bars contribute volume=0; full-day no-data sessions excluded
        - Per-bar metrics: halt slots excluded per hour slot; count may differ by hour
        - gap_pct: nearest non-halt bar fallback for 155900/093000; session excluded if none
+     Corporate-event adjustment (from Step 5b's data) applied per metric type
+     before aggregation — see utils.md populate_precomputed_session_stats() D.
      buy_ratio_baseline requires tick_10 data (lee_ready classification).
      Safe to re-run (INSERT OR IGNORE).
-     Note: Step 6 is skipped if --skip-session-stats flag is passed.
+     Note: Step 6 is skipped if --skip-session-stats flag is passed (Step 5b
+     still runs in that case, since it is cheap and other consumers may need it).
 ```
 
 **Zip handling:**
@@ -151,6 +164,47 @@ populate_ticker_coverage(db_conn=con, dates=ingested_dates)
 
 ---
 
+## Post-Migration: Corporate Events
+
+Must run before Precomputed Session Stats (below) — see rationale in Processing
+Logic Step 5b.
+
+```python
+from metadata_crawler import crawl_corporate_events
+
+all_ingested_tickers = con.execute(
+    "SELECT DISTINCT ticker FROM ohlcv_1min"
+).df()["ticker"].tolist()
+
+for ticker in all_ingested_tickers:
+    crawl_corporate_events(ticker, db_conn=con)
+```
+
+`crawl_corporate_events()`:
+- Fetches split, reverse-split, and dividend history from yfinance
+- Upserts into `corporate_events` (INSERT OR IGNORE — safe to re-run)
+- See `metadata_crawler.md` for the full function definition
+
+**Re-run note:** if `corporate_events` is populated or updated (e.g. a new
+split discovered) *after* `precomputed_session_stats` already exists for the
+affected ticker/date range, those rows are now stale (unadjusted, or adjusted
+against an incomplete corporate_events snapshot). Re-running
+`populate_precomputed_session_stats()` alone will NOT correct them —
+`INSERT OR IGNORE` skips rows that already exist. Correcting stale rows
+requires:
+```sql
+DELETE FROM precomputed_session_stats WHERE ticker IN (affected_tickers)
+```
+followed by re-invoking `populate_precomputed_session_stats()` for those
+tickers' full date range.
+
+**Ticker rename note:** `ticker_history` (used by `utils.load_ohlcv_with_history()`
+for pre-rename bar continuity) has no automated registration — see Open Items:
+ticker rename auto-registration. This tool does not populate it; entries must
+be inserted manually via SQL if a migrated ticker has a known rename history.
+
+---
+
 ## Post-Migration: Precomputed Session Stats
 
 ```python
@@ -170,6 +224,9 @@ populate_precomputed_session_stats(
 - Metrics computed from tick_10 (lee_ready): buy_ratio_baseline, intra_tpm_baseline
 - Day-level metrics (hour='000000'): gap_pct_mean, gap_pct_std
 - Halt handling applied per metric type (see utils.md — populate_precomputed_session_stats)
+- Corporate-event (split/dividend) adjustment applied per metric type before
+  aggregation, using the `corporate_events` table populated in the prior step
+  (see utils.md — populate_precomputed_session_stats() section D.)
 - Stores avg_value, std_value, count per (ticker, as_of_date, hour, metric, n_sessions)
 - Delta smoothing is NOT applied here — applied at load time via load_session_stats()
   or build_session_stats_dict()
@@ -245,5 +302,11 @@ Failed files are logged to `tools/migration_errors.log` with filename and except
 - Time range filter: `hour >= '040000' AND hour <= '200000'` (no session filtering)
 - Must handle malformed JSON files gracefully (log and continue, do not crash)
 - Post-migration calendar/coverage population is mandatory — not optional
+- Post-migration corporate events crawl (Step 5b) is mandatory — not optional,
+  and always runs before session stats computation regardless of
+  --skip-session-stats (cheap, and other consumers besides session_stats
+  depend on corporate_events being populated)
 - Post-migration session stats computation is mandatory unless --skip-session-stats passed
 - `populate_trading_calendar()`, `populate_ticker_coverage()`, and `populate_precomputed_session_stats()` sourced from `utils.py`
+- `crawl_corporate_events()` sourced from `metadata_crawler.py`, not `utils.py` —
+  imported across tool boundaries for this one step

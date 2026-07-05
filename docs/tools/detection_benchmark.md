@@ -76,6 +76,68 @@ FROM vol_avg
 WHERE volume >= vol_ma_20 * 2.5   -- condition G threshold
 ```
 
+```sql
+-- Example: condition E (turnover rate) with per-date shares_outstanding
+-- resolution — a fast SQL approximation of utils.estimate_historical_meta(),
+-- for benchmark speed only. The canonical logic (used by 01_entry_detection.md
+-- in the actual pipeline) lives in utils.py; small SQL/Python discrepancies
+-- here are acceptable since this tool is diagnostic-only (threshold tuning),
+-- not the training or live path itself.
+--
+-- Without this, a naive join against the current stock_meta snapshot would
+-- apply today's share count to every historical date, systematically
+-- under-counting turnover for dates before any split (see V-1 fix).
+WITH latest_shares AS (
+    SELECT ticker, shares_outstanding, date AS latest_date
+    FROM stock_meta
+    WHERE (ticker, date) IN (
+        SELECT ticker, MAX(date) FROM stock_meta
+        WHERE shares_outstanding IS NOT NULL GROUP BY ticker
+    )
+),
+all_ticker_dates AS (
+    SELECT DISTINCT ticker, date FROM ohlcv_1min
+),
+split_ratio AS (
+    -- cumulative split ratio between each date and that ticker's latest
+    -- known shares_outstanding date; product via exp(sum(ln(.))) since
+    -- ratios are always positive (DuckDB has no built-in PRODUCT aggregate)
+    SELECT
+        d.ticker, d.date,
+        COALESCE(
+            EXP(SUM(LN(c.value)) FILTER (
+                WHERE c.event_type IN ('split', 'reverse_split')
+                  AND c.event_date > d.date AND c.event_date <= s.latest_date
+            )),
+            1.0
+        ) AS cum_ratio
+    FROM all_ticker_dates d
+    JOIN latest_shares s ON s.ticker = d.ticker
+    LEFT JOIN corporate_events c ON c.ticker = d.ticker
+    GROUP BY d.ticker, d.date, s.latest_date
+),
+shares_at_date AS (
+    SELECT
+        d.ticker, d.date,
+        COALESCE(m.shares_outstanding, s.shares_outstanding / r.cum_ratio)
+            AS shares_outstanding
+    FROM all_ticker_dates d
+    LEFT JOIN stock_meta m ON m.ticker = d.ticker AND m.date = d.date
+    JOIN latest_shares s ON s.ticker = d.ticker
+    JOIN split_ratio r ON r.ticker = d.ticker AND r.date = d.date
+),
+daily_volume AS (
+    SELECT ticker, date, SUM(volume) AS vol
+    FROM ohlcv_1min
+    WHERE hour >= '040000'   -- volume_base_hour
+    GROUP BY ticker, date
+)
+SELECT dv.ticker, dv.date
+FROM daily_volume dv
+JOIN shares_at_date sd ON sd.ticker = dv.ticker AND sd.date = dv.date
+WHERE dv.vol / sd.shares_outstanding * 100 >= 5.0   -- condition E threshold
+```
+
 The composite expression `(A AND B AND C AND D) AND (E OR F OR G)` is
 assembled by combining SQL WHERE clauses per active condition.
 
@@ -148,10 +210,16 @@ Benchmark results are NOT written to `experiment_log` (that table is for model r
 
 - Must not modify any DuckDB table — read-only access to:
   `ohlcv_1min`, `stock_meta`, `tick_10`, `trading_halts`,
-  `trading_calendar`, `ticker_data_coverage`
+  `trading_calendar`, `ticker_data_coverage`, `corporate_events`
 - Labeling logic must call `Labeler` directly (reuse, do not reimplement)
 - `Labeler.label()` requires `ticks_df`, `halts_df`, `trading_calendar`,
-  and `ticker_data_coverage` — all must be loaded from DuckDB before calling
+  `ticker_data_coverage`, and `corporate_events` — all must be loaded from
+  DuckDB before calling (see 05_labeler.md — corporate_events added for
+  dead position Case A/D dividend/split adjustment)
+- Condition E's SQL (per-date shares_outstanding via split-ratio reversal) is
+  a benchmark-speed approximation of `utils.estimate_historical_meta()` —
+  acceptable here since this tool is diagnostic-only, but `01_entry_detection.md`
+  itself must call the real utility function, not reimplement this SQL
 - `--override` applies in-memory only — config file is never modified
 - SQL-based detection is mandatory for performance; Python-loop fallback only for unsupported conditions
 - Benchmark results saved to `tools/benchmark_results/` — not to `experiment_log`

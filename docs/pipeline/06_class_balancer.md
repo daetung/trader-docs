@@ -98,7 +98,21 @@ Filters applied to train split only — val and test are never filtered.
                regardless of actual price movement. Including them biases the model.
        Config: class_balancer.exclude_case_c: true | false
 
-2. Ambiguous sample exclusion (configurable):
+2. Dead position Case D exclusion (configurable):
+       Remove rows where dead_position_case == "D"
+       Reason: Case D entries (extended/multi-day halt, exit_price unresolvable)
+               are forced to pnl=-1.0 / label_dn5 as a conservative fallback, not
+               an observed market outcome — same rationale class as Case C, but
+               kept as a separate flag since Case D IS a real (if extreme) pnl
+               outcome and some training configurations may prefer to keep it.
+       Config: class_balancer.exclude_case_d: false (default — Case D is a
+               genuine, if conservative, capital-loss outcome; unlike Case C it
+               is not purely a dataset-boundary artifact, so it is retained by
+               default and left as an opt-in exclusion)
+       Note: Case B (delisting) has no exclusion option — it is always retained,
+             consistent with existing treatment prior to this option's addition.
+
+3. Ambiguous sample exclusion (configurable):
        Remove rows where is_ambiguous == True
        Reason: simultaneous bundle-level breach makes the label direction uncertain.
        Config: class_balancer.ambiguous_sample_action: "exclude" | "keep"
@@ -241,7 +255,7 @@ class ClassBalancer:
           1. session_mode filter
           2. Sort by date, split by date boundaries
           3. Apply embargo gap (trading days)
-          4. Apply pre-balance filters to train (Case C, ambiguous)
+          4. Apply pre-balance filters to train (Case C, Case D, ambiguous)
           5. Apply downsampling to train if balance=True
 
         All three splits contain only target session's entry points.
@@ -293,7 +307,7 @@ class ClassBalancer:
           1. session_mode filter on full df (skipped if session_mode is None)
           2. Compute fold date boundaries using resolved parameters
           3. Slice train/val/test
-          4. Apply pre-balance filters to train (Case C, ambiguous)
+          4. Apply pre-balance filters to train (Case C, Case D, ambiguous)
           5. Apply downsampling to train if balance=True
           6. Yield (train_balanced, val, test, fold_meta)
         """
@@ -310,6 +324,8 @@ class_balancer:
   random_state: 42
   apply_balance: true
   exclude_case_c: true
+  exclude_case_d: false                # see Pre-Balance Filtering — Case D is a genuine
+                                       # (if conservative) outcome, not a boundary artifact
   ambiguous_sample_action: "exclude"   # "exclude" | "keep"
   embargo_days: 5                      # default; overridable per call
 

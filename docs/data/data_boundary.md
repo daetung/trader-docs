@@ -117,6 +117,54 @@ In all NaN cases: gap_pct feature = NaN in feature vector (LightGBM handles nati
 
 ---
 
+## Corporate Event Adjustment Boundary
+
+Splits, reverse splits, and dividends require a THIRD category alongside
+"raw" and "feature input" — some paths must use bars/prices exactly as they
+were reported that day (raw), some must use bars corrected for split scale
+(adjusted), and a few need a scalar correction applied at the point of use
+rather than either of those. Mixing these up in either direction is a
+correctness bug: feeding adjusted bars where raw is required corrupts actual
+market-price/volume filters; feeding raw bars where adjustment is required
+reintroduces the split-discontinuity problems this boundary exists to prevent.
+
+```
+Raw bars/ticks (adjustment forbidden — must reflect actual traded values):
+    EntryPointDetector (filters operate on actual traded price/volume that day)
+    Labeler's same-day breach tracking (track_label_breach, build_effective_bar_sequence)
+    BacktestEngine's fill/exit simulation (find_fill_bundle, simulate_exit_fill)
+    tick_10 — never adjusted, in any consumer
+    P_entry — always the literal t bar open price, never adjusted
+
+Adjusted bars (utils.adjust_bars_for_corporate_events() applied before use):
+    FeatureExtractor/IndicatorCalculator input, all Strategy A/B indicators
+        (anchored to the max date in the loaded range — today for live mode,
+        the ticker's last loaded date for training; see 04_feature_extractor.md)
+    caching_calculator.md session_start_compute() (anchored to today)
+    populate_precomputed_session_stats() prior-session values, adjusted
+        in place before aggregation into avg_value/std_value (utils.md D.)
+
+Scalar corrections (neither raw-only nor bar-adjusted — a single value
+derived from corporate_events applied at one specific comparison point):
+    gap_percentile()'s dividend_amount        — ex-dividend cash-drop correction
+    Dead position Case A/D's adjusted_p_entry — overnight split+dividend correction
+                                                 (05_labeler.md, 09_backtest_engine.md)
+    EntryPointDetector filter E's shares_outstanding — point-in-time share count
+                                                        (utils.estimate_historical_meta())
+```
+
+Why EntryPointDetector and Labeler's same-day tracking stay raw even though
+FeatureExtractor's bars are adjusted: these paths compare bars against
+literal, contemporaneous thresholds (a $20 price cap, a 50,000-share volume
+floor, a ±3pp move from the day's own P_entry) — the actual traded value IS
+the correct value for these checks, on its own scale, with no cross-date
+comparison involved. Adjustment only matters where values from DIFFERENT
+dates are compared against each other on a common scale (indicator lookback
+windows, prior-session baselines) — which is exactly the "adjusted bars"
+category above, and nowhere else.
+
+---
+
 ## Label Search Boundary
 
 ```
@@ -251,6 +299,13 @@ Applied in `load_session_stats()` at load time — not stored separately in prec
 | Prior session bars (all) | NO (not in bars input) | — | — | YES (baseline) |
 | Prior session 10-tick | NO | — | — | YES (buy_ratio, tpm) |
 
+Corporate-event (split/dividend) adjustment is a separate, orthogonal axis not
+shown in this table — see "Corporate Event Adjustment Boundary" above. As a
+quick reference: every row that reads from `ohlcv_1min`/`tick_10` directly for
+same-day use (Label Calculation, Backtest Only columns) stays raw; every row
+consumed via FeatureExtractor/IndicatorCalculator or session-stats baselines
+is bar-adjusted.
+
 ---
 
 ## Checklist for Implementers
@@ -275,3 +330,11 @@ Before submitting any module, verify:
 - [ ] REFERENCE_SESSION baselines sourced from precomputed_session_stats — not from bars input
 - [ ] gap_percentile returns NaN for t="093000" or pre-market entries (not an error)
 - [ ] Dead position lookup uses has_data=TRUE filter (not is_trading_day)
+- [ ] EntryPointDetector and Labeler/BacktestEngine's same-day tracking read
+       raw bars/ticks only — never `adjust_bars_for_corporate_events()` output
+- [ ] FeatureExtractor/IndicatorCalculator and `populate_precomputed_session_stats()`
+       always operate on corporate-event-adjusted bars, never raw
+- [ ] gap_percentile's `dividend_amount`, dead position's `adjusted_p_entry`,
+       and filter E's `shares_outstanding` are scalar corrections applied at
+       their one specific comparison point — not a substitute for, and not
+       satisfied by, bar-level adjustment elsewhere in the same module

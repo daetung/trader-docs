@@ -57,10 +57,16 @@ pd.DataFrame  # full labeled feature matrix, unsplit
 1. Connect to DuckDB and load all data:
        ohlcv_df    = SELECT * FROM ohlcv_1min   ORDER BY ticker, date, hour
        ticks_df    = SELECT * FROM tick_10       ORDER BY ticker, date, hour, seq_id
-       meta_df     = SELECT * FROM stock_meta
+       meta_df     = SELECT * FROM stock_meta    ORDER BY ticker, date
+                     # (ticker, date)-keyed since stock_meta schema update —
+                     # multiple rows per ticker now; NOT a single per-ticker snapshot
        halts_df    = SELECT * FROM trading_halts
        calendar_df = SELECT * FROM trading_calendar
        coverage_df = SELECT * FROM ticker_data_coverage
+       corp_events_df = SELECT * FROM corporate_events
+                     # small table — loaded in full, filtered internally by
+                     # Labeler (dead position Case A/D) and by FeatureExtractor's
+                     # Strategy A/D (bars adjustment, gap_percentile dividend_amount)
 
        # REFERENCE_SESSION baselines — bulk load once, shared across all tickers/dates
        session_stats_raw = SELECT * FROM precomputed_session_stats
@@ -82,6 +88,27 @@ pd.DataFrame  # full labeled feature matrix, unsplit
    max_entry_hour exclusion applied inside scan()
    scan() retrieves p_entry from bars[i+1]["open"] (t bar open price)
 
+   # scan() meta (V-1): date-keyed, {date: {"shares_outstanding": value}}
+   # keyed on bars_for_ticker["date"].unique() — ALL dates present in this
+   # ticker's bars, since entry dates aren't known until scan() runs
+   # (narrower than this would be circular). Deliberately separate from
+   # Step 6's ticker_meta (4 fields, keyed on entry dates only, a smaller
+   # and cheaper set once entry_points exists) — not unified into one dict.
+   scan_meta = {
+       date: {
+           "shares_outstanding": (
+               meta_df.loc[(ticker, date), "shares_outstanding"]
+               if (ticker, date) in meta_df.index
+                  and pd.notna(meta_df.loc[(ticker, date), "shares_outstanding"])
+               else utils.estimate_historical_meta(
+                   ticker, date, "shares_outstanding", db_conn
+               )
+           )
+       }
+       for date in bars_for_ticker["date"].unique()
+   }
+   detector.scan(bars_for_ticker, ticker, meta=scan_meta)
+
 3. Save entry_points to DuckDB entry_points table (INSERT OR IGNORE)
 
 4. Labeler.label() for all entry points → labeled_samples
@@ -91,21 +118,55 @@ pd.DataFrame  # full labeled feature matrix, unsplit
            halts_td        = halts_df filtered to (ticker, date)
        labeler.label(
            entry_points_td, ohlcv_future_td, ticks_td, halts_td,
-           calendar_df, coverage_df
+           calendar_df, coverage_df, corp_events_df
        )
        (includes is_dead_position, dead_position_case, is_ambiguous)
+       (corp_events_df: full table passed through, same pattern as calendar_df/
+        coverage_df — Labeler filters internally to the overnight window it needs
+        for dead position Case A/D dividend/split adjustment)
 
 5. Save labeled_samples to DuckDB labeled_samples table (INSERT OR IGNORE)
 
 6. FeatureExtractor.extract_batch() for each ticker:
        bars_td   = ohlcv_df filtered to (ticker, date, hour < t_hour)  [t-1 and earlier]
+
+       # Ticker rename stitching (Item 4): if get_ticker_history(ticker, db_conn)
+       # is not None (the common case is None — no query cost beyond the small
+       # ticker_history lookup), additionally slice ohlcv_df for each
+       # predecessor_ticker (dates before that predecessor's effective_date),
+       # relabel the ticker column to the current ticker, and prepend to
+       # bars_td. Predecessor rows are already present in the in-memory
+       # ohlcv_df under their original symbol — no additional DB query needed
+       # for the bars themselves, only for the small ticker_history table.
+
        ticks_td  = ticks_df filtered to (ticker, date, hour < t_hour)  [before t bar]
        halts_td  = halts_df filtered to (ticker, date)
+       ticker_dates = entry_points_td["date"].unique()
+
+       # Per-date meta resolution (V-1): stock_meta is (ticker, date)-keyed —
+       # a single flat meta dict per ticker would apply one date's values to
+       # every entry point of that ticker regardless of its own date, which is
+       # exactly the staleness problem V-1 fixes. Build a date-keyed dict,
+       # mirroring the session_stats dispatch pattern below:
+       ticker_meta = {
+           date: {
+               field: (
+                   meta_df.loc[(ticker, date), field]
+                   if (ticker, date) in meta_df.index and pd.notna(meta_df.loc[(ticker, date), field])
+                   else utils.estimate_historical_meta(ticker, date, field, db_conn)
+               )
+               for field in ["market_cap", "shares_outstanding", "price_52h", "price_52l"]
+           } | {
+               # sector has no derivation path — most recent available snapshot
+               # regardless of entry date (see 04_feature_extractor.md Meta Features)
+               "sector": meta_df[meta_df["ticker"] == ticker].sort_values("date")["sector"].iloc[-1]
+           }
+           for date in ticker_dates
+       }
 
        # Supply REFERENCE_SESSION baselines for this ticker's dates
        # session_stats format: {as_of_date: {ticker: {metric: {hour: value}}}}
        # Dispatch: select date and ticker dimensions for this specific ticker
-       ticker_dates = entry_points_td["date"].unique()
        ticker_session_stats = {
            date: session_stats.get(date, {}).get(ticker)
            for date in ticker_dates
@@ -114,7 +175,7 @@ pd.DataFrame  # full labeled feature matrix, unsplit
        # extract_batch() internally selects stats[entry_date] per entry point
 
        extractor.extract_batch(
-           entry_points_td, bars_td, ticks_td, meta_td, halts_td,
+           entry_points_td, bars_td, ticks_td, ticker_meta, halts_td,
            session_stats=ticker_session_stats,
        )
 
@@ -208,13 +269,35 @@ misc.lookback_bars
 - `precomputed_session_stats` loaded once at Step 1 for all dates and tickers
 - `build_session_stats_dict()` returns `{as_of_date: {ticker: {metric: {hour: value}}}}`
 - Per-ticker session_stats dispatch at Step 6: `session_stats.get(date, {}).get(ticker)`
-  produces flat `{metric: {hour: value}}` passed to extract_batch() as date-keyed dict
+  produces flat `{metric: {hour: value}}` or `None` (ticker absent for that date —
+  should not occur in normal operation since `populate_precomputed_session_stats()`
+  runs for every ticker with ohlcv_1min data, but handled gracefully regardless);
+  collected into the date-keyed dict passed to `extract_batch()` as `session_stats`
 - Empty `precomputed_session_stats` is not an error: `extract_batch()` receives `None`, REFERENCE_SESSION indicators return NaN
 - `ticks_df` loaded as full day per ticker/date:
   - Labeler receives full day (hour >= t_hour filtered internally per entry point)
   - FeatureExtractor receives ticks before t bar only (hour < t_hour)
 - `halts_df` loaded per ticker/date and passed explicitly to both Labeler and FeatureExtractor
 - `coverage_df` loaded once at step 1 and passed explicitly to Labeler.label()
+- `corp_events_df` loaded once at step 1 (full table) and passed explicitly to
+  Labeler.label() (Case A/D adjustment) — FeatureExtractor's corporate-event bars
+  adjustment and gap_percentile dividend_amount lookup query `corporate_events`
+  independently inside `extract_batch()` (see `04_feature_extractor.md`), not via
+  a value passed in from this script
+- `ticker_meta` (Step 6) is date-keyed, not a flat per-ticker dict — `stock_meta`'s
+  schema is `(ticker, date)`-keyed (see V-1 fix); per-field fallback to
+  `utils.estimate_historical_meta()` when a field is missing for a given date;
+  `sector` always uses the ticker's most recent available snapshot regardless of date
+- `scan_meta` (Step 2) is a separate, smaller date-keyed dict (shares_outstanding
+  only) built BEFORE entry_points exists, keyed on all dates in the ticker's
+  bars — not the same object as `ticker_meta`, which is keyed on entry dates
+  only and includes 3 additional fields; the two are deliberately not unified
+  since entry dates aren't known until after `scan()` returns
+- Ticker rename stitching (Step 6): `get_ticker_history()` returns `None` for the
+  vast majority of tickers (no query cost beyond the small `ticker_history` lookup);
+  when it returns a history, predecessor-ticker rows are sliced from the
+  already-loaded `ohlcv_df` (same table, different ticker label) and relabeled —
+  no additional `ohlcv_1min` query needed
 - `extract_batch()` called per ticker — no Python loop over `extract()` per entry point
 - Empty DataFrames handled gracefully (saves _empty.parquet)
 - `ClassBalancer.split()` called only in standalone mode

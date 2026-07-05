@@ -169,6 +169,8 @@ def interpolate_bundle_price(
         Estimated price (float), clamped to [curr_bundle.low, curr_bundle.high]
     """
     ...
+```
+
 ---
 
 ### Price Breach Detection
@@ -504,6 +506,237 @@ def populate_ticker_coverage(
     Returns: number of rows upserted.
     """
     ...
+
+
+def get_next_trading_day(
+    date: str,
+    db_conn: duckdb.DuckDBPyConnection,
+) -> str:
+    """
+    Return the next date after `date` with is_trading_day=TRUE in trading_calendar.
+
+    Used by metadata_crawler.md's daily collection to determine the as_of_date
+    for populate_precomputed_session_stats(), and by migration_tool.md's
+    post-migration first-live-session setup.
+
+    Query:
+        SELECT date FROM trading_calendar
+        WHERE date > ? AND is_trading_day = TRUE
+        ORDER BY date LIMIT 1
+
+    Note: is_trading_day (NYSE calendar), not has_data — this looks forward to a
+    future date that has not been ingested yet, so has_data is not yet TRUE for
+    it. Distinct from the has_data=TRUE lookup used by Labeler/BacktestEngine
+    for dead position resolution (which looks for a date that already has
+    ingested data).
+
+    Returns: 'YYYYMMDD' string. Raises if no such date exists in trading_calendar
+    (calendar should be populated far enough ahead by populate_trading_calendar()).
+    """
+    ...
+```
+
+---
+
+### Ticker Identity Utilities
+
+```python
+def get_ticker_history(
+    ticker: str,
+    db_conn: duckdb.DuckDBPyConnection,
+) -> list[tuple[str, str]] | None:
+    """
+    Return the predecessor-symbol chain for a ticker due to plain renames
+    (mergers/spin-offs excluded — those are distinct securities, not
+    continuations, and are never registered in ticker_history).
+
+    Returns None if no history exists — the common case for the vast majority
+    of tickers. Callers must check for None first and take the fast path
+    (no further lookup) rather than assuming an empty list.
+
+    If history exists, returns [(previous_ticker, effective_date), ...] sorted
+    oldest-first, e.g. a ticker renamed twice (A→B→C) returns
+    [("A", "20220101"), ("B", "20230601")] when queried as "C".
+
+    Query:
+        SELECT previous_ticker, effective_date FROM ticker_history
+        WHERE current_ticker = ? AND rename_type = 'rename'
+        ORDER BY effective_date ASC
+        -- recursively resolve if previous_ticker itself has an earlier entry
+        -- as current_ticker (chain support)
+
+    ticker_history has no automated registration (see Open Items: ticker
+    rename auto-registration) — rows are inserted manually via SQL.
+    """
+    ...
+
+
+def load_ohlcv_with_history(
+    ticker: str,
+    start_date: str,
+    end_date: str,
+    db_conn: duckdb.DuckDBPyConnection,
+) -> pd.DataFrame:
+    """
+    Load 1-minute bars for a ticker over [start_date, end_date], including bars
+    stored under predecessor symbols (see get_ticker_history()).
+
+    Internally calls get_ticker_history(ticker, db_conn) first; if None
+    (common case), issues a single direct query — no additional overhead
+    beyond the small ticker_history lookup:
+        SELECT * FROM ohlcv_1min WHERE ticker=? AND date>=? AND date<=?
+
+    If history exists, issues one additional query per predecessor covering
+    only the date range before that predecessor's effective_date, relabels
+    the `ticker` column to the current ticker, and UNIONs with the current
+    ticker's own rows. Returned DataFrame is sorted by (date, hour) and its
+    `ticker` column is normalized to the current ticker throughout.
+
+    Used by live_mode_runner.md's Phase 1 historical bar load, where bars are
+    fetched per-ticker via a direct DB query (unlike run_preprocess.md, which
+    bulk-loads the entire ohlcv_1min table into memory and performs the
+    equivalent predecessor-row relabeling in-memory instead of via a second
+    query — see run_preprocess.md Step 6 for that variant).
+    """
+    ...
+```
+
+---
+
+### Corporate Event Utilities
+
+```python
+def cum_split_ratio(
+    ticker: str,
+    from_date: str,
+    to_date: str,
+    db_conn: duckdb.DuckDBPyConnection,
+) -> float:
+    """
+    Cumulative product of split/reverse_split 'value' in corporate_events for
+    this ticker with event_date IN (from_date, to_date]. Returns 1.0 if none
+    (the common case — no query cost beyond a small corporate_events lookup,
+    since the table itself is small regardless of match).
+
+    Shared primitive used by:
+        - adjust_bars_for_corporate_events() (below) — bar-level correction
+        - 04_feature_extractor.md Strategy A per-entry rescale (f_e)
+        - 05_labeler.md / 09_backtest_engine.md dead position Case A/D
+          (there, from_date/to_date are the single-day overnight window D→D+1,
+          and dividend_amount is looked up separately by the caller — this
+          function returns the split ratio component only)
+
+    Query:
+        SELECT value FROM corporate_events
+        WHERE ticker = ? AND event_type IN ('split', 'reverse_split')
+          AND event_date > ? AND event_date <= ?
+        -- product of all matching rows; 1.0 if no rows
+    """
+    ...
+
+
+def adjust_bars_for_corporate_events(
+    bars: pd.DataFrame,
+    ticker: str,
+    reference_date: str,
+    db_conn: duckdb.DuckDBPyConnection,
+) -> pd.DataFrame:
+    """
+    Adjust OHLCV bars to reference_date's split scale using cum_split_ratio().
+
+    For each bar with date=D_bar < reference_date:
+        ratio = cum_split_ratio(ticker, D_bar, reference_date, db_conn)
+        open, high, low, close /= ratio
+        volume *= ratio
+    Bars with date >= reference_date, or no applicable splits (ratio=1.0):
+        no-op — returned unchanged.
+
+    Vectorized via a single merge against corporate_events (a small table) —
+    one pass over `bars`, not a per-row loop. For the vast majority of
+    tickers (no split in the loaded range), this reduces to a no-op copy.
+
+    Does NOT adjust for dividends — dividends affect gap_pct's overnight
+    prev_close comparison and dead-position pnl (both handled as separate
+    scalar corrections by their respective callers — see
+    02_indicator_calculator.md gap_percentile() and 05_labeler.md /
+    09_backtest_engine.md dead position Case A/D) but do not create a
+    continuous price-level discontinuity the way splits do, so they are out
+    of scope for this bar-level correction.
+
+    Called by:
+        - 04_feature_extractor.md extract_batch() Strategy A, reference_date =
+          the max date in the loaded bars range for that call (today for live
+          mode's session_start_compute(), the last date in the ticker's
+          loaded range for training)
+        - inferencer/caching_calculator.md session_start_compute(),
+          reference_date = today
+
+    Returns a new DataFrame — does not mutate the input `bars` in place.
+    """
+    ...
+```
+
+---
+
+### Historical Metadata Utilities
+
+```python
+def estimate_historical_meta(
+    ticker: str,
+    date: str,
+    field: str,
+    db_conn: duckdb.DuckDBPyConnection,
+) -> float | int | None:
+    """
+    Derive a point-in-time stock_meta field value for (ticker, date) from
+    ohlcv_1min + corporate_events, for use when stock_meta has no real crawled
+    row/value for that specific date (see db_schema.md stock_meta — schema is
+    (ticker, date)-keyed; rows exist only for dates actually crawled).
+
+    Supported fields and derivation:
+        shares_outstanding:
+            current_value = most recent stock_meta.shares_outstanding for ticker
+            ratio = cum_split_ratio(ticker, date, most_recent_date, db_conn)
+            return current_value / ratio
+            (buyback/issuance activity between quarters is NOT captured this
+            way — only split-driven share-count changes are reversible from
+            available data; see Open Items: fundamentals history collection)
+
+        market_cap:
+            close = close price for (ticker, date) from ohlcv_1min
+                    (last regular-session bar of that date)
+            shares = estimate_historical_meta(ticker, date, "shares_outstanding", db_conn)
+            return close * shares
+
+        price_52h / price_52l:
+            bars = adjust_bars_for_corporate_events(
+                       ohlcv_1min rows for ticker over trailing 252 trading days
+                       ending at date, ticker, reference_date=date, db_conn)
+            return MAX(bars.high) / MIN(bars.low) respectively
+            (split-adjusted so the 252-day window isn't corrupted by a split
+            crossing it — reuses the same bar-adjustment utility as Strategy A)
+
+        sector:
+            Not supported — no derivation path. Callers must use the most
+            recent available stock_meta snapshot for this field regardless of
+            date; do not call this function with field="sector".
+
+    Called by:
+        - 04_feature_extractor.md Meta Features resolution (training, per
+          entry date) and by run_preprocess.md Step 6 (building the date-keyed
+          `ticker_meta` dict)
+        - 01_entry_detection.md filter E (condition E, turnover rate) — same
+          shares_outstanding resolution, shared rather than duplicated
+        - live_mode_runner.md, only as a fallback if the current day's
+          stock_meta crawl is incomplete for a field (rare — see
+          metadata_crawler.md dual-schedule design)
+
+    Returns None if derivation itself is impossible (e.g. no ohlcv_1min data
+    for the ticker before `date` at all) — caller treats this the same as a
+    missing stock_meta value (NaN feature, or exclusion from filter E as
+    appropriate to that caller's own missing-data handling).
+    """
+    ...
 ```
 
 ---
@@ -534,6 +767,14 @@ def populate_precomputed_session_stats(
     Metrics derived from tick_10 (lee_ready):
         buy_ratio_baseline : per-bar buyer_initiated_ratio per HHMMSS slot
         intra_tpm_baseline : per-bar ticks-per-minute per HHMMSS slot
+
+    Corporate-event and ticker-rename awareness: prior-session raw values are
+    read via load_ohlcv_with_history() (so a ticker rename within the prior
+    n_sessions window does not silently drop history), then adjusted per
+    corporate_events before aggregation (see D. below). ticker_history is
+    small and pre-loaded once as an in-memory dict at the start of this
+    function's execution — no per-ticker DB query added to the inner loop for
+    tickers with no rename (the vast majority).
 
     Halt handling per metric type:
 
@@ -566,6 +807,51 @@ def populate_precomputed_session_stats(
             3. If no non-halt bar found in first 60 minutes: exclude session
 
         Sessions excluded from either determination reduce count.
+
+    D. Corporate-event adjustment (applied to prior-session raw values BEFORE
+       A/B/C aggregation — not a post-hoc correction of the stored mean/std,
+       since the individual per-session values are not retained after
+       aggregation and cannot be un-averaged later):
+
+        For ticker T, as_of_date D, prior session D-k:
+            cum_ratio(D-k) = cum_split_ratio(T, D-k, D, db_conn)
+                             (product of split/reverse_split 'value' with
+                             event_date IN (D-k, D]; 1.0 if none — the common
+                             case, no additional cost beyond the small
+                             corporate_events lookup)
+
+            Applied per metric:
+                rvol_baseline, intra_vol_baseline (volume-based):
+                    adjusted_volume = raw_volume * cum_ratio(D-k)
+                    (post-split share count is higher → historical volume
+                    scaled up to match current scale)
+
+                rel_dvol_baseline (dollar volume = price * volume):
+                    No adjustment needed — price scales down by 1/cum_ratio
+                    while volume scales up by cum_ratio; product invariant.
+
+                intra_return_baseline (per-bar % return):
+                    No adjustment needed — percentage return is scale-invariant.
+
+                gap_pct_mean/std:
+                    adjusted_prev_close(D-k) =
+                        (raw_prev_close(D-k) - dividend_at(D-k)) / split_at(D-k)
+                        where split_at(D-k) = 'split'/'reverse_split' value
+                            with event_date=D-k (1.0 if none)
+                        dividend_at(D-k) = 'dividend' value with
+                            event_date=D-k (0.0 if none)
+                    gap_pct(D-k) = (today_regular_open(D-k) - adjusted_prev_close(D-k))
+                                   / adjusted_prev_close(D-k)
+                    (applied using the halt-fallback prev_close/today_open
+                    values already determined in C above — this adjustment is
+                    independent of, and applied after, the halt fallback)
+
+                buy_ratio_baseline (a ratio, tick-derived): no adjustment needed.
+                intra_tpm_baseline (tick count, not volume): no adjustment needed.
+
+        This replaces session-exclusion as the split/dividend handling
+        approach — adjustment preserves sample count (count is unaffected by
+        D; only A/B/C reduce count) instead of discarding sessions outright.
 
     Stores: avg_value, std_value, count per (ticker, as_of_date, hour, metric, n_sessions)
     count may differ by hour slot within the same ticker/as_of_date (per-bar metrics).
@@ -643,9 +929,6 @@ def build_session_stats_dict(
               access: session_stats_bulk = result[today_date]
     """
     ...
-```
-
-
 ```
 
 ---
@@ -770,4 +1053,45 @@ def temporal_split_simple(
   in-memory only — DB rows unchanged
 - `buy_ratio_baseline` and `intra_tpm_baseline` require tick_10 data — skipped if unavailable
 - `hhmmss_to_minutes()` is an alias for `hour_to_minutes()` with explicit naming for clarity
+- `get_next_trading_day()` filters on `is_trading_day=TRUE` (NYSE calendar), not
+  `has_data=TRUE` — it looks forward to a future date, distinct from the
+  `has_data=TRUE` lookup used for dead position resolution (past/present date
+  that has already been ingested)
+- `get_ticker_history()` returns `None` (not an empty list) when no rename
+  history exists — this is the default/fast path for the vast majority of
+  tickers; callers must branch on `None` explicitly rather than assuming a
+  list and checking its length
+- `load_ohlcv_with_history()` and run_preprocess.md's in-memory equivalent
+  (Step 6) must produce identical results for the same ticker/date range —
+  the two exist only because live mode and training load bars via different
+  mechanisms (per-ticker query vs. one-time bulk load), not because the
+  underlying stitching logic differs
+- `cum_split_ratio()` returns `1.0` (not an error or None) when no splits
+  exist in the given range — this is the common case and must be a true no-op
+  when multiplied against downstream values
+- `adjust_bars_for_corporate_events()` does not mutate its input `bars`
+  DataFrame — always returns a new copy, even when the adjustment is a no-op
+- `adjust_bars_for_corporate_events()` handles splits only, not dividends —
+  dividend adjustment is a separate scalar correction owned by each caller
+  (`gap_percentile()`'s `dividend_amount`, dead position Case A/D's
+  `adjusted_p_entry`) since dividends don't create the continuous bar-level
+  price discontinuity that motivates a full-series bar adjustment
+- `estimate_historical_meta()` must never be called with `field="sector"` —
+  sector has no derivation path; callers use the most recent stock_meta
+  snapshot for sector regardless of date
+- `estimate_historical_meta()`'s `shares_outstanding` derivation does not
+  capture buyback/issuance activity between quarters — only split-driven
+  share-count changes are reversible from `ohlcv_1min` + `corporate_events`;
+  this is a known, accepted limitation (see Open Items: fundamentals history
+  collection) distinct from the corporate-event scale-correction problem this
+  session's other changes solve exactly
+- `populate_precomputed_session_stats()`'s corporate-event adjustment (D.) is
+  applied to individual per-session raw values BEFORE aggregation into
+  avg_value/std_value — it cannot be applied as a post-hoc correction to the
+  stored mean/std, because the individual per-session values needed for
+  correct adjustment are not retained after aggregation (this is also why
+  session_stats correction is persisted in `precomputed_session_stats` at
+  all, unlike bar-level correction which is computed fresh on every call —
+  see `adjust_bars_for_corporate_events()`, which has no persisted-table
+  equivalent because `ohlcv_1min` rows are never lossy-aggregated)
 - No pipeline business logic in this module — utility functions only

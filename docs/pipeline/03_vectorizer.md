@@ -158,9 +158,23 @@ Configured in `pipeline_config.yaml`. Default mapping:
 | **rel_dvol** | **statistical_summary** | **window_comparison** |
 | **intra_season_{metric}** | **statistical_summary** | **window_comparison** |
 | **gap_pct** | **(Vectorizer 미사용 — FeatureExtractor inline 처리)** | — |
+| **obv, ad** | **linear_trend** | **window_comparison (delta only — see note)** |
 
 `gap_percentile` is excluded from Vectorizer dispatch. FeatureExtractor inserts
 the scalar value directly into the feature vector as `gap_pct`. No transform applied.
+
+**obv/ad mapping rationale:** `obv`/`ad` are unbounded cumulative sums — their
+absolute level (`statistical_summary`'s mean/min/max/last) is an artifact of
+where the loaded bars window happened to start, not an economically meaningful
+value, and is not comparable across samples. `rate_of_change`'s ratio form is
+also unsuitable near a zero-crossing (division instability). `linear_trend`
+(slope, r_squared) captures the classic OBV/AD interpretation — sustained
+directional money flow — independent of the series' arbitrary origin, so it is
+the primary method. For `window_comparison` (secondary), only
+`{name}_window_delta` (a difference) is used for `obv`/`ad` —
+`{name}_window_ratio` is excluded for these two indicators specifically,
+since a ratio of two segments of a cumulative series can still divide by a
+near-zero value even though the delta form cannot.
 
 ---
 
@@ -219,3 +233,6 @@ class Vectorizer:
   `dist_sN_pct` sign convention: positive = level below P_entry (support)
 - Same sign convention applies to `level_distance()`: positive = level above P_entry
 - `gap_pct` is never passed to any Vectorizer method — FeatureExtractor inline only
+- `window_comparison()` on `obv`/`ad`: caller (FeatureExtractor) requests only
+  `{name}_window_delta`; `{name}_window_ratio` must not be generated for these
+  two indicators — see "obv/ad mapping rationale" above

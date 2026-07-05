@@ -41,7 +41,13 @@ ticker_data_coverage: pd.DataFrame
     # used for dead position Case A vs Case B determination
     # Case A: ticker found in coverage for next day with has_data=True (data available)
     # Case B: ticker not found in coverage for next day with has_data=True (possible delisting)
+
+corporate_events: pd.DataFrame
+    columns: [ticker, event_date, event_type, value]
+    # used only for dead position Case A/D overnight dividend/split adjustment
+    # (see Step 4) — filtered internally per entry point to event_date IN (D, D+1]
 ```
+
 
 **Output:**
 ```python
@@ -52,7 +58,7 @@ label_matrix: pd.DataFrame
     # one row per entry point
     # exactly one label = 1 per row (mutually exclusive by construction)
     # is_dead_position = True if label assigned via next-day price
-    # dead_position_case = "A" | "B" | "C" | None
+    # dead_position_case = "A" | "B" | "C" | "D" | None
     # is_ambiguous = True if tp and sl thresholds simultaneously satisfied
     #                within the same 10-tick bundle during Stage 1 scan
 ```
@@ -101,12 +107,31 @@ these samples from training, or by Trainer to apply reduced sample weight.
 ```
 Case A: next day has_data=True AND ticker found in ticker_data_coverage for that date
         → next-day open available; apply dead_position_penalty_pct
+        → if exit_price still cannot be resolved (extended halt into next day
+          and beyond) → falls through to Case D instead
 
 Case B: next day has_data=True AND ticker NOT found in ticker_data_coverage for that date
-        → possible delisting; label_sw assigned directly (cannot determine direction)
+        → possible delisting; pnl = -1.0 (full loss), label assigned by pnl
+          threshold (resolves to label_dn5) — see rationale below
 
 Case C: no next day with has_data=True in dataset (boundary condition)
         → label_sw assigned directly; excluded from training (see ClassBalancer config)
+        → dataset-boundary artifact, not a market outcome — label_sw retained
+          (unlike Case B/D, there is no real trade outcome to score here)
+
+Case D: Case A path entered, but exit_price unresolvable after fallback
+        (pre-market first tick AND next-day first bar open both unavailable —
+         extended/multi-day halt) → pnl = -1.0 (full loss), label assigned by
+        pnl threshold (resolves to label_dn5), same mechanism as Case B
+
+Case B/D rationale: pnl threshold definitions are literal (label_dn5 = pnl <=
+-threshold_5pp); a full loss of capital is definitionally label_dn5 regardless
+of whether the underlying cause is delisting (B) or extended halt (D) —
+assigning label_sw here would train the model to treat capital-destroying
+outcomes as neutral, and would also diverge from BacktestEngine (which already
+scores both as pnl=-1.0). dead_position_case still distinguishes B and D for
+downstream filtering (e.g. ClassBalancer exclusion options) even though both
+now resolve to the same label.
 ```
 
 ---
@@ -192,17 +217,30 @@ In this case:
     Case A — has_data=True AND ticker exists in ticker_data_coverage:
         exit_price = next day pre-market first tick
                      fallback: next day ohlcv_1min first bar open
+        if exit_price cannot be resolved from either source (NaN/unavailable):
+            → proceed to Case D (below); do not assign a label here
         exit_price *= (1 - dead_position_penalty_pct)
+        adjusted_P_entry = (P_entry - dividend_amount) / cum_split_ratio
+            where cum_split_ratio = product of split/reverse_split 'value' in
+                corporate_events WHERE ticker=? AND event_date IN (D, D+1]
+            dividend_amount = 'dividend' value in corporate_events with
+                event_date IN (D, D+1] (0.0 if none; same overnight window as
+                cum_split_ratio — a split or ex-dividend date effective D+1
+                is what would otherwise corrupt this comparison, since US
+                splits/ex-dividend adjustments always take effect before
+                market open)
         is_dead_position = True
         dead_position_case = "A"
-        pnl = (exit_price - P_entry) / P_entry
+        pnl = (exit_price - adjusted_P_entry) / adjusted_P_entry
         apply label by pnl threshold (same rules as Step 3)
 
     Case B — has_data=True AND ticker NOT in ticker_data_coverage:
         is_dead_position = True
         dead_position_case = "B"
-        assign label_sw directly
-        (direction cannot be determined — possible delisting)
+        pnl = -1.0
+        apply label by pnl threshold (same rules as Step 3) — resolves to label_dn5
+        (possible delisting; full loss is the conservative, literal reading of
+         pnl threshold definitions — see "Dead Position Cases" rationale above)
 
     Case C — no next day with has_data=True in dataset (boundary condition):
         is_dead_position = True
@@ -210,6 +248,15 @@ In this case:
         assign label_sw directly
         (dataset boundary — actual price movement unknown)
         Note: ClassBalancer can optionally exclude Case C from training.
+
+    Case D — Case A path entered, but exit_price unresolvable after fallback
+             (extended/multi-day halt continuing past D+1):
+        is_dead_position = True
+        dead_position_case = "D"
+        pnl = -1.0
+        apply label by pnl threshold (same rules as Step 3) — resolves to label_dn5
+        (same mechanism as Case B — capital is locked/at-risk with no resolvable
+         exit price; dead_position_case="D" retained for downstream filtering)
 ```
 
 **Key invariant:** Exactly one label equals 1 per entry point. All others are 0.
@@ -230,6 +277,7 @@ class Labeler:
         halts_df:             pd.DataFrame,
         trading_calendar:     pd.DataFrame,
         ticker_data_coverage: pd.DataFrame,
+        corporate_events:     pd.DataFrame,
     ) -> pd.DataFrame:
         """
         Generate label matrix for all entry points.
@@ -260,7 +308,7 @@ Note: `build_effective_bar_sequence()` is an internal delegation to
 - Threshold values (threshold_3pp, threshold_5pp) must be read from config, not hardcoded
 - `build_effective_bar_sequence()` is sourced from `utils.py` — do not reimplement
 - `is_dead_position` flag must be set in all dead position cases regardless of label assigned
-- `dead_position_case` must be set to "A", "B", or "C" for dead position rows; None otherwise
+- `dead_position_case` must be set to "A", "B", "C", or "D" for dead position rows; None otherwise
 - `is_ambiguous` sourced from `track_label_breach()` Stage 1 return value only;
   Stage 2 ambiguity does not affect the flag
 - `ambiguity_priority` controls breach direction on simultaneous bundle breach — read from config
@@ -269,9 +317,20 @@ Note: `build_effective_bar_sequence()` is an internal delegation to
 - `exit_interpolation` passed through to `track_label_breach()` — read from config
 - `ticker_data_coverage` must be pre-loaded and passed explicitly;
   used for dead position Case A vs Case B determination only
-- Dead position Case A: pnl computed from next-day exit_price; label assigned by threshold
-- Dead position Case B: label_sw assigned directly — no pnl threshold applied
+- Dead position Case A: pnl computed from next-day exit_price, dividend/split
+  adjusted (see Step 4) via `corporate_events`; label assigned by threshold;
+  if exit_price cannot be resolved, falls through to Case D instead
+- Dead position Case B: pnl = -1.0 fixed; label assigned by threshold
+  (resolves to label_dn5) — not label_sw
 - Dead position Case C: label_sw assigned directly — no pnl threshold applied
+  (dataset-boundary artifact only; distinct from B/D, which are real outcomes)
+- Dead position Case D: pnl = -1.0 fixed; label assigned by threshold
+  (resolves to label_dn5), identical mechanism to Case B; triggered only when
+  Case A's exit_price cannot be resolved after fallback
+- Case A/D overnight dividend/split lookup uses `corporate_events` rows passed
+  in by the caller (see Input section) — consistent with how `trading_calendar`
+  and `ticker_data_coverage` are already supplied; Labeler does not query
+  DuckDB directly anywhere in this module
 
 ---
 
@@ -302,8 +361,10 @@ labeler:
 | Neither ±3pp breached, 15:59 reached within 60 bars | label_sw (session close exit) |
 | Neither ±3pp breached, 60 valid bars collected before 15:59 | label_sw (time-limit exit, last valid bar close) |
 | Ambiguous bundle (both ±3pp in same bundle), priority="up" | label_up3/up5, is_ambiguous=True |
-| Dead position Case A (ticker in coverage, has_data=True next day) | is_dead_position=True, case="A", label by pnl threshold |
-| Dead position Case B (ticker missing, has_data=True next day) | is_dead_position=True, case="B", label_sw |
+| Dead position Case A (ticker in coverage, has_data=True next day) | is_dead_position=True, case="A", label by pnl threshold (dividend/split adjusted) |
+| Dead position Case B (ticker missing, has_data=True next day) | is_dead_position=True, case="B", pnl=-1.0, label_dn5 |
 | Dead position Case C (no next day with has_data=True) | is_dead_position=True, case="C", label_sw |
+| Dead position Case D (Case A entered, exit_price unresolvable — extended halt) | is_dead_position=True, case="D", pnl=-1.0, label_dn5 |
+| Dead position Case A with split effective D+1 | pnl computed against split-adjusted P_entry, not raw P_entry |
 | Halt bar skipped in 60-bar count | label assigned after halt |
 | Time-limit exit: 60 valid bars collected, 15:59 bar not yet reached | exit at last valid bar close, no dead position |

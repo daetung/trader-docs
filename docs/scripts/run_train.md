@@ -192,7 +192,9 @@ trainer:
 - `fold_idx` default -1 for standalone (no rolling fold); 0-based for rolling folds
 - `outer_fold_idx` default -1 for non-nested runs; 0-based for nested outer folds
 - `trial_idx` default 0 for standalone/selection/full; -1 for outer eval rows;
-  0-based for exploitation inner trials
+  0-based for exploitation inner trials; also 0 for the exploitation final
+  model (outer_fold_idx=-1) — same "single implicit trial" semantics as
+  standalone/selection/full, just reached via a different phase
 - `fold_train_end` sourced from fold_meta["fold_train_end"] — Trainer does not compute it
 - Sample weight column (`__sample_weight__`) generated inside Trainer when
   `use_ambiguous_sample_weight=True`; must not appear in feature_names

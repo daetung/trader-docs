@@ -119,6 +119,14 @@ SELECT 1 FROM ticker_data_coverage
 WHERE ticker = ? AND date = ?
 ```
 
+### Corporate events (for dead position Case A/D dividend/split adjustment)
+```sql
+SELECT event_type, value FROM corporate_events
+WHERE ticker = ? AND event_date > ? AND event_date <= ?
+```
+Queried only when Case A/D resolution is reached — not on every trade.
+Same window and rationale as Labeler's equivalent lookup (see `05_labeler.md`).
+
 For each (ticker, date) group, the following data is loaded from DuckDB once
 and passed down to internal methods:
 
@@ -353,9 +361,19 @@ Occurs when:
 Case A — next trading day has_data=True AND ticker exists in ticker_data_coverage:
     exit_price = next day pre-market first tick
                  fallback: next day ohlcv_1min first bar open
+    if exit_price cannot be resolved from either source (NaN/unavailable):
+        → Case D (below)
     exit_price *= (1 - dead_position_penalty_pct)
+    adjusted_p_entry = (p_entry - dividend_amount) / cum_split_ratio
+        where cum_split_ratio = product of split/reverse_split 'value' in
+            corporate_events WHERE ticker=? AND event_date IN (D, D+1]
+        dividend_amount = 'dividend' value in corporate_events with
+            event_date IN (D, D+1] (0.0 if none) — same overnight window and
+            rationale as Labeler's Case A (see 05_labeler.md); US splits and
+            ex-dividend adjustments always take effect before market open
     exit_reason = "dead_position"
     is_dead_position = True
+    pnl = (exit_price - adjusted_p_entry) / adjusted_p_entry
 
 Case B — next trading day has_data=True AND ticker NOT in ticker_data_coverage:
     pnl = -1.0  (full loss — possible delisting)
@@ -367,6 +385,15 @@ Case C — next trading day not in dataset (dataset boundary):
     exit_price = p_entry * (1 - 0.5)
     exit_reason = "dead_position_no_data"
     is_dead_position = True
+
+Case D — Case A path entered, but exit_price unresolvable after fallback
+         (pre-market first tick AND next-day first bar open both unavailable
+         — extended/multi-day halt):
+    pnl = -1.0  (full loss — capital locked with no resolvable exit price)
+    exit_price = 0
+    exit_reason = "dead_position_extended_halt"
+    is_dead_position = True
+    (mirrors Labeler's Case D — see 05_labeler.md — same mechanism as Case B)
 ```
 
 Dead position trades are included in the winning_rate denominator.
@@ -424,6 +451,11 @@ is_ambiguous             BOOLEAN,   -- True if simultaneous bundle-level tp/sl b
 - After-market data used only as fallback when 15:59 bar is halt/no_data
 - Dead position: session_end fallback fails only (15:59 halt + no after-market data)
 - Dead position lookup uses `has_data = TRUE` filter (not `is_trading_day`) — consistent with Labeler
+- Dead position Case A pnl uses dividend/split-adjusted p_entry (see Dead Position section) —
+  `corporate_events` rows for (ticker, event_date IN (D, D+1]) are loaded alongside
+  `trading_calendar`/`ticker_data_coverage` for this lookup; same query pattern as Labeler
+- Dead position Case D (`exit_reason = "dead_position_extended_halt"`) triggers only when
+  Case A's exit_price cannot be resolved after fallback — pnl = -1.0, consistent with Case B
 - `simulate_exit_fill()` ticks exhaustion (unfilled_qty > 0) is partial fill — not dead position;
   `is_dead_position` remains False; diagnostic via `trade_log.unfilled_quantity`
 - sell_rate_tp > sell_rate_sl: rising-market exits have more available buy-side depth

@@ -93,16 +93,42 @@ CREATE TABLE tick_10 (
     PRIMARY KEY (ticker, date, hour, seq_id)
 );
 
--- Stock metadata (refreshed daily by metadata crawling tool)
+-- Stock metadata (crawled daily; append-only per date — see metadata_crawler.md)
+-- PRIMARY KEY includes date: a row exists only for dates actually crawled.
+-- Dates before schema deployment, or individual fields that failed to crawl on
+-- a given date, have no row / no value here — callers fall back to
+-- utils.estimate_historical_meta(), applied per FIELD (not per row):
+--   shares_outstanding, market_cap, price_52h, price_52l — derived from
+--     ohlcv_1min + corporate_events when the real crawled value is unavailable
+--   sector — has no derivation path; callers always use the most recent
+--     available snapshot regardless of entry date (accepted approximation)
+-- FeatureExtractor's MetaFeatures and EntryPointDetector's filter E (condition E)
+-- share this same fallback utility rather than each implementing their own.
 CREATE TABLE stock_meta (
-    ticker             VARCHAR   PRIMARY KEY,
+    ticker             VARCHAR   NOT NULL,
+    date               VARCHAR   NOT NULL,   -- 'YYYYMMDD', date actually crawled
     sector             VARCHAR,
     market_cap         DOUBLE,
     shares_outstanding BIGINT,
     price_52h          DOUBLE,
     price_52l          DOUBLE,
     avg_volume         DOUBLE,
-    updated_at         VARCHAR
+    updated_at         VARCHAR,
+    PRIMARY KEY (ticker, date)
+);
+
+-- Ticker symbol rename history (plain renames only — mergers/spin-offs excluded,
+-- since those are treated as distinct securities, not continuations).
+-- No automated registration yet — manual SQL insert only. See Open Items:
+-- ticker rename auto-registration (registration API/CLI design deferred).
+-- Used by utils.get_ticker_history() / load_ohlcv_with_history() to stitch
+-- pre-rename bars into a continuous series addressed under the current symbol.
+CREATE TABLE ticker_history (
+    current_ticker  VARCHAR NOT NULL,   -- current (post-rename) symbol
+    previous_ticker VARCHAR NOT NULL,   -- prior symbol
+    effective_date  VARCHAR NOT NULL,   -- 'YYYYMMDD', first date current_ticker is used
+    rename_type     VARCHAR NOT NULL DEFAULT 'rename',
+    PRIMARY KEY (current_ticker, effective_date)
 );
 
 -- Trading halts (crawled from NYSE, refreshed daily)
@@ -139,18 +165,24 @@ CREATE TABLE ticker_data_coverage (
     PRIMARY KEY (ticker, date)
 );
 
--- Corporate events (splits and reverse splits)
--- Populated by metadata_crawler via yfinance splits history.
--- US stock splits always take effect before market open — no intra-session splits occur.
--- Used by populate_precomputed_session_stats() to exclude split-affected sessions
--- from baseline calculations (planned — see Open Items in architecture.md).
--- 'dividend' event_type is reserved for future use; not currently collected.
+-- Corporate events (splits, reverse splits, dividends)
+-- Populated by metadata_crawler via yfinance splits/dividends history.
+-- US stock splits and ex-dividend adjustments always take effect before market
+-- open — no intra-session events occur.
+-- Used by populate_precomputed_session_stats() to adjust prior-session baseline
+-- values in place (volume/price scale for splits; gap_pct prev_close for both)
+-- so that baselines remain consistent with current share/price scale — see
+-- utils.md populate_precomputed_session_stats() for the adjustment formulas.
+-- Also used by adjust_bars_for_corporate_events() (utils.md) for split-scale
+-- correction of raw bars feeding CONTINUOUS/cumulative indicators, and by
+-- gap_percentile() / dead-position pnl (labeler.md, backtest_engine.md) for
+-- scalar dividend/split adjustment across overnight boundaries.
 CREATE TABLE corporate_events (
     ticker      VARCHAR NOT NULL,
     event_date  VARCHAR NOT NULL,   -- 'YYYYMMDD' (effective date, before market open)
-    event_type  VARCHAR NOT NULL,   -- 'split' | 'reverse_split'
-                                    -- 'dividend': reserved, not currently collected
-    ratio       DOUBLE  NOT NULL,   -- split: >1.0 (e.g. 2.0 for 2:1), reverse: <1.0 (e.g. 0.5)
+    event_type  VARCHAR NOT NULL,   -- 'split' | 'reverse_split' | 'dividend'
+    value       DOUBLE  NOT NULL,   -- split/reverse_split: ratio (>1.0 or <1.0)
+                                    -- dividend: per-share cash amount (USD, >0)
     PRIMARY KEY (ticker, event_date, event_type)
 );
 
@@ -168,7 +200,10 @@ CREATE TABLE entry_points (
 -- dead_position_case: "A" (next day has_data=True, ticker found in coverage) |
 --                     "B" (next day has_data=True, ticker missing — possible delisting) |
 --                     "C" (no next day with has_data=True — dataset boundary) |
+--                     "D" (Case A entered but exit_price unresolvable — extended halt) |
 --                     NULL (not a dead position)
+-- Case B and D both resolve to label_dn5 via pnl=-1.0 threshold (not label_sw);
+-- only Case C (dataset-boundary artifact, not a market outcome) retains label_sw.
 -- is_ambiguous: TRUE if tp and sl thresholds simultaneously satisfied within the same
 --               10-tick bundle during Stage 1 of track_label_breach().
 --               Label is still assigned (via ambiguity_priority rule).
@@ -184,14 +219,15 @@ CREATE TABLE labeled_samples (
     label_dn3           INTEGER      NOT NULL,
     label_dn5           INTEGER      NOT NULL,
     is_dead_position    BOOLEAN      NOT NULL DEFAULT FALSE,
-    dead_position_case  VARCHAR,                -- "A" | "B" | "C" | NULL
+    dead_position_case  VARCHAR,                -- "A" | "B" | "C" | "D" | NULL
     is_ambiguous        BOOLEAN      NOT NULL DEFAULT FALSE,
     PRIMARY KEY (ticker, date, hour)
 );
 
 -- Train log (output of run_train.py — one row per training run or fold)
 -- trial_idx:      -1  = outer evaluation row (not part of inner trial search)
---                  0  = standalone / selection / full (single implicit trial)
+--                  0  = standalone / selection / full (single implicit trial);
+--                       also: exploitation final model (outer_fold_idx=-1)
 --                 >=0 = exploitation inner trial (0-based per optimizer_run_id)
 -- fold_idx:       -1  = standalone / outer eval (no rolling fold structure)
 --                 >=0 = rolling inner fold index (0-based)
@@ -436,9 +472,9 @@ session_stats_all = con.execute("""
 """, [20]).df()
 # Pass to build_session_stats_dict(); access result[date][ticker] per entry point
 
-# Check for corporate events (splits) for a ticker
+# Check for corporate events (splits, reverse splits, dividends) for a ticker
 events = con.execute("""
-    SELECT ticker, event_date, event_type, ratio
+    SELECT ticker, event_date, event_type, value
     FROM corporate_events
     WHERE ticker = ?
       AND event_date >= ? AND event_date <= ?

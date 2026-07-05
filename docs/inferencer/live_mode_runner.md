@@ -62,11 +62,16 @@ LiveModeRunner.start_session(today_date):
          Using worker pool (config: live_mode.session_start_workers)
 
          For each ticker in all_tickers (parallelized):
-             historical_bars = db_conn.execute("""
-                 SELECT * FROM ohlcv_1min
-                 WHERE ticker = ? AND date >= ?
-                 ORDER BY date, hour
-             """, [ticker, lookback_start_date]).df()
+             historical_bars = utils.load_ohlcv_with_history(
+                 ticker, lookback_start_date, today_date, db_conn
+             )
+             # Stitches in predecessor-ticker bars if a rename occurred within
+             # the lookback window (see utils.md get_ticker_history() /
+             # load_ohlcv_with_history()) — returns None-history fast path
+             # (a single direct query) for the vast majority of tickers.
+             # Corporate-event split adjustment is NOT applied here — that
+             # happens inside session_start_compute() itself, anchored to
+             # today_date (see caching_calculator.md).
 
              calc = CachingIndicatorCalculator(config)
              calc.session_start_compute(historical_bars)
@@ -81,6 +86,31 @@ LiveModeRunner.start_session(today_date):
                  calculators[ticker] = calc  # retain in RAM
 
          del session_stats_bulk   # Phase 1 RAM released after all tickers done
+
+  3b. [Meta Bulk Load] Bulk load stock_meta for today, with per-field fallback:
+         stock_meta_today = SELECT * FROM stock_meta WHERE date = ?
+         # stock_meta is (ticker, date)-keyed (see db_schema.md V-1 fix); a row
+         # exists only if today's crawl (see metadata_crawler.md dual-schedule)
+         # succeeded for that ticker/field by session start.
+
+         meta_bulk: dict[str, dict] = {}
+         for ticker in all_tickers:
+             meta_bulk[ticker] = {
+                 field: (
+                     stock_meta_today.get(ticker, field)
+                     if ticker in stock_meta_today.index and pd.notna(stock_meta_today.loc[ticker, field])
+                     else utils.estimate_historical_meta(ticker, today_date, field, db_conn)
+                 )
+                 for field in ["market_cap", "shares_outstanding", "price_52h", "price_52l"]
+             } | {
+                 "sector": most recent available stock_meta.sector for ticker
+                 # sector has no derivation path — most recent snapshot regardless of date
+             }
+         # meta_bulk is looked up (not rebuilt) inside the watchdog loop's
+         # Inferencer.infer() call — see Watchdog Polling Loop step 5b.
+         # estimate_historical_meta() fallback should rarely trigger for
+         # today's own date given the dual-crawl schedule, but is not
+         # guaranteed-zero (vendor update latency — see metadata_crawler.md).
 
   4. Inferencer init:
          calculate_required_history() → self.required_bars
@@ -129,7 +159,7 @@ loop every poll_interval_seconds:
   5. For each ticker with completed bar and active calc:
      a. Re-verify entry point candidate (detect())
      b. If confirmed: Inferencer.infer(
-            bars, ticks, meta, entry,
+            bars, ticks, meta_bulk[ticker], entry,
             session_stats=calculators[ticker]._session_stats
         )
      c. If signal (up5 / up3): submit buy order via trading API
@@ -286,3 +316,19 @@ live_mode:
   (exception: inference_log and entry_points INSERT via Inferencer)
 - session_start_compute() parallelized across workers; thread-safety per-ticker guaranteed
   (no shared state between CachingCalculator instances)
+- Eager Pool bars loading (Step 3) uses `utils.load_ohlcv_with_history()`, not a raw
+  `ohlcv_1min` query — stitches predecessor-ticker bars when a rename occurred
+  within the lookback window; no-op fast path for the vast majority of tickers
+- Corporate-event split adjustment of loaded bars happens inside
+  `session_start_compute()` (see `caching_calculator.md`), anchored to
+  `today_date` — not performed here in LiveModeRunner
+- `meta_bulk` (Step 3b) is (ticker, date)-keyed at the source (`stock_meta`)
+  but resolved to a flat per-ticker dict for today's date only, since live mode
+  has exactly one date in play per session — unlike training's `extract_batch()`,
+  which must stay date-keyed across a ticker's multiple historical entry dates
+  (see `04_feature_extractor.md`)
+- `meta_bulk` depends on `metadata_crawler.md`'s premarket crawl having run
+  before session start for maximum freshness; `utils.estimate_historical_meta()`
+  fallback covers any field still missing at session start (rare, but not
+  guaranteed-zero — vendor update latency is a known, unresolvable-by-scheduling
+  limitation, see `metadata_crawler.md`)

@@ -110,15 +110,47 @@ Different strategies apply per indicator category:
 
 ```
 Strategy A — ticker당 1회 계산 (CONTINUOUS indicators):
-    1. Compute indicators once for the full ticker bars DataFrame
+    0. Corporate-event bar adjustment (before indicator computation):
+       reference_date = max date present in the bars DataFrame for this call
+       adj_bars = utils.adjust_bars_for_corporate_events(bars, ticker,
+                      reference_date, db_conn)
+       (single vectorized pass against corporate_events, a small table —
+        no-op / near-zero cost for the vast majority of tickers with no
+        split in the loaded range)
+    1. Compute indicators once for the full ticker adj_bars DataFrame
        → dict[str, pd.DataFrame]  (time-series per indicator)
     2. For each entry point in entry_points:
        a. Slice indicator time-series up to t-1 bar (by hour index)
-       b. Apply Vectorizer to sliced series → feature vector
+       a2. Scale-type rescale (only when f_e != 1.0 for this entry — see below):
+           f_e = cum_split_ratio(entry_date, reference_date)  (1.0 if no split
+                 between entry_date and reference_date — the common case)
+           if f_e != 1.0: apply per 02_indicator_calculator.md's
+                 "Corporate Event Scale Sensitivity" table —
+                 scale_type=price   → sliced value *= f_e
+                 scale_type=volume  → sliced value /= f_e
+                 scale_type=invariant → no change
+       b. Apply Vectorizer to sliced (and rescaled, if applicable) series
+          → feature vector
     Applies to: ma, ema, macd, rsi, atr, bb, adx, dmi, sar, vr_volume,
                 obv, ad, vwap, roll_spread, hl_spread, lee_ready, tpm,
                 avg_vol_per_tick, rvol (today series), rel_dvol (today series),
                 intra_season_{metric} (today series)
+
+    obv/ad exception: both are unbounded cumulative sums (no session reset),
+    so step 0's single-pass adjustment is only valid for tickers/date-ranges
+    with no split inside the loaded bars range. When corporate_events shows a
+    split within [bars.date.min(), reference_date] for this ticker,
+    extract_batch() falls back to per-entry-date recomputation for obv/ad
+    specifically: re-run adjust_bars_for_corporate_events() with
+    reference_date=entry_date on bars up to that entry, then compute obv/ad
+    fresh for that entry (no step 2a2 rescale needed in the fallback path,
+    since the bars are already anchored to the entry's own date). All other
+    Strategy A indicators are self-referential within their own transform
+    (statistical_summary, rate_of_change, linear_trend, window_comparison,
+    shape_features all operate on the series' own internal shape — see
+    03_vectorizer.md) and do not need this fallback; step 2a2 rescale is
+    sufficient for them since none of these five transforms compare a raw,
+    unadjusted external reference against the indicator series.
 
 Strategy B — ticker당 1회 (monotonic deque):
     fibonacci_retracement: computed in a single O(N) pass over all ticker bars
@@ -142,6 +174,10 @@ Strategy D — date당 1회 스칼라 (gap_percentile only):
     gap_percentile returns float — not a time series.
     Computed once per date (same value for all entry points of the same date).
     session_stats dict provides the baseline.
+    dividend_amount looked up once per date from corporate_events
+    (event_type='dividend', event_date=today; 0.0 if none) and passed to
+    IndicatorCalculator.gap_percentile() — corporate_events is queried here,
+    not inside IndicatorCalculator (which remains DB-unaware).
     NaN for t="093000" or pre-market entries.
     Inserted directly into feature vector as "gap_pct" (no Vectorizer step).
 
@@ -179,12 +215,33 @@ class FeatureExtractor:
         Batch feature extraction for all entry points of a single ticker.
         bars and ticks must be strictly before t bar open (data boundary enforced by caller).
         halts_df passed explicitly for MissingBarClassifier and market_structure_features.
+        meta: date-keyed stock_meta resolution for this ticker's entry dates.
+            Format: {date_str: {field: value}}
+            Keys are entry dates ('YYYYMMDD'); values are the per-field
+            resolved dict described in "Meta Features" below (real crawled
+            value where available, else utils.estimate_historical_meta()
+            fallback per field; sector always the most recent snapshot).
+            extract_batch() internally selects meta[entry_date] for each entry
+            point before computing meta_features. This mirrors the
+            session_stats dispatch pattern below — required because
+            stock_meta is now (ticker, date)-keyed (see V-1 fix, db_schema.md):
+            a single flat dict shared across all of a ticker's entry points
+            would apply one date's values to every other date, reintroducing
+            the staleness problem the (ticker, date) schema was meant to fix.
+            The caller (run_preprocess.md Step 6 / Inferencer for live) builds
+            this dict — FeatureExtractor does not query stock_meta directly.
         session_stats: pre-loaded REFERENCE_SESSION baselines from precomputed_session_stats.
             Format: {date_str: {metric: {hour: smoothed_avg_value}}} | None
             Keys are as_of_date strings ('YYYYMMDD') mapping to single-ticker baseline dicts.
             extract_batch() internally selects stats[entry_date] for each entry point,
             then passes the flat {metric: {hour: value}} dict to IndicatorCalculator.
-            If None or entry date missing, REFERENCE_SESSION indicators return NaN.
+            If session_stats is None, entry_date is missing from session_stats, or
+            session_stats[entry_date] is itself None (ticker absent for that date —
+            possible if populate_precomputed_session_stats() has not yet run for
+            this specific ticker/date combination), REFERENCE_SESSION indicators
+            return NaN. This third case is not currently expected in normal
+            operation (see run_preprocess.md constraints) but is handled
+            identically to the other two for safety.
         """
         ...
 
@@ -202,6 +259,11 @@ class FeatureExtractor:
         Single entry point feature extraction.
         Used in live inference (Inferencer) and visualization.
         halts_df passed explicitly — consistent with extract_batch() pattern.
+        meta: flat {field: value} dict for this single entry point's (ticker, date) —
+            resolved by the caller the same way as extract_batch()'s per-date
+            entries (real value with utils.estimate_historical_meta() fallback
+            per field; sector from most recent snapshot). Not date-keyed here,
+            since a single entry point has exactly one date already.
         session_stats: flat single-date baseline for this entry point's ticker/date.
             Format: {metric: {hour: smoothed_avg_value}} | None
             In live mode, supplied by LiveModeRunner via CachingIndicatorCalculator._session_stats.
@@ -268,6 +330,29 @@ meta_features = {
 
 Monetary fields are log-transformed at feature extraction time.
 Raw values are stored in `stock_meta` — not transformed in DB.
+
+**Source resolution per field (caller responsibility, before meta_features
+computation):** `stock_meta` is keyed `(ticker, date)` — a row/field exists
+only for dates actually crawled. For each of `market_cap`,
+`shares_outstanding`, `price_52h`, `price_52l`, resolved independently per
+field (not per row):
+```
+value = stock_meta.get(ticker, entry_date, field)   # real crawled value, if present
+if value is None:
+    value = utils.estimate_historical_meta(ticker, entry_date, field, db_conn)
+    # derived from ohlcv_1min + corporate_events — see utils.md
+```
+`sector` has no derivation path — always use the most recent available
+`stock_meta` snapshot regardless of entry date (accepted approximation,
+unrelated to corporate-event scale).
+`EntryPointDetector`'s filter E (condition E, turnover rate) uses this same
+`shares_outstanding` resolution via the identical utility — see
+`01_entry_detection.md`.
+
+For `extract_batch()`, this per-field resolution is performed once per
+(ticker, date) by the caller and packaged into the date-keyed `meta`
+parameter described in the Interface section above — not recomputed inside
+FeatureExtractor itself.
 
 ---
 
@@ -409,3 +494,21 @@ They are used by ClassBalancer for pre-balance filtering.
 - Init ConfigurationError if `lookback_days * 390 < max(sr_levels.window_bars, fibonacci.window_bars)`
 - `n_sessions` and `lookback_days` are independent — no constraint between them
   (REFERENCE_SESSION baselines come from precomputed_session_stats, not from bars window)
+- Strategy A bars are corporate-event-adjusted (`utils.adjust_bars_for_corporate_events()`,
+  anchored to the max date in the loaded bars range) before indicator computation —
+  raw, unadjusted bars must never reach IndicatorCalculator via this path; see
+  `data_boundary.md` for the full raw-vs-adjusted boundary
+- `obv`/`ad` require the per-entry-date fallback described in Strategy A whenever
+  a split falls within the loaded bars range for that ticker — this is the only
+  Strategy A indicator pair with this exception
+- `meta_features` fields (`market_cap`, `shares_outstanding`, `price_52h`,
+  `price_52l`) are resolved per-field from `stock_meta(ticker, entry_date)`
+  with fallback to `utils.estimate_historical_meta()` — never from a single
+  global `stock_meta` snapshot; `sector` is the sole exception (no fallback,
+  always most-recent snapshot)
+- `gap_percentile()`'s `dividend_amount` is looked up from `corporate_events`
+  by FeatureExtractor (Strategy D) and passed as a scalar — IndicatorCalculator
+  itself never queries `corporate_events`
+- `extract_batch()`'s `meta` parameter is date-keyed (`{date: {field: value}}`),
+  not a flat per-ticker dict — required because `stock_meta` is `(ticker, date)`-keyed;
+  `extract()`'s `meta` remains flat since it handles exactly one date already

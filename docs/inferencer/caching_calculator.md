@@ -80,6 +80,18 @@ def session_start_compute(self, historical_bars: pd.DataFrame) -> None:
     historical_bars: full lookback window bars up to D-1 (last closed session).
     Covers lookback_days trading days.
 
+    Step 0: Corporate-event bar adjustment (before any indicator computation)
+        historical_bars = utils.adjust_bars_for_corporate_events(
+            historical_bars, self._ticker, reference_date=self._today_date, db_conn
+        )
+        # Anchored to today (self._today_date) — since live mode has exactly
+        # one date in play per session, this is always a no-op unless a split
+        # occurred within the loaded lookback window. No per-entry rescale is
+        # needed afterward (unlike training's Strategy A, which must rescale
+        # per entry date because a single ticker-batch spans many dates) —
+        # here f_e is implicitly 1.0 for every value derived from these bars,
+        # since "today" is the only date being computed against.
+
     Step 1: Layer 1 — fixed indicators
         self._fixed["pivot_points"] = self.pivot_points(historical_bars)
         # gap_pct: deferred to on_regular_session_open()
@@ -308,6 +320,16 @@ Indicators with `precalculate_bars: 0` (vwap, lee_ready, tpm, avg_vol_per_tick, 
 - `sr_levels` is always recomputed fresh in `get_for_entry()` — never stored in Layer 2 cache
 - `gap_pct` is stored as a scalar in Layer 1 after `on_regular_session_open()` — never in Layer 2
 - fibonacci deque state must be initialized from historical_bars in `session_start_compute()` before `on_bar_close()` is called
+- `session_start_compute()` must apply `utils.adjust_bars_for_corporate_events()`
+  (Step 0) before computing Layer 1/Layer 2 — this is unconditional, not
+  optional, though it is a no-op for the vast majority of tickers/days
+- `obv`/`ad`'s training-specific per-entry-date fallback (see
+  `04_feature_extractor.md` Strategy A) does not apply here: live mode
+  recomputes `historical_bars` fresh each session from a short
+  `lookback_days` window, uniformly anchored to today via Step 0 — there is
+  no multi-date range within a single `session_start_compute()` call for a
+  split to fall between, unlike training's ticker-batch spanning many
+  historical entry dates
 - Thread safety of `_cache` and `_fixed` dicts is the responsibility of LiveModeRunner
   (single-threaded access recommended; parallel session_start_compute() across tickers is safe
   as instances share no state)
