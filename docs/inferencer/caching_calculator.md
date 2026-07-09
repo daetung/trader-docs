@@ -32,11 +32,19 @@ class CachingIndicatorCalculator(IndicatorCalculator):
         then incrementally updated as today's bars arrive.
         fibonacci: monotonic deque — O(1) update per bar.
 
-    Not cached (computed on demand):
+    Not cached (computed on demand, session-only by default):
         sr_levels: per-entry-point recomputation via get_for_entry()
                    (scipy prominence is not incrementally computable)
-        vwap, lee_ready, tpm, avg_vol_per_tick: SESSION_RESET or tick-based;
-                   precalculate_bars=0 — computed bar-by-bar from today's data
+        vwap: SESSION_RESET — always bar-by-bar, no lookback option
+        lee_ready, tpm, avg_vol_per_tick (and other tick-derived indicators —
+                   see 02_indicator_calculator.md's Tick-Derived Indicator
+                   Scale Sensitivity registry): default precalculate_bars=0,
+                   computed bar-by-bar from today's ticks; precalculate_bars:
+                   "lookback" is also a valid per-indicator config, in which
+                   case Layer 2 IS seeded at session start from
+                   tick_bar_history (see session_start_compute() Step 2b
+                   below) — these are not permanently uncacheable, only
+                   session-only by default
     """
 ```
 
@@ -70,15 +78,27 @@ self._cache: dict[str, pd.DataFrame]
 
 ## Methods
 
-### `session_start_compute(historical_bars)`
+### `session_start_compute(historical_bars, tick_bar_history=None)`
 
 Called once by LiveModeRunner at session start (before market open).
 
 ```python
-def session_start_compute(self, historical_bars: pd.DataFrame) -> None:
+def session_start_compute(
+    self,
+    historical_bars: pd.DataFrame,
+    tick_bar_history: pd.DataFrame | None = None,
+) -> None:
     """
     historical_bars: full lookback window bars up to D-1 (last closed session).
     Covers lookback_days trading days.
+    tick_bar_history: wide-format tick-derived indicator history (one column
+        per indicator), for whichever tick-derived indicators are configured
+        with precalculate_bars: "lookback" (02_indicator_calculator.md). Loaded
+        by the SAME per-ticker parallel Eager Pool worker that loads
+        historical_bars — via utils.load_tick_bar_aggregates_with_history() —
+        not staggered across a separate round; both must be available before
+        this call. None if no indicator in config uses "lookback" for its
+        tick-derived precalculate_bars value.
 
     Step 0: Corporate-event bar adjustment (before any indicator computation)
         historical_bars = utils.adjust_bars_for_corporate_events(
@@ -91,12 +111,17 @@ def session_start_compute(self, historical_bars: pd.DataFrame) -> None:
         # per entry date because a single ticker-batch spans many dates) —
         # here f_e is implicitly 1.0 for every value derived from these bars,
         # since "today" is the only date being computed against.
+        # tick_bar_history is NOT adjusted at this step — it stays raw/native
+        # per its own date, same as training; correction (where scale_type
+        # requires it) happens downstream via
+        # utils.adjust_tick_derived_series_for_corporate_events(), anchored
+        # to entry_date, at FeatureExtractor's slicing step — not here.
 
     Step 1: Layer 1 — fixed indicators
         self._fixed["pivot_points"] = self.pivot_points(historical_bars)
         # gap_pct: deferred to on_regular_session_open()
 
-    Step 2: Layer 2 — precalculate from config
+    Step 2: Layer 2 — precalculate from config (bar-derived indicators)
         For each indicator where config.precalculate_bars > 0:
             "lookback" → use historical_bars[-lookback_days*390:]
             "window"   → use historical_bars[-window_bars:]
@@ -107,6 +132,15 @@ def session_start_compute(self, historical_bars: pd.DataFrame) -> None:
         fibonacci special case:
             Initialize monotonic deque from historical_bars.
             self._fib_max_deque, self._fib_min_deque ready for O(1) updates.
+
+    Step 2b: Layer 2 — precalculate from tick_bar_history (tick-derived
+             indicators with precalculate_bars: "lookback" only)
+        For each tick-derived indicator configured "lookback":
+            self._cache[indicator] = tick_bar_history[indicator column]
+        Indicators still configured 0 (the default) are unaffected — they
+        remain in the session-only, on_bar_close()-accumulated path below.
+        If tick_bar_history is None (no indicator uses "lookback"), this
+        step is a no-op.
     """
 ```
 
@@ -152,8 +186,17 @@ def on_bar_close(
         Accumulate cumsum(typical_price * volume), cumsum(volume)
         → vwap value for this bar appended to self._cache["vwap"]
 
-    For lee_ready, tpm, avg_vol_per_tick (tick-based):
+    For lee_ready, tpm, avg_vol_per_tick, and other tick-derived indicators
+    configured precalculate_bars: 0 (default — see 02_indicator_calculator.md's
+    Tick-Derived Indicator Scale Sensitivity registry for the current set,
+    e.g. vol_weighted_buy_ratio, avg_delta_per_tick, tick_realized_vol,
+    path_efficiency, vol_concentration, tick_burstiness):
         Process ticks_for_bar → append bar aggregation to cache
+
+    For tick-derived indicators configured precalculate_bars: "lookback":
+        Same bar-by-bar accumulation as above — Step 2b only affects the
+        session_start_compute() seed value; on_bar_close()'s per-bar
+        aggregation logic is identical either way.
 
     For sr_levels:
         NOT updated here — computed on demand in get_for_entry()
@@ -339,3 +382,13 @@ Indicators with `precalculate_bars: 0` (vwap, lee_ready, tpm, avg_vol_per_tick, 
   `load_from_db()` does not restore `_session_stats`
 - After `persist_to_db()`, instance may be released from RAM
 - After `load_from_db()`, `set_session_stats()` must be called before any use
+- `session_start_compute()`'s `tick_bar_history` parameter and Step 2b affect
+  only WHICH bars seed `self._cache` for tick-derived indicators configured
+  `precalculate_bars: "lookback"` — `persist_to_db()`/`load_from_db()`
+  serialize/restore `self._cache` generically regardless of what seeded it,
+  so no change to either method is required by this parameter's addition
+- `utils.load_tick_bar_aggregates_with_history()`'s 3-tier fallback (cache
+  hit / on-the-fly compute / genuine data absence — see utils.md) is
+  resolved entirely within that utility, before `tick_bar_history` reaches
+  this module — `session_start_compute()` always receives a ready-to-use
+  wide DataFrame (or `None`), never a tier indicator

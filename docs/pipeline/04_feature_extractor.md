@@ -110,47 +110,94 @@ Different strategies apply per indicator category:
 
 ```
 Strategy A — ticker당 1회 계산 (CONTINUOUS indicators):
-    0. Corporate-event bar adjustment (before indicator computation):
-       reference_date = max date present in the bars DataFrame for this call
-       adj_bars = utils.adjust_bars_for_corporate_events(bars, ticker,
-                      reference_date, db_conn)
-       (single vectorized pass against corporate_events, a small table —
-        no-op / near-zero cost for the vast majority of tickers with no
-        split in the loaded range)
-    1. Compute indicators once for the full ticker adj_bars DataFrame
-       → dict[str, pd.DataFrame]  (time-series per indicator)
-    2. For each entry point in entry_points:
-       a. Slice indicator time-series up to t-1 bar (by hour index)
-       a2. Scale-type rescale (only when f_e != 1.0 for this entry — see below):
-           f_e = cum_split_ratio(entry_date, reference_date)  (1.0 if no split
-                 between entry_date and reference_date — the common case)
-           if f_e != 1.0: apply per 02_indicator_calculator.md's
-                 "Corporate Event Scale Sensitivity" table —
-                 scale_type=price   → sliced value *= f_e
-                 scale_type=volume  → sliced value /= f_e
-                 scale_type=invariant → no change
-       b. Apply Vectorizer to sliced (and rescaled, if applicable) series
-          → feature vector
-    Applies to: ma, ema, macd, rsi, atr, bb, adx, dmi, sar, vr_volume,
-                obv, ad, vwap, roll_spread, hl_spread, lee_ready, tpm,
-                avg_vol_per_tick, rvol (today series), rel_dvol (today series),
-                intra_season_{metric} (today series)
 
-    obv/ad exception: both are unbounded cumulative sums (no session reset),
-    so step 0's single-pass adjustment is only valid for tickers/date-ranges
-    with no split inside the loaded bars range. When corporate_events shows a
-    split within [bars.date.min(), reference_date] for this ticker,
-    extract_batch() falls back to per-entry-date recomputation for obv/ad
-    specifically: re-run adjust_bars_for_corporate_events() with
-    reference_date=entry_date on bars up to that entry, then compute obv/ad
-    fresh for that entry (no step 2a2 rescale needed in the fallback path,
-    since the bars are already anchored to the entry's own date). All other
-    Strategy A indicators are self-referential within their own transform
-    (statistical_summary, rate_of_change, linear_trend, window_comparison,
-    shape_features all operate on the series' own internal shape — see
-    03_vectorizer.md) and do not need this fallback; step 2a2 rescale is
-    sufficient for them since none of these five transforms compare a raw,
-    unadjusted external reference against the indicator series.
+    Bar-derived (adj_bars; anchored to reference_date):
+        0. Corporate-event bar adjustment (before indicator computation):
+           reference_date = max date present in the bars DataFrame for this call
+           adj_bars = utils.adjust_bars_for_corporate_events(bars, ticker,
+                          reference_date, db_conn)
+           (single vectorized pass against corporate_events, a small table —
+            no-op / near-zero cost for the vast majority of tickers with no
+            split in the loaded range)
+        1. Compute indicators once for the full ticker adj_bars DataFrame
+           → dict[str, pd.DataFrame]  (time-series per indicator)
+        2. For each entry point in entry_points:
+           a. Slice indicator time-series up to t-1 bar (by hour index)
+           a2. Scale-type rescale (only when f_e != 1.0 for this entry — see below):
+               f_e = cum_split_ratio(entry_date, reference_date)  (1.0 if no split
+                     between entry_date and reference_date — the common case)
+               if f_e != 1.0: apply per 02_indicator_calculator.md's
+                     "Corporate Event Scale Sensitivity" table —
+                     scale_type=price   → sliced value *= f_e
+                     scale_type=volume  → sliced value /= f_e
+                     scale_type=invariant → no change
+           b. Apply Vectorizer to sliced (and rescaled, if applicable) series
+              → feature vector
+        Applies to: ma, ema, macd, rsi, atr, bb, adx, dmi, sar, vr_volume,
+                    obv, ad, vwap, roll_spread, hl_spread,
+                    rvol (today series), rel_dvol (today series),
+                    intra_season_{metric} (today series)
+
+        obv/ad exception: both are unbounded cumulative sums (no session reset),
+        so step 0's single-pass adjustment is only valid for tickers/date-ranges
+        with no split inside the loaded bars range. When corporate_events shows a
+        split within [bars.date.min(), reference_date] for this ticker,
+        extract_batch() falls back to per-entry-date recomputation for obv/ad
+        specifically: re-run adjust_bars_for_corporate_events() with
+        reference_date=entry_date on bars up to that entry, then compute obv/ad
+        fresh for that entry (no step 2a2 rescale needed in the fallback path,
+        since the bars are already anchored to the entry's own date). All other
+        bar-derived Strategy A indicators are self-referential within their own
+        transform (statistical_summary, rate_of_change, linear_trend,
+        window_comparison, shape_features all operate on the series' own
+        internal shape — see 03_vectorizer.md) and do not need this fallback;
+        step 2a2 rescale is sufficient for them since none of these five
+        transforms compare a raw, unadjusted external reference against the
+        indicator series.
+
+    Tick-derived (raw ticks; never adj_bars-anchored — tick_10 is never
+    adjusted, in any consumer, so this bar-derived pipeline's premise does
+    not apply — see 02_indicator_calculator.md's Tick-Derived Indicator Scale
+    Sensitivity registry and data_boundary.md):
+        1. Compute per-bar values once for the full ticker's raw ticks
+           (same "ticker당 1회" efficiency as bar-derived, but no adj_bars step)
+           → dict[str, pd.DataFrame]
+        2. For each entry point in entry_points:
+           a. Slice to t-1 bar (by hour index)
+           a2'. Tick-derived correction dispatch (replaces step 2a2 above for
+                these indicators specifically):
+               scale_type = registry lookup in 02_indicator_calculator.md's
+                   Tick-Derived Indicator Scale Sensitivity table
+               sliced = utils.adjust_tick_derived_series_for_corporate_events(
+                   sliced, ticker, entry_date, scale_type, db_conn
+               )
+               (anchored directly to entry_date — no reference_date detour,
+               since these series were never reference_date-anchored to begin
+               with; invariant-type indicators pass through this call as a
+               no-op, so all tick-derived indicators share one dispatch path
+               regardless of scale_type)
+           a3'. Reindex to the full expected bar index for the sliced window
+                (same bar index bars/adj_bars uses for this ticker/date range)
+                before applying step a2'. A (ticker, date, hour) with zero
+                tick bundles (halt / no-trade slot) has no row in
+                tick_bar_aggregates for any indicator (see db_schema.md) —
+                reindexing surfaces this as an explicit NaN at that position,
+                rather than silently shrinking the window handed to
+                Vectorizer's window_comparison/statistical_summary (which
+                would understate the true window length and skew the
+                resulting mean/std/ratio). Applies identically whether the
+                slice was sourced from tick_bar_aggregates directly or via
+                the Tier 2 on-the-fly fallback in
+                utils.load_tick_bar_aggregates_with_history().
+           b. Apply Vectorizer to corrected series → feature vector
+        Applies to: current tick-derived indicators registered in
+                    02_indicator_calculator.md's Tick-Derived Indicator Scale
+                    Sensitivity table (tpm, avg_vol_per_tick, lee_ready's
+                    outputs, vol_weighted_buy_ratio, avg_delta_per_tick,
+                    tick_realized_vol, path_efficiency, vol_concentration,
+                    tick_burstiness) — registering a new tick-derived indicator
+                    there is sufficient to route it through this dispatch;
+                    no FeatureExtractor code change needed per new indicator.
 
 Strategy B — ticker당 1회 (monotonic deque):
     fibonacci_retracement: computed in a single O(N) pass over all ticker bars
@@ -182,11 +229,16 @@ Strategy D — date당 1회 스칼라 (gap_percentile only):
     Inserted directly into feature vector as "gap_pct" (no Vectorizer step).
 
 Strategy E — session_stats lookup (REFERENCE_SESSION baselines):
-    rvol, rel_dvol, intraday_seasonality baselines loaded from
-    session_stats dict (pre-loaded from precomputed_session_stats table).
-    Baseline is pre-smoothed per delta_minutes at session_stats load time.
-    extract_batch() selects session_stats[entry_date] for each entry point,
-    then passes the flat {metric: {hour: value}} dict to IndicatorCalculator.
+    rvol, rel_dvol, intraday_seasonality, relative_avg_vol_per_tick baselines
+    loaded from session_stats dict (pre-loaded from precomputed_session_stats
+    table). Baseline is pre-smoothed per delta_minutes at session_stats load
+    time. extract_batch() selects session_stats[entry_date] for each entry
+    point, then passes the flat {metric: {hour: value}} dict to
+    IndicatorCalculator. relative_avg_vol_per_tick reads
+    session_stats["intra_avg_vol_per_tick_baseline"] — sourced from
+    tick_bar_aggregates (see db_schema.md, utils.md
+    populate_precomputed_session_stats()), not computed from raw ticks at
+    this layer.
 ```
 
 ---
@@ -325,11 +377,58 @@ meta_features = {
                                         # unknown sector → 0
                                         # known sectors → 1, 2, 3, ...
                                         # registered as LightGBM categorical
+
+    # Fundamentals-derived (yield form — see rationale below), from
+    # fundamentals_quarterly (db_schema.md) via utils.get_ttm_value() /
+    # utils.estimate_historical_meta()-style as-of lookup. All as-of
+    # filed_date <= entry_date (data_boundary.md point-in-time principle).
+    # NaN if the underlying fundamentals_quarterly data is unavailable for
+    # this ticker/date — LightGBM handles natively, no imputation.
+    "earnings_yield":          float,   # utils.get_ttm_value(ticker, date, "net_income", ...)
+                                        # / market_cap
+    "book_to_price":           float,   # most-recent as-of stockholders_equity
+                                        # / market_cap
+    "sales_to_price":          float,   # utils.get_ttm_value(ticker, date, "revenue", ...)
+                                        # / market_cap
+    "dilution_rate":           float,   # QoQ shares_outstanding change rate — see
+                                        # "dilution_rate computation" below
+    "cash_to_mcap":            float,   # most-recent as-of cash / market_cap
+    "debt_to_mcap":            float,   # most-recent as-of total_liabilities / market_cap
 }
 ```
 
 Monetary fields are log-transformed at feature extraction time.
 Raw values are stored in `stock_meta` — not transformed in DB.
+
+**Fundamentals yield-form rationale:** this system's universe ($20-and-under
+tickers) has a high proportion of unprofitable or negative-book-value
+companies. Direct-form ratios (PER = price/earnings, PBR = price/book) are
+ill-defined or numerically explosive when the denominator is near zero or
+negative. Inverting to price-in-the-denominator form (earnings/price,
+book/price) keeps the feature well-behaved and numerically stable across
+the full range, including negative values, which remain meaningful signal
+(a very negative `earnings_yield` is a real, valid data point — not an
+error) rather than an edge case requiring special handling.
+
+**dilution_rate computation:**
+```
+shares_t   = most recent fundamentals_quarterly shares_outstanding as-of
+             entry_date's filing quarter
+shares_t_1 = the PRIOR quarter's filed shares_outstanding value
+ratio      = cum_split_ratio(ticker, shares_t_1's fiscal_period_end,
+                             shares_t's fiscal_period_end, db_conn)
+dilution_rate = (shares_t / (shares_t_1 * ratio)) - 1
+```
+The `cum_split_ratio()` correction is required for the same reason as
+Strategy A's `f_e` rescale (see above): a real stock split between the two
+quarters would otherwise appear as a spurious multi-hundred-percent
+"dilution" (e.g. a 4:1 split reads as shares_t / shares_t_1 ≈ 4.0), when no
+actual share issuance occurred. `dilution_rate` is this system's most
+directly relevant fundamentals feature — QoQ share-count changes from
+registered-direct offerings and ATM programs are a primary driver of this
+universe's low-float volatility, and the split correction ensures the
+feature isolates genuine issuance/buyback activity from mechanical
+share-count changes.
 
 **Source resolution per field (caller responsibility, before meta_features
 computation):** `stock_meta` is keyed `(ticker, date)` — a row/field exists
@@ -512,3 +611,13 @@ They are used by ClassBalancer for pre-balance filtering.
 - `extract_batch()`'s `meta` parameter is date-keyed (`{date: {field: value}}`),
   not a flat per-ticker dict — required because `stock_meta` is `(ticker, date)`-keyed;
   `extract()`'s `meta` remains flat since it handles exactly one date already
+- Fundamentals-derived meta features (`earnings_yield`, `book_to_price`,
+  `sales_to_price`, `dilution_rate`, `cash_to_mcap`, `debt_to_mcap`) resolve
+  `fundamentals_quarterly` as-of `filed_date <= entry_date`, never
+  `fiscal_period_end` — see `data_boundary.md`'s point-in-time principle;
+  NaN (not an error) if no eligible filing exists as of `entry_date`
+- `dilution_rate`'s two-quarter shares_outstanding comparison must apply
+  `cum_split_ratio()` between the two filing dates before computing the QoQ
+  ratio — a real split between quarters must not read as spurious dilution
+  (same correction principle as Strategy A's `f_e` rescale, applied here to
+  a fundamentals feature rather than a bar-derived indicator)

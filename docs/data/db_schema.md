@@ -57,7 +57,9 @@ Field mapping (applies to both 1min and 10tick):
 - `data_root` is configurable (CLI argument or config file)
 - Both directory and zip formats are supported
 - Duplicate detection: if `(ticker, date, resolution)` already exists in DuckDB, the file is skipped
-- **No time-of-day filtering at ingestion** — all bars including pre-market and after-market are stored
+- **No session-of-day filtering at ingestion** — all bars across pre-market, regular,
+  and after-market sessions (`hour` 040000~200000) are stored; overnight (outside
+  this range) is excluded — see `migrate_json_to_duckdb.py`'s time-range filter
 
 ---
 
@@ -93,13 +95,46 @@ CREATE TABLE tick_10 (
     PRIMARY KEY (ticker, date, hour, seq_id)
 );
 
+-- Bar-level cache of tick-derived indicator primitives (EAV — new `indicator`
+-- values register without a schema change; mirrors indicator_cache's shape
+-- but is a PERSISTENT, growing historical store like ohlcv_1min /
+-- precomputed_session_stats, not a session-purged transient cache).
+-- Populated offline (collect_daily.py, via utils.compute_tick_bar_aggregates(),
+-- which calls the SAME IndicatorCalculator functions used everywhere else —
+-- not a reimplementation, so cached and on-the-fly values cannot diverge).
+-- Values are RAW/native-scale for that bar's own date. Correction to a
+-- specific entry's basis happens downstream via
+-- utils.adjust_tick_derived_series_for_corporate_events() — identically
+-- whether the value came from this table or the Tier-2 on-the-fly fallback
+-- in utils.load_tick_bar_aggregates_with_history().
+-- A (ticker, date, hour) with zero ticks (halt / no-trade slot) has no row
+-- for any indicator — callers reindex against the full expected bar index
+-- (same one used for bars) so gaps surface as explicit NaN, never a silently
+-- shortened window (see 02_indicator_calculator.md Tick-Derived Indicator
+-- Scale Sensitivity).
+CREATE TABLE tick_bar_aggregates (
+    ticker      VARCHAR NOT NULL,
+    date        VARCHAR NOT NULL,
+    hour        VARCHAR NOT NULL,   -- bar open time, 'HHMMSS'
+    indicator   VARCHAR NOT NULL,   -- 'tpm' | 'avg_vol_per_tick' | 'buyer_initiated_ratio' |
+                                    -- 'vol_weighted_buy_ratio' | 'avg_delta_per_tick' |
+                                    -- 'tick_realized_vol' | 'path_efficiency' |
+                                    -- 'vol_concentration' | 'tick_burstiness'
+    value       DOUBLE,             -- NULL if indicator undefined for this bar
+                                    -- (e.g. <2 tick bundles for a delta/interval-based
+                                    -- indicator — see 02_indicator_calculator.md)
+    PRIMARY KEY (ticker, date, hour, indicator)
+);
+
 -- Stock metadata (crawled daily; append-only per date — see metadata_crawler.md)
 -- PRIMARY KEY includes date: a row exists only for dates actually crawled.
 -- Dates before schema deployment, or individual fields that failed to crawl on
 -- a given date, have no row / no value here — callers fall back to
 -- utils.estimate_historical_meta(), applied per FIELD (not per row):
---   shares_outstanding, market_cap, price_52h, price_52l — derived from
---     ohlcv_1min + corporate_events when the real crawled value is unavailable
+--   shares_outstanding, market_cap, price_52h, price_52l — when the real
+--     crawled value is unavailable, derived from ohlcv_1min + corporate_events,
+--     or from fundamentals_quarterly (see below) where that source covers
+--     the metric
 --   sector — has no derivation path; callers always use the most recent
 --     available snapshot regardless of entry date (accepted approximation)
 -- FeatureExtractor's MetaFeatures and EntryPointDetector's filter E (condition E)
@@ -117,10 +152,54 @@ CREATE TABLE stock_meta (
     PRIMARY KEY (ticker, date)
 );
 
+-- CIK (SEC identifier) mapping per ticker, upserted daily from SEC's
+-- company_tickers.json. Backs both ticker-rename auto-detection (a rename
+-- keeps the same CIK; a merger/spin-off does not) and fundamentals_quarterly's
+-- lookup key. first_seen/last_seen let a (cik, ticker) pairing be recognized
+-- as historical vs. current without deleting superseded rows.
+CREATE TABLE ticker_cik_map (
+    cik             VARCHAR NOT NULL,
+    ticker          VARCHAR NOT NULL,
+    first_seen_date VARCHAR NOT NULL,   -- 'YYYYMMDD', first observed
+    last_seen_date  VARCHAR NOT NULL,   -- 'YYYYMMDD', most recent observed (upsert-refreshed)
+    PRIMARY KEY (cik, ticker)
+);
+
+-- Quarterly/annual fundamentals from SEC EDGAR XBRL companyfacts (EAV — new
+-- `metric` values register without a schema change). Sourced via
+-- ticker_cik_map. Point-in-time correctness depends on `filed_date`, not
+-- `fiscal_period_end` — see data_boundary.md.
+CREATE TABLE fundamentals_quarterly (
+    ticker            VARCHAR NOT NULL,
+    cik               VARCHAR NOT NULL,
+    fiscal_period_end VARCHAR NOT NULL,   -- 'YYYYMMDD', reporting period end
+    filed_date        VARCHAR NOT NULL,   -- 'YYYYMMDD', filing date — as-of queries
+                                          -- must filter on this, not fiscal_period_end,
+                                          -- to avoid using pre-disclosure information
+    metric            VARCHAR NOT NULL,   -- 'shares_outstanding' | 'net_income' |
+                                          -- 'stockholders_equity' | 'revenue' |
+                                          -- 'eps_diluted' | 'total_assets' |
+                                          -- 'total_liabilities' | 'cash' |
+                                          -- 'operating_income' | 'operating_cash_flow'
+    period_months     INTEGER,            -- NULL = instant (shares_outstanding,
+                                          -- stockholders_equity, total_assets, etc.);
+                                          -- 3 = quarterly duration; 12 = annual duration
+                                          -- (Q4-only duration values are derived at
+                                          -- read time as FY - (Q1+Q2+Q3), never stored)
+    value             DOUBLE  NOT NULL,
+    PRIMARY KEY (ticker, fiscal_period_end, metric, filed_date)
+);
+
 -- Ticker symbol rename history (plain renames only — mergers/spin-offs excluded,
 -- since those are treated as distinct securities, not continuations).
--- No automated registration yet — manual SQL insert only. See Open Items:
--- ticker rename auto-registration (registration API/CLI design deferred).
+-- effective_date provenance: detected at premarket from a ticker_cik_map
+-- mapping change (best-effort estimate, since that day's ohlcv_1min does not
+-- exist yet), then self-corrected the same evening once ohlcv_1min for the
+-- new ticker is actually available (see metadata_crawler.md). Ambiguous or
+-- CIK-unmatched cases (e.g. tickers not registered with the SEC) are not
+-- auto-registered — logged to tools/rename_candidates.log for manual review
+-- via the same CLI used for manual entry (see metadata_crawler.md
+-- --register-rename / --list-rename-candidates).
 -- Used by utils.get_ticker_history() / load_ohlcv_with_history() to stitch
 -- pre-rename bars into a continuous series addressed under the current symbol.
 CREATE TABLE ticker_history (
@@ -174,7 +253,9 @@ CREATE TABLE ticker_data_coverage (
 -- so that baselines remain consistent with current share/price scale — see
 -- utils.md populate_precomputed_session_stats() for the adjustment formulas.
 -- Also used by adjust_bars_for_corporate_events() (utils.md) for split-scale
--- correction of raw bars feeding CONTINUOUS/cumulative indicators, and by
+-- correction of raw bars feeding CONTINUOUS/cumulative indicators, by
+-- adjust_tick_derived_series_for_corporate_events() (utils.md) for the
+-- entry-date-direct correction of tick-derived indicator series, and by
 -- gap_percentile() / dead-position pnl (labeler.md, backtest_engine.md) for
 -- scalar dividend/split adjustment across overnight boundaries.
 CREATE TABLE corporate_events (
@@ -367,6 +448,10 @@ CREATE TABLE precomputed_session_stats (
     --   "intra_return_baseline": prior N sessions avg price_return at this hour slot
     --   "intra_tpm_baseline"   : prior N sessions avg tpm at this hour slot
     --   "buy_ratio_baseline"   : prior N sessions avg buy_ratio at this hour slot (tick-derived)
+    --   "intra_avg_vol_per_tick_baseline" : prior N sessions avg avg_vol_per_tick at this
+    --                            hour slot (tick-derived; sourced from tick_bar_aggregates,
+    --                            same as buy_ratio_baseline/intra_tpm_baseline — see
+    --                            utils.md populate_precomputed_session_stats() D.)
     --   "gap_pct_mean"         : prior N sessions gap mean  (hour='000000')
     --   "gap_pct_std"          : prior N sessions gap std   (hour='000000')
     n_sessions  INTEGER  NOT NULL,
@@ -602,7 +687,9 @@ exp_results = con.execute("""
 ## Ingestion Rules
 
 - All numeric fields from JSON are stored as strings → cast to DOUBLE/BIGINT on insert
-- **No time-of-day filter** — all bars (pre-market, regular, after-market) are stored
+- **No session filtering** — all sessions (pre-market, regular, after-market;
+  `hour` 040000~200000) are stored; overnight is excluded by the ingestion
+  time-range filter — see `migrate_json_to_duckdb.py` / `metadata_crawler.md`
 - `seq_id` for tick_10: assigned as row-order index within each `(ticker, date, hour)` group, starting from 0
 - Duplicate skip: check existence of `(ticker, date)` pair in target table before inserting; skip entire file if already present
 - entry_points table: INSERT OR IGNORE — written by both Preprocessor (training) and Inferencer (live)

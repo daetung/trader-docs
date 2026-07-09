@@ -75,8 +75,8 @@ Actual lookback per indicator is configured in `configs/pipeline_config.yaml`.
 
 ## REFERENCE_SESSION Indicator Boundary
 
-REFERENCE_SESSION indicators (rvol, rel_dvol, gap_percentile, intraday_seasonality)
-use prior session data as a statistical baseline.
+REFERENCE_SESSION indicators (rvol, rel_dvol, gap_percentile, intraday_seasonality,
+relative_avg_vol_per_tick) use prior session data as a statistical baseline.
 
 ```
 Prior session bars used as baseline:
@@ -128,21 +128,54 @@ correctness bug: feeding adjusted bars where raw is required corrupts actual
 market-price/volume filters; feeding raw bars where adjustment is required
 reintroduces the split-discontinuity problems this boundary exists to prevent.
 
+The categories below are defined by **consumer**, not by table — the same
+underlying table (`ohlcv_1min` or `tick_10`) is read raw by some consumers and
+adjusted (via a copy) by others; neither utility ever mutates the source table.
+
 ```
-Raw bars/ticks (adjustment forbidden — must reflect actual traded values):
+Raw (adjustment forbidden for these consumers — must reflect actual traded values):
     EntryPointDetector (filters operate on actual traded price/volume that day)
     Labeler's same-day breach tracking (track_label_breach, build_effective_bar_sequence)
     BacktestEngine's fill/exit simulation (find_fill_bundle, simulate_exit_fill)
-    tick_10 — never adjusted, in any consumer
     P_entry — always the literal t bar open price, never adjusted
 
-Adjusted bars (utils.adjust_bars_for_corporate_events() applied before use):
-    FeatureExtractor/IndicatorCalculator input, all Strategy A/B indicators
-        (anchored to the max date in the loaded range — today for live mode,
-        the ticker's last loaded date for training; see 04_feature_extractor.md)
-    caching_calculator.md session_start_compute() (anchored to today)
-    populate_precomputed_session_stats() prior-session values, adjusted
-        in place before aggregation into avg_value/std_value (utils.md D.)
+Note: this is a consumer-level guarantee, not a table-level one. The
+ohlcv_1min/tick_10 source tables themselves are never modified by either
+adjustment utility below (both return a new copy) — tick_10 is just as
+eligible as ohlcv_1min to be adjusted *within* the FeatureExtractor/
+IndicatorCalculator layer (see "Adjusted" below). Only the consumers listed
+above must never receive an adjusted value.
+
+Adjusted (FeatureExtractor/IndicatorCalculator layer — covers both bar-derived
+and tick-derived series; both utilities below return a new copy, never
+mutating the source table):
+
+    Bar-derived, reference_date-anchored (utils.adjust_bars_for_corporate_events()):
+        FeatureExtractor/IndicatorCalculator input, all Strategy A/B indicators
+            (anchored to the max date in the loaded range — today for live mode,
+            the ticker's last loaded date for training; see 04_feature_extractor.md)
+        caching_calculator.md session_start_compute() (anchored to today)
+        populate_precomputed_session_stats() prior-session values, adjusted
+            in place before aggregation into avg_value/std_value (utils.md D.)
+
+    Tick-derived, entry_date-direct-anchored
+    (utils.adjust_tick_derived_series_for_corporate_events()):
+        FeatureExtractor's tick-derived Strategy A indicators — see
+            02_indicator_calculator.md's "Tick-Derived Indicator Scale
+            Sensitivity" registry for the current list and each one's
+            scale_type; anchored directly to entry_date (ticks were never
+            reference_date-anchored to begin with, so no reference_date
+            detour is needed)
+
+    General principle: any indicator computed inside this layer may be
+    adjusted regardless of which source table it reads from, and several
+    indicators may share a single cum_split_ratio() lookup. The only two
+    conditions that must hold are (a) the source tables (ohlcv_1min,
+    tick_10) are never mutated, and (b) no consumer in the "Raw" category
+    above ever receives an adjusted value. As long as both hold, registering
+    a new bar- or tick-derived indicator for adjustment requires no revision
+    to this file — registering its scale_type in
+    02_indicator_calculator.md's taxonomy is sufficient.
 
 Scalar corrections (neither raw-only nor bar-adjusted — a single value
 derived from corporate_events applied at one specific comparison point):
@@ -160,8 +193,16 @@ floor, a ±3pp move from the day's own P_entry) — the actual traded value IS
 the correct value for these checks, on its own scale, with no cross-date
 comparison involved. Adjustment only matters where values from DIFFERENT
 dates are compared against each other on a common scale (indicator lookback
-windows, prior-session baselines) — which is exactly the "adjusted bars"
-category above, and nowhere else.
+windows, prior-session baselines) — which is exactly the "adjusted" category
+above, and nowhere else.
+
+**Point-in-time correctness for fundamentals** is a related but distinct
+concern from corporate-event scale adjustment: `fundamentals_quarterly`
+values must be read as-of a date using `filed_date` (when the market could
+have known the value), never `fiscal_period_end` (the period the value
+describes) — filtering on the latter would leak pre-disclosure information
+into features computed for dates before the filing existed. See
+`utils.md`'s TTM/as-of helpers and `db_schema.md`'s `fundamentals_quarterly`.
 
 ---
 
@@ -231,7 +272,9 @@ tick_10 `hour` field represents the **last tick** timestamp of each 10-tick bund
 
 10-tick data is used for three purposes:
 
-1. **Auxiliary indicator input** — TPM, avg_vol_per_tick, and derived features.
+1. **Auxiliary indicator input** — TPM, avg_vol_per_tick, and other tick-derived
+   indicators (see 02_indicator_calculator.md's Tick-Derived Indicator Scale
+   Sensitivity registry for the current set).
    Computed from ticks with timestamp < t bar open only.
 
 2. **Label breach detection** — ticks from t bar onward used by Labeler via
@@ -244,8 +287,9 @@ tick_10 `hour` field represents the **last tick** timestamp of each 10-tick bund
    Backtest-only; must not feed into the feature pipeline.
 
 4. **REFERENCE_SESSION baseline (offline)** — prior session 10-tick data used by
-   `populate_precomputed_session_stats()` to compute buy_ratio_baseline and
-   intra_tpm_baseline via Lee-Ready classification.
+   `populate_precomputed_session_stats()`, sourced from `tick_bar_aggregates`
+   (see db_schema.md), to compute buy_ratio_baseline, intra_tpm_baseline, and
+   intra_avg_vol_per_tick_baseline.
    Computed offline (migration/daily update); not computed at runtime.
 
 ```
@@ -259,7 +303,8 @@ tick_10 `hour` field represents the **last tick** timestamp of each 10-tick bund
 
 ## Session Mode and Data Coverage
 
-All data is stored without time-of-day filtering.
+All data is stored without session-of-day filtering beyond the 040000~200000
+ingestion range (see db_schema.md Ingestion Rules).
 Pre-market, regular session, and after-market bars are all ingested and available.
 
 Session mode (`entry_detector.session_mode`) controls which entry points are used during training:
@@ -297,14 +342,15 @@ Applied in `load_session_stats()` at load time — not stored separately in prec
 | 10-tick within t bar | NO | YES (track_label_breach) | YES (entry slippage) | — |
 | 10-tick within exit bar | NO | YES (track_label_breach) | YES (exit slippage) | — |
 | Prior session bars (all) | NO (not in bars input) | — | — | YES (baseline) |
-| Prior session 10-tick | NO | — | — | YES (buy_ratio, tpm) |
+| Prior session 10-tick | NO | — | — | YES (buy_ratio, tpm, avg_vol_per_tick) |
 
 Corporate-event (split/dividend) adjustment is a separate, orthogonal axis not
 shown in this table — see "Corporate Event Adjustment Boundary" above. As a
 quick reference: every row that reads from `ohlcv_1min`/`tick_10` directly for
 same-day use (Label Calculation, Backtest Only columns) stays raw; every row
 consumed via FeatureExtractor/IndicatorCalculator or session-stats baselines
-is bar-adjusted.
+is adjusted via `adjust_bars_for_corporate_events()` or
+`adjust_tick_derived_series_for_corporate_events()`, as appropriate to its source.
 
 ---
 
@@ -331,10 +377,14 @@ Before submitting any module, verify:
 - [ ] gap_percentile returns NaN for t="093000" or pre-market entries (not an error)
 - [ ] Dead position lookup uses has_data=TRUE filter (not is_trading_day)
 - [ ] EntryPointDetector and Labeler/BacktestEngine's same-day tracking read
-       raw bars/ticks only — never `adjust_bars_for_corporate_events()` output
+       raw bars/ticks only — never `adjust_bars_for_corporate_events()` or
+       `adjust_tick_derived_series_for_corporate_events()` output
 - [ ] FeatureExtractor/IndicatorCalculator and `populate_precomputed_session_stats()`
-       always operate on corporate-event-adjusted bars, never raw
+       always operate on corporate-event-adjusted bars/tick-derived series, never raw
 - [ ] gap_percentile's `dividend_amount`, dead position's `adjusted_p_entry`,
        and filter E's `shares_outstanding` are scalar corrections applied at
        their one specific comparison point — not a substitute for, and not
-       satisfied by, bar-level adjustment elsewhere in the same module
+       satisfied by, bar-level or tick-derived-series adjustment elsewhere
+       in the same module
+- [ ] `fundamentals_quarterly` lookups filter on `filed_date`, never
+       `fiscal_period_end`, for any as-of query

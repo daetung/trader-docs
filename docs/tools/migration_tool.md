@@ -199,9 +199,62 @@ followed by re-invoking `populate_precomputed_session_stats()` for those
 tickers' full date range.
 
 **Ticker rename note:** `ticker_history` (used by `utils.load_ohlcv_with_history()`
-for pre-rename bar continuity) has no automated registration — see Open Items:
-ticker rename auto-registration. This tool does not populate it; entries must
-be inserted manually via SQL if a migrated ticker has a known rename history.
+for pre-rename bar continuity) is normally populated by an automated
+premarket-detection + evening-self-correction mechanism (see
+`metadata_crawler.md`) going forward. This migration tool covers historical
+backfill only, before that mechanism was live — retroactive rename discovery
+for the backfilled period is NOT automated (the CIK-mapping detector only
+observes the *current* mapping state, not historical mapping changes), so
+any renames within the backfilled date range must still be identified and
+registered manually via `metadata_crawler.py --register-rename OLD NEW
+EFFECTIVE_DATE` — a known, accepted limitation of the migration path
+specifically, not of the ongoing daily mechanism.
+
+**Stale session_stats from a corrected rename:** the same staleness problem
+described in the Re-run note above (corporate_events discovered late) applies
+when a `ticker_history.effective_date` is self-corrected by the evening
+mechanism (see `metadata_crawler.md`) — any `precomputed_session_stats` rows
+already computed for that ticker using the pre-correction (wrong)
+`effective_date` were built from an incomplete or misaligned bar-loading
+window and are now stale. Correct them the same way as the corporate_events
+case:
+```sql
+DELETE FROM precomputed_session_stats WHERE ticker = affected_ticker
+```
+followed by re-invoking `populate_precomputed_session_stats()` for that
+ticker's full date range.
+
+---
+
+## Post-Migration: Tick Bar Aggregates and Fundamentals Backfill
+
+Two additional one-time backfills, independent of each other and of the
+corporate-events/session-stats ordering above:
+
+```python
+from utils import compute_tick_bar_aggregates
+
+for ticker in all_ingested_tickers:
+    for indicator in [...]:  # all 9 registered tick-derived indicators —
+                              # see 02_indicator_calculator.md's Tick-Derived
+                              # Indicator Scale Sensitivity registry
+        compute_tick_bar_aggregates(ticker, start_date, end_date, [indicator], db_conn)
+        # INSERT OR IGNORE into tick_bar_aggregates — see db_schema.md
+```
+
+```python
+# fundamentals_quarterly backfill, via SEC EDGAR XBRL companyfacts,
+# keyed through ticker_cik_map (see db_schema.md, Open Item 2 design)
+for ticker in all_ingested_tickers:
+    fetch_and_upsert_companyfacts(ticker, db_conn)   # rate-limited 10 req/s
+```
+
+Both are large one-time backfills (tick_bar_aggregates over the full
+migrated tick_10 history; fundamentals over ~12k tickers at 10 req/s) —
+expect this step to take substantially longer than the other Post-Migration
+steps. Both support `--skip-tick-bar-aggregates` / `--skip-fundamentals`
+flags (same convention as `--skip-session-stats`) for deferring to the
+first regular `collect_daily.py` evening run instead.
 
 ---
 

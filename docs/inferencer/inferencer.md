@@ -68,7 +68,11 @@ ticks: pd.DataFrame
     # tick_10 data strictly before t bar open
 
 meta: dict
-    # stock_meta row for this ticker
+    # flat {field: value}, already resolved by the caller (LiveModeRunner's
+    # meta_bulk — see live_mode_runner.md) with per-field
+    # utils.estimate_historical_meta() fallback where today's stock_meta
+    # crawl is incomplete; not a raw stock_meta row passed through
+    # unresolved — matches 04_feature_extractor.md extract()'s meta contract
 
 entry: dict
     # {ticker, date, hour, p_entry}
@@ -213,6 +217,9 @@ def infer_batch(
     Process multiple candidates efficiently.
     halts_df loaded once per (ticker, date) pair — not per candidate.
     session_stats shared across all candidates (same session).
+    meta_by_ticker: per-ticker resolved flat dicts, same per-field fallback
+        contract as infer()'s meta (see Input/Output above) — not raw
+        stock_meta rows passed through unresolved.
 
     Returns:
         (results, stats_dict)

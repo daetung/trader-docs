@@ -164,6 +164,16 @@ pd.DataFrame  # full labeled feature matrix, unsplit
            for date in ticker_dates
        }
 
+       # Fundamentals-derived yield features (earnings_yield, book_to_price,
+       # sales_to_price, dilution_rate, cash_to_mcap, debt_to_mcap — see
+       # 04_feature_extractor.md Meta Features) are resolved separately from
+       # fundamentals_quarterly inside extract_batch() itself, via
+       # utils.get_ttm_value() / an as-of most-recent-filed lookup — not
+       # added to ticker_meta here. ticker_meta stays scoped to the original
+       # 5 stock_meta-sourced fields; fundamentals_quarterly resolution does
+       # not depend on entry_date-keyed dict construction the way stock_meta
+       # did, since as-of filtering happens per-lookup inside extract_batch().
+
        # Supply REFERENCE_SESSION baselines for this ticker's dates
        # session_stats format: {as_of_date: {ticker: {metric: {hour: value}}}}
        # Dispatch: select date and ticker dimensions for this specific ticker

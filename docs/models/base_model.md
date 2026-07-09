@@ -118,7 +118,8 @@ class BaseModel(ABC, Generic[M]):
 ## Artifact Management
 
 Artifacts saved to `{model_dir}/{model_type}/{run_id}/`:
-- `{run_id}.pkl` — serialized model binary (subclass-defined)
+- File format and count are subclass-defined (e.g. LGBMPipeline saves one
+  `.lgb` file per classifier, not a single `{run_id}.pkl`).
 - `{run_id}_meta.json` — metadata: `model_type`, `model_version`, `feature_names`, `categorical_cols`, `eval_result`, config snapshot
 
 The artifact directory is created automatically on `__init__`.

@@ -20,6 +20,11 @@ lightweight premarket corporate-events refresh):
    and `ticker_data_coverage` for newly ingested dates
 5. **Session stats update** — compute and store `precomputed_session_stats`
    for newly ingested dates (REFERENCE_SESSION baselines)
+6. **Tick bar aggregates update** — compute and store `tick_bar_aggregates`
+   for newly ingested dates (see db_schema.md, utils.compute_tick_bar_aggregates())
+7. **Ticker rename detection + fundamentals collection** — premarket CIK-map-based
+   rename detection (with evening self-correction) and incremental
+   fundamentals_quarterly collection (see new sections below)
 
 ---
 
@@ -206,6 +211,93 @@ populate_precomputed_session_stats(
 
 ---
 
+## Tick Bar Aggregates Update (Daily)
+
+Runs after ingestion and before Session Stats Update, populating
+`tick_bar_aggregates` (see db_schema.md) for today's newly-ingested data —
+this ordering matters: `populate_precomputed_session_stats()` sources its
+tick-derived baselines (`buy_ratio_baseline`, `intra_tpm_baseline`,
+`intra_avg_vol_per_tick_baseline`) from `tick_bar_aggregates`, so this step
+must complete first within the same evening run for tomorrow's baselines to
+reflect today's data.
+
+```python
+from utils import compute_tick_bar_aggregates
+
+for ticker in todays_ingested_tickers:
+    compute_tick_bar_aggregates(ticker, today, today, all_registered_indicators, db_conn)
+    # INSERT OR IGNORE into tick_bar_aggregates
+```
+
+Skipped if `--skip-tick-bar-aggregates` is passed (session stats step still
+runs — falls back to Tier 2/3 on-the-fly resolution per utils.md).
+
+---
+
+## Premarket Ticker Rename Detection
+
+Runs at premarket (same schedule slot as the corporate-events-only refresh),
+**before** `LiveModeRunner.start_session()` — a rename must be registered
+before that day's Eager Pool bar loading, or the renamed ticker's history
+lookback is silently truncated for that entire day.
+
+```python
+def detect_rename_candidates(db_conn) -> list[dict]:
+    """
+    1. Fetch SEC company_tickers.json → upsert ticker_cik_map
+    2. Find (cik, ticker_old) -> (cik, ticker_new) mapping changes where
+       ticker_old has existing ohlcv_1min history (ticker_new's own history
+       is not required — it doesn't exist yet at premarket)
+    3. Unambiguous matches: INSERT OR IGNORE INTO ticker_history
+       (effective_date = today, a best-effort estimate; self-corrected this
+       evening — see below)
+    4. Ambiguous / CIK-unmatched: log to tools/rename_candidates.log
+    """
+```
+
+```bash
+# Premarket schedule addition (~04:00 ET, alongside corporate-events-only):
+python tools/collect_daily.py --db-path data/market.duckdb --ticker-rename-only
+```
+
+## Evening Ticker Rename Self-Correction
+
+Runs during the evening full run, after ingestion:
+
+```python
+def self_correct_rename_effective_dates(db_conn, today) -> None:
+    """
+    For ticker_history rows with effective_date within the last 5 trading
+    days: compare registered effective_date against
+    MIN(date) FROM ohlcv_1min WHERE ticker = ticker_new.
+    If different: UPDATE ticker_history SET effective_date = actual.
+    If ohlcv_1min still has no rows for ticker_new after grace_period
+    (5 trading days): re-log to rename_candidates.log as a likely false
+    positive from the premarket detector.
+    """
+```
+
+Idempotent — safe to run every evening regardless of whether any rename is
+pending correction.
+
+---
+
+## Fundamentals Incremental Collection (Daily)
+
+```python
+def collect_fundamentals_incremental(db_conn) -> int:
+    """
+    Reuses ticker_cik_map from the same day's premarket refresh (no second
+    company_tickers.json fetch). For each ticker with a CIK, fetch SEC EDGAR
+    submissions feed; if new filings exist since the last stored filed_date
+    for that ticker, fetch companyfacts and upsert into fundamentals_quarterly
+    via resolve_xbrl_tag_value() (see utils.md) per configs/xbrl_tag_map.json
+    tag priority. Skipped if --skip-fundamentals.
+    """
+
+
+---
+
 ## Dual Schedule: Evening Full Run + Premarket Corporate-Events Refresh
 
 The evening run (17:00 ET, below) computes `precomputed_session_stats` for
@@ -223,11 +315,25 @@ resolution all only need "today's own corporate_events to be as fresh as
 possible" — they don't recompute any aggregate that would be invalidated by
 a second crawl.
 
+Ticker rename detection (see "Premarket Ticker Rename Detection" below)
+shares this same premarket slot and the same rationale — it must complete
+before `LiveModeRunner.start_session()`'s Eager Pool bar loading, for the
+same reason the corporate-events refresh must: a rename or split discovered
+only at evening (after that day's session already ran) is one day too late
+for that day's own bar loading, even though it's still in time for the
+following day's `precomputed_session_stats` (evening) and future sessions.
+
 ```bash
 # Corporate-events-only refresh, run twice before/around market open:
 python tools/collect_daily.py \
     --db-path data/market.duckdb \
     --corporate-events-only
+
+# Ticker rename detection, same premarket window (see "Premarket Ticker
+# Rename Detection" below):
+python tools/collect_daily.py \
+    --db-path data/market.duckdb \
+    --ticker-rename-only
 ```
 
 Recommended timing: once well before premarket bar accumulation begins
@@ -275,6 +381,20 @@ python tools/collect_daily.py \
     --data-root /path/to/json/data \
     --date today \
     --skip-session-stats
+
+# Skip tick bar aggregates / fundamentals collection independently
+python tools/collect_daily.py --db-path data/market.duckdb --date today --skip-tick-bar-aggregates
+python tools/collect_daily.py --db-path data/market.duckdb --date today --skip-fundamentals
+
+# Premarket-only: ticker_cik_map refresh + rename candidate detection
+# (see "Premarket Ticker Rename Detection" below)
+python tools/collect_daily.py --db-path data/market.duckdb --ticker-rename-only
+
+# List unresolved rename candidates for manual review
+python tools/collect_daily.py --list-rename-candidates
+
+# Manually register a rename (SEC-unmatched tickers only)
+python tools/collect_daily.py --register-rename OLD_TICKER NEW_TICKER 20260715
 
 # Refresh metadata for specific tickers
 python tools/collect_daily.py \

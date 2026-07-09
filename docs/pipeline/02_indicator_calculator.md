@@ -273,6 +273,55 @@ tpm(ticks, bars)
 
 avg_vol_per_tick(ticks, bars)
     → Average volume per tick per bar
+
+vol_weighted_buy_ratio(ticks, bars)
+    → Lee-Ready direction (see lee_ready() above) weighted by each bundle's
+      own volume, rather than counted per-bundle
+    → buy_volume = Σ(bundle.volume for bundles classified buyer-initiated)
+    → total_volume = Σ(bundle.volume for all bundles in bar)
+    → output: buy_volume / total_volume (0~1)
+    → Distinguishes "many small buy bundles" from "one large buy bundle" —
+      buyer_initiated_ratio (count-based) cannot make this distinction
+    → Reuses lee_ready()'s bundle-direction classification internally —
+      does not reclassify ticks independently
+
+avg_delta_per_tick(ticks, bars)
+    → Average absolute price movement between consecutive tick bundles
+      within a bar
+    → per_bar_value = mean(|bundle[i].close - bundle[i-1].close|) over all
+      consecutive bundle pairs in the bar
+    → NULL if fewer than 2 bundles in the bar (no consecutive pair exists)
+
+tick_realized_vol(ticks, bars)
+    → Realized volatility from bundle-to-bundle returns within a bar
+    → bundle_return[i] = (bundle[i].close / bundle[i-1].close) - 1
+    → per_bar_value = sqrt(Σ bundle_return[i]²) over all consecutive bundle
+      pairs in the bar
+    → NULL if fewer than 2 bundles in the bar
+
+path_efficiency(ticks, bars)
+    → Kaufman Efficiency Ratio, applied at the tick-bundle level within a bar
+    → net_move = |bundle[last].close - bundle[first].close|
+    → total_move = Σ |bundle[i].close - bundle[i-1].close| over all
+      consecutive bundle pairs in the bar
+    → per_bar_value = net_move / total_move  (0~1; 1 = straight-line move,
+      near 0 = choppy/reversing)
+    → NULL if fewer than 2 bundles in the bar, or if total_move == 0
+      (no price movement between any bundles — degenerate case)
+
+vol_concentration(ticks, bars)
+    → Herfindahl-Hirschman-style concentration of volume across a bar's
+      tick bundles
+    → per_bar_value = Σ(bundle.volume / bar_total_volume)²  over all
+      bundles in the bar (0~1; higher = volume concentrated in few
+      bundles, e.g. block/sweep activity; lower = evenly distributed)
+    → Well-defined even for a single-bundle bar (value = 1.0)
+
+tick_burstiness(ticks, bars)
+    → Coefficient of variation of inter-bundle arrival time within a bar
+    → intervals = seconds between consecutive bundles' hour timestamps
+    → per_bar_value = std(intervals) / mean(intervals)
+    → NULL if fewer than 2 bundles in the bar (no interval exists)
 ```
 
 ---
@@ -286,6 +335,15 @@ REFERENCE_SESSION baselines (prior session averages) are pre-computed and stored
 `precomputed_session_stats` DuckDB table. At runtime, FeatureExtractor supplies
 the pre-loaded baseline dict to avoid repeated DB lookups.
 IndicatorCalculator does not query DuckDB directly.
+
+`intra_*`-prefixed baseline keys (`intra_vol_baseline`, `intra_return_baseline`,
+`intra_tpm_baseline`, `intra_avg_vol_per_tick_baseline`) name **intraday
+seasonality baselines** — the prior-N-sessions average value at this specific
+HHMMSS *slot* (a single point in time), consumed via `intraday_seasonality()`
+below. This is distinct from the *cumulative*-style baselines (`rvol_baseline`,
+`rel_dvol_baseline`) which track a running total up to a given time. `intra_*`
+answers "is this one moment unusual for this time of day"; `rvol`/`rel_dvol`
+answer "is today's running total unusual so far".
 
 ### Session Policy
 ```
@@ -357,6 +415,28 @@ intraday_seasonality(indicator_series, date, n_sessions,
     → normalized_value[t_hour] = indicator_value[t_hour] / baseline[t_hour]
     → output: per-bar normalized series
     → output column: intra_season_{metric}  (e.g. intra_season_vol)
+
+relative_avg_vol_per_tick(bars, ticks, date, n_sessions, delta_minutes,
+                          session_mode, session_stats)
+    → Cross-session per-slot comparison of avg_vol_per_tick — same pattern
+      as rvol/rel_dvol (current value over baseline), not a self-rolling
+      comparison against this ticker's own recent bars
+    → today_value_at_T = avg_vol_per_tick(ticks, bars) for the bar at hour T
+    → baseline = session_stats["intra_avg_vol_per_tick_baseline"][T]
+      (prior N sessions avg avg_vol_per_tick at hour T; precomputed and
+      stored in precomputed_session_stats, sourced from tick_bar_aggregates
+      — see db_schema.md and utils.md populate_precomputed_session_stats())
+    → output: today_value_at_T / baseline[T]  (per-bar ratio series)
+    → output column: relative_avg_vol_per_tick
+    → Rationale for cross-session (not self-rolling) design: rvol/rel_dvol
+      already cover "is today's running total volume unusual" — a
+      self-rolling avg_vol_per_tick comparison would duplicate that same
+      within-session-trend signal (and overlaps with avg_vol_per_tick's own
+      window_comparison output — see 03_vectorizer.md). The cross-session
+      form instead answers "is the average trade SIZE at this specific
+      moment unusual for this time of day", independent of whether total
+      volume is normal — e.g. detecting an unusually large-block trade
+      pattern even when cumulative volume looks unremarkable.
 ```
 
 ---
@@ -400,13 +480,18 @@ Only indicators reachable via Strategy A/B (the single-pass, whole-range
 computation) are listed — REFERENCE_SESSION indicators are excluded here
 because their scale consistency is handled separately (today-series volume
 terms already share the same anchor as the baseline; see `rvol`/`rel_dvol`
-above and `utils.md` `populate_precomputed_session_stats()`).
+above and `utils.md` `populate_precomputed_session_stats()`). Tick-derived
+indicators are also excluded here — they are never `adj_bars`-anchored to
+begin with (ticks are never adjusted; see `data_boundary.md`), so this
+table's premise ("bars passed into this module are pre-adjusted... anchored
+to the last date in the loaded window") does not hold for them. See "Tick-
+Derived Indicator Scale Sensitivity" below instead.
 
 | scale_type | Slice-time correction | Indicators |
 |---|---|---|
 | `price` | × f_e | `ma`, `ema`, `macd`, `parabolic_sar`, `atr`, `bollinger_bands` (upper/middle/lower only), `vwap`, `fibonacci_retracement`, `pivot_points` |
-| `volume` | ÷ f_e | `volume_ma`, `vr_volume` numerator only (see note), `obv`, `ad`, `avg_vol_per_tick` |
-| `invariant` | none | `rsi`, `roc`, `stochastic`, `cci`, `mfi`, `bollinger_bands` (`pct_b`, `bandwidth` outputs only), `adx`, `dmi`, `vr_volatility`, `vr_volume` (ratio output — numerator and its own `volume_ma` denominator scale identically, cancels), `roll_spread` (`roll_spread_pct` output), `hl_spread` (`hl_spread_pct` output), `lee_ready` (`buyer_initiated_ratio`, `tick_direction_momentum` — both ratios), `tpm` (tick count, not volume) |
+| `volume` | ÷ f_e | `volume_ma`, `vr_volume` numerator only (see note), `obv`, `ad` |
+| `invariant` | none | `rsi`, `roc`, `stochastic`, `cci`, `mfi`, `bollinger_bands` (`pct_b`, `bandwidth` outputs only), `adx`, `dmi`, `vr_volatility`, `vr_volume` (ratio output — numerator and its own `volume_ma` denominator scale identically, cancels), `roll_spread` (`roll_spread_pct` output), `hl_spread` (`hl_spread_pct` output) |
 
 Notes:
 - `bollinger_bands()` and `vr_volume()` straddle two scale_types depending on
@@ -414,10 +499,10 @@ Notes:
   need `price`/`volume` correction; the derived ratio outputs (`pct_b`,
   `bandwidth`, the `vr_volume` ratio itself) do not. Apply the correction
   before computing the ratio, not after, for the two straddling cases.
-- `roll_spread`, `hl_spread`, and `lee_ready` were previously misclassified /
-  omitted in earlier drafts of this table — all three are confirmed
-  `invariant` because their defined outputs are explicitly normalized
-  (`_pct` division by close, or a bounded ratio) rather than raw levels.
+- `roll_spread` and `hl_spread` were previously misclassified / omitted in
+  earlier drafts of this table — both are confirmed `invariant` because
+  their defined outputs are explicitly normalized (`_pct` division by
+  close) rather than raw levels.
 - `obv`/`ad` are cumulative (no session reset) — if a split falls within the
   Strategy A loaded range, the single-pass computation is only valid for
   tickers/date-ranges with no split in range. When a split is present,
@@ -426,6 +511,68 @@ Notes:
   entry's own date — see `04_feature_extractor.md` Strategy A note.
 - `hl_spread` has no listed config parameters (bar-level calculation) and no
   further scale interaction beyond the table above.
+
+## Tick-Derived Indicator Scale Sensitivity
+
+tick_10 is never adjusted for any consumer, in any layer (see
+`data_boundary.md`) — so unlike the bar-derived table above, a tick-derived
+indicator's raw output is always already expressed in that bar's own
+native date's scale; it was never `reference_date`-anchored to begin with.
+Correction (where scale_type requires it) is applied directly to
+`entry_date` via `utils.adjust_tick_derived_series_for_corporate_events()`,
+called from `04_feature_extractor.md`'s tick-derived dispatch path — not via
+this file's step 2a2 mechanism above, and not through a `reference_date`
+detour.
+
+| scale_type | Indicators |
+|---|---|
+| `price` | `avg_delta_per_tick` |
+| `volume` | `avg_vol_per_tick` |
+| `invariant` | `tpm` (tick count), `lee_ready` (`buyer_initiated_ratio`, `tick_direction_momentum` — both ratios), `vol_weighted_buy_ratio` (ratio), `tick_realized_vol` (built from returns — scale-invariant), `path_efficiency` (ratio), `vol_concentration` (ratio/HHIstyle), `tick_burstiness` (coefficient of variation — scale-invariant) |
+
+Adding a new tick-derived indicator to this table is sufficient to route it
+through the correction dispatch above — no change to `04_feature_extractor.md`
+or `data_boundary.md` is needed for the scale-correction path itself (see
+"Adding a New Tick-Derived Indicator — Checklist" below for the full set of
+things a new tick-derived indicator must still declare).
+
+`relative_avg_vol_per_tick` is NOT in this table — it is a REFERENCE_SESSION
+indicator (see above), reached via `precomputed_session_stats`, not via
+Strategy A's tick-derived dispatch path.
+
+Minimum tick-bundle count: `avg_delta_per_tick`, `tick_realized_vol`,
+`path_efficiency`, and `tick_burstiness` are defined only where at least 2
+tick bundles exist within a bar (each requires a bundle-to-bundle
+comparison) — a bar with fewer bundles returns NULL for that indicator (see
+`db_schema.md` `tick_bar_aggregates`), not an error and not a silently
+dropped row. A bar with zero tick bundles (halt / no-trade slot) has no row
+at all for any tick-derived indicator in `tick_bar_aggregates` — callers
+reindex the sliced series against the full expected bar index so the gap
+surfaces as an explicit NaN rather than silently shrinking the window fed to
+`window_comparison`/`statistical_summary` (see `04_feature_extractor.md`).
+
+## Adding a New Tick-Derived Indicator — Checklist
+
+1. **Formula** — define as with any other indicator above.
+2. **scale_type** — register in the "Tick-Derived Indicator Scale
+   Sensitivity" table above (`price` | `volume` | `invariant`). This alone
+   routes the indicator through the existing correction dispatch — no
+   `04_feature_extractor.md` change needed for scale correction itself.
+3. **Vectorizer mapping** — register in `03_vectorizer.md`'s Indicator →
+   Method Mapping table.
+4. **Live-mode windowing** — must be explicitly declared, one of:
+   a. `"session-only"` (`precalculate_bars: 0`, the default) — today-only
+      accumulation; requires a minimum-sample guard on any
+      `window_comparison` output (see `caching_calculator.md`).
+   b. `"lookback"` — full multi-day parity via `tick_bar_aggregates`; see
+      `utils.load_tick_bar_aggregates_with_history()`.
+   There is no default if omitted — a new tick-derived indicator's live
+   behavior must be stated, not assumed.
+5. **REFERENCE_SESSION counterpart (optional)** — independent of (4); if a
+   cross-session per-slot comparison is also needed (like
+   `relative_avg_vol_per_tick`), add a `precomputed_session_stats` baseline
+   metric and route it through `intraday_seasonality()` or a dedicated
+   REFERENCE_SESSION method.
 
 ---
 
@@ -486,6 +633,12 @@ class IndicatorCalculator:
     # Tick-derived
     def tpm(self, ticks: pd.DataFrame, bars: pd.DataFrame) -> pd.DataFrame: ...
     def avg_vol_per_tick(self, ticks: pd.DataFrame, bars: pd.DataFrame) -> pd.DataFrame: ...
+    def vol_weighted_buy_ratio(self, ticks: pd.DataFrame, bars: pd.DataFrame) -> pd.DataFrame: ...
+    def avg_delta_per_tick(self, ticks: pd.DataFrame, bars: pd.DataFrame) -> pd.DataFrame: ...
+    def tick_realized_vol(self, ticks: pd.DataFrame, bars: pd.DataFrame) -> pd.DataFrame: ...
+    def path_efficiency(self, ticks: pd.DataFrame, bars: pd.DataFrame) -> pd.DataFrame: ...
+    def vol_concentration(self, ticks: pd.DataFrame, bars: pd.DataFrame) -> pd.DataFrame: ...
+    def tick_burstiness(self, ticks: pd.DataFrame, bars: pd.DataFrame) -> pd.DataFrame: ...
 
     # REFERENCE_SESSION
     def rvol(
@@ -515,6 +668,12 @@ class IndicatorCalculator:
         session_mode: str,
         metric: str,
         session_stats: dict,
+    ) -> pd.DataFrame: ...
+
+    def relative_avg_vol_per_tick(
+        self, bars: pd.DataFrame, ticks: pd.DataFrame, date: str,
+        n_sessions: int, delta_minutes: int, session_mode: str,
+        session_stats: dict,   # reads session_stats["intra_avg_vol_per_tick_baseline"]
     ) -> pd.DataFrame: ...
 ```
 
@@ -548,7 +707,10 @@ indicators:
     precalculate_bars: "window" # precalculate window_bars worth of bars at session start
   lee_ready:
     momentum_n: 5
-    precalculate_bars: 0        # tick-based — precalculation not applicable
+    precalculate_bars: 0        # default: session-only (today's ticks only).
+                                # "lookback" also valid — see Tick-Derived
+                                # Indicator Scale Sensitivity checklist above;
+                                # loads history via tick_bar_aggregates.
   roll_spread_window: 20
   # hl_spread: no params (bar-level calculation)
   sr_levels:
@@ -557,9 +719,21 @@ indicators:
     precalculate_bars: 0        # per-entry-point recomputation in live mode;
                                 # date당 1회 per-entry-point in training
   tpm:
-    precalculate_bars: 0        # tick-based
+    precalculate_bars: 0        # default: session-only; "lookback" also valid (see above)
   avg_vol_per_tick:
-    precalculate_bars: 0        # tick-based
+    precalculate_bars: 0        # default: session-only; "lookback" also valid (see above)
+  vol_weighted_buy_ratio:
+    precalculate_bars: 0        # default: session-only; "lookback" also valid
+  avg_delta_per_tick:
+    precalculate_bars: 0        # default: session-only; "lookback" also valid
+  tick_realized_vol:
+    precalculate_bars: 0        # default: session-only; "lookback" also valid
+  path_efficiency:
+    precalculate_bars: 0        # default: session-only; "lookback" also valid
+  vol_concentration:
+    precalculate_bars: 0        # default: session-only; "lookback" also valid
+  tick_burstiness:
+    precalculate_bars: 0        # default: session-only; "lookback" also valid
 
   # REFERENCE_SESSION
   reference_session:
@@ -593,3 +767,4 @@ indicators:
 - `fibonacci_retracement()` uses monotonic deque for O(N) sliding window max/min when processing full ticker bars
 - `gap_percentile()`'s `dividend_amount` is a caller-supplied scalar (corporate_events lookup) — this method does not query DuckDB directly, consistent with the session_stats supply pattern
 - Raw bars passed into this module are assumed pre-adjusted for splits by the caller (`adjust_bars_for_corporate_events()`); this module has no corporate_events awareness beyond the `dividend_amount` scalar on `gap_percentile()` — see "Corporate Event Scale Sensitivity" table above for which outputs still need a caller-side scalar rescale after slicing
+- Tick-derived indicators requiring a bundle-to-bundle comparison (`avg_delta_per_tick`, `tick_realized_vol`, `path_efficiency`, `tick_burstiness`) must return NaN for bars with fewer than 2 tick bundles, consistent with this file's existing warm-up NaN convention (e.g. `roll_spread`'s `cov > 0` breakdown case) — never raise, never silently omit the bar

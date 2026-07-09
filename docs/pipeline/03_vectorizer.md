@@ -150,18 +150,31 @@ Configured in `pipeline_config.yaml`. Default mapping:
 | ATR, BB bandwidth | statistical_summary | — |
 | TPM | window_comparison | statistical_summary |
 | avg_vol_per_tick | window_comparison | — |
+| **vol_weighted_buy_ratio** | **statistical_summary** | **window_comparison** |
+| **avg_delta_per_tick** | **linear_trend** | **window_comparison** |
+| **tick_realized_vol** | **linear_trend** | **window_comparison** |
+| **path_efficiency** | **statistical_summary** | **window_comparison** |
+| **vol_concentration** | **linear_trend** | **window_comparison** |
+| **tick_burstiness** | **linear_trend** | **window_comparison** |
 | MA, EMA, MACD | linear_trend | statistical_summary |
 | fibonacci_retracement | level_distance | — |
 | pivot_points | level_distance | — |
 | sr_levels | sr_distance | — |
 | **rvol** | **statistical_summary** | **window_comparison** |
 | **rel_dvol** | **statistical_summary** | **window_comparison** |
+| **relative_avg_vol_per_tick** | **statistical_summary** | **window_comparison** |
 | **intra_season_{metric}** | **statistical_summary** | **window_comparison** |
 | **gap_pct** | **(Vectorizer 미사용 — FeatureExtractor inline 처리)** | — |
 | **obv, ad** | **linear_trend** | **window_comparison (delta only — see note)** |
 
 `gap_percentile` is excluded from Vectorizer dispatch. FeatureExtractor inserts
 the scalar value directly into the feature vector as `gap_pct`. No transform applied.
+
+**relative_avg_vol_per_tick note:** unlike `gap_percentile` (a single scalar
+per entry point), this indicator's own output (per 02_indicator_calculator.md)
+is a per-bar ratio series spanning today's session-so-far — the same shape as
+`rvol`/`rel_dvol`'s output. It is mapped identically for that reason, not as
+a special case.
 
 **obv/ad mapping rationale:** `obv`/`ad` are unbounded cumulative sums — their
 absolute level (`statistical_summary`'s mean/min/max/last) is an artifact of

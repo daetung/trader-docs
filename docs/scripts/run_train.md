@@ -77,7 +77,10 @@ class Trainer:
             trial_idx:
                 0-based trial counter within the inner trial loop.
                 -1 for outer evaluation rows (not part of inner trial search).
-                0 for standalone/selection/full (single implicit trial).
+        0 for standalone/selection/full (single implicit trial), and also for
+        the exploitation-phase final (consensus) model — disambiguated from
+        an exploitation inner trial 0 by outer_fold_idx: -1 for the final
+        model, >=0 for an inner trial tied to a specific outer fold.
             dry_run:
                 True = train and evaluate normally, but skip train_log INSERT
                        and model artifact save. Returns train_log_row in result dict.
@@ -130,8 +133,12 @@ train_log_row = {
     "optimizer_run_id":    optimizer_run_id,        # None for standalone
     "run_at":              run_at,
     "phase":               phase,                   # "selection"|"exploitation"|"full"|None
-    "trial_idx":           trial_idx,               # -1 for outer eval; 0 for standalone;
-                                                    # 0-based for exploitation inner trials
+    "trial_idx":           trial_idx,               # -1 for outer eval; 0 for standalone/
+                                                    # selection/full and for the exploitation
+                                                    # final model (outer_fold_idx=-1
+                                                    # disambiguates it from inner trial 0);
+                                                    # 0-based otherwise for exploitation
+                                                    # inner trials
     "fold_idx":            fold_idx,                # -1 for standalone/outer eval
     "outer_fold_idx":      outer_fold_idx,          # -1 for non-nested runs
     "fold_train_end":      fold_train_end,          # None for standalone

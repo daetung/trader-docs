@@ -111,7 +111,7 @@ Standalone scripts:
 
 | Document | Description |
 |---|---|
-| `data/data_boundary.md` | **Read before any module implementation.** Shared boundary rules, P_entry definition, REFERENCE_SESSION boundary, leakage prevention |
+| `data/data_boundary.md` | **Read before any module implementation.** Shared boundary rules, P_entry definition, REFERENCE_SESSION boundary, leakage prevention, Corporate Event Adjustment Boundary (raw/adjusted/scalar-corrected layering) |
 | `data/db_schema.md` | DuckDB schema, JSON ingestion logic, inference_log, precomputed_session_stats |
 | `pipeline/01_entry_detection.md` | EntryPointDetector logic, session_mode, volume_base_hour |
 | `pipeline/02_indicator_calculator.md` | All indicator methods, REFERENCE_SESSION indicators, VWAP reset_mode, missing bar classification, precalculate_bars config |
@@ -127,7 +127,7 @@ Standalone scripts:
 | `scripts/run_preprocess.md` | Preprocessor class, return_data, training pipeline only |
 | `scripts/run_train.md` | Trainer class, session_mode filter, train_log |
 | `scripts/run_backtest.md` | Backtester class, sole experiment_log writer |
-| `utils/utils.md` | Shared utilities: bar sequence, signal resolution, slippage/fill simulation, label breach detection, encoding maps, trading calendar, REFERENCE_SESSION stats (populate + load) |
+| `utils/utils.md` | Shared utilities: bar sequence, signal resolution, slippage/fill simulation, label breach detection, encoding maps, trading calendar, REFERENCE_SESSION stats (populate + load), corporate-event adjustment (cum_split_ratio, adjust_bars_for_corporate_events, adjust_tick_derived_series_for_corporate_events, estimate_historical_meta, ticker rename stitching) |
 | `inferencer/inferencer.md` | Live inference service object — _prepare_bars, infer/infer_batch, inference_log |
 | `inferencer/live_mode_runner.md` | Live mode execution orchestrator — watchdog loop, position manager loop, session lifecycle |
 | `inferencer/caching_calculator.md` | CachingIndicatorCalculator — Layer 1/2 cache, fibonacci deque, sr_levels per-entry-point |
@@ -235,6 +235,9 @@ stock-scalping/
 │   ├── pipeline_config.yaml
 │   ├── sector_map.json
 │   ├── day_of_week_map.json
+│   ├── halt_reason_code_map.json
+│   ├── cik_map.json
+│   ├── xbrl_tag_map.json
 │   └── secrets.yaml               # gitignored
 └── experiment_log.csv             # legacy; authoritative store is DuckDB
 ```

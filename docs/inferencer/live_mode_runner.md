@@ -69,12 +69,20 @@ LiveModeRunner.start_session(today_date):
              # the lookback window (see utils.md get_ticker_history() /
              # load_ohlcv_with_history()) — returns None-history fast path
              # (a single direct query) for the vast majority of tickers.
+             # Loaded in the same per-ticker parallel worker, alongside
+             # historical_bars — both must be ready before session_start_compute():
+             tick_bar_history = utils.load_tick_bar_aggregates_with_history(
+                 ticker,
+                 indicators=[i for i in configured_tick_indicators
+                             if i.precalculate_bars == "lookback"],
+                 lookback_start_date, today_date, db_conn
+             ) if any_indicator_configured_lookback else None
              # Corporate-event split adjustment is NOT applied here — that
              # happens inside session_start_compute() itself, anchored to
              # today_date (see caching_calculator.md).
 
              calc = CachingIndicatorCalculator(config)
-             calc.session_start_compute(historical_bars)
+             calc.session_start_compute(historical_bars, tick_bar_history)
              calc.set_session_stats(
                  session_stats_bulk.get(ticker, {})
              )
@@ -124,6 +132,13 @@ LiveModeRunner.start_session(today_date):
 ```
 session_stats_bulk peak:  ~15,000 tickers × ~18KB ≈ ~270MB
                           Released after Step 3 completes.
+
+tick_bar_history (Eager Pool, only if any tick-derived indicator is
+configured "lookback" — none are, by default; all 9 currently ship with
+precalculate_bars: 0):
+  Per-ticker cost scales with bar count (like historical_bars), not tick
+  count — bar-level EAV cache, not raw tick replay. Negligible at default
+  config; re-profile if any indicator is switched to "lookback".
 
 calculators pool ("memory" mode):
   ~15,000 tickers × ~790KB (Layer1 + Layer2 + session_stats) ≈ ~11.9GB sustained

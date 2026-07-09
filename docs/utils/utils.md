@@ -565,8 +565,10 @@ def get_ticker_history(
         -- recursively resolve if previous_ticker itself has an earlier entry
         -- as current_ticker (chain support)
 
-    ticker_history has no automated registration (see Open Items: ticker
-    rename auto-registration) — rows are inserted manually via SQL.
+    ticker_history is populated by an automated premarket-detection +
+    evening-self-correction mechanism (see metadata_crawler.md), with manual
+    CLI entry retained as a fallback for SEC-unmatched tickers — rows are no
+    longer manual-SQL-only.
     """
     ...
 
@@ -674,11 +676,135 @@ def adjust_bars_for_corporate_events(
     Returns a new DataFrame — does not mutate the input `bars` in place.
     """
     ...
+
+
+def adjust_tick_derived_series_for_corporate_events(
+    series: pd.DataFrame,
+    ticker: str,
+    anchor_date: str,
+    scale_type: str,
+    db_conn: duckdb.DuckDBPyConnection,
+) -> pd.DataFrame:
+    """
+    Correct a tick-derived indicator's raw output series to anchor_date's
+    native scale, directly — no reference_date detour.
+
+    Symmetric in spirit to adjust_bars_for_corporate_events(), but for a
+    different situation: tick_10 (the real input behind tick-derived
+    indicators) is never itself adjusted (see data_boundary.md), so a
+    tick-derived indicator's raw per-bar output is always already expressed
+    in that bar's own native date's scale — it was never moved to
+    reference_date's basis the way adj_bars is. Correcting it therefore goes
+    straight to whatever date the caller actually needs (anchor_date —
+    normally entry_date), not through reference_date first.
+
+    For each row with date=D_row in `series`:
+        ratio = cum_split_ratio(ticker, D_row, anchor_date, db_conn)
+        scale_type == "price"     → value /= ratio
+        scale_type == "volume"    → value *= ratio
+        scale_type == "invariant" → no change (present for API symmetry, so
+                                     ALL tick-derived indicators can be routed
+                                     through this same function regardless of
+                                     scale_type — see
+                                     02_indicator_calculator.md's
+                                     Tick-Derived Indicator Scale Sensitivity
+                                     registry for which indicator uses which)
+
+    Optimization: checks cum_split_ratio(ticker, series.date.min(), anchor_date,
+    db_conn) once first; if 1.0 (the common case — no split in range), skips
+    the per-row loop entirely and returns the input unchanged. Same cost
+    profile as adjust_bars_for_corporate_events().
+
+    Does not mutate the input `series` — always returns a new copy. Never
+    touches tick_10 — operates only on an already-computed indicator output
+    (whether sourced from tick_bar_aggregates or the Tier-2 on-the-fly
+    fallback in load_tick_bar_aggregates_with_history()).
+
+    Called by:
+        - 04_feature_extractor.md extract_batch()'s tick-derived dispatch
+          path, anchor_date = entry_date (per entry point)
+    """
+    ...
 ```
 
 ---
 
-### Historical Metadata Utilities
+### Tick Bar Aggregate Utilities
+
+```python
+def compute_tick_bar_aggregates(
+    ticker: str,
+    start_date: str,
+    end_date: str,
+    indicators: list[str],
+    db_conn: duckdb.DuckDBPyConnection,
+) -> pd.DataFrame:
+    """
+    Compute bar-level tick-derived indicator values for a ticker over a date
+    range, directly from raw tick_10 + ohlcv_1min.
+
+    Thin wrapper only — internally calls IndicatorCalculator's own
+    avg_vol_per_tick() / tpm() / lee_ready() / etc. (whichever `indicators`
+    lists) rather than reimplementing their formulas, so a value computed
+    here can never diverge from a value computed the same way elsewhere
+    (Strategy A during training, or the Tier-2 fallback below).
+
+    Output: long/EAV format matching tick_bar_aggregates — columns
+    [ticker, date, hour, indicator, value]. Rows with fewer than the
+    indicator's required tick-bundle count (e.g. <2 bundles for a
+    delta/interval-based indicator) get value=NULL rather than being omitted,
+    so downstream reindexing against the full bar index still finds a row
+    to report NaN from.
+
+    Called by:
+        - collect_daily.py (offline; result INSERT OR IGNORE'd into
+          tick_bar_aggregates — see metadata_crawler.md)
+        - load_tick_bar_aggregates_with_history()'s Tier 2 fallback (below;
+          result used in-memory only for that session, never written back to
+          tick_bar_aggregates — writing is collect_daily.py's job alone)
+    """
+    ...
+
+
+def load_tick_bar_aggregates_with_history(
+    ticker: str,
+    indicators: list[str],
+    lookback_start_date: str,
+    today_date: str,
+    db_conn: duckdb.DuckDBPyConnection,
+) -> pd.DataFrame:
+    """
+    Load historical tick-derived indicator values for live mode's Eager Pool,
+    for indicators configured with precalculate_bars: "lookback"
+    (02_indicator_calculator.md). Returns wide format (one column per
+    indicator) for direct use seeding CachingIndicatorCalculator's Layer 2.
+
+    3-tier resolution per (ticker, date) in [lookback_start_date, today_date):
+        Tier 1 — tick_bar_aggregates has rows for this date: read directly.
+        Tier 2 — no cached rows, but ticker_data_coverage.has_tick is True for
+            this date (collect_daily.py's batch simply hasn't reached it yet,
+            or ticker is newly listed): call compute_tick_bar_aggregates() for
+            this date on the fly. Result used for this session only — not
+            written to tick_bar_aggregates (collect_daily.py owns writes).
+        Tier 3 — has_tick is False for this date (genuine data absence):
+            NaN for this date. Only this tier is a true missing-data gap in
+            the sense precomputed_session_stats also uses; Tier 2 is an
+            expected, cheap, self-healing case in normal operation.
+
+    Tier 2 is expected to be rare in steady-state operation (daily batch
+    keeps tick_bar_aggregates current) — when it does happen, only that one
+    ticker's Eager Pool worker is slowed, not session start as a whole
+    (parallel workers are independent).
+
+    Called by:
+        - live_mode_runner.md's Eager Pool, in the same per-ticker parallel
+          worker call that also loads historical_bars via
+          load_ohlcv_with_history() — both must be available before that
+          worker's session_start_compute() call, not staggered across
+          separate rounds.
+    """
+    ...
+```
 
 ```python
 def estimate_historical_meta(
@@ -695,12 +821,25 @@ def estimate_historical_meta(
 
     Supported fields and derivation:
         shares_outstanding:
-            current_value = most recent stock_meta.shares_outstanding for ticker
-            ratio = cum_split_ratio(ticker, date, most_recent_date, db_conn)
-            return current_value / ratio
-            (buyback/issuance activity between quarters is NOT captured this
-            way — only split-driven share-count changes are reversible from
-            available data; see Open Items: fundamentals history collection)
+            1. Real crawled stock_meta(ticker, date) value, if present (unchanged).
+            2. fundamentals_quarterly tier: most recent row with
+               filed_date <= date (see data_boundary.md — never
+               fiscal_period_end) and metric="shares_outstanding", then
+               adjusted for any split between that filing's fiscal_period_end
+               and date via cum_split_ratio() (XBRL values are as of their
+               own filing date, so subsequent splits must still be applied).
+               Uses get_ttm_value()-adjacent as-of lookup logic (see
+               Fundamentals Utilities below), not a TTM sum itself since
+               shares_outstanding is an instant, not a duration, metric.
+            3. Fallback (unchanged): current_value = most recent
+               stock_meta.shares_outstanding for ticker;
+               ratio = cum_split_ratio(ticker, date, most_recent_date, db_conn);
+               return current_value / ratio
+               (buyback/issuance activity between quarters is NOT captured
+               this way — only split-driven share-count changes are
+               reversible from ohlcv_1min + corporate_events alone; tier 2
+               closes this gap for tickers/dates fundamentals_quarterly
+               covers, tier 3 remains the safety net for the rest)
 
         market_cap:
             close = close price for (ticker, date) from ohlcv_1min
@@ -741,6 +880,75 @@ def estimate_historical_meta(
 
 ---
 
+### Fundamentals Utilities
+
+```python
+def resolve_xbrl_tag_value(
+    companyfacts_json: dict,
+    tag_priority_list: list[str],
+) -> tuple[str, float] | None:
+    """
+    Given a company's raw SEC EDGAR companyfacts JSON and a metric's ordered
+    tag-name priority list (e.g. configs/xbrl_tag_map.json's list for
+    "revenue"), return the (tag_name, value) from the first tag in the
+    priority list that has any reported facts, or None if none of the tags
+    are present at all for this company.
+
+    This resolves cross-filer tag fragmentation (e.g. revenue reported under
+    RevenueFromContractWithCustomerExcludingAssessedTax by one filer,
+    Revenues by another) — configs/xbrl_tag_map.json is the source of each
+    metric's priority list, keyed by metric name, extendable by editing that
+    JSON alone (no code change to add a new fallback tag for an existing
+    metric).
+
+    Does not itself apply any as-of filtering — returns whatever facts exist
+    for the resolved tag; callers (estimate_historical_meta(),
+    get_ttm_value()) apply the filed_date <= date filter themselves.
+
+    Multiple units/contexts per tag (e.g. consolidated vs. segment,
+    original vs. restated filing) are a known parsing subtlety not fully
+    resolved by tag-priority alone — flagged here as an implementation-time
+    concern, not a blocker for this function's design.
+    """
+    ...
+
+
+def get_ttm_value(
+    ticker: str,
+    date: str,
+    metric: str,
+    db_conn: duckdb.DuckDBPyConnection,
+) -> float | None:
+    """
+    Trailing-twelve-month value for a duration-type fundamentals_quarterly
+    metric (e.g. "net_income", "revenue"), as of `date`.
+
+    As-of filtering: only rows with filed_date <= date are eligible — see
+    data_boundary.md's point-in-time principle (never fiscal_period_end).
+
+    Resolution:
+        Sum the four most recent eligible quarters' values for this metric
+        (period_months=3 rows), ending at or before `date`.
+        Q4 does not exist as a filed row on its own — where the most recent
+        eligible quarter would be Q4, derive it as
+        FY_value - (Q1 + Q2 + Q3) using the matching period_months=12 row
+        and the three preceding period_months=3 rows for the same fiscal year.
+
+    Returns None if fewer than 4 eligible quarters (or the FY+3Q components
+    for a Q4 derivation) are available as of `date` — caller treats this the
+    same as any other unavailable fundamentals value (NaN feature).
+
+    Not applicable to instant-type metrics (shares_outstanding,
+    stockholders_equity, total_assets, etc. — period_months=NULL) — those are
+    point-in-time by nature and use a plain as-of most-recent-filed lookup
+    instead, not a TTM sum (see estimate_historical_meta()'s shares_outstanding
+    tier 2 for that pattern).
+    """
+    ...
+```
+
+---
+
 ### REFERENCE_SESSION Utilities
 
 ```python
@@ -764,9 +972,12 @@ def populate_precomputed_session_stats(
         gap_pct_mean/std   : (today_regular_open - prev_close) / prev_close
                              stored as mean and std (hour='000000')
 
-    Metrics derived from tick_10 (lee_ready):
-        buy_ratio_baseline : per-bar buyer_initiated_ratio per HHMMSS slot
-        intra_tpm_baseline : per-bar ticks-per-minute per HHMMSS slot
+    Metrics derived from tick_10, via tick_bar_aggregates (see db_schema.md —
+    this function reads the same table Strategy A's live-mode fallback does,
+    rather than re-deriving from raw tick_10 independently):
+        buy_ratio_baseline               : per-bar buyer_initiated_ratio per HHMMSS slot
+        intra_tpm_baseline                : per-bar ticks-per-minute per HHMMSS slot
+        intra_avg_vol_per_tick_baseline    : per-bar avg_vol_per_tick per HHMMSS slot
 
     Corporate-event and ticker-rename awareness: prior-session raw values are
     read via load_ohlcv_with_history() (so a ticker rename within the prior
@@ -846,8 +1057,28 @@ def populate_precomputed_session_stats(
                     values already determined in C above — this adjustment is
                     independent of, and applied after, the halt fallback)
 
-                buy_ratio_baseline (a ratio, tick-derived): no adjustment needed.
-                intra_tpm_baseline (tick count, not volume): no adjustment needed.
+                buy_ratio_baseline (a ratio, tick-derived): no adjustment needed
+                    — scale-invariant, same reasoning as intra_return_baseline.
+
+                intra_tpm_baseline (tick count, not volume): no adjustment
+                    needed — a count is unaffected by a split, same reasoning
+                    as any other invariant tick-derived quantity (see
+                    02_indicator_calculator.md's Tick-Derived Indicator Scale
+                    Sensitivity registry).
+
+                intra_avg_vol_per_tick_baseline (volume-based, tick-derived):
+                    adjusted_value = raw_value * cum_ratio(D-k) — same
+                    direction and reasoning as rvol_baseline/intra_vol_baseline
+                    above (post-split volume scales up to match current
+                    share-count basis). This is the one tick-derived baseline
+                    metric that DOES need correction — unlike buy_ratio/
+                    intra_tpm above, its underlying indicator (avg_vol_per_tick)
+                    is volume-scale_type, not invariant. Explicitly named here
+                    (rather than left implicit) so a future tick-derived
+                    baseline addition is not mis-classified by omission —
+                    every tick-derived metric this function computes must
+                    appear in this list with an explicit adjustment call,
+                    not rely on absence-from-D meaning "no adjustment".
 
         This replaces session-exclusion as the split/dividend handling
         approach — adjustment preserves sample count (count is unaffected by
@@ -1095,3 +1326,30 @@ def temporal_split_simple(
   see `adjust_bars_for_corporate_events()`, which has no persisted-table
   equivalent because `ohlcv_1min` rows are never lossy-aggregated)
 - No pipeline business logic in this module — utility functions only
+- `adjust_tick_derived_series_for_corporate_events()` anchors directly to
+  whatever `anchor_date` the caller supplies (normally entry_date) — it does
+  NOT go through reference_date the way `adjust_bars_for_corporate_events()`
+  does, because tick-derived series were never reference_date-anchored to
+  begin with; do not add a reference_date parameter to this function
+- `compute_tick_bar_aggregates()` must call IndicatorCalculator's own
+  per-indicator methods (avg_vol_per_tick(), tpm(), etc.) rather than
+  reimplementing their formulas — this is what guarantees a cached
+  tick_bar_aggregates value and a freshly-computed one can never diverge
+- `load_tick_bar_aggregates_with_history()`'s Tier 2 (on-the-fly compute)
+  result is never written back to `tick_bar_aggregates` — only
+  collect_daily.py's offline batch writes that table; Tier 2 existing at all
+  is expected to be rare in steady-state operation, not a sign of a broken
+  pipeline
+- Tick-derived indicators requiring more than one tick bundle to be defined
+  (e.g. any delta- or interval-based indicator between bundles) must return
+  NULL/NaN for bars with fewer bundles than required, rather than raising or
+  silently omitting the row — see 02_indicator_calculator.md's Tick-Derived
+  Indicator Scale Sensitivity registry for the current minimum-bundle-count
+  requirements per indicator
+- `get_ttm_value()` and `estimate_historical_meta()`'s `fundamentals_quarterly`
+  tier both filter on `filed_date <= date`, never `fiscal_period_end` — see
+  data_boundary.md's point-in-time principle; this applies to any future
+  fundamentals_quarterly consumer as well
+- `resolve_xbrl_tag_value()`'s tag-priority list per metric lives in
+  `configs/xbrl_tag_map.json`, not hardcoded in this function — adding a
+  fallback tag for an existing metric is a config change, not a code change

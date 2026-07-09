@@ -214,9 +214,10 @@ Suppressed entries:  45
   stop_loss:                456
   session_end:              143
   time_limit:                56
-  dead_position:             10
-  dead_position_delisted:     1
+  dead_position:              8
+  dead_position_delisted:     2
   dead_position_no_data:      1
+  dead_position_extended_halt: 1
 
 --- Label Base Rates (test set) ---
   up5:  18204 events, base_rate=6.4%
@@ -228,7 +229,8 @@ Suppressed entries:  45
 --- Dead Position Case Distribution (test set) ---
   Case A (next-day data available):  8
   Case B (ticker missing next day):  2
-  Case C (dataset boundary):         2
+  Case C (dataset boundary):         1
+  Case D (extended halt):            1
 
 Run ID: 20250715_143022
 Fold:   -1 (standalone)
