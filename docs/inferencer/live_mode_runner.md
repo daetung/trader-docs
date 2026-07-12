@@ -175,9 +175,11 @@ LiveModeRunner.start_session(today_date):
          # paying Eager Pool's cost — see Health Gate 1 rationale below.
 
   4. [Health Gate 1] Pre-Eager-Pool health checks — evaluated after Steps 2-3,
-     before the expensive Eager Pool parallel compute. Two of three checks
-     are measured directly from data already loaded above; the third is a
-     batch_runs marker lookup (no loading dependency):
+     before the expensive Eager Pool parallel compute. Two of four checks
+     (a, b) are measured directly from data already loaded above; the other
+     two each require their own lookup — c a batch_runs marker query, d
+     (N-8) the model artifact's feature_names, loaded here rather than at
+     its originally-later point (see d's own note):
 
      a. session_stats coverage:
             eligible = SELECT ticker FROM ticker_data_coverage
@@ -208,14 +210,49 @@ LiveModeRunner.start_session(today_date):
 
      c. premarket completion marker:
             SELECT status FROM batch_runs
-            WHERE stage IN ('premarket_rename', 'premarket_corporate_events')
+            WHERE stage IN ('premarket_rename', 'premarket_corporate_events',
+                             'premarket_quarantine_check')
               AND date = today_date
             missing or status != 'success'
                 → WARN + proceed with yesterday's state
                 → suppress new entries on any ticker where
-                  ticker_cik_map.status = 'suspended'
-                  (enforced downstream by is_tradable() — see Watchdog
-                  Polling Loop)
+                  is_tradable() returns False
+                  (enforced downstream — see Watchdog Polling Loop)
+            # 'premarket_quarantine_check' added for P-8's
+            # check_corporate_event_anomaly() — that stage's own writes
+            # use ticker_cik_map.quarantine_reason (N-2 — see
+            # db_schema.md), a column independent of the rename case's
+            # rename_pending, so it needs no separate handling here beyond
+            # being included in this marker check; a ticker it would have
+            # evaluated but didn't reach is simply not yet protected
+            # today, not incorrectly blocked (see that function).
+            # 'premarket_quarantine_recheck' (N-3's 09:20 ET pass) is
+            # deliberately NOT in this list — it runs well after Health
+            # Gate 1 (which fires shortly after Session Start Gating,
+            # around 04:00-05:00 ET), so its completion cannot be known
+            # yet at this check regardless of stage name.
+
+     d. feature_names consistency (N-8):
+            model_features = set(meta["feature_names"])   # from the run_id's
+                                                            # model artifact
+                                                            # meta.json (see
+                                                            # base_model.md)
+            extractor_features = set(FeatureExtractor(config).get_feature_names())
+            mismatch = model_features.symmetric_difference(extractor_features)
+            mismatch is non-empty
+                → ABORT SESSION (hard gate)
+            # No warn-and-proceed variant considered — a mismatch means
+            # every inference this session would either KeyError on a
+            # missing feature or silently ignore one the model never
+            # trained on, depending on direction. Both are as severe as
+            # the P-0-class session_stats coverage failure above; there is
+            # no meaningful degraded mode for "the model and the feature
+            # pipeline disagree on what a feature vector is."
+            # Cheap relative to Eager Pool — reads two already-available
+            # name lists, no additional DB or model-artifact I/O beyond
+            # what Step 7's Inferencer init would load anyway (moved
+            # forward from there to before Step 5's cost, same rationale
+            # as the other three checks in this gate).
 
      Any ABORT SESSION outcome stops here — Eager Pool (Step 5) never runs.
 
@@ -619,43 +656,64 @@ loop every position_check_interval_seconds (config, default: 5s):
        position.bars_since_entry each call — no incremental bookkeeping
        needed)
 
-    1a. Halt check (see live_mode_runner.md's halt-detection history for
-        rationale) — position-scoped only, not applied to new-entry
-        candidates:
-        Fetch recent ticks from trading API (trailing
-        halt_check_window_seconds, config default: 60s)
-        tick_rate_per_min = len(ticks) * (60 / halt_check_window_seconds)
-        if tick_rate_per_min < halt_heuristic_tpm (config, default: 10):
+    1a. Halt check — position-scoped only, not applied to new-entry
+        candidates. API-primary, tick-rate fallback (see P-1's halt-status
+        endpoint integration — utils.query_halt_status()):
+
+        Once per Position Manager Loop iteration (not once per position —
+        same single-shared-loop batching principle as the global polling
+        design above; `max_positions` is small by design, so this bulk
+        call is always small too):
+        ```
+        halt_status = utils.query_halt_status(
+            tickers=[p.ticker for p in open_positions],
+            trading_api_url=config["live_mode"]["trading_api_url"],
+            chunk_size=config["live_mode"]["bulk_api_chunk_size"],
+            # bulk_api_chunk_size defined once in metadata_crawler.md's
+            # Config Keys (shared pipeline_config.yaml) — barely matters
+            # here since open_positions is small (bounded by
+            # max_positions), almost always one chunk regardless of value.
+        )
+        ```
+
+        For each open position:
+        ```
+        if halt_status is not None and position.ticker in halt_status:
+            is_halted = halt_status[position.ticker]   # API authoritative
+            signal_source = "api"
+        else:
+            # whole call failed, or this ticker missing from the response —
+            # fall back to the tick-rate heuristic
+            Fetch recent ticks from trading API (trailing
+            halt_check_window_seconds, config default: 60s)
+            tick_rate_per_min = len(ticks) * (60 / halt_check_window_seconds)
+            is_halted = tick_rate_per_min < halt_heuristic_tpm (config, default: 10)
+            signal_source = "tick_rate_fallback"
+
+        if is_halted:
             position.status = 'halted'
-            alert (see health_report.md)
+            alert (see health_report.md), tagged with signal_source for
+            diagnosability (see health_report.md's new fallback-rate finding)
             → skip Steps 2-4 this iteration (no reliable price to act on)
         else:
-            position.status = 'active' (clears automatically once tick
-            rate recovers — no separate resumption-detection logic needed)
-
-        Note — separate halt-status endpoint (not integrated here): the
-        trading API exposes halt status via a distinct, dedicated endpoint
-        from the bar/tick data used above — not a flag embedded in the
-        regular market-data response. Direct integration is deferred; the
-        tick-rate heuristic above is the only halt-detection mechanism this
-        spec currently implements. Noting the endpoint's existence now so a
-        future session designing direct integration starts from an
-        accurate premise instead of rediscovering it.
+            position.status = 'active' (clears automatically once either
+            signal recovers — no separate resumption-detection logic needed)
+        ```
 
         No separate "resumption-auction exit" pre-registration mechanism —
         deliberately not built. A `'halted'` position is not removed from
         this loop's iteration set; it simply skips Steps 2-4 while halted.
-        The instant `tick_rate_per_min` recovers above threshold,
-        `position.status` flips back to `'active'` and the very next
-        iteration of this same loop resumes ordinary Step 2 exit evaluation
-        automatically — the loop structure already IS the "pre-registered"
-        re-check, with no extra state or broker-side resting order needed.
-        (An actual resting auction order was considered and rejected: no
-        confirmed trading-API support for halt-resumption order types, and
-        an unprotected order risks a very unfavorable fill if the
-        resumption gap moves against the position — same reasoning as
-        Entry Slippage Model's limit-order option existing for the analogous
-        entry-side concern.)
+        The instant the active signal (whichever of the two above produced
+        it) recovers, `position.status` flips back to `'active'` and the
+        very next iteration of this same loop resumes ordinary Step 2 exit
+        evaluation automatically — the loop structure already IS the
+        "pre-registered" re-check, with no extra state or broker-side
+        resting order needed. (An actual resting auction order was
+        considered and rejected: no confirmed trading-API support for
+        halt-resumption order types, and an unprotected order risks a very
+        unfavorable fill if the resumption gap moves against the position —
+        same reasoning as Entry Slippage Model's limit-order option
+        existing for the analogous entry-side concern.)
 
     2. tp_pct = config["execution"]["take_profit_up5"] if position.signal == "up5" \
                 else config["execution"]["take_profit_up3"]
@@ -718,7 +776,10 @@ live_mode:
   trading_api_ticker_url:         "http://trading-api/tickers/today"
 
   # Halt detection (Position Manager Loop only — see is_tradable() in
-  # execution_common.md for the separate, unrelated new-entry rename gate)
+  # execution_common.md for the separate, unrelated new-entry rename gate).
+  # trading_api_url above is the API-primary signal (see
+  # utils.query_halt_status()); the two keys below configure the
+  # tick-rate FALLBACK only, used when that call fails or omits a ticker.
   halt_check_window_seconds:      60
   halt_heuristic_tpm:             10      # ticks/min below this → position.status='halted'
 

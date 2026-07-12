@@ -95,24 +95,28 @@ def is_tradable(ticker: str, db_conn) -> bool:
     now". Checked once, at the point EntryPointDetector confirms a
     candidate, before sizing/order submission.
 
-    Currently checks only ticker_cik_map.status (rename-pending-confirmation
-    case — see db_schema.md, metadata_crawler.md). Deliberately does NOT
-    check tick-rate/staleness/halt — EntryPointDetector's own volume-gated
-    filters (B/C/D — see 01_entry_detection.md) already fail on a
-    genuinely stale or halted ticker, so a separate check here would be
-    redundant (see the former open_items_production_readiness.md P-6
-    countermeasure 3 discussion).
+    Checks ticker_cik_map.rename_pending (rename-pending-confirmation case)
+    and .quarantine_reason (P-8's same-day corporate-event anomaly case —
+    see metadata_crawler.md's check_corporate_event_anomaly()) — tradable
+    only when BOTH are clear. The two are independent columns (N-2 — see
+    db_schema.md's ticker_cik_map) specifically so this OR-of-two-blockers
+    check can be a flat condition with no cross-reason interaction to
+    reason about. Deliberately does NOT check tick-rate/staleness/halt —
+    EntryPointDetector's own volume-gated filters (B/C/D — see
+    01_entry_detection.md) already fail on a genuinely stale or halted
+    ticker, so a separate check here would be redundant (see the former
+    open_items_production_readiness.md P-6 countermeasure 3 discussion).
 
     Returns:
-        True if the ticker is tradable (status != 'suspended', or no
-        ticker_cik_map row exists at all — an unmapped ticker is not a
-        rename-ambiguity case).
+        True if the ticker is tradable (rename_pending=FALSE AND
+        quarantine_reason IS NULL, or no ticker_cik_map row exists at all
+        — an unmapped ticker is not a rename-ambiguity or quarantine case).
     """
     row = db_conn.execute(
-        "SELECT status FROM ticker_cik_map WHERE ticker = ? "
-        "ORDER BY last_seen_date DESC LIMIT 1", [ticker]
+        "SELECT rename_pending, quarantine_reason FROM ticker_cik_map "
+        "WHERE ticker = ? ORDER BY last_seen_date DESC LIMIT 1", [ticker]
     ).fetchone()
-    return row is None or row[0] != 'suspended'
+    return row is None or (row[0] is False and row[1] is None)
 ```
 
 ---
@@ -256,6 +260,54 @@ execution:
   # only backtest-simulation-specific keys (initial_cash, max_hold_bars,
   # entry_cooldown_minutes, entry_threshold, suppress_threshold,
   # dead_position_penalty_pct) — see 09_backtest_engine.md.
+
+  # N-7: rejection multiplier for fit_execution_params()'s relative-bound
+  # check (see shadow_retraining.md) — a refit landing outside
+  # [current_value / fit_rejection_multiplier, current_value *
+  # fit_rejection_multiplier] is rejected for that cycle. Deliberately
+  # relative to the current authoritative value, not an absolute range —
+  # simulate_exit_fill()'s own docstring already says the true participation
+  # rate is unknown at design time and must come from calibration; a fixed
+  # absolute range would reject a genuinely-correct calibration result that
+  # happens to differ a lot from the 0.1/30 seed defaults, defeating the
+  # whole reason fit_execution_params() exists.
+  fit_rejection_multiplier: 3
+```
+
+### Execution-Parameter Resolution
+
+```python
+def get_execution_param(param_name: str, db_conn, config) -> float:
+    """
+    Single read point for buy_rate, sell_rate_tp, sell_rate_sl,
+    cancel_after_seconds — BacktestEngine and LiveModeRunner both call this
+    rather than querying execution_params directly, so the read-time
+    hard-bound defense below exists in exactly one place (same
+    single-source-of-truth pattern as resolve_signal(), can_enter()).
+
+    1. row = latest execution_params row for param_name, if any
+       (see db_schema.md's execution_params)
+    2. value = row.value if row exists else config["execution"][param_name]
+       (the seed default)
+    3. Hard-bound check (N-7) — mathematically derived, not configurable:
+           buy_rate, sell_rate_tp, sell_rate_sl: valid range is (0, 1].
+               Derived directly from simulate_entry_fill()/
+               simulate_exit_fill()'s floor(per_tick_vol * rate) — 0 is
+               permanent zero-fill degeneracy, anything above 1.0 asserts
+               participation exceeding a bundle's own volume.
+           cancel_after_seconds: valid range is > 0. <= 0 is a degenerate
+               "canceled before submission" value.
+       value outside its range → log + fall back to
+       config["execution"][param_name] (the seed), ignoring whatever was
+       stored. A stored value failing this can only mean manual corruption
+       or a future write-path bug reaching execution_params directly,
+       bypassing fit_execution_params() — the relative-bound check there
+       (see shadow_retraining.md) is what prevents a bad value from being
+       written under normal operation; this is defense-in-depth at the
+       read side, not the primary mechanism.
+    4. return value
+    """
+    ...
 ```
 
 ---
@@ -399,8 +451,9 @@ def simulate_entry_fill(
 - `check_funds_available()`'s `use_all_cash` defaults to `True` — the default
   behavior sizes a trade down to fit remaining cash rather than skipping it
   outright; set `False` to restore the older all-or-nothing behavior
-- Entry-side call order (both BacktestEngine and LiveModeRunner):
-  `is_tradable()` → `compute_position_size(fill_price=p_entry, ...)` →
+- Entry-side call order, LiveModeRunner ONLY (N-5 — deliberately not
+  BacktestEngine; see below): `is_tradable()` →
+  `compute_position_size(fill_price=p_entry, ...)` →
   `check_funds_available(quantity, p_entry, ...)` →
   `simulate_entry_fill(quantity=adjusted_quantity, p_entry=p_entry, ...)`.
   Sizing and the funds gate both use `p_entry` (always known immediately,
@@ -409,6 +462,27 @@ def simulate_entry_fill(
   price, and it needs a quantity as *input*, so sizing cannot wait for it.
   This mirrors `data_boundary.md`'s existing use of `p_entry` as the
   "Backtest fill price reference" role.
+- `is_tradable()` is intentionally NOT part of BacktestEngine's entry-side
+  flow (N-5), even though it is Sizing→Funds→Fill's first step for
+  LiveModeRunner above. `ticker_cik_map`'s rename_pending/quarantine_reason
+  reflect data-pipeline/vendor-latency state AS OF NOW, not as of whatever
+  historical date a backtest run happens to be simulating — there is no
+  date-scoping on that table (see db_schema.md's ticker_cik_map). Calling
+  `is_tradable()` from BacktestEngine would therefore make backtest results
+  depend on the CURRENT contents of a table unrelated to the dates being
+  simulated (non-deterministic re-runs of the "same" backtest, and
+  systematic contamination of any backtest window that overlaps a
+  currently-suspended ticker — most relevant for P-12's live-vs-backtest
+  divergence check, since "recent" and "current" nearly coincide there).
+  More fundamentally: both suspend reasons exist to hedge LIVE, real-time
+  uncertainty about information a backtest already has resolved by the
+  time anyone runs it (was this really a rename? was this really an
+  unconfirmed corporate event?) — by backtest time by definition the
+  answer is known, so the hedge has nothing left to hedge against. This is
+  not a coverage gap to close with better date-scoping; the check does not
+  belong in a hindsight-informed simulation at all. See
+  09_backtest_engine.md's Constraints for the corresponding removal from
+  that module's sourced-function list.
 - `simulate_exit_fill()` is called after `utils.track_price_breach()` confirms
   direction; sell_rate selection (tp vs sl) is the caller's responsibility
 - `simulate_entry_fill()` mirrors `simulate_exit_fill()`'s per-bundle structure;
@@ -428,3 +502,13 @@ def simulate_entry_fill(
   price won't come back within the same `cancel_after_seconds` window;
   `status` is therefore not subdivided by shortfall cause (volume vs
   price) — a single `"canceled"` covers both
+- `get_execution_param()` (N-7) is the sole read point for buy_rate,
+  sell_rate_tp, sell_rate_sl, cancel_after_seconds — BacktestEngine and
+  LiveModeRunner must not query `execution_params` directly, for the same
+  reason they must not duplicate `resolve_signal()`/`can_enter()`. Its
+  hard-bound fallback is deliberately not configurable (mathematically
+  derived from the fill-simulation formulas, not a judgment call) and is
+  a distinct, independent mechanism from `fit_execution_params()`'s
+  relative-bound rejection (see shadow_retraining.md) — the latter guards
+  what gets written, this guards what gets read, and neither substitutes
+  for the other.

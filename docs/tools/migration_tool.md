@@ -372,3 +372,88 @@ Failed files are logged to `tools/migration_errors.log` with filename and except
 - `populate_trading_calendar()`, `populate_ticker_coverage()`, and `populate_precomputed_session_stats()` sourced from `utils.py`
 - `crawl_corporate_events()` sourced from `metadata_crawler.py`, not `utils.py` —
   imported across tool boundaries for this one step
+
+---
+
+## Survivorship Audit (P-11, one-time, manual)
+
+Unlike every other section in this file, NOT part of the automated
+migration path — never invoked by `migrate_json_to_duckdb.py` itself, no
+`batch_runs` marker, no scheduling. Run manually, once, when someone is
+ready to supply the external comparison source below.
+
+**What this checks:** whether the original JSON collection (the files
+`migrate_json_to_duckdb.py` imports — see Input File Convention above,
+whose own selection methodology predates and is external to this tool) is
+missing tickers that were listed at some point during the collection
+window but delisted (bankruptcy/liquidation specifically — see rationale
+below) before or during collection. Distinct from Dead Position Case B
+(`05_labeler.md` / `09_backtest_engine.md`), which already handles a
+ticker that IS present and then stops — this checks for tickers absent
+from `ohlcv_1min` entirely.
+
+```python
+def audit_survivorship_bias(
+    db_conn, collection_start_date, collection_end_date, delisting_source
+) -> dict:
+    """
+    1. present_tickers = SELECT DISTINCT ticker FROM ohlcv_1min
+
+    2. expected_tickers = <every ticker listed at any point during
+       [collection_start_date, collection_end_date], per delisting_source>
+       delisting_source: external data, not yet selected (candidates: SEC
+       EDGAR Form 25 filings, a purchased/scraped historical ticker
+       roster) — this function's contract (an external source yielding a
+       ticker-with-date-range list) is fixed now so the comparison logic
+       can be designed against it before the source itself is chosen.
+
+    3. missing = expected_tickers - present_tickers
+
+    4. For each ticker in missing, classify delisting reason if
+       delisting_source provides one: bankruptcy/liquidation vs.
+       M&A/going-private vs. unknown. Only bankruptcy/liquidation
+       plausibly understates dn5 exposure — a ticker acquired at a
+       premium didn't crash first, so its absence doesn't bias downside
+       risk the way a bankrupt ticker's does. Tickers with unknown reason
+       are conservatively counted alongside bankruptcy/liquidation in
+       gap_ratio (see below) rather than excluded, for the same
+       resolve-ambiguity-toward-the-flagged-side reasoning
+       check_corporate_event_anomaly() (P-8) uses.
+
+    5. gap_ratio = |missing tickers classified bankruptcy/liquidation or
+                     unknown| / |expected_tickers|
+
+    Returns {gap_ratio, missing_tickers: [...], classified: {...}} — the
+    full breakdown, not just the ratio, so a human reviewing the result
+    can sanity-check the classification before the decision policy below
+    acts on gap_ratio alone.
+    """
+    ...
+```
+
+**Decision policy** (fixed now; does not depend on the actual gap_ratio):
+
+```
+gap_ratio < quarantine.survivorship_gap_threshold (config, default 0.02):
+    document the measured ratio; no further action.
+
+gap_ratio >= threshold:
+    if historical data for the missing tickers is obtainable (a real
+    per-source decision at audit time, not knowable now):
+        backfill via migrate_json_to_duckdb.py's existing per-ticker
+        ingestion path, same as any other JSON backfill.
+    else:
+        attach a standing caveat to backtest/experiment_log reporting:
+        "measured survivorship gap_ratio = X — dn5 exposure may be
+        understated by an unquantified amount." Deliberately not
+        converted into a numeric haircut applied to reported metrics —
+        an invented correction factor would present false precision;
+        stating the raw measured gap is more honest than manufacturing
+        an adjusted number from it.
+```
+
+```yaml
+# pipeline_config.yaml addition
+quarantine:
+  survivorship_gap_threshold: 0.02   # see audit_survivorship_bias() above
+```

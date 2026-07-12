@@ -581,8 +581,21 @@ is_ambiguous             BOOLEAN,   -- True if simultaneous bundle-level tp/sl b
   `interpolate_bundle_price()`, `hour_to_int()`, `hour_to_minutes()`,
   `hour_add_seconds()` — sourced from `utils.py`
 - `resolve_signal()`, `can_enter()`, `simulate_exit_fill()`, `simulate_entry_fill()`,
-  `compute_position_size()`, `check_funds_available()`, `is_tradable()` —
+  `compute_position_size()`, `check_funds_available()` —
   sourced from `docs/utils/execution_common.md`'s module
+- `is_tradable()` is deliberately NOT called here (N-5), unlike every other
+  function in the bullet above. `ticker_cik_map`'s rename_pending /
+  quarantine_reason (see db_schema.md) reflect data-pipeline/vendor-latency
+  state as of right now, with no date-scoping — calling it here would check
+  TODAY's suspension state against whatever historical date a given backtest
+  run happens to be simulating, which is both non-deterministic (re-running
+  the "same" backtest on a different day can change results) and, more
+  fundamentally, the wrong question: both suspend reasons exist to hedge
+  live, real-time uncertainty (is this really a rename? a real corporate
+  event?) that a backtest already has resolved by the time anyone runs it.
+  If a future change reintroduces an `is_tradable()` call here, re-read
+  execution_common.md's Constraints (the matching note lives there) before
+  assuming its absence was an oversight — it was not.
 - `trading_halts` (used above for `halts_td`) is populated by the daily NYSE
   crawl (see metadata_crawler.md) and is training/backtest-only — LiveModeRunner
   never queries this table for real-time decisions; its live-mode halt signal

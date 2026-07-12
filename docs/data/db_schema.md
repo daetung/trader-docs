@@ -157,21 +157,31 @@ CREATE TABLE stock_meta (
 -- keeps the same CIK; a merger/spin-off does not) and fundamentals_quarterly's
 -- lookup key. first_seen/last_seen let a (cik, ticker) pairing be recognized
 -- as historical vs. current without deleting superseded rows.
--- status/suspend_reason back LiveModeRunner's is_tradable() gate (see
--- live_mode_runner.md): a newly-observed (cik, ticker) pairing is inserted
--- as 'suspended'/'pending_rename_confirmation' and flips to 'active' once
--- the same-evening self-correction (or manual CLI) confirms it. Reserved
--- for future non-rename suspend_reason values (e.g. a later trading-halt
--- integration) — not populated by any reason other than
--- 'pending_rename_confirmation' today.
+-- rename_pending/quarantine_reason back LiveModeRunner's is_tradable() gate
+-- (see execution_common.md): is_tradable() returns tradable only when
+-- BOTH are clear (rename_pending=FALSE AND quarantine_reason IS NULL).
+-- N-2 restructure: originally a single status/suspend_reason pair, which
+-- meant the P-8 quarantine write (below) and the rename-detection write
+-- (metadata_crawler.md) could clobber each other's state for a ticker
+-- flagged by both at once (rename-ambiguous immediately after a
+-- corporate event is exactly the case where this could co-occur).
+-- Independent columns make that structurally impossible rather than
+-- guarding against it at each of the four write sites — see
+-- metadata_crawler.md's detect_rename_candidates(),
+-- self_correct_rename_effective_dates(), check_corporate_event_anomaly(),
+-- self_correct_quarantine().
+-- quarantine_reason is VARCHAR (not BOOLEAN) to leave room for future
+-- non-'corporate_event_anomaly' reasons without another schema change —
+-- rename_pending stays BOOLEAN since the rename case has exactly one
+-- reason by construction (there is no second way to become rename-pending).
 CREATE TABLE ticker_cik_map (
-    cik             VARCHAR NOT NULL,
-    ticker          VARCHAR NOT NULL,
-    first_seen_date VARCHAR NOT NULL,   -- 'YYYYMMDD', first observed
-    last_seen_date  VARCHAR NOT NULL,   -- 'YYYYMMDD', most recent observed (upsert-refreshed)
-    status          VARCHAR NOT NULL DEFAULT 'active',  -- 'active' | 'suspended'
-    suspend_reason  VARCHAR,            -- NULL when status='active';
-                                        -- 'pending_rename_confirmation' today
+    cik               VARCHAR NOT NULL,
+    ticker            VARCHAR NOT NULL,
+    first_seen_date   VARCHAR NOT NULL,   -- 'YYYYMMDD', first observed
+    last_seen_date    VARCHAR NOT NULL,   -- 'YYYYMMDD', most recent observed (upsert-refreshed)
+    rename_pending    BOOLEAN NOT NULL DEFAULT FALSE,
+    quarantine_reason VARCHAR,            -- NULL | 'corporate_event_anomaly' today;
+                                          -- reserved for future reasons (see above)
     PRIMARY KEY (cik, ticker)
 );
 

@@ -94,12 +94,47 @@ entry-count denominator for `buy_rate`/`cancel_after_seconds` — a fully-
 unfilled entry is itself a direct, relevant observation for those two
 parameters, not noise to exclude.
 
-A parameter that clears its gate gets a new row in `execution_params`
+**Relative-bound check (N-7)**, applied to each parameter that clears its
+sample-size gate above, before it is written:
+```
+current = get_execution_param(param_name, db_conn, config)  # see
+                                                              # execution_common.md
+                                                              # — already
+                                                              # applies the
+                                                              # hard bound
+                                                              # to `current`
+if this is the parameter's first-ever fit (no prior execution_params row):
+    skip this check — nothing to compare against yet; the hard bound
+    inside get_execution_param() (see execution_common.md) is the only
+    guard on a first fit
+elif abs(log(fitted_value / current)) > log(config["execution"]["fit_rejection_multiplier"]):
+    reject — do not write to execution_params this cycle. `current`
+    remains authoritative. Log + surface via health_report.md's finding 9.
+    # Deliberately relative to the CURRENT authoritative value, not the
+    # 0.1/30 seed — calibration is expected to legitimately move the
+    # value away from the seed over successive weeks; comparing against
+    # the seed forever would eventually reject correct, far-from-seed
+    # fits as if they were errors.
+else:
+    proceed to write (below)
+```
+Sample-size gating (above) guards against too little data; this guards
+against a small-but-sufficient sample that happens to be unrepresentative
+— a different failure mode, not a stricter version of the same one, so it
+is a separate check rather than a tighter sample-size threshold. Distinct
+from `get_execution_param()`'s hard bound (execution_common.md) too — that
+one is a mathematically-derived degeneracy check applied at every read
+regardless of source; this one is specifically about a fit result jumping
+implausibly far from where it already was.
+
+A parameter that clears BOTH its sample-size gate and the relative-bound
+check gets a new row in `execution_params`
 (fitted value, `fitted_at`, the cumulative `sample_size` used, and the
 triggering `week_start`) — see db_schema.md. BacktestEngine and
-LiveModeRunner both read the latest `execution_params` row per parameter in
-preference to the `execution:` config seed at session start; the config
-value is the pre-pilot seed only.
+LiveModeRunner both read the latest `execution_params` row per parameter,
+via `get_execution_param()` (execution_common.md), in preference to the
+`execution:` config seed at session start; the config value is the
+pre-pilot seed only.
 
 *Divergence alert*: `health_report.py` gets a new finding, separate from
 the winning-rate divergence — predicted-vs-actual fill price gap
@@ -197,3 +232,28 @@ the current market regime.
 - `execution_params` table rows are the effective values once any exist for
   a given `param_name`; the `execution:` config block is a seed default,
   read only before the first fit — not a fallback re-consulted later
+
+---
+
+## Operational Notes
+
+**Timezone / DST Discipline.** All schedule times in this system (04:00 ET
+premarket corporate-events refresh, ~09:25 ET premarket re-check, 09:30
+regular session open, 15:59 session close, 17:00 ET evening batch run) are
+wall-clock America/New_York times, which observe DST. The deployment
+host/container must set its system TZ to `America/New_York` (not a fixed
+UTC offset), so that all cron schedules and bar-close authority (see
+live_mode_runner.md) shift correctly across the two annual transitions.
+Operator checklist: on the Monday following each DST transition
+(mid-March, early November), verify that day's `batch_runs` rows landed at
+the expected wall-clock times before trusting the session.
+
+**DuckDB Backup/Recovery.** `data/market.duckdb` is backed up via a
+nightly file-level copy, scheduled in the quiescent window after the
+evening batch completes and before the next premarket batch begins —
+concretely, after `batch_runs` shows `stage='evening_session_stats',
+status='success'` for the day (see P-5's ownership windows in
+live_mode_runner.md / metadata_crawler.md). Retention: N most recent
+nightly copies (N TBD) plus one longer-retained weekly snapshot. Recovery
+is a plain file-copy restore of the single `.duckdb` file — no
+WAL/point-in-time replay involved.

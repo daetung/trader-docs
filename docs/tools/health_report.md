@@ -54,6 +54,45 @@ def gather_findings(db_conn, today_date, log_dir) -> dict:
        divergence and an execution-parameter divergence are different
        failure modes (retrain vs. recalibrate) and must not be merged into
        one signal. Threshold TBD, same deferral as finding 6.
+    8. Halt-check signal-source rate (N-4: data path matches finding 5's
+       pattern) — fraction of today's Position Manager Loop halt checks
+       (see live_mode_runner.md's Step 1a) tagged
+       signal_source='tick_rate_fallback' vs. 'api'. Not recomputed here —
+       LiveModeRunner tallies signal_source per check as the session runs
+       and passes the aggregate in at each of health_report.py's two daily
+       invocations, the same way Health Gate 2's tier_used tally already
+       reaches finding 5 (see live_mode_runner.md's Health Gate 2 — this is
+       the same pattern, a second aggregate threaded through the same
+       existing call). Unlike findings 6/7, this is NOT a placeholder — no
+       pilot-stage accumulation is needed, since the signal is tagged on
+       every check from the day P-1's halt-status endpoint integration
+       ships. A high fallback rate means the halt-status endpoint is
+       degrading or down, not that the strategy itself is underperforming
+       — this is an infrastructure-health signal, distinct in kind from
+       findings 6/7. Threshold TBD (same deferral status as the rate
+       itself always being computed and loggable, only the warn cutoff
+       undecided).
+    9. Execution-parameter fit rejections (N-7, pilot stage onward) — count
+       of this week's fit_execution_params() run, per parameter, where a
+       value cleared its sample-size gate but was rejected by the
+       relative-bound check (landed outside
+       [current/fit_rejection_multiplier, current*fit_rejection_multiplier]
+       — see shadow_retraining.md and execution_common.md's
+       fit_rejection_multiplier config). Also includes get_execution_param()
+       hard-bound fallbacks (a stored value outside its mathematically
+       valid range — see execution_common.md), though those should never
+       occur under normal operation since the relative-bound check is what
+       prevents a bad value from being written in the first place; a
+       nonzero count here specifically would point at manual corruption or
+       a write-path bug bypassing fit_execution_params() entirely, not at
+       calibration behaving unexpectedly. A nonzero relative-bound
+       rejection count means the CURRENT authoritative value is older than
+       the sample-size gate alone would suggest — worth a human look at
+       whether the fit reflects a genuine regime shift (in which case the
+       multiplier itself may need revisiting) or noise. Independent of
+       finding 7 — a rejected fit and a magnitude-off predicted-vs-actual
+       gap are different failure modes. Never merged with finding 7 or
+       with each other for the same reason findings 6 and 7 stay separate.
 
     Returns: dict of {finding_name: {severity: 'ok'|'warn'|'abort', detail: ...}}
     """
@@ -187,3 +226,16 @@ alerting:
   spec doc) — `health_report.py` must not compute or report either finding
   before then. They remain two separate findings even once defined — never
   merged into a single "things seem off" signal.
+- Finding 8 (halt-check signal-source rate) is unlike findings 6/7: it has
+  no accumulation gate and is always computable from the current session's
+  halt checks alone — only its warn threshold is undecided. It must not be
+  merged with finding 6 or 7 either, for the same reason those two stay
+  separate from each other — a degraded halt-status endpoint, a model
+  drift, and an execution-fill drift are three distinct failure modes with
+  three distinct responses.
+- Finding 9 (execution-parameter fit rejections) has nothing to report
+  before Pilot stage produces its first fit_execution_params() run, but
+  unlike findings 6/7 has no further threshold to defer once Pilot begins
+  — rejection is a boolean per parameter per week against
+  `fit_rejection_multiplier` (already a concrete config value, not TBD),
+  not a magnitude needing a warn cutoff decided later.

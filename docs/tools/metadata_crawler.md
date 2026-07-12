@@ -113,6 +113,111 @@ Notes:
 
 ---
 
+## Per-Ticker Corporate-Event Anomaly Check (P-8)
+
+Last-line defense against a vendor-latency miss: a same-day corporate
+event (typically a reverse split) that neither premarket crawl caught
+yet, which would otherwise leave every CONTINUOUS indicator for that
+ticker badly distorted all session.
+
+**Call order within each corporate-events-only pass** (04:00 ET and
+~09:25 ET — see Dual Schedule above) is deliberately NOT
+"crawl, then fetch, then check" — the two trading-API bulk fetches below
+have no dependency on `crawl_corporate_events()` completing (only the
+judgment step does, via `has_event_today`), so they run first and overlap
+with the crawl loop's much larger cost instead of stacking after it:
+
+```
+1. quotes       = bulk_fetch_today_first_price(...)   # trading API, chunked
+   halt_status  = utils.query_halt_status(...)          # trading API, chunked
+2. for ticker in active_ticker_universe:
+       crawl_corporate_events(ticker, db_conn)           # yfinance — dominant cost
+3. check_corporate_event_anomaly(db_conn, config, quotes, halt_status)  # judgment only
+```
+
+```python
+def bulk_fetch_today_first_price(
+    tickers: list[str],
+    trading_api_quotes_url: str,
+    chunk_size: int,
+) -> dict[str, float]:
+    """
+    Via utils.bulk_api_call_chunked() — NOT a true single call at universe
+    scale (~15k tickers against an assumed ~100 tickers/sec real-world
+    ceiling would be ~150s even chunked-and-sequential; see that function).
+    Called first, ahead of the crawl_corporate_events() loop below, so its
+    cost overlaps with the loop's far larger one rather than adding after it.
+
+    Returns {ticker: today_first_price} — a ticker with no premarket tick
+    yet is absent, not 0/NaN; check_corporate_event_anomaly() already
+    treats absence as "skip this ticker" (see below).
+    """
+    ...
+
+
+def check_corporate_event_anomaly(
+    db_conn, config, quotes: dict[str, float], halt_status: dict[str, bool] | None
+) -> None:
+    """
+    Pure judgment step — takes quotes/halt_status as already-fetched
+    arguments (see "Call order" above) rather than fetching them itself.
+
+    This offline batch context has no live tick stream, so there is no
+    tick-rate fallback available here the way live_mode_runner.md has one
+    for its own query_halt_status() call: if halt_status is None (total
+    fetch failure) or a ticker is absent from it, that ticker is treated
+    as NOT halted — the conservative direction. Suppressing a quarantine
+    because halt status is merely unresolved would be wrong: this
+    function's whole premise is that a false-positive quarantine (cost:
+    one ticker's trades for one day) is far cheaper than trading a
+    10x-distorted feature set (see the original P-8 problem statement) —
+    the same asymmetry argues for resolving any ambiguity here toward
+    quarantine-eligible, not away from it.
+
+    For each ticker with a non-null quote in `quotes`:
+        yesterday_close = <today's D-1 close, via the same halt-aware
+            search utils.md's gap_pct C. logic uses for a single prior
+            session: try D-1's 155900 bar close; if halt/missing,
+            search backward within D-1's regular session for the last
+            non-halt bar; if none found, skip this ticker (no baseline)>
+        if yesterday_close is None: skip
+        gap = abs(quotes[ticker] / yesterday_close - 1)
+        has_event_today = EXISTS corporate_events
+                           WHERE ticker = ? AND event_date = today
+        is_halted = halt_status.get(ticker, False) if halt_status is not None else False
+
+        if (gap > config["quarantine"]["price_anomaly_threshold"]
+            and not has_event_today
+            and not is_halted):
+            UPDATE ticker_cik_map SET status = 'suspended',
+                suspend_reason = 'corporate_event_anomaly'
+                WHERE ticker = ?
+            # is_tradable() (execution_common.md) reads status generically
+            # — no code change needed there; see db_schema.md's
+            # ticker_cik_map, whose suspend_reason column already
+            # reserved this case.
+            log to tools/quarantine_candidates.log for manual review
+        elif (current row has suspend_reason = 'corporate_event_anomaly'
+              and the condition above no longer holds):
+            UPDATE ticker_cik_map SET status = 'active', suspend_reason = NULL
+                WHERE ticker = ?
+            # Lets the 09:25 pass self-clear a 04:00 false alarm caused
+            # by thin premarket liquidity, without waiting for the
+            # evening self-correction below.
+
+    Writes its own batch_runs row: stage='premarket_quarantine_check',
+    date=today — status='running' at start, 'success'/'failed' at
+    completion, same convention as the other premarket stages.
+    """
+```
+
+Evening self-correction for a quarantine set by this function is handled
+by `self_correct_quarantine()` — see "Evening Ticker Rename
+Self-Correction" below, which covers both self-correction functions
+despite its (unchanged) section name.
+
+---
+
 ## Additional Data Sources
 
 ### NYSE Trading Halts
@@ -245,18 +350,19 @@ lookback is silently truncated for that entire day.
 def detect_rename_candidates(db_conn) -> list[dict]:
     """
     1. Fetch SEC company_tickers.json → upsert ticker_cik_map
-       (new (cik, ticker) pairings default to status='active' per
-       db_schema.md — overridden to 'suspended' below when ambiguous)
+       (new (cik, ticker) pairings default to rename_pending=FALSE per
+       db_schema.md — overridden to TRUE below when ambiguous. N-2: this
+       and quarantine_reason, below check_corporate_event_anomaly(), are
+       independent columns — see db_schema.md's ticker_cik_map)
     2. Find (cik, ticker_old) -> (cik, ticker_new) mapping changes where
        ticker_old has existing ohlcv_1min history (ticker_new's own history
        is not required — it doesn't exist yet at premarket)
     3. Unambiguous matches: INSERT OR IGNORE INTO ticker_history
        (effective_date = today, a best-effort estimate; self-corrected this
        evening — see below). ticker_cik_map row for ticker_new stays
-       status='active' — no gate needed, identity is confirmed.
+       rename_pending=FALSE — no gate needed, identity is confirmed.
     4. Ambiguous / CIK-unmatched:
-       UPDATE ticker_cik_map SET status='suspended',
-           suspend_reason='pending_rename_confirmation'
+       UPDATE ticker_cik_map SET rename_pending = TRUE
            WHERE cik=? AND ticker=?
        (this is what LiveModeRunner's is_tradable() gate — see
        execution_common.md — actually reads; the log below is for human
@@ -297,16 +403,18 @@ def self_correct_rename_effective_dates(db_conn, today) -> None:
     If different: UPDATE ticker_history SET effective_date = actual.
 
     For any ticker_new confirmed here (a row now exists in ohlcv_1min):
-        UPDATE ticker_cik_map SET status='active', suspend_reason=NULL
+        UPDATE ticker_cik_map SET rename_pending = FALSE
             WHERE ticker = ticker_new
-    — this is the only place status transitions from 'suspended' back to
-    'active' for the rename case; a ticker flagged ambiguous at premarket
-    stays 'suspended' (new entries blocked via is_tradable()) until this
-    same-evening check confirms it.
+    — this is the only place rename_pending transitions back to FALSE for
+    the rename case; a ticker flagged ambiguous at premarket stays
+    rename_pending=TRUE (new entries blocked via is_tradable() — see
+    db_schema.md's ticker_cik_map, N-2) until this same-evening check
+    confirms it. Independent of, and never touches, quarantine_reason —
+    see self_correct_quarantine() below.
 
     If ohlcv_1min still has no rows for ticker_new after grace_period
     (5 trading days): re-log to rename_candidates.log as a likely false
-    positive from the premarket detector. status stays 'suspended' —
+    positive from the premarket detector. rename_pending stays TRUE —
     resolution requires manual CLI action (--register-rename), not another
     automatic retry.
     """
@@ -314,6 +422,36 @@ def self_correct_rename_effective_dates(db_conn, today) -> None:
 
 Idempotent — safe to run every evening regardless of whether any rename is
 pending correction.
+
+```python
+def self_correct_quarantine(db_conn, today) -> None:
+    """
+    Companion to self_correct_rename_effective_dates() above, same evening
+    slot — corrects a quarantine set by check_corporate_event_anomaly()
+    (see "Per-Ticker Corporate-Event Anomaly Check", P-8).
+
+    For every ticker_cik_map row with suspend_reason='corporate_event_anomaly':
+        If corporate_events now has a row for (ticker, today) (the evening
+        crawl, which runs after both premarket passes, may have caught the
+        event both premarket passes missed): UPDATE status='active',
+        suspend_reason=NULL — the anomaly is now explained.
+        Otherwise: leave status='suspended'. Re-evaluated by tomorrow's
+        premarket pass per check_corporate_event_anomaly() — a vendor
+        delay stubborn enough to miss the evening crawl too can leave a
+        ticker quarantined for more than one day; this is intended
+        behavior, not a bug (see check_corporate_event_anomaly()'s
+        false-positive-is-cheap rationale — the same asymmetry argues for
+        leaving a still-unexplained ticker quarantined rather than
+        timing it out).
+    """
+```
+
+Idempotent — safe to run every evening regardless of whether any
+quarantine is pending correction. No interaction with
+`self_correct_rename_effective_dates()` — a `ticker_cik_map` row's
+`suspend_reason` holds one value at a time (`'pending_rename_confirmation'`
+or `'corporate_event_anomaly'`), never both, so the two self-correction
+functions never contend over the same row.
 
 ---
 
@@ -374,8 +512,33 @@ python tools/collect_daily.py \
 Recommended timing: once well before premarket bar accumulation begins
 (e.g. ~04:00 ET), and once again just before regular session open (~09:25 ET)
 as a re-check. `crawl_corporate_events()`'s `INSERT OR IGNORE` makes running
-it twice (or more) safe — a second run either finds nothing new (no-op) or
-catches an event the first run missed.
+it twice (or more) safe *once the first pass has actually finished* — a
+second run either finds nothing new (no-op) or catches an event the first
+run missed.
+
+**Collision guard (P-7):** that safety claim assumes the 04:00 pass has
+already reached `'success'` or `'failed'` by 09:25 — DuckDB is
+single-writer (P-5), so if the 04:00 pass is still mid-run
+(`status='running'`, meaning the ~15k-yfinance-call crawl is simply
+taking longer than the 5.25-hour gap), launching a second
+`--corporate-events-only` process concurrently would contend for the same
+write connection rather than safely no-op. Before doing any of its own
+work, the 09:25 invocation must therefore check:
+```
+SELECT status FROM batch_runs
+WHERE stage = 'premarket_corporate_events' AND date = today_date
+if status = 'running':
+    log + skip this pass entirely (bulk_fetch_today_first_price(),
+    query_halt_status(), crawl_corporate_events(), and
+    check_corporate_event_anomaly() all deferred to whenever the still-
+    running 04:00 pass itself finishes — no separate retry scheduled;
+    that pass's own eventual completion, however late, is what matters)
+else:
+    proceed normally (status is 'success', 'failed', or no row at all)
+```
+This is a read-only check against the SAME connection-acquisition pattern
+already governing every other stage here — no new locking primitive, just
+consulting `batch_runs` before writing rather than only after.
 
 **This is risk mitigation, not a guarantee.** Split/dividend effective dates
 are always before-market-open by convention (see `db_schema.md`
@@ -592,6 +755,37 @@ fmp_api_key: "your_key_here"
 
 ---
 
+## Config Keys (pipeline_config.yaml)
+
+```yaml
+# Bulk today-vs-yesterday price quote endpoint for
+# check_corporate_event_anomaly() (P-8) — a distinct endpoint from
+# trading_api_url / trading_api_ticker_url (see live_mode_runner.md),
+# since this crawler runs standalone, outside any LiveModeRunner session.
+# URL path and response schema: TBD (API spec sheet).
+trading_api_quotes_url: "http://trading-api/quotes/today"
+
+# Chunk size for utils.bulk_api_call_chunked() — shared by
+# bulk_fetch_today_first_price() (below) and, via the same physical
+# pipeline_config.yaml, live_mode_runner.md's query_halt_status() call
+# (see that file's Position Manager Loop Step 1a). Estimated against a
+# ~100 tickers/sec real-world throughput ceiling — TBD pending the actual
+# API spec sheet.
+bulk_api_chunk_size: 50
+
+quarantine:
+  price_anomaly_threshold: 0.40   # |today_first_price / yesterday_close - 1|
+                                  # above this, with no corporate_events row
+                                  # for today and no halt explanation, quarantines
+                                  # the ticker for the day — see
+                                  # check_corporate_event_anomaly(). Threshold
+                                  # is a placeholder pending shadow-stage tuning
+                                  # against real momentum-gapper false-positive
+                                  # rates (see original P-8 problem statement).
+```
+
+---
+
 ## Constraints
 
 - `secrets.yaml` must be in `.gitignore` — never commit API keys
@@ -628,10 +822,22 @@ fmp_api_key: "your_key_here"
   at its own completion, independent of the other two. This lets
   LiveModeRunner's Health Gate 1 (live_mode_runner.md) distinguish exactly
   which stage of an evening run failed, not just that the run as a whole did.
-- `--corporate-events-only` runs only `crawl_corporate_events()` for all
-  tickers — no metadata fields, no ingestion, no calendar/session-stats steps
+- `--corporate-events-only` runs `bulk_fetch_today_first_price()` +
+  `utils.query_halt_status()` + `crawl_corporate_events()` for all tickers,
+  then `check_corporate_event_anomaly()` (see "Per-Ticker Corporate-Event
+  Anomaly Check", P-8) — no metadata fields, no ingestion, no
+  calendar/session-stats steps. (Originally this flag ran only
+  `crawl_corporate_events()`; P-8 added the other three to this same flag's
+  scope rather than introducing a separate CLI flag, since all four share
+  this exact schedule slot and rationale.)
 - Must be safe to run multiple times on the same date (idempotent) — including
-  multiple `--corporate-events-only` runs on the same day
+  multiple `--corporate-events-only` runs on the same day. Also applies to
+  the three P-8 additions above: `bulk_fetch_today_first_price()` and
+  `query_halt_status()` are stateless reads: re-running them changes
+  nothing by itself. `check_corporate_event_anomaly()`'s own writes are
+  themselves idempotent per-ticker (each run's UPDATE reflects only that
+  run's fresh quote/halt inputs, not an accumulating count) — see that
+  function.
 - Failed metadata tickers do not block ingestion — two steps are independent
 - No session time filter on ingested data — all periods (040000~200000) stored
 - US stock splits and ex-dividend adjustments always take effect before market

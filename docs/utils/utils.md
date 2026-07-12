@@ -1160,6 +1160,100 @@ def temporal_split_simple(
 
 ---
 
+### Trading API Utilities
+
+```python
+def bulk_api_call_chunked(
+    tickers: list[str],
+    api_call_fn: Callable[[list[str]], dict],
+    chunk_size: int,
+) -> tuple[dict, bool]:
+    """
+    Shared chunking wrapper for trading-API bulk endpoints that cannot
+    accept the full ~15k-ticker universe in a single request. Assumes a
+    real-world throughput ceiling on the order of ~100 tickers/sec
+    (estimate pending the actual API spec sheet) — splits `tickers` into
+    `chunk_size`-sized groups and calls `api_call_fn(chunk)` once per
+    group, SEQUENTIALLY, not concurrently. Sequential is deliberate: a
+    ~100/s figure is more likely a server-side throughput ceiling than a
+    per-connection limit, so firing chunks concurrently risks throttling
+    or errors rather than bypassing the limit — revisit if the real API
+    spec sheet confirms the server supports concurrent bulk requests.
+
+    A single chunk's failure does not fail the whole call — that chunk's
+    tickers are simply absent from the merged result, the same way an
+    endpoint omitting an unrecognized ticker is already treated as normal
+    by both callers below. No retry/backoff within this function — that
+    policy is TBD, same deferred status as Feed Outage Recovery's
+    reconnect backoff (see live_mode_runner.md).
+
+    `chunk_size` is not defaulted here — utils.md functions carry no
+    pipeline business logic or config access (see Constraints); callers
+    read it from their own config (see metadata_crawler.md's Config Keys
+    for the shared `bulk_api_chunk_size` value both call sites use).
+
+    Returns (merged_dict, total_failure). total_failure=True only when
+    EVERY chunk failed (zero usable results) — a partial result (some
+    chunks succeeded) is expressed entirely through which tickers are
+    present in merged_dict, not surfaced as a separate flag.
+
+    Called by:
+        - query_halt_status() (below)
+        - metadata_crawler.md's bulk_fetch_today_first_price()
+    """
+    ...
+
+
+def query_halt_status(
+    tickers: list[str],
+    trading_api_url: str,
+    chunk_size: int,
+) -> dict[str, bool] | None:
+    """
+    Bulk-query the trading API's dedicated halt-status endpoint for the
+    given tickers, via bulk_api_call_chunked() above — not truly a single
+    call at universe scale, but the single access point regardless of
+    caller (same bulk-rationale as trading_api_ticker_url's existing "one
+    call, full range" convention — see live_mode_runner.md's Session
+    Lifecycle Step 1 — scaled down to chunk_size-sized requests underneath).
+
+    Returns {ticker: is_halted} for tickers the endpoint recognizes. A
+    ticker requested but absent from the response is the caller's problem
+    to handle (treated as "unknown", not as False) — this function does not
+    silently default a missing ticker to not-halted.
+
+    Returns None (not an exception) on total_failure from
+    bulk_api_call_chunked() (every chunk failed). This function does not
+    decide the degraded-mode behavior for that case; each call site
+    interprets None per its own context, since the two current call sites
+    have different fallback signals available:
+        - live_mode_runner.md's Position Manager Loop: falls back to the
+          existing tick-rate heuristic per position. Its own tickers list
+          is small (bounded by max_positions), so chunk_size barely
+          matters there — almost always one chunk regardless of value.
+        - metadata_crawler.md's check_corporate_event_anomaly(): no
+          live-tick fallback exists in that offline batch context: treats
+          an unresolved ticker as not-halted (conservative direction — see
+          that function for why).
+
+    Endpoint URL, request/response schema, and field names: TBD (API spec
+    sheet). This function's contract — bulk ticker list in,
+    {ticker: bool} | None out — is fixed now so both call sites can be
+    designed against it immediately; `trading_api_url` reuses the same
+    config key both call sites already read for other endpoints (see
+    live_mode_runner.md's Config Keys), not a new key.
+
+    Called by:
+        - live_mode_runner.md's Position Manager Loop, Step 1a (halt check,
+          API-primary + tick-rate fallback)
+        - metadata_crawler.md's check_corporate_event_anomaly() (premarket
+          quarantine check, P-8)
+    """
+    ...
+```
+
+---
+
 ## Constraints
 
 - All functions are stateless — no module-level state or caching
@@ -1269,3 +1363,10 @@ def temporal_split_simple(
 - `resolve_xbrl_tag_value()`'s tag-priority list per metric lives in
   `configs/xbrl_tag_map.json`, not hardcoded in this function — adding a
   fallback tag for an existing metric is a config change, not a code change
+- `query_halt_status()` is the sole halt-status-endpoint access point —
+  neither live_mode_runner.md nor metadata_crawler.md queries that trading-
+  API endpoint directly, for the same single-source-of-truth reason
+  `compute_tick_bar_aggregates()` is the sole IndicatorCalculator wrapper
+- `query_halt_status()` returning `None` is a call failure, not "no tickers
+  halted" — callers must not conflate the two; conflating them would mean a
+  dead endpoint silently reads as "everything is fine"
