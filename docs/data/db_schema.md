@@ -157,11 +157,21 @@ CREATE TABLE stock_meta (
 -- keeps the same CIK; a merger/spin-off does not) and fundamentals_quarterly's
 -- lookup key. first_seen/last_seen let a (cik, ticker) pairing be recognized
 -- as historical vs. current without deleting superseded rows.
+-- status/suspend_reason back LiveModeRunner's is_tradable() gate (see
+-- live_mode_runner.md): a newly-observed (cik, ticker) pairing is inserted
+-- as 'suspended'/'pending_rename_confirmation' and flips to 'active' once
+-- the same-evening self-correction (or manual CLI) confirms it. Reserved
+-- for future non-rename suspend_reason values (e.g. a later trading-halt
+-- integration) — not populated by any reason other than
+-- 'pending_rename_confirmation' today.
 CREATE TABLE ticker_cik_map (
     cik             VARCHAR NOT NULL,
     ticker          VARCHAR NOT NULL,
     first_seen_date VARCHAR NOT NULL,   -- 'YYYYMMDD', first observed
     last_seen_date  VARCHAR NOT NULL,   -- 'YYYYMMDD', most recent observed (upsert-refreshed)
+    status          VARCHAR NOT NULL DEFAULT 'active',  -- 'active' | 'suspended'
+    suspend_reason  VARCHAR,            -- NULL when status='active';
+                                        -- 'pending_rename_confirmation' today
     PRIMARY KEY (cik, ticker)
 );
 
@@ -242,6 +252,48 @@ CREATE TABLE ticker_data_coverage (
     has_1min    BOOLEAN   NOT NULL,
     has_tick    BOOLEAN   NOT NULL,
     PRIMARY KEY (ticker, date)
+);
+
+-- Completion markers for daily batch stages (metadata_crawler.md's Dual
+-- Schedule + LiveModeRunner's own session-end marker). Backs two things:
+-- (1) LiveModeRunner's Health Gate 1/2 (live_mode_runner.md) reads this to
+--     detect a stale/failed/still-running upstream batch before trading
+--     starts; (2) DuckDB access-ownership sequencing (P-5): the premarket
+--     stage's completion marker gates LiveModeRunner's session start, and
+--     LiveModeRunner's own 'live_session_end' row gates the evening stage's
+--     start — see live_mode_runner.md and metadata_crawler.md.
+CREATE TABLE batch_runs (
+    stage        VARCHAR   NOT NULL,  -- 'premarket_rename' | 'premarket_corporate_events' |
+                                      -- 'evening_ingestion' | 'evening_tick_bar_aggregates' |
+                                      -- 'evening_session_stats' | 'live_session_end'
+    date         VARCHAR   NOT NULL,  -- 'YYYYMMDD' — the trading day this batch targets
+    status       VARCHAR   NOT NULL,  -- 'running' | 'success' | 'failed'
+    started_at   TIMESTAMP NOT NULL,
+    finished_at  TIMESTAMP,           -- NULL while status='running'
+    PRIMARY KEY (stage, date)
+);
+
+-- Fitted execution-simulation parameters (buy_rate, sell_rate_tp, sell_rate_sl,
+-- cancel_after_seconds), refit periodically from pilot-stage predicted-vs-actual
+-- fill comparisons (see trade_log.predicted_* columns and
+-- shadow_retraining.md's fit_execution_params()). The `execution:` config
+-- block values (execution_common.md) are seed defaults only, used until the
+-- first row lands here for a given param_name; BacktestEngine and
+-- LiveModeRunner both read the latest row per param_name at session start
+-- in preference to the config seed — this table is never written by hand.
+CREATE TABLE execution_params (
+    param_name   VARCHAR   NOT NULL,  -- 'buy_rate' | 'sell_rate_tp' | 'sell_rate_sl' |
+                                      -- 'cancel_after_seconds'
+    value        DOUBLE    NOT NULL,
+    fitted_at    TIMESTAMP NOT NULL,
+    sample_size  INTEGER   NOT NULL,  -- cumulative pilot-stage trade count used —
+                                      -- see shadow_retraining.md for why this
+                                      -- accumulates across weeks rather than
+                                      -- resetting each calendar-week cycle
+    week_start   VARCHAR   NOT NULL,  -- 'YYYYMMDD' — calendar-week this fit run
+                                      -- was triggered on (the run cadence, not
+                                      -- the data window — see above)
+    PRIMARY KEY (param_name, fitted_at)
 );
 
 -- Corporate events (splits, reverse splits, dividends)
@@ -382,7 +434,9 @@ CREATE TABLE experiment_log (
     PRIMARY KEY (run_id)
 );
 
--- Trade log (output of BacktestEngine — one row per executed trade)
+-- Trade log (output of BacktestEngine — one row per executed trade;
+-- also written by LiveModeRunner in shadow mode — see is_shadow below and
+-- live_mode_runner.md's Shadow Mode section)
 CREATE TABLE trade_log (
     run_id                  VARCHAR      NOT NULL,
     ticker                  VARCHAR      NOT NULL,
@@ -394,13 +448,41 @@ CREATE TABLE trade_log (
     exit_price              DOUBLE,
     weighted_avg_exit_price DOUBLE,
     pnl_pct                 DOUBLE,
-    exit_reason             VARCHAR,
+    exit_reason             VARCHAR,     -- includes 'entry_canceled' (quantity=0,
+                                        -- fill_price=p_entry, exit_bar=entry_bar) —
+                                        -- entry-side order fully unfilled by
+                                        -- cancel_after_seconds; a real observation,
+                                        -- not omitted from the table (see
+                                        -- shadow_retraining.md — this case is a
+                                        -- direct signal for buy_rate/cancel_after_seconds
+                                        -- being too tight, and must be visible to
+                                        -- fit_execution_params()).
+                                        -- Also includes 'feed_gap_exit' — live-only,
+                                        -- a position whose exit condition triggered
+                                        -- during a Feed Outage Recovery gap (see
+                                        -- live_mode_runner.md); excluded from
+                                        -- ordinary strategy PnL attribution since
+                                        -- it reflects outage handling, not strategy
+                                        -- performance
     is_dead_position        BOOLEAN      NOT NULL DEFAULT FALSE,
     slippage_pct            DOUBLE,
     quantity                INTEGER,
     partial_fills_count     INTEGER,
     unfilled_quantity        INTEGER,
     is_ambiguous            BOOLEAN      NOT NULL DEFAULT FALSE,
+    is_shadow               BOOLEAN      NOT NULL DEFAULT FALSE,  -- TRUE = hypothetical
+                                        -- fill from LiveModeRunner shadow mode, not a
+                                        -- real BacktestEngine run; run_id distinguishes
+                                        -- which shadow session (not a real backtest run_id)
+    predicted_fill_price              DOUBLE,  -- pilot-stage only: simulate_entry_fill()
+                                        -- run counterfactually against the same tick
+                                        -- data as the real fill above, at session end
+                                        -- (see shadow_retraining.md Stage 2). NULL for
+                                        -- backtest/shadow rows (no "real" counterpart
+                                        -- to predict against) and for scale-stage rows.
+    predicted_weighted_avg_exit_price DOUBLE,  -- same, exit side
+    predicted_partial_fills_count     INTEGER, -- same, exit side — diagnostic
+                                        -- counterpart to partial_fills_count above
     PRIMARY KEY (run_id, ticker, date, entry_bar)
 );
 

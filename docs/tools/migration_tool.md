@@ -12,6 +12,15 @@ Supports both directory and zip formats. Skips already-imported data.
 After migration, initializes `trading_calendar`, `ticker_data_coverage`,
 and `precomputed_session_stats` tables.
 
+**Concurrency assumption**: this tool is run manually/rarely, never on an
+automated schedule, and is assumed to never run concurrently with a live
+trading session or the evening/premarket batch jobs (see P-5's DB
+ownership design in live_mode_runner.md / metadata_crawler.md, which this
+tool does not participate in — no `batch_runs` marker writes here). Running
+it while any of those hold the writer connection will fail with a DuckDB
+lock error rather than corrupt data — an operator error to avoid, not a
+case this tool detects or works around.
+
 ---
 
 ## Input File Convention

@@ -45,6 +45,11 @@ Label search range:    t bar open → 15:59 close or 60th valid bar close (which
 REFERENCE_SESSION:     prior session baselines sourced from precomputed_session_stats
                        (offline DB table) — NOT from bars feature window
                        gap_percentile returns NaN for t="093000" or pre-market entries
+Fundamentals:          fundamentals_quarterly must be read as-of a date via
+                       filed_date, NEVER fiscal_period_end — filtering on the
+                       latter leaks pre-disclosure information into features
+                       computed for dates before the filing existed
+                       (see data_boundary.md, db_schema.md)
 ```
 
 ---

@@ -245,13 +245,23 @@ lookback is silently truncated for that entire day.
 def detect_rename_candidates(db_conn) -> list[dict]:
     """
     1. Fetch SEC company_tickers.json → upsert ticker_cik_map
+       (new (cik, ticker) pairings default to status='active' per
+       db_schema.md — overridden to 'suspended' below when ambiguous)
     2. Find (cik, ticker_old) -> (cik, ticker_new) mapping changes where
        ticker_old has existing ohlcv_1min history (ticker_new's own history
        is not required — it doesn't exist yet at premarket)
     3. Unambiguous matches: INSERT OR IGNORE INTO ticker_history
        (effective_date = today, a best-effort estimate; self-corrected this
-       evening — see below)
-    4. Ambiguous / CIK-unmatched: log to tools/rename_candidates.log
+       evening — see below). ticker_cik_map row for ticker_new stays
+       status='active' — no gate needed, identity is confirmed.
+    4. Ambiguous / CIK-unmatched:
+       UPDATE ticker_cik_map SET status='suspended',
+           suspend_reason='pending_rename_confirmation'
+           WHERE cik=? AND ticker=?
+       (this is what LiveModeRunner's is_tradable() gate — see
+       execution_common.md — actually reads; the log below is for human
+       review, not machine consumption)
+       log to tools/rename_candidates.log for manual review
     """
 ```
 
@@ -259,6 +269,12 @@ def detect_rename_candidates(db_conn) -> list[dict]:
 # Premarket schedule addition (~04:00 ET, alongside corporate-events-only):
 python tools/collect_daily.py --db-path data/market.duckdb --ticker-rename-only
 ```
+
+Both `--ticker-rename-only` and the corporate-events-only refresh (above)
+write their own `batch_runs` row (`stage='premarket_rename'` /
+`stage='premarket_corporate_events'`, `date=today`) — `status='running'` at
+start, `status='success'`/`'failed'` at completion. LiveModeRunner's Health
+Gate 1 reads these (see live_mode_runner.md).
 
 ## Evening Ticker Rename Self-Correction
 
@@ -271,9 +287,20 @@ def self_correct_rename_effective_dates(db_conn, today) -> None:
     days: compare registered effective_date against
     MIN(date) FROM ohlcv_1min WHERE ticker = ticker_new.
     If different: UPDATE ticker_history SET effective_date = actual.
+
+    For any ticker_new confirmed here (a row now exists in ohlcv_1min):
+        UPDATE ticker_cik_map SET status='active', suspend_reason=NULL
+            WHERE ticker = ticker_new
+    — this is the only place status transitions from 'suspended' back to
+    'active' for the rename case; a ticker flagged ambiguous at premarket
+    stays 'suspended' (new entries blocked via is_tradable()) until this
+    same-evening check confirms it.
+
     If ohlcv_1min still has no rows for ticker_new after grace_period
     (5 trading days): re-log to rename_candidates.log as a likely false
-    positive from the premarket detector.
+    positive from the premarket detector. status stays 'suspended' —
+    resolution requires manual CLI action (--register-rename), not another
+    automatic retry.
     """
 ```
 
@@ -452,6 +479,7 @@ corporate events collection — see Constraints.
 
 ## Output / Logging
 
+Console output (human-readable, unchanged):
 ```
 Daily Collection — 20250715
   [Metadata]
@@ -483,9 +511,41 @@ Daily Collection — 20250715
     Duration            : 1m 48s
 ```
 
+File log (machine-parseable, for `tools/health_report.md` — see that doc):
+written to `logs/metadata_crawler_{date}.log` (one file per run date, not
+appended across dates), every line tab-separated `key=value`, no free-form
+text:
+
+```
+2026-07-11T04:23:01	INFO	ticker=AAPL	status=updated	source=yfinance
+2026-07-11T04:23:47	WARN	ticker=XYZ	status=failed	source=yfinance	fallback=fmp	fallback_status=success
+2026-07-11T05:47:33	SUMMARY	stage=evening_ingestion	date=20260711	processed=11847	updated=11820	failed=27
+```
+
+A `SUMMARY` line is written at the end of each stage. Its absence (rather
+than a `failed` count) is `health_report.md`'s signal for an abnormal
+termination, distinct from a high-but-nonzero failure count. Per-ticker
+`INFO`/`WARN` lines are for human debugging; only `SUMMARY` lines are
+parsed by `health_report.md`.
+
 ---
 
 ## Cron / Scheduler Setup
+
+**Evening job start gate**: before its first stage (metadata/corporate-events
+crawl) begins, the evening run polls `batch_runs` for
+`stage='live_session_end' AND date=today, status='success'` — written by
+LiveModeRunner at its own session shutdown (see live_mode_runner.md's
+Session Shutdown). This is the DuckDB-ownership-handoff half of P-5's
+temporal ownership design (the other half — LiveModeRunner waiting on the
+premarket marker before opening its own connection — is in
+live_mode_runner.md's Session Start Gating). No timeout specified here —
+unlike the premarket wait, there is no equivalent "proceed in degraded mode"
+option for the evening job; if LiveModeRunner's session hasn't ended yet,
+the evening job simply keeps waiting (regular-session trading hours end well
+before 17:00 ET in ordinary operation, so this is expected to be a very
+short or zero wait in practice — a long wait here would itself indicate
+something worth investigating, not something to silently override).
 
 ```bash
 # Run after market close daily (weekdays only), 17:00 ET
@@ -546,6 +606,20 @@ fmp_api_key: "your_key_here"
   single evening run must not change; the premarket refresh is intentionally
   a separate, later, supplementary crawl that session_stats does NOT re-read
 - `populate_trading_calendar()`, `populate_ticker_coverage()`, and `populate_precomputed_session_stats()` sourced from `utils.py`
+- The evening run writes three `batch_runs` rows as it progresses —
+  `stage='evening_ingestion'` (around Steps 3-4 above), `stage='evening_tick_bar_aggregates'`
+  (Tick Bar Aggregates Update), `stage='evening_session_stats'` (Session Stats
+  Update) — each `status='running'` at its own start, `'success'`/`'failed'`
+  at its own completion, independent of the other two. This lets
+  LiveModeRunner's Health Gate 1 (live_mode_runner.md) distinguish exactly
+  which stage of an evening run failed, not just that the run as a whole did.
+- The evening run writes three `batch_runs` rows as it progresses —
+  `stage='evening_ingestion'` (around Steps 3-4 above), `stage='evening_tick_bar_aggregates'`
+  (Tick Bar Aggregates Update), `stage='evening_session_stats'` (Session Stats
+  Update) — each `status='running'` at its own start, `'success'`/`'failed'`
+  at its own completion, independent of the other two. This lets
+  LiveModeRunner's Health Gate 1 (live_mode_runner.md) distinguish exactly
+  which stage of an evening run failed, not just that the run as a whole did.
 - `--corporate-events-only` runs only `crawl_corporate_events()` for all
   tickers — no metadata fields, no ingestion, no calendar/session-stats steps
 - Must be safe to run multiple times on the same date (idempotent) — including

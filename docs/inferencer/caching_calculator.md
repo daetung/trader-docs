@@ -174,7 +174,14 @@ def on_bar_close(
 
     For CONTINUOUS indicators (ema, rsi, atr, etc.):
         Append new_bar to internal rolling window.
-        Recompute indicator for the new tail (incremental or full window).
+        Recompute indicator for the new tail — O(1) incremental update only
+        (e.g. Wilder's smoothing for rsi/atr/adx, recursive ema, running
+        sum/sum-of-squares for bollinger's rolling std, cumulative sum for
+        obv). Full-window recomputation from scratch on every call is not
+        permitted for any indicator in this category — see the catch-up
+        rationale in live_mode_runner.md's Watchdog Polling Loop (Step 3's
+        multi-bar replay loop is only cheap because every indicator here is
+        O(1) per call).
 
     For fibonacci (monotonic deque):
         deque.add(new_bar["close"])
@@ -199,10 +206,21 @@ def on_bar_close(
         aggregation logic is identical either way.
 
     For sr_levels:
-        NOT updated here — computed on demand in get_for_entry()
+        NOT updated here — computed on demand in get_for_entry() from the
+        bars_up_to_t1 passed in at call time.
 
     For gap_pct:
         NOT updated here — fixed after on_regular_session_open()
+
+    Rule for any future indicator that cannot be reduced to an O(1)
+    incremental update (e.g. another scipy-prominence-style computation):
+    it MUST follow the sr_levels pattern above — excluded from this
+    method's per-bar path entirely, computed fresh in get_for_entry() from
+    the caller-supplied bars window. It must NOT be added to the CONTINUOUS
+    category with a "full window" fallback. This keeps every call to this
+    method cheap regardless of how many bars are being replayed in one
+    batch (see live_mode_runner.md's Watchdog Polling Loop and Position
+    Manager Loop).
     """
 ```
 
@@ -344,7 +362,10 @@ Config value  → Bars to use at session_start_compute()
 0             → not precalculated (bar-by-bar in on_bar_close)
 ```
 
-Indicators with `precalculate_bars: 0` (vwap, lee_ready, tpm, avg_vol_per_tick, sr_levels):
+Indicators with `precalculate_bars: 0` (vwap, sr_levels, and all tick-derived
+indicators at their default — lee_ready, tpm, avg_vol_per_tick, and the 6
+added since — see 02_indicator_calculator.md's Tick-Derived Indicator Scale
+Sensitivity registry for the current full set):
 - Not included in Layer 2 cache at session start
 - Computed or accumulated as today's bars/ticks arrive
 

@@ -1,3 +1,4 @@
 session_handoff.md
 .compare/
 .patch/
+*.patch

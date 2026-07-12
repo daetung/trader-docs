@@ -735,6 +735,17 @@ indicators:
   tick_burstiness:
     precalculate_bars: 0        # default: session-only; "lookback" also valid
 
+  # Why `precalculate_bars: 0` is the current default for all 9 tick-derived
+  # indicators above: building and profiling "lookback" live-parity for an
+  # indicator DimensionalityReducer may later drop is wasted effort. The
+  # default is intentionally temporary — session-only until the selection
+  # phase (see pipeline_optimizer.md) finalizes selected_features.json.
+  # Indicators that survive selection should then have precalculate_bars
+  # flipped to "lookback" for live deployment, closing the train/serve
+  # window-semantics gap this default otherwise leaves open. This is a
+  # sequencing decision already made in principle, pending selection
+  # completion — not an open architecture question.
+
   # REFERENCE_SESSION
   reference_session:
     n_sessions: 20              # prior sessions for baseline; independent of lookback_days

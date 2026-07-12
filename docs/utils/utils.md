@@ -63,43 +63,10 @@ def build_effective_bar_sequence(
 
 ### Signal Resolution
 
-```python
-def resolve_signal(
-    row: pd.Series,
-    threshold: float,
-    suppress_threshold: float | None = None,
-) -> str | None:
-    """
-    Determine entry signal from model probability output.
-    up5 takes priority over up3.
-
-    Suppression logic:
-        If suppress_threshold is not None, downside classifiers (dn5, dn3)
-        are checked first. If either exceeds suppress_threshold, the signal
-        is suppressed regardless of upside probabilities.
-
-        This prevents entering long positions when the model has strong
-        conviction of a downside move, even if upside probabilities also
-        happen to exceed threshold.
-
-    Used by BacktestEngine and Inferencer.
-
-    Setting suppress_threshold higher than entry_threshold results in more
-    permissive suppression (fewer entries blocked). Setting them equal is
-    the recommended starting point.
-
-    Logic:
-        if suppress_threshold is not None:
-            if prob_dn5 >= suppress_threshold or prob_dn3 >= suppress_threshold:
-                return None   # suppressed — downside conviction overrides upside signal
-        if prob_up5 >= threshold:
-            return "up5"
-        if prob_up3 >= threshold:
-            return "up3"
-        return None
-    """
-    ...
-```
+`resolve_signal()` moved to `docs/utils/execution_common.md` — shared
+execution-time logic between BacktestEngine and LiveModeRunner now lives
+there rather than growing utils.py indefinitely. See execution_common.md
+for the full spec.
 
 ---
 
@@ -266,60 +233,12 @@ def track_label_breach(
 
 ### Exit Fill Simulation
 
-```python
-def simulate_exit_fill(
-    ticks_exit: pd.DataFrame,
-    ohlcv_exit: pd.DataFrame,
-    position_size: int,
-    breach_bundle_idx: int,
-    breach_price: float,
-    sell_rate: float,
-    halts_df: pd.DataFrame,
-) -> tuple[float, int, int, str]:
-    """
-    Simulate partial exit fills across tick bundles from the breach point onward.
-    Continues through session close into after-market until position is fully
-    closed or all ticks are exhausted.
-
-    Used exclusively by BacktestEngine after track_price_breach() confirms direction.
-    Caller selects sell_rate based on exit direction:
-        sell_rate_tp for take-profit; sell_rate_sl for stop-loss.
-
-    Per-bundle fill logic (from breach_bundle_idx onward):
-        if bundle overlaps halt interval in halts_df → skip
-        per_tick_vol = bundle.volume / 10
-        sellable     = floor(per_tick_vol * sell_rate)
-        if sellable == 0 → skip
-        filled_qty   = min(remaining, sellable)
-        fill_price   = interpolate_bundle_price(prev_bundle, bundle, bundle.hour)
-        total_value += fill_price * filled_qty
-        total_filled += filled_qty
-
-    Breach bundle handling:
-        fill_price = breach_price (computed by caller via interpolate_bundle_price).
-        sellable   = floor((breach_bundle.volume / 10) * sell_rate)
-        if sellable == 0 → skip breach bundle, start from breach_bundle_idx + 1.
-
-    Session close: no forced liquidation; after-market ticks processed identically.
-    Ticks exhausted with remaining > 0: unfilled_quantity = remaining.
-
-    weighted_avg_exit_price:
-        Σ(fill_price_i * qty_i) / Σ(qty_i) if total_filled > 0 else breach_price.
-
-    Args:
-        ticks_exit:        tick_10 from breach_bundle_idx onward (full day, after-market included)
-        ohlcv_exit:        1-minute bars from breach bar onward (halt detection)
-        position_size:     total shares to exit
-        breach_bundle_idx: iloc index of breach bundle in ticks_exit
-        breach_price:      estimated price at breach bundle
-        sell_rate:         fraction of per-tick volume available (sell_rate_tp or sell_rate_sl)
-        halts_df:          trading_halts rows for this ticker/date
-
-    Returns:
-        (weighted_avg_exit_price, total_filled, unfilled_quantity, final_exit_hour)
-    """
-    ...
-```
+`simulate_exit_fill()` moved to `docs/utils/execution_common.md`, alongside
+its new entry-side counterpart `simulate_entry_fill()` — both are backtest
+consumers today, but live entirely without label/training involvement
+(unlike `track_price_breach()`, which stays here — see execution_common.md's
+Role section for the split rationale). See execution_common.md for the full
+spec.
 
 ---
 
@@ -1248,11 +1167,6 @@ def temporal_split_simple(
   — Labeler and BacktestEngine both import from here; logic must not be duplicated
 - `build_effective_bar_sequence()` never returns bars with hour > "155900" —
   after-market bars are excluded regardless of target_valid_bars
-- `resolve_signal()` is the single source of truth for entry signal thresholding
-  — BacktestEngine and Inferencer both import from here
-- `resolve_signal()` suppression check always precedes entry signal check
-  — suppression takes priority regardless of upside probability magnitude
-- `suppress_threshold=None` disables suppression entirely
 - `apply_overrides()` must deep-copy config — original must never be mutated
 - `load_encoding_map()` returns empty dict (not error) when file does not exist
   — FeatureExtractor handles first-run map creation
@@ -1260,10 +1174,12 @@ def temporal_split_simple(
   load or inject encoding maps directly
 - All categorical encoding maps guarantee integer values, never NaN
 - `halt_reason_code_map.json` must always contain `"no_halt": 0` as a reserved entry
-- `track_price_breach()` is the low-level primitive for single tp/sl detection (BacktestEngine)
+- `track_price_breach()` is the low-level primitive for single tp/sl detection —
+  BacktestEngine and LiveModeRunner's Position Manager Loop both import from
+  here (see P-10 in the former open_items_production_readiness.md; Position
+  Manager Loop calls it on live-accumulated bars/ticks each poll, stateless
+  re-scan, no incremental state — see live_mode_runner.md)
 - `track_label_breach()` is the high-level wrapper for two-stage label detection (Labeler only)
-- `simulate_exit_fill()` is called after track_price_breach() confirms direction;
-  sell_rate selection (tp vs sl) is the caller's responsibility
 - `generate_run_id()` not called inside parallel workers or sequential fold loops —
   coordinator pre-generates structured run_ids in all optimizer contexts
 - `compute_vol_regime_holdout()` uses regular session bars only (093000–155900)

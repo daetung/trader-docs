@@ -118,6 +118,16 @@ save_json({"fold_reports": reduction_reports},
           "configs/feature_selection_log.json")
 ```
 
+**Post-selection follow-up (manual, not automated by this phase):** review
+`selected_features` for any of the 9 tick-derived indicators (see
+02_indicator_calculator.md's Tick-Derived Indicator Scale Sensitivity
+registry). Indicators that survived selection should have their
+`precalculate_bars` config flipped from the default `0` to `"lookback"` for
+live deployment — see the rationale note alongside that config block. This
+step is deliberately not triggered automatically by `frequency_vote()`
+completing; it is a config decision made once selected_features stabilizes,
+not a per-run action.
+
 ---
 
 ### Phase: "exploitation"
@@ -610,6 +620,15 @@ class PipelineOptimizer:
                             if holdout enabled)
           - "full":         one fold pass, no reducer, backtest
                             returns experiment_log rows
+          - "refresh":      routine retraining entry point — the two-depth
+                            design (calendar-triggered refit vs.
+                            divergence-triggered re-optimization) is
+                            specified in docs/ops/shadow_retraining.md's
+                            "Retraining Cadence" section, not in this file —
+                            this phase has no dedicated algorithm of its
+                            own; it dispatches to "full" or "exploitation"
+                            depending on which trigger fired (see
+                            `optimizer.refresh` config block below).
         """
         ...
 
@@ -627,8 +646,16 @@ class PipelineOptimizer:
 
 ```yaml
 optimizer:
-  phase: "exploitation"     # "selection" | "exploitation" | "full"
+  phase: "exploitation"     # "selection" | "exploitation" | "full" | "refresh"
   selected_features_path: "configs/selected_features.json"
+
+  refresh:
+    calendar_cadence_days: 30      # monthly-level; "refit only" trigger (dispatches
+                                   # to "full" phase — same hyperparameters/features,
+                                   # freshly-fit on extended data)
+    divergence_reoptimize: true    # if the divergence check (see health_report.md /
+                                   # shadow-retraining spec) fires as severe, dispatch
+                                   # to "exploitation" instead of "full" for this cycle
 
   hyperparameter_search:
     max_trials: 30
