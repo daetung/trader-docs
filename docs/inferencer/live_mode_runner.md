@@ -633,6 +633,15 @@ loop every position_check_interval_seconds (config, default: 5s):
             position.status = 'active' (clears automatically once tick
             rate recovers — no separate resumption-detection logic needed)
 
+        Note — separate halt-status endpoint (not integrated here): the
+        trading API exposes halt status via a distinct, dedicated endpoint
+        from the bar/tick data used above — not a flag embedded in the
+        regular market-data response. Direct integration is deferred; the
+        tick-rate heuristic above is the only halt-detection mechanism this
+        spec currently implements. Noting the endpoint's existence now so a
+        future session designing direct integration starts from an
+        accurate premise instead of rediscovering it.
+
         No separate "resumption-auction exit" pre-registration mechanism —
         deliberately not built. A `'halted'` position is not removed from
         this loop's iteration set; it simply skips Steps 2-4 while halted.

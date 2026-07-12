@@ -262,6 +262,14 @@ def detect_rename_candidates(db_conn) -> list[dict]:
        execution_common.md — actually reads; the log below is for human
        review, not machine consumption)
        log to tools/rename_candidates.log for manual review
+
+    Fallback path (not integrated here): for cases SEC's company_tickers.json
+    alone leaves ambiguous, a cross-check against the trading service API
+    (the same API already queried in live_mode_runner.md's Session Lifecycle
+    Step 1 for today's tradable ticker list) is intended as a secondary
+    signal. Noted as a planned path only — the specific endpoint/call
+    contract for this cross-check is not defined in this spec; SEC's
+    company_tickers.json is the sole source actually implemented above.
     """
 ```
 
