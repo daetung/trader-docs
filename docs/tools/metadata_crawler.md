@@ -373,9 +373,11 @@ runs — falls back to Tier 2/3 on-the-fly resolution per utils.md).
 
 ## Premarket Ticker Rename Detection
 
-Runs at premarket (same schedule slot as the corporate-events-only refresh),
-**before** `LiveModeRunner.start_session()` — a rename must be registered
-before that day's Eager Pool bar loading, or the renamed ticker's history
+Runs at premarket, as Step 1 of `--premarket-open` (N-1 — see "Dual
+Schedule" below; no longer a separately-scheduled process alongside the
+corporate-events crawl), **before** the crawl and before
+`LiveModeRunner.start_session()` — a rename must be registered before
+that day's Eager Pool bar loading, or the renamed ticker's history
 lookback is silently truncated for that entire day.
 
 ```python
@@ -411,16 +413,22 @@ def detect_rename_candidates(db_conn) -> list[dict]:
     """
 ```
 
+Scheduled automatically as Step 1 of `--premarket-open` (see "Dual
+Schedule" below and Constraints) — no separate cron entry. Available
+standalone as `--ticker-rename-only` for manual re-run/debugging only
+(same "legacy flags remain for isolated re-runs" convention as
+`--corporate-events-only` — see Constraints):
 ```bash
-# Premarket schedule addition (~04:00 ET, alongside corporate-events-only):
 python tools/collect_daily.py --db-path data/market.duckdb --ticker-rename-only
 ```
 
-Both `--ticker-rename-only` and the corporate-events-only refresh (above)
-write their own `batch_runs` row (`stage='premarket_rename'` /
-`stage='premarket_corporate_events'`, `date=today`) — `status='running'` at
-start, `status='success'`/`'failed'` at completion. LiveModeRunner's Health
-Gate 1 reads these (see live_mode_runner.md).
+Whichever path runs it, rename detection writes its own `batch_runs` row
+(`stage='premarket_rename'`, `date=today`) — `status='running'` at start,
+`status='success'`/`'failed'` at completion — same as before, independent
+of the `stage='premarket_corporate_events'` row `crawl_corporate_events()`
+writes later in the same `--premarket-open` process (see "Two distinct
+call patterns" above). LiveModeRunner's Health Gate 1 reads both (see
+live_mode_runner.md).
 
 ## Evening Ticker Rename Self-Correction
 
