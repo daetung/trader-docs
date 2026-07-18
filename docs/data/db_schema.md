@@ -275,13 +275,19 @@ CREATE TABLE ticker_data_coverage (
 CREATE TABLE batch_runs (
     stage        VARCHAR   NOT NULL,  -- 'premarket_rename' | 'premarket_corporate_events' |
                                       -- 'evening_ingestion' | 'evening_tick_bar_aggregates' |
-                                      -- 'evening_session_stats' | 'live_session_end'
+                                      -- 'evening_session_stats' | 'live_session_start' |
+                                      -- 'live_session_end'
     date         VARCHAR   NOT NULL,  -- 'YYYYMMDD' — the trading day this batch targets
     status       VARCHAR   NOT NULL,  -- 'running' | 'success' | 'failed'
     started_at   TIMESTAMP NOT NULL,
     finished_at  TIMESTAMP,           -- NULL while status='running'
     PRIMARY KEY (stage, date)
 );
+-- 'live_session_start' (R-2): written 'running' at Session Lifecycle Step
+-- 1c, flipped to 'success' at clean Session Shutdown alongside
+-- 'live_session_end'. A today row still 'running' with no
+-- 'live_session_end' row is the crash signature warm-restart detection
+-- keys on — see live_mode_runner.md.
 
 -- Fitted execution-simulation parameters (buy_rate, sell_rate_tp, sell_rate_sl,
 -- cancel_after_seconds), refit periodically from pilot-stage predicted-vs-actual
@@ -326,7 +332,54 @@ CREATE TABLE corporate_events (
     event_type  VARCHAR NOT NULL,   -- 'split' | 'reverse_split' | 'dividend'
     value       DOUBLE  NOT NULL,   -- split/reverse_split: ratio (>1.0 or <1.0)
                                     -- dividend: per-share cash amount (USD, >0)
+    source      VARCHAR NOT NULL DEFAULT 'yfinance',  -- 'yfinance' | 'investing'
+                                    -- which vendor supplied the value now
+                                    -- stored. NOT part of the primary key —
+                                    -- see the invariant below.
     PRIMARY KEY (ticker, event_date, event_type)
+);
+-- item N INVARIANT: exactly ONE row per (ticker, event_date, event_type),
+-- always. This is load-bearing, not incidental: cum_split_ratio() (utils.md)
+-- computes the PRODUCT of every matching row, so a second row for the same
+-- event — e.g. the same 2:1 split reported by both vendors — would yield
+-- 2.0 * 2.0 = 4.0 and silently mis-scale every adjusted price and volume
+-- that depends on it (adjust_bars_for_corporate_events(),
+-- adjust_tick_derived_series_for_corporate_events(),
+-- populate_precomputed_session_stats() section D, gap_percentile(),
+-- Labeler Case A, BacktestEngine dead-position). No exception raised, no
+-- log line — just wrong numbers. Any future vendor added here must respect
+-- this invariant.
+--
+-- Vendor disagreement is therefore resolved AT WRITE TIME, by the shared
+-- upsert_corporate_event() helper (metadata_crawler.md), never by keeping
+-- both rows here:
+--   no existing row               -> INSERT
+--   existing row, values agree    -> no-op (agreement needs no second row)
+--   existing row, values disagree -> corporate_events keeps the
+--                                    investing.com value (the confirmed
+--                                    tie-break: date-scoped same-day query,
+--                                    treated as fresher), AND both values
+--                                    are recorded in corporate_event_conflicts
+--                                    below so the disagreement is fully
+--                                    inspectable without endangering the
+--                                    one-row invariant.
+-- Consequence: no reader needs tie-break logic, and none was added.
+
+-- Vendor disagreements for the same event (item N). Diagnostic only — no
+-- runtime consumer reads this table; it exists so that "the two vendors
+-- disagreed about this split/dividend" is a recoverable fact rather than
+-- something a blind overwrite silently discarded. Surfaced by
+-- health_report.md.
+CREATE TABLE corporate_event_conflicts (
+    ticker        VARCHAR   NOT NULL,
+    event_date    VARCHAR   NOT NULL,   -- 'YYYYMMDD'
+    event_type    VARCHAR   NOT NULL,   -- 'split' | 'reverse_split' | 'dividend'
+    kept_source   VARCHAR   NOT NULL,   -- vendor whose value is in corporate_events
+    kept_value    DOUBLE    NOT NULL,
+    other_source  VARCHAR   NOT NULL,   -- vendor whose value was NOT kept
+    other_value   DOUBLE    NOT NULL,
+    observed_at   TIMESTAMP NOT NULL,
+    PRIMARY KEY (ticker, event_date, event_type, other_source)
 );
 
 -- Entry points (output of EntryPointDetector)
@@ -467,13 +520,47 @@ CREATE TABLE trade_log (
                                         -- direct signal for buy_rate/cancel_after_seconds
                                         -- being too tight, and must be visible to
                                         -- fit_execution_params()).
-                                        -- Also includes 'feed_gap_exit' — live-only,
-                                        -- a position whose exit condition triggered
-                                        -- during a Feed Outage Recovery gap (see
-                                        -- live_mode_runner.md); excluded from
+                                        -- Also includes the LIVE-ONLY, PnL-EXCLUDED
+                                        -- operational family — exits driven by
+                                        -- operational handling rather than by the
+                                        -- strategy, and therefore excluded from
                                         -- ordinary strategy PnL attribution since
-                                        -- it reflects outage handling, not strategy
-                                        -- performance
+                                        -- they reflect handling, not strategy
+                                        -- performance:
+                                        --   'feed_gap_exit' — exit condition
+                                        --     triggered during a Feed Outage
+                                        --     Recovery gap (live_mode_runner.md).
+                                        --   'restart_gap_exit' (R-2) — tp/sl
+                                        --     breached during a crash gap,
+                                        --     detected retroactively on warm
+                                        --     restart via gap-fill ticks + the
+                                        --     2-print guard, and liquidated at
+                                        --     CURRENT price (the historical breach
+                                        --     price is stale by then). If the gap
+                                        --     already exceeds
+                                        --     execution.max_hold_bars,
+                                        --     retro-detection is skipped and the
+                                        --     position is liquidated immediately,
+                                        --     still 'restart_gap_exit'.
+                                        --   'overnight_exit' (R-3) — a position
+                                        --     carried from a PRIOR trading day
+                                        --     (halt-through-close, unfilled EOD
+                                        --     exit, or an unmatched broker
+                                        --     position of unknown date),
+                                        --     liquidated at market as soon as
+                                        --     tradable. Shares its liquidation
+                                        --     mechanism with 'restart_gap_exit';
+                                        --     the two differ only by whether the
+                                        --     carry was same-day or cross-day.
+                                        --   'reconcile_ghost' (R-3) — a
+                                        --     live_positions row with
+                                        --     status='open' but no matching
+                                        --     broker position at Broker Reconcile
+                                        --     (quantity=0; there was never a real
+                                        --     fill to attribute).
+                                        -- See live_mode_runner.md's "Broker
+                                        -- Reconcile (shared procedure)" and
+                                        -- "Unified Overnight Policy."
     is_dead_position        BOOLEAN      NOT NULL DEFAULT FALSE,
     slippage_pct            DOUBLE,
     quantity                INTEGER,
@@ -563,11 +650,17 @@ CREATE TABLE precomputed_session_stats (
 -- (build_session_stats_dict() or load_session_stats()) — not stored in this table.
 -- Changing delta_minutes requires no DB recomputation.
 
--- Indicator cache for live mode (used only when indicator_cache_mode = "db")
+-- Indicator cache for live mode. Primary runtime store when
+-- indicator_cache_mode = "db" (see below). Also written REGARDLESS of mode
+-- as a crash-recovery backup (R-2) — persist_to_db() is called per ticker
+-- right after each Eager-Pool worker finishes, so a warm restart can
+-- restore via load_from_db() instead of recomputing historical_bars; in
+-- "memory" mode the RAM copy stays authoritative for the running session
+-- and this backup is read only on a warm restart.
 -- Populated by CachingIndicatorCalculator.persist_to_db() at session_start.
--- Loaded per-ticker on first watchdog event via load_from_db().
+-- Loaded per-ticker on first watchdog event via load_from_db() ("db" mode),
+-- or by a warm restart (any mode — R-2, see live_mode_runner.md).
 -- session_stats are NOT stored here — sourced from precomputed_session_stats separately.
--- Not created or queried when indicator_cache_mode = "memory" (default).
 CREATE TABLE indicator_cache (
     session_date  VARCHAR  NOT NULL,   -- 'YYYYMMDD'
     ticker        VARCHAR  NOT NULL,
@@ -576,7 +669,48 @@ CREATE TABLE indicator_cache (
     cache_data    BLOB     NOT NULL,   -- serialized numpy array / DataFrame (Arrow IPC or pickle)
     PRIMARY KEY (session_date, ticker, layer, indicator)
 );
--- Retention: current session_date only; prior session_date rows purged at each session_start.
+-- Retention: current session_date only, purged at COLD session_start. On a
+-- WARM RESTART (crash recovery, R-2 — see live_mode_runner.md) the purge
+-- is SKIPPED — today's backup must survive so a re-crash during recovery
+-- can re-restore from it.
+
+-- Real (non-shadow) position lifecycle, persisted so a mid-session crash
+-- is recoverable (R-2). The 'pending' row is written at ORDER SUBMISSION
+-- time (not fill), so a limit order pending across a crash is
+-- reconcilable by order_id, and the submission-vs-fill window is covered
+-- even for market orders.
+CREATE TABLE live_positions (
+    run_id       VARCHAR NOT NULL,
+    ticker       VARCHAR NOT NULL,
+    date         VARCHAR NOT NULL,   -- 'YYYYMMDD'
+    entry_bar    INTEGER NOT NULL,   -- HHMMSS, mirrors trade_log
+    order_id     VARCHAR NOT NULL,   -- trading-API order id (submission)
+    limit_price  DOUBLE,             -- NULL for market orders
+    submitted_at VARCHAR NOT NULL,   -- 'YYYYMMDD_HHMMSS'
+    signal       VARCHAR NOT NULL,   -- 'up5' | 'up3'
+    status       VARCHAR NOT NULL,   -- 'pending'|'open'|'closed'|'canceled'
+    fill_price   DOUBLE,             -- NULL until 'open'
+    fill_second  INTEGER,            -- HHMMSS, NULL until 'open'
+    quantity     INTEGER,            -- NULL until 'open'
+    updated_at   VARCHAR NOT NULL,
+    PRIMARY KEY (run_id, ticker, date, entry_bar)
+);
+-- status lifecycle: 'pending' -> 'open' -> 'closed'; branch 'canceled'
+--   (pending expired/canceled/rejected before fill).
+-- Never deleted intra-day -- closed/canceled rows retained so cooldown
+--   state is derivable after a restart.
+-- No entry_ticks column: tp/sl detection is WS/REST-tick driven (see
+--   live_mode_runner.md's Exit Architecture), not track_price_breach()
+--   in live mode, so no "t-bar ticks" field is needed here.
+
+-- One row per session date; preserves the sizing basis across a restart.
+CREATE TABLE live_session_state (
+    date               VARCHAR NOT NULL,
+    run_id             VARCHAR NOT NULL,
+    session_start_cash DOUBLE  NOT NULL,
+    started_at         VARCHAR NOT NULL,
+    PRIMARY KEY (date)
+);
 ```
 
 ---

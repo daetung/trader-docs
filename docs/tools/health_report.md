@@ -72,27 +72,55 @@ def gather_findings(db_conn, today_date, log_dir) -> dict:
        findings 6/7. Threshold TBD (same deferral status as the rate
        itself always being computed and loggable, only the warn cutoff
        undecided).
-    9. Execution-parameter fit rejections (N-7, pilot stage onward) — count
-       of this week's fit_execution_params() run, per parameter, where a
-       value cleared its sample-size gate but was rejected by the
-       relative-bound check (landed outside
-       [current/fit_rejection_multiplier, current*fit_rejection_multiplier]
-       — see shadow_retraining.md and execution_common.md's
-       fit_rejection_multiplier config). Also includes get_execution_param()
-       hard-bound fallbacks (a stored value outside its mathematically
-       valid range — see execution_common.md), though those should never
-       occur under normal operation since the relative-bound check is what
-       prevents a bad value from being written in the first place; a
-       nonzero count here specifically would point at manual corruption or
-       a write-path bug bypassing fit_execution_params() entirely, not at
-       calibration behaving unexpectedly. A nonzero relative-bound
-       rejection count means the CURRENT authoritative value is older than
-       the sample-size gate alone would suggest — worth a human look at
-       whether the fit reflects a genuine regime shift (in which case the
-       multiplier itself may need revisiting) or noise. Independent of
-       finding 7 — a rejected fit and a magnitude-off predicted-vs-actual
-       gap are different failure modes. Never merged with finding 7 or
-       with each other for the same reason findings 6 and 7 stay separate.
+    10. investing.com match rate (item N) — per run, the fraction of
+        scraped investing.com calendar rows that FAILED to match
+        active_ticker_universe. A rising rate signals symbology drift
+        between investing.com and our universe (the naive-match interim —
+        see the ticker-normalization open item, open_items_session4.md).
+        Surfaced specifically so that normalization gap is observable
+        before a normalization layer exists. Threshold TBD, same deferral
+        status as finding 8's warn cutoff.
+    11. Session end marker missing (R-2) — set when the evening job's
+        DuckDB-lock liveness probe (see metadata_crawler.md's "Evening job
+        start gate") finds LiveModeRunner dead with no clean shutdown
+        (live_session_start still 'running', no live_session_end row).
+        Distinct from a normal 'failed' status — this is a crash signal,
+        not a stage failure.
+    12. Unknown broker order/position at reconcile (R-2/R-3) — a broker
+        open order or open position with no matching live_positions row at
+        any Broker Reconcile call site (session start, warm restart, feed
+        outage). Should not occur under normal operation; a nonzero count
+        points at a gap in the reconcile/adopt logic, not at strategy
+        performance.
+    13. restart_gap_exit count (R-2) — positions liquidated on warm restart
+        for a tp/sl breach detected retroactively within the crash gap, or
+        liquidated immediately because the gap already exceeded
+        execution.max_hold_bars. A nonzero count is expected after any
+        crash; the count itself is diagnostic (frequency/severity of
+        crashes), not an error signal on its own.
+    14. Position held overnight: halted through close (R-3) — count of
+        positions that skipped `session_end` while `status='halted'` and
+        were carried to the next session's Broker Reconcile. Surfaces what
+        was previously a silent skip (see live_mode_runner.md's Position
+        Manager Loop Step 1a).
+    15. Overnight position liquidated at session start (R-3) — count of
+        `exit_reason='overnight_exit'` liquidations from the Unified
+        Overnight Policy, this session. Includes the `reconcile_ghost`
+        count as a separate, distinct tally within the same finding (a row
+        with no matching broker position is a data/bookkeeping issue, not
+        an overnight-carry issue, even though both surface at the same
+        Broker Reconcile call).
+    16. Corporate-event vendor conflicts (item N) — rows added to
+        corporate_event_conflicts (db_schema.md) since the last run, with
+        the (ticker, event_date, event_type, both values, both sources)
+        detail. A conflict is not itself an error — the investing.com value
+        is kept per the confirmed tie-break and trading continues — but a
+        rising count, or a conflict on a large split ratio rather than a
+        dividend's trailing decimal, is worth a human look: it is the only
+        place the two vendors' disagreement is visible, and it is also the
+        practical evidence for whether
+        quarantine.corporate_event_value_tolerance is set sensibly
+        (see metadata_crawler.md's upsert_corporate_event()).
 
     Returns: dict of {finding_name: {severity: 'ok'|'warn'|'abort', detail: ...}}
     """

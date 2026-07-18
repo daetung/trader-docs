@@ -371,6 +371,49 @@ Sensitivity registry for the current full set):
 
 ---
 
+## Scoped Mid-Session Recompute (item N)
+
+Triggered by LiveModeRunner (not by `on_bar_close()`) when an
+already-Eager-Pooled ticker gains a NEW same-day `corporate_events` row —
+from either vendor (yfinance narrow crawl or investing.com bulk; see
+metadata_crawler.md), after this instance's `session_start_compute()`
+already ran on stale (pre-event) data.
+
+```python
+def scoped_recompute(
+    self,
+    historical_bars: pd.DataFrame,
+    tick_bar_history: pd.DataFrame | None,
+    bars_today: pd.DataFrame,
+) -> None:
+    """
+    One-shot correction for a single ticker whose indicators were seeded
+    before its corporate event was known.
+
+      1. Re-run the session_start_compute() body — Step 0
+         (adjust_bars_for_corporate_events, now seeing the new row) + Layer
+         1 / Layer 2 seeding — exactly as at session start. This is a
+         single-ticker full recompute, NOT an on_bar_close() call, so the
+         O(1) per-call rule for on_bar_close() (see Constraints) is
+         untouched.
+      2. Replay today's bars so far via on_bar_close() from session start
+         to the current bar. Reuses the same cheap replay path Watchlist
+         Append and Feed Outage Recovery already rely on (on_bar_close()
+         is O(1) per bar, so replaying N bars is O(N) — fine for one
+         ticker).
+
+    After this returns, LiveModeRunner clears the ticker's
+    quarantine_reason if it was set (the distortion is corrected; no
+    reason to keep blocking entries) — see live_mode_runner.md.
+
+    Cost note: touches ONE ticker, not the universe-wide Eager Pool. Runs
+    as a background task off the hot loops.
+    """
+    ...
+```
+
+---
+
 ## Constraints
 
 - `CachingIndicatorCalculator` preserves the full `IndicatorCalculator` interface
@@ -387,6 +430,10 @@ Sensitivity registry for the current full set):
 - `session_start_compute()` must apply `utils.adjust_bars_for_corporate_events()`
   (Step 0) before computing Layer 1/Layer 2 — this is unconditional, not
   optional, though it is a no-op for the vast majority of tickers/days
+  `scoped_recompute()` (item N) re-applies this same Step 0 when a
+  corporate event is discovered after session start — the only sanctioned
+  mid-session re-application, and still a single-ticker one-shot, never
+  folded into `on_bar_close()`.
 - `obv`/`ad`'s training-specific per-entry-date fallback (see
   `04_feature_extractor.md` Strategy A) does not apply here: live mode
   recomputes `historical_bars` fresh each session from a short

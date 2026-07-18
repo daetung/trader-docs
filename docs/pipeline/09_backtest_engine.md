@@ -345,33 +345,20 @@ direction, exit_price, exit_hour, is_ambiguous = utils.track_price_breach(
 )
 
 if direction is not None:
-    # Poll-delay simulation (see former open_items_production_readiness.md
-    # P-10 discussion): live's Position Manager Loop only ever observes a
-    # breach at its next position_check_interval_seconds poll, never at the
-    # exact tick it occurred — backtest's instantaneous
-    # track_price_breach() call otherwise overstates achievable exit
-    # precision. Aligned to session start (09:30:00), matching the
-    # single-global-shared-loop design (see live_mode_runner.md's Position
-    # Manager Loop) rather than any particular session's real poll phase,
-    # so the simulation stays deterministic across runs. exit_price/exit_hour
-    # above are deliberately left as track_price_breach()'s raw output (used
-    # by Ambiguity/diagnostic logic elsewhere in this file unmodified);
-    # effective_second/effective_price below are the poll-delayed values
-    # actually used for the fill simulation and — see the note at the end of
-    # this section — for trade_log.exit_bar.
-    effective_second = ceil_to_interval(
-        exit_hour,
-        interval_seconds=config["live_mode"]["position_check_interval_seconds"],
-        align_to="093000",
-    )
-    if effective_second != exit_hour:
-        # Price may have moved further during the simulated poll delay —
-        # re-interpolate at the delayed second rather than reusing exit_price.
-        effective_price = utils.interpolate_bundle_price(
-            prev_bundle_at(effective_second), bundle_at(effective_second), effective_second
-        )
-    else:
-        effective_price = exit_price
+    # P-10 REVISED (R-2): the former poll-delay alignment
+    # (ceil_to_interval to the live position_check_interval_seconds grid)
+    # modeled the OLD periodic-poll live loop. Live now detects tp/sl at
+    # TICK granularity (WS-primary / REST-backstop — see
+    # live_mode_runner.md's Exit Architecture), so there is no poll delay
+    # left to model: backtest uses track_price_breach()'s raw
+    # exit_hour/exit_price (already interpolate_bundle_price-precision)
+    # directly for the fill simulation and for trade_log.exit_bar. The
+    # relationship this corrects: live is now ground truth at tick
+    # granularity, and backtest approximates it — not the reverse, as the
+    # removed poll-delay alignment implied.
+    effective_second = exit_hour        # raw, no ceil_to_interval
+    effective_price  = exit_price       # raw interpolate_bundle_price output,
+                                        # no re-interpolation at a delayed second
 
     sell_rate = config["execution"]["sell_rate_tp"] if direction == "up" \
                 else config["execution"]["sell_rate_sl"]
@@ -563,12 +550,12 @@ is_ambiguous             BOOLEAN,   -- True if simultaneous bundle-level tp/sl b
 - Entry slippage search window: entry_hour to entry_hour + 100s (not limited to 1-minute t bar)
 - Cooldown applied continuously across full time axis; no reset at session boundaries
 - `entry_bar` stored as int via `utils.hour_to_int(entry_hour)`. `exit_bar` stored
-  as int via `utils.hour_to_int(effective_second)` — the poll-delay-adjusted
-  value (see Exit Logic's poll-delay simulation), NOT the raw `exit_hour`
-  `track_price_breach()` returns — so `trade_log.exit_bar` reflects the
-  realistically-detectable exit moment, consistent with why the poll-delay
-  simulation exists in the first place. `exit_reason='entry_canceled'` rows
-  (see Entry Slippage Model) set `exit_bar = entry_bar` — there is no
+  as int via `utils.hour_to_int(effective_second)`, which is now simply
+  `exit_hour` itself (P-10 revised, R-2 — the poll-delay alignment was
+  removed since live detects tp/sl at tick granularity; see Exit Logic).
+  `trade_log.exit_bar` therefore reflects `track_price_breach()`'s raw,
+  bundle-interpolated exit moment directly. `exit_reason='entry_canceled'`
+  rows (see Entry Slippage Model) set `exit_bar = entry_bar` — there is no
   distinct exit moment for a trade that never opened.
 - `trades_by_signal` and `trades_by_exit` JSON-serialized before writing to `experiment_log`
 - Dead position trades included in winning_rate denominator
@@ -601,3 +588,15 @@ is_ambiguous             BOOLEAN,   -- True if simultaneous bundle-level tp/sl b
   never queries this table for real-time decisions; its live-mode halt signal
   is a separate tick-rate heuristic scoped to open positions (see
   live_mode_runner.md's Position Manager Loop)
+- Backtest-vs-live exit asymmetry (R-2) — two DISTINCT kinds, do not
+  conflate: (1) DATA-GRANULARITY, irreducible — backtest has only 10-tick
+  OHLC bundles (`tick_10`) and cannot see intra-bundle spikes that live's
+  true WS/REST tick stream detects; shadow mode quantifies this residual.
+  (2) The FORMER backstop-vs-WS filter asymmetry (a bundle-based backstop
+  would have been less sensitive than WS's per-tick 2-print guard) does
+  NOT apply here — it never shipped; the live REST backstop polls
+  individual ticks at WS granularity with the same 2-print guard from the
+  start (see live_mode_runner.md's Exit Architecture), so only latency
+  differs between WS and its own backstop, not accuracy. Only asymmetry
+  (1) is a live open residual; it is inherent to the historical dataset's
+  granularity, not a design gap.

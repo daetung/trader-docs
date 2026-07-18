@@ -1254,6 +1254,36 @@ def query_halt_status(
 
 ---
 
+### Tick Stitching (R-2)
+
+```python
+def stitch_ticks(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame:
+    """
+    Single source of truth for concatenating REST-fetched ticks onto an
+    existing tick buffer/history. Used EVERYWHERE ticks are stitched: WS
+    gap-fill, the WS-dead REST backstop, and warm-restart gap-fill catch-up
+    (see live_mode_runner.md).
+
+    TICK IDENTITY RULE (global): two ticks are the SAME only when `hour`
+    AND ALL OHLCV fields match. `hour` alone is NOT a key — multiple ticks
+    can share one wall-clock second (sub-second events collapse to the same
+    `hour`), so deduping on `hour` alone would wrongly drop distinct ticks.
+    Dedup on the full (hour, open, high, low, close, volume) tuple.
+
+    Known limitation: two genuinely distinct fills that happen to coincide
+    on `hour` + OHLCV merge into one. Negligible given 10-tick bundling in
+    the historical data this dedup rule was designed against (it implies
+    same-second, same-price-band activity within one bundle); recorded, not
+    engineered around.
+
+    Returns: existing with incoming appended, deduped per the rule above,
+    re-sorted by (hour, seq_id) if present.
+    """
+    ...
+```
+
+---
+
 ## Constraints
 
 - All functions are stateless — no module-level state or caching
@@ -1268,11 +1298,15 @@ def query_halt_status(
   load or inject encoding maps directly
 - All categorical encoding maps guarantee integer values, never NaN
 - `halt_reason_code_map.json` must always contain `"no_halt": 0` as a reserved entry
-- `track_price_breach()` is the low-level primitive for single tp/sl detection —
-  BacktestEngine and LiveModeRunner's Position Manager Loop both import from
-  here (see P-10 in the former open_items_production_readiness.md; Position
-  Manager Loop calls it on live-accumulated bars/ticks each poll, stateless
-  re-scan, no incremental state — see live_mode_runner.md)
+- `track_price_breach()` is the low-level primitive for single tp/sl
+  detection in BACKTEST ONLY (R-2). Live no longer calls it — live tp/sl
+  detection is WS-primary / REST-backstop over the real tick stream (see
+  live_mode_runner.md's Exit Architecture). The function's own contract is
+  unchanged; only its live call site was removed. (Formerly also called by
+  LiveModeRunner's Position Manager Loop — see P-10 in the former
+  open_items_production_readiness.md for that history.)
+- `stitch_ticks()`'s tick-identity rule (hour + full OHLCV, not hour alone)
+  applies wherever REST ticks are concatenated — see that function above.
 - `track_label_breach()` is the high-level wrapper for two-stage label detection (Labeler only)
 - `generate_run_id()` not called inside parallel workers or sequential fold loops —
   coordinator pre-generates structured run_ids in all optimizer contexts

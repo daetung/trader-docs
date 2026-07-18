@@ -238,12 +238,14 @@ the current market regime.
 ## Operational Notes
 
 **Timezone / DST Discipline.** All schedule times in this system (04:00 ET
-`--premarket-open`, 09:20 ET `--premarket-recheck` — see
+`--premarket-open`, 09:20 ET `--premarket-recheck` — R-1: the 09:20 pass
+is now a LiveModeRunner in-process task, not a cron entry — see
 metadata_crawler.md's "Dual Schedule", N-1/N-3 — 09:30 regular session
 open, 15:59 session close, 17:00 ET evening batch run) are wall-clock
 America/New_York times, which observe DST. The deployment host/container
 must set its system TZ to `America/New_York` (not a fixed UTC offset), so
-that all cron schedules and bar-close authority (see live_mode_runner.md)
+that all cron schedules, the in-process recheck's scheduled time, and
+bar-close authority (see live_mode_runner.md)
 shift correctly across the two annual transitions. Operator checklist: on
 the Monday following each DST transition (mid-March, early November),
 verify that day's `batch_runs` rows landed at the expected wall-clock
