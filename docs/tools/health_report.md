@@ -72,6 +72,27 @@ def gather_findings(db_conn, today_date, log_dir) -> dict:
        findings 6/7. Threshold TBD (same deferral status as the rate
        itself always being computed and loggable, only the warn cutoff
        undecided).
+    9. Execution-parameter fit rejections (N-7, pilot stage onward) — count
+       of this week's fit_execution_params() run, per parameter, where a
+       value cleared its sample-size gate but was rejected by the
+       relative-bound check (landed outside
+       [current/fit_rejection_multiplier, current*fit_rejection_multiplier]
+       — see shadow_retraining.md and execution_common.md's
+       fit_rejection_multiplier config). Also includes get_execution_param()
+       hard-bound fallbacks (a stored value outside its mathematically
+       valid range — see execution_common.md), though those should never
+       occur under normal operation since the relative-bound check is what
+       prevents a bad value from being written in the first place; a
+       nonzero count here specifically would point at manual corruption or
+       a write-path bug bypassing fit_execution_params() entirely, not at
+       calibration behaving unexpectedly. A nonzero relative-bound
+       rejection count means the CURRENT authoritative value is older than
+       the sample-size gate alone would suggest — worth a human look at
+       whether the fit reflects a genuine regime shift (in which case the
+       multiplier itself may need revisiting) or noise. Independent of
+       finding 7 — a rejected fit and a magnitude-off predicted-vs-actual
+       gap are different failure modes. Never merged with finding 7 or
+       with each other for the same reason findings 6 and 7 stay separate.
     10. investing.com match rate (item N) — per run, the fraction of
         scraped investing.com calendar rows that FAILED to match
         active_ticker_universe. A rising rate signals symbology drift

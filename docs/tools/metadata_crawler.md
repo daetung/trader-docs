@@ -133,12 +133,14 @@ def crawl_corporate_events_investing(date: str, db_conn) -> int:
 
     Filters scraped rows to active_ticker_universe (NAIVE symbol match for
     now — investing.com symbology may differ from ours; see the
-    ticker-normalization open item), then upserts into corporate_events
-    with source='investing' via INSERT OR REPLACE (see db_schema.md —
-    investing.com always wins a same-key conflict, by construction of this
-    statement, regardless of write order relative to crawl_corporate_events()).
+    ticker-normalization open item), then writes each row through the
+    shared upsert_corporate_event() helper below with source='investing'.
+    Does NOT write corporate_events directly: the one-row-per-event
+    invariant (see db_schema.md) and the vendor-disagreement handling both
+    live in that helper, so neither vendor's crawler can bypass them.
 
-    Returns: number of newly-inserted-or-replaced rows.
+    Returns: number of rows newly inserted or updated in corporate_events
+    (a no-op agreement with an existing row is not counted).
     """
     ...
 ```
@@ -159,6 +161,54 @@ Notes:
   matching purposes; if coverage later proves partial, "not found in
   investing.com's calendar" stops being a safe proxy for "no event" and
   this crawl's absence-of-a-row can no longer be read as confirmation.
+
+### Shared Corporate-Event Write Path (item N)
+
+Both vendors' crawlers write through this one helper. Neither writes
+`corporate_events` directly — the one-row-per-event invariant that
+`cum_split_ratio()` depends on (see db_schema.md) is enforced here, in a
+single place, rather than trusted to each caller's choice of
+`INSERT OR IGNORE` / `INSERT OR REPLACE`.
+
+```python
+def upsert_corporate_event(
+    ticker: str, event_date: str, event_type: str,
+    value: float, source: str, db_conn,
+) -> bool:
+    """
+    Vendor-agnostic write path for corporate_events.
+
+        no existing row for (ticker, event_date, event_type)
+            -> INSERT this row (source recorded).
+        existing row, values AGREE within tolerance
+            -> no-op. Agreement needs no second row, and rewriting only
+               churns `source` for no gain.
+        existing row, values DISAGREE
+            -> corporate_events keeps (or is updated to) the investing.com
+               value — the confirmed tie-break, since investing.com is a
+               date-scoped same-day query and treated as fresher — and BOTH
+               values are written to corporate_event_conflicts (db_schema.md)
+               so the disagreement survives for inspection.
+
+    Agreement tolerance: relative, config
+    `quarantine.corporate_event_value_tolerance` (placeholder default; the
+    right magnitude is unknown until real cross-vendor values are observed
+    — the two vendors are expected to differ in rounding, e.g. a dividend
+    of 0.25 vs 0.2500, which must count as agreement, while a genuine
+    0.25-vs-0.30 disagreement must not). Compared as
+    abs(a - b) <= tol * max(abs(a), abs(b)).
+
+    Returns True if corporate_events was inserted or updated, False on a
+    no-op agreement.
+    """
+    ...
+```
+
+Note that a conflict does NOT quarantine the ticker or block anything —
+one vendor being wrong about a dividend's third decimal is not grounds to
+stop trading it. The conflict row and its health_report finding are for a
+human to look at, and for judging whether the tolerance above is set
+sensibly once real data exists.
 
 ### Shared Corporate-Event Write Path (item N)
 
