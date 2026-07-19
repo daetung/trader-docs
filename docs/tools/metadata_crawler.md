@@ -76,29 +76,36 @@ Upserts into `corporate_events` table (INSERT OR IGNORE).
 def crawl_corporate_events(ticker: str, db_conn) -> int:
     """
     Fetch split, reverse-split, and dividend history from yfinance and upsert
-    into corporate_events. Determines event_type from split ratio:
-    >1.0 → 'split', <1.0 → 'reverse_split'. Dividends stored separately with
-    event_type='dividend' and value=per-share cash amount.
-    Returns: number of new rows inserted (splits + dividends combined).
+    into corporate_events via the shared upsert_corporate_event() helper
+    (item N — the same helper crawl_corporate_events_investing() uses below,
+    so a yfinance write and a later investing.com write for the same event
+    are both conflict-checked against whatever is already there, regardless
+    of which vendor wrote first; without this, a write ordered before an
+    investing.com write for the same event would bypass conflict detection
+    entirely via a bare INSERT OR IGNORE). Determines event_type from split
+    ratio: >1.0 → 'split', <1.0 → 'reverse_split'. Dividends stored
+    separately with event_type='dividend' and value=per-share cash amount.
+    Returns: number of rows newly inserted or updated (a no-op agreement
+    with an existing row is not counted — see upsert_corporate_event()).
     """
     inserted = 0
 
     splits = yf.Ticker(ticker).splits
     for date, ratio in splits.items():
         event_type = "split" if ratio > 1.0 else "reverse_split"
-        db_conn.execute("""
-            INSERT OR IGNORE INTO corporate_events (ticker, event_date, event_type, value)
-            VALUES (?, ?, ?, ?)
-        """, [ticker, date.strftime("%Y%m%d"), event_type, float(ratio)])
-        inserted += 1
+        if upsert_corporate_event(
+            ticker, date.strftime("%Y%m%d"), event_type, float(ratio),
+            "yfinance", db_conn,
+        ):
+            inserted += 1
 
     dividends = yf.Ticker(ticker).dividends
     for date, amount in dividends.items():
-        db_conn.execute("""
-            INSERT OR IGNORE INTO corporate_events (ticker, event_date, event_type, value)
-            VALUES (?, ?, 'dividend', ?)
-        """, [ticker, date.strftime("%Y%m%d"), float(amount)])
-        inserted += 1
+        if upsert_corporate_event(
+            ticker, date.strftime("%Y%m%d"), "dividend", float(amount),
+            "yfinance", db_conn,
+        ):
+            inserted += 1
 
     return inserted
 ```
@@ -109,7 +116,10 @@ Notes:
   event_type is no longer reserved-only, it is actively collected
 - yfinance split/dividend history is comprehensive for US equities; no
   fallback needed for either
-- Safe to re-run (INSERT OR IGNORE)
+- Writes via upsert_corporate_event() (item N), not a bare INSERT — safe to
+  re-run (a no-op on an already-agreeing row), and symmetric with
+  crawl_corporate_events_investing()'s own write path — see that function's
+  Second Vendor section below for the helper's definition.
 
 ### Second Vendor: investing.com (item N)
 

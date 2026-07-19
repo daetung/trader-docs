@@ -352,7 +352,20 @@ LiveModeRunner.start_session(today_date):
                  session_stats_bulk.get(ticker, {})
              )
 
-             calc.persist_to_db(db_conn, today_date, ticker)
+             with write_lock:   # R-2 GAP-FIX 9: persist_to_db() does its
+                 # own DELETE-then-INSERT sequence on writer_conn with no
+                 # locking of its own (see caching_calculator.md — its
+                 # docstring never mentions write_lock). 8 parallel Eager
+                 # Pool workers each calling this concurrently, unlocked,
+                 # is exactly the hazard write_lock exists to prevent —
+                 # unlike db_write()'s callers elsewhere, this call site
+                 # was missed when db_write() became the funnel. Holding
+                 # the lock for this whole call (not a single execute())
+                 # serializes the DELETE+INSERT pair, not just each
+                 # statement — necessary since a half-applied delete from
+                 # one worker interleaved with another's insert is exactly
+                 # the kind of race a per-statement lock would not prevent.
+                 calc.persist_to_db(db_conn, today_date, ticker)
              # R-2: written in BOTH modes now, as a crash-recovery backup —
              # each worker persists its own ticker as soon as it finishes,
              # not batched at the end. A warm restart (see "Session Restart
