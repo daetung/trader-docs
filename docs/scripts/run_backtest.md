@@ -179,6 +179,15 @@ experiment_log_row = {
     "dead_position_count":  summary["dead_position_count"],
     "dead_position_rate":   summary["dead_position_rate"],
     "suppressed_count":     summary["suppressed_count"],
+    "gate_blocked_cap_tickers":     summary["gate_blocked_cap_tickers"],
+    "gate_blocked_cap_per_ticker":  summary["gate_blocked_cap_per_ticker"],
+    "gate_blocked_cooldown":        summary["gate_blocked_cooldown"],
+    "gate_blocked_sizing_zero":     summary["gate_blocked_sizing_zero"],
+    "gate_blocked_funds":           summary["gate_blocked_funds"],
+    "breaker_max_realized_loss_abs":  summary["breaker_max_realized_loss_abs"],
+    "breaker_max_realized_loss_pct":  summary["breaker_max_realized_loss_pct"],
+    "breaker_max_consecutive_losses": summary["breaker_max_consecutive_losses"],
+    "breaker_peak_entries_per_hour":  summary["breaker_peak_entries_per_hour"],
     "trades_by_signal":     json.dumps(summary["trades_by_signal"]),
     "trades_by_exit":       json.dumps(summary["trades_by_exit"]),
 }
@@ -196,7 +205,9 @@ In standalone mode, these are derived from `test_df["date"].min()` and `.max()`.
 BACKTEST RESULTS
 ============================================================
 
-Total trades:        1234
+Total trades:        1234        # opened trades only — never-opened rows
+                                 # (entry_canceled / entry_rejected) are
+                                 # excluded from this and every rate below
 Winning trades:      567
 Winning rate:        45.9%
 Avg PnL:             0.02%
@@ -204,6 +215,18 @@ Total PnL:           1234.56
 Avg slippage:        0.0012%
 Dead positions:      12  (0.97%)
 Suppressed entries:  45
+
+--- Entries Blocked at Gates ---
+  max_tickers:              31
+  max_positions_per_ticker: 12
+  cooldown:                 88
+  sizing (quantity=0):       4
+  funds:                     0   # always 0 when initial_cash=0 — gate not called
+
+--- Circuit Breaker Metrics (computed, not enforced here) ---
+  Max realized loss:        -412.30  (-1.8%)
+  Max consecutive losses:   6
+  Peak entries/hour:        14
 
 --- By Signal ---
   up3: 456 trades, win_rate=44.5%, avg_pnl=0.01%
@@ -218,6 +241,8 @@ Suppressed entries:  45
   dead_position_delisted:     2
   dead_position_no_data:      1
   dead_position_extended_halt: 1
+  entry_canceled:             9   # never-opened: listed here, excluded from
+                                  # Total trades / Winning rate / Avg PnL
 
 --- Label Base Rates (test set) ---
   up5:  18204 events, base_rate=6.4%
@@ -253,7 +278,34 @@ Elapsed: 45.2s
 - `outer_fold_idx` default -1 for non-nested runs; 0-based for nested outer folds
 - `eval_type` default None for standalone; set explicitly by PipelineOptimizer
 - In standalone mode, `fold_test_start`/`fold_test_end` derived from test_df date range
-- `suppressed_count` sourced from BacktestEngine summary — must always be present
+- `summary_dict`'s key set and `experiment_log`'s metric columns are 1:1 —
+  every key BacktestEngine's `run()` returns has a matching column here,
+  and every metric column here is sourced from a `summary_dict` key. A name
+  on only one side is a defect, not a style choice; this single rule
+  replaces enumerating each metric's "must be present" individually as the
+  metric count grows (currently: `suppressed_count`, the five
+  `gate_blocked_*` counters, and the four `breaker_*` metrics)
+- The `gate_blocked_*` and `breaker_*` metrics are diagnostic only —
+  `PipelineOptimizer.best_config()` ranks on `winning_rate` and never reads
+  them. The gate counters exist so a run whose edge was capped out is
+  distinguishable from one that simply produced few signals, which
+  `winning_rate` alone cannot show; the breaker metrics exist so Pilot has
+  real distributions to calibrate `execution.intraday_loss_limit_pct` /
+  `consecutive_loss_limit` / `entries_per_hour_limit` against before they
+  are armed (see shadow_retraining.md)
+- `gate_blocked_funds` and `breaker_max_realized_loss_pct` are both
+  conditioned on `backtest.initial_cash > 0`: at the `0` default,
+  `check_funds_available()` is never called (so the former is always 0 —
+  "the gate did not run", not "nothing was blocked") and there is no
+  equity basis to express a loss as a percentage against (so the latter is
+  `None`, not `0.0`, which would misread as "no loss")
+- Never-opened rows (`exit_reason='entry_canceled'`; live also
+  `'entry_rejected'`) are written to `trade_log` but excluded from
+  `total_trades` / `winning_rate` / `avg_pnl_pct` / `total_pnl_abs` —
+  `quantity=0` and `pnl_pct=NULL` mean no position existed, so counting them
+  would dilute the rates with non-events. They stay visible through
+  `trades_by_exit`, which is why no separate summary column is added for
+  them (see 09_backtest_engine.md)
 - Metadata columns (`is_dead_position`, `dead_position_case`, `is_ambiguous`) must not
   be passed to model.predict() as features
 - `model_dir` resolution order: explicit arg → config["model"]["model_dir"] fallback →

@@ -70,7 +70,8 @@ dividends = yf.Ticker("AAPL").dividends
 ```
 
 Corporate events collection runs alongside metadata crawling (same ticker batch).
-Upserts into `corporate_events` table (INSERT OR IGNORE).
+Writes to `corporate_events` via the shared `upsert_corporate_event()`
+helper (item N), not a bare INSERT OR IGNORE — see below.
 
 ```python
 def crawl_corporate_events(ticker: str, db_conn) -> int:
@@ -779,7 +780,8 @@ see live_mode_runner.md — not the same "third recheck" this paragraph
 rejects).
 
 `--premarket-open`'s `crawl_corporate_events()` step keeps the same
-`INSERT OR IGNORE` idempotency as before — safe to re-run manually (e.g.
+re-run safety as before, now via `upsert_corporate_event()` (item N)
+rather than a bare `INSERT OR IGNORE` — safe to re-run manually (e.g.
 via the legacy `--corporate-events-only` flag) if needed outside the
 normal schedule.
 
@@ -913,8 +915,9 @@ python tools/collect_daily.py \
       individual NULL fields within an existing same-day row, an explicit
       UPDATE ... WHERE field IS NULL is used instead of a blind re-insert)
    e. Fetch split/dividend history from yfinance → upsert into corporate_events
-      via crawl_corporate_events() (INSERT OR IGNORE — safe to re-run; no
-      fallback needed for either)
+      via crawl_corporate_events(), which writes through the shared
+      upsert_corporate_event() helper (item N) — safe to re-run; no
+      fallback needed for either
 
 3. Log: fetched / failed / unchanged
 ```
@@ -1102,8 +1105,9 @@ quarantine:
   `INSERT OR REPLACE` keyed on `ticker` alone (see db_schema.md V-1 fix);
   `updated_at` still set to today for the freshness of whichever fields
   resolved this run
-- corporate_events uses INSERT OR IGNORE — same as before, unaffected by the
-  stock_meta schema change
+- corporate_events writes go through the shared upsert_corporate_event()
+  helper (item N), not a bare INSERT OR IGNORE — unaffected by the
+  stock_meta schema change (V-1), a separate table
 - Ingestion logic delegates to `migrate_json_to_duckdb.py` — no duplicated logic
 - Calendar/coverage update always runs after ingestion — not optional
 - Session stats update runs after calendar/coverage update — not optional unless --skip-session-stats
@@ -1125,13 +1129,6 @@ quarantine:
   lets LiveModeRunner's Health Gate 1 (live_mode_runner.md) distinguish
   exactly which stage of an evening run failed, not just that the run as a
   whole did.
-- The evening run writes three `batch_runs` rows as it progresses —
-  `stage='evening_ingestion'` (around Steps 3-4 above), `stage='evening_tick_bar_aggregates'`
-  (Tick Bar Aggregates Update), `stage='evening_session_stats'` (Session Stats
-  Update) — each `status='running'` at its own start, `'success'`/`'failed'`
-  at its own completion, independent of the other two. This lets
-  LiveModeRunner's Health Gate 1 (live_mode_runner.md) distinguish exactly
-  which stage of an evening run failed, not just that the run as a whole did.
 - `--premarket-open` (N-1; replaces running `--ticker-rename-only` and
   `--corporate-events-only` as two separate cron processes at 04:00 ET)
   runs `detect_rename_candidates()` → `bulk_fetch_today_first_price()` +
@@ -1169,7 +1166,8 @@ quarantine:
   `stage='premarket_quarantine_recheck'`.
 - Must be safe to run multiple times on the same date (idempotent) —
   `--premarket-open`'s four internal steps are each independently
-  idempotent (`crawl_corporate_events()`'s `INSERT OR IGNORE`;
+  idempotent (`crawl_corporate_events()`'s `upsert_corporate_event()`
+  write path — a no-op on an already-agreeing row, item N;
   `bulk_fetch_today_first_price()`/`query_halt_status()` are stateless
   reads; `check_corporate_event_anomaly()`'s UPDATE reflects only that
   run's fresh inputs, not an accumulating count) — re-running the whole

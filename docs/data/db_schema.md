@@ -274,9 +274,12 @@ CREATE TABLE ticker_data_coverage (
 --     start — see live_mode_runner.md and metadata_crawler.md.
 CREATE TABLE batch_runs (
     stage        VARCHAR   NOT NULL,  -- 'premarket_rename' | 'premarket_corporate_events' |
+                                      -- 'premarket_quarantine_check' |
+                                      -- 'premarket_quarantine_recheck' |
                                       -- 'evening_ingestion' | 'evening_tick_bar_aggregates' |
-                                      -- 'evening_session_stats' | 'live_session_start' |
-                                      -- 'live_session_end'
+                                      -- 'evening_session_stats' |
+                                      -- 'evening_investing_forward_check' |
+                                      -- 'live_session_start' | 'live_session_end'
     date         VARCHAR   NOT NULL,  -- 'YYYYMMDD' — the trading day this batch targets
     status       VARCHAR   NOT NULL,  -- 'running' | 'success' | 'failed'
     started_at   TIMESTAMP NOT NULL,
@@ -492,8 +495,76 @@ CREATE TABLE experiment_log (
     dead_position_count  INTEGER,
     dead_position_rate   DOUBLE,
     suppressed_count     INTEGER,
+    -- Entry-gate rejection counters (R-5). One per gate in the step-5c.0
+    -- sequence (see live_mode_runner.md); a candidate stopped at a gate has
+    -- NO trade_log row, so these are the only record it existed.
+    -- Diagnostic ONLY: best_config() ranks on winning_rate alone and never
+    -- reads these.
+    -- Nullable on purpose — NULL means "run predates the caps", 0 means
+    -- "caps were active and blocked nothing". Those are different facts.
+    -- Column naming: gate_blocked_* / breaker_* prefixes group these at a
+    -- glance as the table grows, and gate_blocked_* matches
+    -- inference_log.gate_result's own values name-for-name.
+    -- Five counters, not nine: `gate_result` has nine non-'submitted'
+    -- values, but four have no counter here — 'freeze' and 'not_tradable'
+    -- have no backtest concept at all (N-5, see execution_common.md);
+    -- 'breaker' is evaluated in backtest but never enforced (see
+    -- breaker_* below, which reports the underlying metrics instead of a
+    -- blocked-count that would imply enforcement); 'error' has no
+    -- backtest analogue since backtest makes no network calls.
+    gate_blocked_cap_tickers     INTEGER,  -- candidates stopped by
+                                 -- execution.max_tickers. Counts CANDIDATES,
+                                 -- not distinct tickers — the name reads the
+                                 -- other way at a glance.
+    gate_blocked_cap_per_ticker  INTEGER,  -- candidates stopped by
+                                 -- execution.max_positions_per_ticker.
+                                 -- Mutually exclusive with the counter above
+                                 -- by construction, not by gate order: the
+                                 -- ticker cap only fires when the ticker is
+                                 -- NOT already held, the per-ticker cap only
+                                 -- when it IS. Summing them double-counts
+                                 -- nothing.
+    gate_blocked_cooldown        INTEGER,  -- candidates stopped by can_enter()
+    gate_blocked_sizing_zero     INTEGER,  -- compute_position_size() returned 0
+                                 -- (typically the vol_based leg on a thin
+                                 -- t bar), so there was nothing to submit
+    gate_blocked_funds           INTEGER,  -- check_funds_available() returned
+                                 -- proceed=False. Counts only the FULL skip
+                                 -- (not even one share affordable). Under the
+                                 -- default use_all_cash: true, ordinary cash
+                                 -- pressure shows up as a sized-DOWN order
+                                 -- that proceeds — visible through
+                                 -- trade_log.requested_quantity, not here —
+                                 -- so a cash-starved run can legitimately
+                                 -- report a LOW value here. With
+                                 -- initial_cash: 0 the gate is never called
+                                 -- and this is always 0: not "nothing was
+                                 -- blocked", but "the gate never ran".
+    -- R-4 breaker metrics (computed every session; thresholds default to 0
+    -- = no limit, so these exist to give Pilot calibration data before any
+    -- limit is armed — see shadow_retraining.md). Backtest COMPUTES these
+    -- the same way live does but never enforces a trip (see
+    -- 09_backtest_engine.md) — reporting raw metrics rather than a trip
+    -- count keeps that true regardless of whether the thresholds are set,
+    -- since a trip count would read as zero (and therefore uninformative)
+    -- for every run while they default to disabled.
+    breaker_max_realized_loss_abs   DOUBLE,   -- always populated
+    breaker_max_realized_loss_pct   DOUBLE,   -- NULL when initial_cash=0 —
+                                 -- inf mode has no equity basis to divide
+                                 -- by, and 0 would misread as "no loss"
+    breaker_max_consecutive_losses  INTEGER,
+    breaker_peak_entries_per_hour   INTEGER,
     trades_by_signal     VARCHAR,                -- JSON
     trades_by_exit       VARCHAR,                -- JSON
+    -- Column vs JSON: trades_by_exit is JSON because exit_reason is an OPEN,
+    -- growing set (four new values landed in this session alone). The gate
+    -- and breaker counters above are CLOSED sets known at design time, so
+    -- they are columns — this is what makes `WHERE
+    -- gate_blocked_cap_tickers > 0` a plain filter instead of a
+    -- json_extract() + cast. DuckDB is columnar, so a query that does not
+    -- select these columns does not pay for their presence; the column
+    -- count on this table is not a performance concern at the row volumes
+    -- this table sees (one row per backtest run).
     PRIMARY KEY (run_id)
 );
 
@@ -506,27 +577,72 @@ CREATE TABLE trade_log (
     date                    VARCHAR      NOT NULL,
     entry_bar               INTEGER      NOT NULL,  -- HHMMSS as integer
     exit_bar                INTEGER      NOT NULL,
+    exit_date               VARCHAR      NOT NULL,  -- 'YYYYMMDD' — the date exit_bar
+                                        -- belongs to. ALWAYS populated: equal to
+                                        -- `date` for every exit resolved on the entry
+                                        -- date, which is the overwhelming majority.
+                                        -- NULL was rejected because every date-scoped
+                                        -- query would then need COALESCE for a rare
+                                        -- case. `date` alone is insufficient because
+                                        -- it is the ENTRY date, and exit_bar is only
+                                        -- HHMMSS: for a carried position the pair
+                                        -- (date, exit_bar) reads as an exit BEFORE its
+                                        -- own entry. Differs from `date` in exactly
+                                        -- two situations:
+                                        --   dead position Case A — resolved against
+                                        --     D+1 data (09_backtest_engine.md)
+                                        --   'overnight_exit' — liquidated on a later
+                                        --     session, possibly several days later
+                                        --     across a weekend, holiday, or multi-day
+                                        --     halt (live_mode_runner.md)
+                                        -- health_report.md's "what did this session
+                                        -- close" queries key on this column, not
+                                        -- `date`.
     signal                  VARCHAR      NOT NULL,  -- "up5" | "up3"
     fill_price              DOUBLE       NOT NULL,
     exit_price              DOUBLE,
     weighted_avg_exit_price DOUBLE,
     pnl_pct                 DOUBLE,
-    exit_reason             VARCHAR,     -- includes 'entry_canceled' (quantity=0,
-                                        -- fill_price=p_entry, exit_bar=entry_bar) —
-                                        -- entry-side order fully unfilled by
-                                        -- cancel_after_seconds; a real observation,
-                                        -- not omitted from the table (see
-                                        -- shadow_retraining.md — this case is a
-                                        -- direct signal for buy_rate/cancel_after_seconds
-                                        -- being too tight, and must be visible to
-                                        -- fit_execution_params()).
-                                        -- Also includes the LIVE-ONLY, PnL-EXCLUDED
-                                        -- operational family — exits driven by
-                                        -- operational handling rather than by the
-                                        -- strategy, and therefore excluded from
-                                        -- ordinary strategy PnL attribution since
-                                        -- they reflect handling, not strategy
-                                        -- performance:
+    exit_reason             VARCHAR,     -- TWO families below sit outside ordinary
+                                        -- strategy PnL attribution, for DIFFERENT
+                                        -- reasons. They are named and kept separate
+                                        -- deliberately: health_report.md reports them
+                                        -- as distinct findings, and
+                                        -- 09_backtest_engine.md's summary denominators
+                                        -- treat only one of them as a trade.
+                                        --
+                                        -- (1) NEVER-OPENED family — no position ever
+                                        -- existed (quantity=0, pnl_pct=NULL), so there
+                                        -- is no PnL to exclude; it structurally does
+                                        -- not exist. Excluded from total_trades /
+                                        -- winning_rate / avg_pnl_pct / total_pnl_abs,
+                                        -- but still visible via trades_by_exit:
+                                        --   'entry_canceled' — entry-side order fully
+                                        --     unfilled by cancel_after_seconds; a real
+                                        --     observation, not omitted from the table
+                                        --     (see shadow_retraining.md — a direct
+                                        --     signal for buy_rate/cancel_after_seconds
+                                        --     being too tight, and must be visible to
+                                        --     fit_execution_params()).
+                                        --   'entry_rejected' (R-7, LIVE-ONLY) — the
+                                        --     broker or the account refused the
+                                        --     submission itself (account restriction,
+                                        --     insufficient funds at the actual price,
+                                        --     ticker not permitted). Same row shape as
+                                        --     'entry_canceled', and it likewise counts
+                                        --     as a cooldown attempt — but it is
+                                        --     EXCLUDED from fit_execution_params(),
+                                        --     because a refusal carries no evidence
+                                        --     about how the market absorbed an order.
+                                        --     The two labels are opposites on exactly
+                                        --     that point.
+                                        --
+                                        -- (2) LIVE-ONLY OPERATIONAL family — a real
+                                        -- position existed and produced real PnL, but
+                                        -- was closed by operational handling rather
+                                        -- than by the strategy, so it is excluded from
+                                        -- attribution as reflecting handling, not
+                                        -- strategy performance:
                                         --   'feed_gap_exit' — exit condition
                                         --     triggered during a Feed Outage
                                         --     Recovery gap (live_mode_runner.md).
@@ -564,6 +680,42 @@ CREATE TABLE trade_log (
     is_dead_position        BOOLEAN      NOT NULL DEFAULT FALSE,
     slippage_pct            DOUBLE,
     quantity                INTEGER,
+    reject_reason           VARCHAR,     -- R-8: the broker's own reason for refusing a
+                                        -- submission. Populated ONLY on
+                                        -- exit_reason='entry_rejected' rows; NULL
+                                        -- everywhere else, and ALWAYS NULL in backtest,
+                                        -- which has no broker to refuse anything.
+                                        -- Stored as the broker returned it, NOT
+                                        -- normalised to an enum: the vocabulary is an
+                                        -- unverified vendor contract
+                                        -- (api_contract_checklist.md), and defining an
+                                        -- enum before seeing real values would mean
+                                        -- inventing a mapping that silently collapses
+                                        -- unmatched reasons. Normalisation is deferred
+                                        -- until the vocabulary is measured.
+                                        -- Load-bearing because insufficient margin, a
+                                        -- non-permitted ticker and a malformed order
+                                        -- need three different responses (add capital /
+                                        -- fix the universe / fix the code). Under the
+                                        -- risk-based intraday margin regime that
+                                        -- replaced the PDT rule in June 2026, rejections
+                                        -- RISING WITH EXPOSURE is normal behaviour, so
+                                        -- without the reason there is no way to separate
+                                        -- normal from pathological.
+    requested_quantity      INTEGER,     -- quantity actually SUBMITTED — i.e. after
+                                        -- check_funds_available() sized the order down
+                                        -- to fit available cash. Deliberately NOT the
+                                        -- pre-gate sizing output: quantity /
+                                        -- requested_quantity is the fill-rate
+                                        -- denominator fit_execution_params() reads
+                                        -- (shadow_retraining.md), and a funds-driven
+                                        -- reduction must never enter it — only
+                                        -- market-driven shortfall. With full capital
+                                        -- deployment as the intended operating point,
+                                        -- the funds gate truncates routinely late in a
+                                        -- session, so conflating the two would bias
+                                        -- buy_rate downward exactly when the book is
+                                        -- fullest.
     partial_fills_count     INTEGER,
     unfilled_quantity        INTEGER,
     is_ambiguous            BOOLEAN      NOT NULL DEFAULT FALSE,
@@ -585,7 +737,11 @@ CREATE TABLE trade_log (
 
 -- Inference log (live mode inference events and preload failures)
 CREATE TABLE inference_log (
-    logged_at     VARCHAR  NOT NULL,   -- 'YYYYMMDD_HHMMSS'
+    logged_at     VARCHAR  NOT NULL,   -- 'YYYYMMDD_HHMMSS_ffffff' (R-8) — microsecond
+                                       -- suffix. This is a FORMAT change on a VARCHAR,
+                                       -- not a TIMESTAMP precision change; fixed-width
+                                       -- zero padding keeps lexicographic ordering
+                                       -- equal to chronological ordering.
     ticker        VARCHAR  NOT NULL,
     date          VARCHAR  NOT NULL,
     hour          VARCHAR  NOT NULL,
@@ -597,6 +753,89 @@ CREATE TABLE inference_log (
     --   "preload_fail"   : insufficient bar history
     --   "bars_trimmed"   : t bar or later detected and auto-trimmed from input
     --   "no_detection"   : EntryPointDetector.detect() returned False
+    gate_result   VARCHAR,             -- R-5: what became of this candidate at
+                                       -- the entry gates. Populated on
+                                       -- event='signal_fired' rows ONLY; NULL
+                                       -- everywhere else. Values, in the same
+                                       -- order as the step-5c.0 sequence in
+                                       -- live_mode_runner.md:
+                                       --   'submitted'      : cleared every gate
+                                       --   'freeze'         : a freeze_reason
+                                       --                      covering
+                                       --                      entry_submission
+                                       --                      (feed_outage or
+                                       --                      restart_warmup)
+                                       --   'error'          : the gate sequence
+                                       --                      itself raised
+                                       --                      (the only
+                                       --                      network call
+                                       --                      among the
+                                       --                      gates is
+                                       --                      check_funds_
+                                       --                      available());
+                                       --                      the candidate
+                                       --                      is otherwise
+                                       --                      unaccounted
+                                       --                      for without
+                                       --                      this
+                                       --   'breaker'        : R-4 circuit-breaker
+                                       --                      trip. A SEPARATE value
+                                       --                      from 'freeze' even
+                                       --                      though both work through
+                                       --                      freeze_reasons: folding
+                                       --                      them together would bury
+                                       --                      the one event of the
+                                       --                      three that most needs to
+                                       --                      be seen.
+                                       --   'cap_tickers'    : execution.max_tickers
+                                       --   'cap_per_ticker' : execution
+                                       --                      .max_positions_per_ticker
+                                       --   'cooldown'       : can_enter()
+                                       --   'not_tradable'   : is_tradable()
+                                       --   'sizing_zero'    : quantity resolved to 0
+                                       --   'funds'          : check_funds_available()
+                                       -- A COLUMN rather than new event values,
+                                       -- because gate_result is not a separate
+                                       -- occurrence: it is how the
+                                       -- 'signal_fired' event ENDED. One
+                                       -- candidate evaluation is one event, and
+                                       -- the gate verdict is that event's
+                                       -- outcome, not a second event following
+                                       -- it. (An earlier draft justified this by
+                                       -- PK collision at second granularity;
+                                       -- R-8 added `event` to the PK and
+                                       -- microseconds to logged_at, so that
+                                       -- reason no longer holds — the design
+                                       -- stands on the one above, which is
+                                       -- independent of key layout.)
+                                       -- 'submitted' is explicit, not implied by
+                                       -- NULL, so every signal_fired row carries
+                                       -- a terminal state and
+                                       -- COUNT(*) FILTER (WHERE gate_result <>
+                                       -- 'submitted') is the total gate loss
+                                       -- directly.
+                                       -- Broker rejection is NOT in this set: it
+                                       -- happens AFTER submission, so such a row
+                                       -- is gate_result='submitted' and the
+                                       -- outcome lands in trade_log as
+                                       -- exit_reason='entry_rejected'.
+                                       -- Shadow mode enforces the same gates, so
+                                       -- these values mean the same thing there
+                                       -- (with 'submitted' reading as "would
+                                       -- have been submitted").
+                                       -- Written ONCE, by LiveModeRunner, the
+                                       -- instant the gate sequence ends —
+                                       -- never by a later UPDATE. See
+                                       -- Constraints below for why this one
+                                       -- event value is LiveModeRunner's to
+                                       -- write even though the rest of this
+                                       -- table is Inferencer's. NULL on a
+                                       -- signal_fired row means exactly one
+                                       -- thing: the row predates this
+                                       -- column, nothing else — a
+                                       -- single-INSERT design has no
+                                       -- "gate not yet evaluated"
+                                       -- in-between state to also mean.
     signal        VARCHAR,             -- "up5" | "up3" | NULL
     prob_up5      DOUBLE,
     prob_up3      DOUBLE,
@@ -607,7 +846,29 @@ CREATE TABLE inference_log (
     actual_bars   INTEGER,             -- populated on preload_fail only
     fail_reason   VARCHAR,             -- populated on preload_fail / bars_trimmed
     run_id        VARCHAR  NOT NULL,
-    PRIMARY KEY (logged_at, ticker, date, hour)
+    PRIMARY KEY (logged_at, ticker, date, hour, event)
+    -- R-8: `event` added to the PK. Without it, two DIFFERENT events about the
+    -- same evaluation of the same ticker/bar in the same second collide — which
+    -- is normal operation, not an anomaly (e.g. a 'bars_trimmed' warning
+    -- alongside the 'signal_fired' outcome). The old PK asserted a uniqueness
+    -- that was simply false. Microsecond logged_at above and this key answer
+    -- different halves: the key makes the claim true, the timestamp closes the
+    -- residual case of one event repeating within a second.
+    -- Write mode: INSERT OR IGNORE, with the DROPPED-ROW COUNT surfaced by
+    -- health_report.md. Plain INSERT was rejected: a session holding real
+    -- positions must not die because a diagnostic log row collided. The usual
+    -- objection to INSERT OR IGNORE — that it loses a diagnostic silently — is
+    -- answered by counting the drops: the content is gone but the fact is not.
+    -- INSERT OR REPLACE is worse than both (loses a row AND makes which one
+    -- survives depend on ordering).
+    -- General principle, applying to every diagnostic write in this system: a
+    -- logging failure of ANY kind — PK collision, disk, lock, serialisation —
+    -- must never abort trading. Wrap the write, count the failure, continue.
+    -- Same discipline as health_report.md's write_to_log(), which always runs
+    -- regardless of whether alert delivery succeeds.
+    -- Note the PK's remaining scope is narrow: after the two changes above, the
+    -- only thing it still prevents is duplicate insertion on replay, and live
+    -- never re-logs a past bar.
 );
 
 -- Precomputed session statistics (REFERENCE_SESSION baselines)
@@ -688,15 +949,38 @@ CREATE TABLE live_positions (
     limit_price  DOUBLE,             -- NULL for market orders
     submitted_at VARCHAR NOT NULL,   -- 'YYYYMMDD_HHMMSS'
     signal       VARCHAR NOT NULL,   -- 'up5' | 'up3'
-    status       VARCHAR NOT NULL,   -- 'pending'|'open'|'closed'|'canceled'
-    fill_price   DOUBLE,             -- NULL until 'open'
-    fill_second  INTEGER,            -- HHMMSS, NULL until 'open'
-    quantity     INTEGER,            -- NULL until 'open'
+    status       VARCHAR NOT NULL,   -- 'pending'|'partial_open'|'open'|'halted'|
+                                     --   'exiting'|'closed'|'canceled'
+    fill_price   DOUBLE,             -- NULL until first fill; weighted average across
+                                     --   partial fills once there is more than one
+    fill_second  INTEGER,            -- HHMMSS of the first fill, NULL until then
+    quantity     INTEGER,            -- shares filled SO FAR; NULL until first fill
+    requested_quantity INTEGER,      -- shares submitted; fixed at submission. The
+                                     --   in-flight tracker compares quantity against
+                                     --   this to decide partial vs. complete (see
+                                     --   live_mode_runner.md's In-flight order
+                                     --   tracking), and it is what trade_log's own
+                                     --   requested_quantity is written from.
     updated_at   VARCHAR NOT NULL,
     PRIMARY KEY (run_id, ticker, date, entry_bar)
 );
--- status lifecycle: 'pending' -> 'open' -> 'closed'; branch 'canceled'
---   (pending expired/canceled/rejected before fill).
+-- status lifecycle:
+--   'pending' -> 'open' -> 'exiting' -> 'closed'
+--   'pending' -> 'partial_open' -> 'open' -> ... (R-7: fills arrive on a
+--     separate channel, not in the order API's response, so an order can sit
+--     partially filled. The filled shares ARE a real position from that
+--     moment — they enter exit management and count toward
+--     execution.max_tickers / max_positions_per_ticker — while the order
+--     itself stays in flight awaiting the rest.)
+--   'pending' -> 'canceled'   (expired or rejected with NOTHING filled)
+--   'open'|'partial_open' <-> 'halted'  (position-scoped halt; clears itself)
+-- No 'full_open': the two ways 'partial_open' ends — reaching
+--   requested_quantity, or abandoning the remainder at cancel_after_seconds —
+--   both mean "no longer awaiting fills", which is exactly 'open'. This also
+--   matches backtest, where a partially-filled entry simply proceeds sized
+--   down.
+-- 'partial_open' NEVER goes to 'canceled': shares were actually bought, so
+--   the outcome is a smaller position, not a non-event.
 -- Never deleted intra-day -- closed/canceled rows retained so cooldown
 --   state is derivable after a restart.
 -- No entry_ticks column: tp/sl detection is WS/REST-tick driven (see
@@ -709,6 +993,29 @@ CREATE TABLE live_session_state (
     run_id             VARCHAR NOT NULL,
     session_start_cash DOUBLE  NOT NULL,
     started_at         VARCHAR NOT NULL,
+    breaker_tripped_at VARCHAR,           -- R-4/Warm Restart: NULL until the
+                                          -- circuit breaker trips this
+                                          -- session, then the trip
+                                          -- timestamp. Read (not written) by
+                                          -- Warm Restart: the three breaker
+                                          -- counters are recomputed from
+                                          -- trade_log on every restart, but
+                                          -- entries_per_hour is a ROLLING
+                                          -- window that decays during
+                                          -- downtime, so recomputing alone
+                                          -- can let a real trip fall back
+                                          -- under threshold after a long
+                                          -- outage — which would silently
+                                          -- violate R-4's "no auto-clear
+                                          -- within a session". This column
+                                          -- is what makes the trip persist
+                                          -- regardless of what the
+                                          -- recomputed counters say. Not a
+                                          -- new table: live_session_state
+                                          -- already exists for exactly this
+                                          -- purpose (session_start_cash is
+                                          -- restored from here, not
+                                          -- re-queried).
     PRIMARY KEY (date)
 );
 ```

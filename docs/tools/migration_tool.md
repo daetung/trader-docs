@@ -191,7 +191,8 @@ for ticker in all_ingested_tickers:
 
 `crawl_corporate_events()`:
 - Fetches split, reverse-split, and dividend history from yfinance
-- Upserts into `corporate_events` (INSERT OR IGNORE — safe to re-run)
+- Writes into `corporate_events` via the shared `upsert_corporate_event()`
+  helper (item N) — safe to re-run, not a bare INSERT OR IGNORE
 - See `metadata_crawler.md` for the full function definition
 
 **Re-run note:** if `corporate_events` is populated or updated (e.g. a new

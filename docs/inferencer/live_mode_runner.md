@@ -93,6 +93,91 @@ elif wait_deadline reached first: proceed anyway (this IS the "degraded
     hold write access)
 ```
 
+## Session Start Probes (R-7 / R-8)
+
+Three cheap, one-shot checks run after Session Start Gating and before the
+Watchdog loop opens. Each is a single call; none is on a hot path.
+
+**Clock offset (R-8).** Config `clock_check`: `source` (`"ntp_daemon"` default
+| `"vendor_api"` | `"disabled"`), `max_offset_seconds` (default 1.0),
+`on_exceed` (`"abort"` default | `"warn"`).
+
+`"ntp_daemon"` reads the local NTP daemon's own reported offset — no vendor
+contract needed, the dependency closes inside the host. `"vendor_api"` is a
+PLACEHOLDER: whether the trading API exposes a server clock is itself
+unverified (api_contract_checklist.md), so the option exists to be selected
+later, not to be implemented now.
+
+1.0s is not arbitrary. Bar-Close Authority judges in whole seconds, and the
+Feed Outage trigger fires when >50% of the watchlist misses its deadline in
+the same minute — past ~1s of skew EVERY ticker misses simultaneously, so 1s
+is the boundary at which a clock fault starts impersonating a feed outage.
+
+`abort` is the default because a skewed clock disguises itself as other
+faults: it looks like a dead feed, it freezes exits along with entries, and it
+misaligns `fill_second` against the vendor's tick timestamps so that
+`fit_execution_params()`'s counterfactual replay lands on the wrong ticks and
+biases `buy_rate`/`sell_rate` with no error anywhere. Refusing to start beats
+running with silently corrupted calibration.
+
+An `abort` here fires strictly before health_report.py's own session-start
+invocation, so without a deliberate exception the operator learns nothing —
+"no positions today because of a clock fault" and "an ordinary quiet day"
+look identical from outside. On abort, send health_report immediately (at
+`abort` severity) before terminating — the same mid-session trigger
+mechanism Circuit Breaker uses below, reused rather than duplicated.
+
+**Margin ratio (R-8).** Queried from its own endpoint (config key for the path;
+see api_contract_checklist.md) and held as a session constant, consumed by
+`execution.sizing_basis` (execution_common.md). On failure: fall back to
+`execution.margin_ratio_fallback` (default 4.0, a typical day-trading
+buying-power multiple) plus a health_report finding. Never aborts: this
+refines sizing, it does not authorise trading.
+
+The fallback is deliberately NOT 1.0. `sizing_basis: "equity"` divides the
+queried balance by margin_ratio; the safe direction for that division is the
+LARGER divisor, because whether the balance figure itself is cash or buying
+power is still unverified (api_contract_checklist.md T-4). If it is buying
+power and the fallback were 1.0, "fully deployed" would silently mean the
+full buying-power figure — the exact multiplication `sizing_basis` exists to
+prevent, arriving at the one moment its own input is missing. A fallback
+that turns out too conservative once T-4 is verified only under-sizes, which
+costs opportunity, not solvency — the same one-sided-error reasoning
+`sizing_basis`'s own default already applies.
+
+Background: the PDT designation and its $25,000 floor were removed from FINRA
+Rule 4210 effective 2026-06-04, replaced by a risk-based INTRADAY margin
+standard tied to live exposure. That is why this is queried rather than
+encoded — the requirement now moves with position state, brokers phase the new
+framework in on their own schedules through 2027-10-20, and house rules may be
+stricter than the regulatory floor. Modelling the rule in code would be wrong
+for some broker at some date; asking is not.
+
+One query at session start does not track intraday movement, and it is not
+meant to. The binding constraint is enforced by the broker, and it becomes
+visible to us as rejected submissions (`entry_rejected` with `reject_reason`).
+Sizing's job is only to avoid submitting what will obviously be refused.
+
+**Retention boundary (R-7).** Config `retention_probe`: `enabled`,
+`lookback_days` (ask from further back than retention is expected to reach),
+`assumed_days` (fallback).
+
+Measured, not modelled: request history for one liquid ticker from
+`now - lookback_days` and record the OLDEST timestamp actually returned as
+`retention_boundary`, a session constant. This sidesteps having to guess
+whether the vendor counts trading days or calendar days — the returned
+timestamp is the answer either way. On failure or an empty response, fall back
+to `assumed_days` and raise a health_report finding.
+
+Consumed by Warm Restart gap-fill and Feed Outage Recovery: compare the gap's
+start against `retention_boundary` BEFORE attempting to fill it. Today an
+unrecoverable gap is discovered by asking and getting nothing back; this makes
+it a prior judgement, so the crash path skips a pointless round trip at its
+most time-critical moment and goes straight to `restart_gap_exit`. The
+measured value is also logged every session, which fills in
+api_contract_checklist.md's retention row from ordinary operation rather than
+from a one-off measurement.
+
 ## Session Shutdown
 
 LiveModeRunner's last action before process exit, after both loops have
@@ -548,6 +633,60 @@ loop every poll_interval_seconds:
             session_stats=calculators[ticker]._session_stats
         )
      c. If signal (up5 / up3):
+        0.  Entry gates (R-5) — evaluated in this order, before every step
+            below. Enforced identically in shadow mode; unlike R-4's
+            breaker (evaluate-but-don't-enforce in shadow), a shadow run
+            that ignored these caps would record entries live could not
+            have taken, overstating exactly what shadow exists to measure.
+            - freeze_reasons: skip if any active reason's scope includes
+              entry_submission (see Feed Outage Recovery). Record
+              gate_result='freeze', or 'breaker' when the active reason is
+              'breaker_trip' — see Circuit Breaker below.
+            - Ticker cap: COUNT(DISTINCT ticker) over today's
+              live_positions rows with status IN ('pending','partial_open',
+              'open','halted','exiting'). If this ticker is not already
+              among them AND that count >= execution.max_tickers → skip.
+            - Per-ticker cap: this ticker's own row count over the same
+              statuses >= execution.max_positions_per_ticker → skip.
+            - can_enter(ticker, current_hour, last_entry_hour,
+              execution.entry_cooldown_minutes) → skip if False.
+            Both caps read live_positions DB status, never the
+            in_flight_orders runtime cache (R-2: the row is the SSoT);
+            pending rows count as reserved capacity. last_entry_hour is the
+            SUBMISSION time of this ticker's most recent entry attempt this
+            session, including attempts that ended 'canceled' or
+            'entry_rejected' — the same definition Warm Restart's cooldown
+            restore rebuilds from the DB.
+            # Config validation: execution.entry_cooldown_minutes * 60 >=
+            # execution.cancel_after_seconds must hold. The submission-time
+            # cooldown clock is what stops a re-flagged ticker from
+            # double-submitting while its own order is still in flight, but
+            # that protection follows from the two values' relative size —
+            # it is not structural, and a short cooldown configured against
+            # a long cancel window removes it.
+            Whichever gate stops the candidate, write its reason to
+            inference_log.gate_result on THIS candidate's own
+            event='signal_fired' row — 'freeze' | 'cap_tickers' |
+            'cap_per_ticker' | 'cooldown', and likewise 'not_tradable'
+            (step i), 'sizing_zero' / 'funds' (step ii) below. A candidate
+            reaching submission in step iii records 'submitted'. If step
+            ii's check_funds_available() call raises (the one network call
+            in this sequence — timeout, connection error) rather than
+            returning a verdict, record 'error': the candidate otherwise
+            vanishes from every count with no record it was ever
+            evaluated. Every signal_fired row therefore ends with a
+            terminal state, so non-'submitted' rows are the complete
+            record of candidates lost at the gates — they get no
+            trade_log row at all (a broker rejection is different: that IS
+            'submitted', and shows up as trade_log
+            exit_reason='entry_rejected'). This row is written as a SINGLE
+            INSERT the instant the gate sequence concludes, whichever way —
+            never as an UPDATE to a row Inferencer wrote earlier (see
+            Constraints for why this one event is LiveModeRunner's to
+            write). See db_schema.md's inference_log for the value list and
+            why this is a column rather than a new event. health_report.md's
+            finding 19 reads these rows directly, so no in-session tally has
+            to be threaded through to it.
         i.  is_tradable(ticker, db_conn) — execution_common.md gate.
             False (ticker_cik_map.status = 'suspended') → skip, no order.
         ii. quantity = execution_common.compute_position_size(
@@ -599,17 +738,33 @@ loop every poll_interval_seconds:
                      entry_bar, order_id, limit_price, submitted_at=now,
                      signal, status='pending', fill_price=NULL,
                      fill_second=NULL, quantity=NULL)
-                 if order_type == "limit":
-                     pending_entries[order_id] = {ticker, submitted_at: now,
-                         limit_price, quantity}
+                 # R-7: the order API's response confirms ACCEPTANCE of the
+                 # submission, not a fill — fills arrive on the separate
+                 # fill channel (WS account stream / REST order query). The
+                 # former "market: real fill returned synchronously" branch
+                 # was wrong for this vendor and is removed. The only
+                 # rejection knowable at this instant is structural and
+                 # price-independent (account restriction, ticker not
+                 # permitted, malformed order); a market order's
+                 # insufficient-funds-at-actual-price rejection and every
+                 # limit rejection surface later on the fill channel.
+                 if submission rejected structurally:
+                     no order_id exists and no live_positions row is
+                     written — nothing was accepted. Log trade_log row:
+                     exit_reason='entry_rejected', quantity=0,
+                     fill_price=p_entry, exit_bar=entry_bar, and
+                     reject_reason = the broker's own refusal text, stored
+                     verbatim (see db_schema.md's never-opened family).
+                     Counts as a cooldown attempt via step 5c.0's
+                     last_entry_hour; excluded from fit_execution_params()
+                     (see shadow_retraining.md).
+                 else:
+                     in_flight_orders[order_id] = {ticker, side: 'entry',
+                         submitted_at: now, limit_price,
+                         requested_quantity: quantity}
                      # runtime cache over the live_positions row above —
-                     # tracked to fill/cancel by Position Manager Loop — see
-                     # that section's "Pending limit-entry tracking"
-                 else:  # "market": real fill returned synchronously
-                     db_write: transition the live_positions row just
-                         written to status='open' (fill_price, fill_second,
-                         quantity from the fill), then proceed into
-                         open-position handling as before.
+                     # BOTH order types, tracked to fill/reject/cancel by
+                     # Position Manager Loop's "In-flight order tracking"
 ```
 
 ---
@@ -632,12 +787,21 @@ lost.
 
 **Recovery procedure**, on detecting the trigger:
 ```
-1. Freeze: set session-wide freeze flag = True.
-   Watchdog Polling Loop step 5c and Position Manager Loop step 3 both
-   check this flag first — while True, no new entries are submitted and
-   no exits are submitted (exit *evaluation* — track_price_breach() —
-   still runs and still accumulates bars/ticks normally; only order
-   *submission* is held).
+1. Freeze: add 'feed_outage' to freeze_reasons.
+
+   freeze_reasons is a SET of active reasons, each carrying its own scope
+   — not a single session-wide boolean. A boolean cannot represent two
+   overlapping causes, and clearing it on recovery from one would silently
+   release the others (e.g. a feed outage during a warm restart's cache
+   reload would unfreeze entries the restart still needs held):
+     'feed_outage'    → blocks entry_submission AND exit_submission
+     'restart_warmup' → blocks entry_submission only (Warm Restart step 4)
+     'breaker_trip'   → blocks entry_submission only (Circuit Breaker, R-4)
+   A gate blocks whenever ANY active reason covers its scope, so releasing
+   one reason leaves the others in force. Watchdog Polling Loop step 5c.0
+   checks entry_submission; Position Manager Loop step 3 checks
+   exit_submission. Exit *evaluation* is never frozen — it keeps running
+   and accumulating bars/ticks; only order *submission* is held.
 
 2. Reconnect: retry the trading API/watchdog service connection
    (backoff policy TBD — not specified here).
@@ -673,8 +837,66 @@ lost.
    this trade is excluded from ordinary strategy PnL attribution — it
    reflects outage handling, not strategy performance.
 
-6. Unfreeze: clear the session-wide freeze flag. Normal operation resumes.
+6. Unfreeze: remove 'feed_outage' from freeze_reasons — only this reason.
+   If another reason is still active (e.g. 'restart_warmup'), its own
+   scope stays in force and normal operation resumes only for what it
+   does not cover.
 ```
+
+## Circuit Breaker (R-4)
+
+Protects against a failure mode stop-losses structurally cannot catch. A
+stop-loss handles one trade going the wrong way, independently each time. It
+does nothing about the same wrongness repeating: at
+`position_size_cash_pct: 0.05` and `stop_loss_pct: 0.03`, each stopped trade
+costs ~0.15% of the account, so a full book of 20 stopping out is ~3% — with
+every stop-loss behaving exactly as designed. What the breaker targets is a
+broken model or feature pipeline emitting bad entries continuously.
+
+**Three thresholds** (execution_common.md; all default 0 = no limit):
+`intraday_loss_limit_pct`, `consecutive_loss_limit`, `entries_per_hour_limit`.
+They are deliberately staggered along the failure timeline — entry rate spikes
+first, before any loss exists; then losing exits run; realised loss accumulates
+last.
+
+**On trip:** add `'breaker_trip'` to freeze_reasons, scope `entry_submission`
+only, and db_write `live_session_state.breaker_tripped_at = now` (see
+db_schema.md — this is what lets the trip survive a crash; see Warm Restart
+below). Open positions keep running their own tp/sl — force-flatten is
+rejected (market-impact risk for no gain). Does not auto-clear within the
+session.
+
+**State is updated on the events themselves, not polled.** All three quantities
+change only at moments the system already handles: realised loss and the
+consecutive counter at position close, entries-per-hour at submission — both
+restricted to `is_shadow = FALSE` rows for a live session's own counters (a
+shadow evaluation, below, tracks its own is_shadow=TRUE counters separately
+so the two never mix). So the entry gate reads a value that is current by
+construction. Evaluating on the Position Manager Loop's cadence and having
+the 1s gate consume the last verdict was considered and rejected — it admits
+up to five gate cycles between the condition becoming true and being
+enforced. The one delay that remains is inherent: a close is not known until
+the loop observes it, which no evaluation cadence changes.
+
+**Consecutive counter** counts consecutive LOSING exits (`pnl_pct < 0`) and is
+reset only by a profitable exit — see execution_common.md for why the
+stop-loss-only reading leaves a hole. Operational-family and never-opened rows
+are skipped entirely, incrementing nothing and resetting nothing. Where several
+positions close in one cycle, order by `exit_bar`, then ticker alphabetically —
+the same tiebreak backtest already uses.
+
+**Shadow mode: evaluate, do not enforce.** A real trip would truncate exactly
+the bad-day data shadow exists to observe. Because nothing is enforced,
+`gate_result` still records `'submitted'`, so a would-have-tripped event CANNOT
+be read from `gate_result` — it is reported as its own health_report finding.
+Note this is the opposite policy from the position caps, which ARE enforced in
+shadow: caps shape what live would have done, the breaker only reacts to it.
+
+**On trip, health_report.py is invoked immediately** — a third trigger beside
+session start and session end — at `abort` severity, so it reaches even
+`alert_level: "abort_only"`. No new alerting infrastructure: the Discord and
+email channels already exist and were simply never wired to a mid-session
+event.
 
 ## Broker Reconcile (shared procedure) — R-3
 
@@ -717,7 +939,11 @@ the Unified Overnight Policy below.
 Any adopted position dated to a PRIOR trading day (halt-through-close,
 unfilled/rejected EOD exit, crash orphan, or an unmatched broker position
 of unknown date) is liquidated at market as soon as the ticker is
-tradable, `exit_reason='overnight_exit'`, PnL-excluded.
+tradable, `exit_reason='overnight_exit'`, PnL-excluded. `exit_date` is the
+date of that liquidation, NOT the row's `date` (the entry date) — these are
+by definition different for this label, and may differ by more than one day
+across a weekend, holiday, or multi-day halt. See db_schema.md's
+`trade_log.exit_date`.
 
 **Mechanism** — no special executor needed: the adopted position enters
 the ordinary Position Manager Loop, where `execution.max_hold_bars` was
@@ -783,8 +1009,9 @@ so a re-crash during recovery re-enters warm restart on the same signature.
         config["execution"]["max_hold_bars"], skip retro-detection and
         liquidate immediately (still 'restart_gap_exit').
 
-4. Entries stay frozen (freeze reason 'restart_warmup') while the
-   indicator cache reloads: if today's Eager-Pool backup exists in
+4. Entries stay frozen — add 'restart_warmup' to freeze_reasons
+   (entry_submission scope only, so step 3's exit-only management above
+   keeps submitting exits) — while the indicator cache reloads: if today's Eager-Pool backup exists in
    indicator_cache, restore each ticker via load_from_db() (skipping the
    historical_bars recompute) then replay today's bars via on_bar_close();
    if no backup exists (Eager Pool never ran this process), fall back to
@@ -809,6 +1036,24 @@ so a re-crash during recovery re-enters warm restart on the same signature.
    with exit_reason IN ('entry_canceled', 'entry_rejected'). The
    pending_entries in-memory dict is rebuilt from live_positions rows with
    status='pending'.
+
+7. Circuit breaker restore (R-4): recompute all three counters from
+   today's `trade_log`, `is_shadow = FALSE` only (a shadow evaluation's
+   counters, if this process also ran shadow, are recomputed the same way
+   but restricted to `is_shadow = TRUE` and kept separate — see Circuit
+   Breaker). Realised loss and the consecutive-loss counter are exact:
+   both are cumulative or determined by exit order, neither decays with
+   time. entries_per_hour is a ROLLING window and DOES decay during
+   downtime, so recomputing it alone can under-report a real trip after a
+   long outage. Recomputation therefore is NOT sufficient by itself:
+     if live_session_state.breaker_tripped_at IS NOT NULL:
+         restore 'breaker_trip' to freeze_reasons regardless of what the
+         three recomputed counters show — this is the only path that
+         upholds "no auto-clear within a session" (Circuit Breaker) across
+         a crash. The recomputed counters still matter: they are what
+         health_report.md reports going forward, and they are what a
+         second, independent trip condition (post-restart) would be
+         evaluated against.
 ```
 
 ## Watchlist Append
@@ -906,7 +1151,12 @@ universe, below, is unchanged — a different problem at a different scale).
 Feeds the exit-decision consumed by Position Manager Loop Step 2.
 
 **Primary — WebSocket tick stream.** On fill, subscribe to that ticker's
-realtime trade stream (at most `max_positions` concurrent subscriptions).
+realtime trade stream. Subscriptions are per TICKER, not per position, so
+several positions on one ticker share one subscription; the bound is
+`execution.max_tickers` against `execution.ws_ticker_limit`,
+NOT a position count. Price tracking holds one of the two WS sequences the
+API permits for the whole session; see "WS sequence lease" under Position
+Manager Loop for how the second one is shared.
 Immediately after subscribing, REST gap-fill the short window between fill
 and subscription-active, deduped by the global tick-dedup rule (see
 utils.md's `stitch_ticks()`). Each inbound tick:
@@ -958,16 +1208,24 @@ event loop so position status transitions serialize naturally;
 periodic loop could otherwise race (e.g. a simultaneous price breach and
 `session_close` — see R-3 for the tp/sl-wins ordering rule).
 
-**Config-driven, not hardcoded.** `max_positions` (WS subscription cap
-above) and `position_check_interval_seconds` (the REST backstop's poll
-frequency) are read from config at every use in this section and
-elsewhere — this spec deliberately does not commit specific values (e.g.
-a 1s poll or a 10-position cap) beyond the existing defaults already in
-Config Keys. Any future change to R-4's circuit-breaker thresholds, R-5's
-entry-gate `max_positions` checks, or `compute_position_size()`'s
-notional/exposure sums must read the same config keys rather than
-hardcode a value independently — see open_items_session4.md for the
-forward note on R-4/R-5 until those are patched.
+**Config-driven, not hardcoded.** `execution.max_tickers` (the
+subscription bound above), `execution.max_positions_per_ticker`, and
+`position_check_interval_seconds` (the REST backstop's poll frequency) are
+read from config at every use in this section and elsewhere — this spec
+deliberately does not commit specific values beyond the defaults already in
+Config Keys and `execution:`. Any future change to R-4's circuit-breaker
+thresholds, R-5's entry-gate cap checks (Watchdog Polling Loop step 5c.0),
+or `compute_position_size()`'s notional/exposure sums must read the same
+config keys rather than hardcode a value independently — see
+open_items_session4.md for the forward note on R-4 until it is patched.
+
+Inf mode (`0`) on either cap means "unlimited" for BacktestEngine only.
+LiveModeRunner clamps: `max_tickers` 0 → 50 (the vendor limit above, which
+is not a configurable choice), `max_positions_per_ticker` 0 →
+`floor(execution.max_hold_bars / execution.entry_cooldown_minutes)` — the
+largest same-ticker stack the cooldown can admit inside one position's
+maximum hold. Both clamps are derived, not configurable, in the same spirit
+as `get_execution_param()`'s hard bounds.
 
 ---
 
@@ -990,32 +1248,147 @@ position.bars_since_entry  = []   # grown each iteration; used for
 # track_price_breach() itself is unchanged and remains backtest-only.
 ```
 
-**Pending limit-entry tracking** (real orders only, `execution.entry_order_type
-== "limit"`; not applicable to `"market"` or to shadow mode, which has no
-real order to be pending): submitted at Watchdog Polling Loop step 5c.iii,
-tracked here rather than in a separate loop — reuses the same
-`position_check_interval_seconds` cadence already running:
+**In-flight order tracking** (real orders only — shadow mode has no real
+order): covers BOTH order types and BOTH sides. Fills are not returned by
+the order-submission API (R-7); they arrive on a separate channel, so every
+accepted order is tracked here until it reaches a terminal state:
 ```
-pending_entries: dict[order_id, dict]  # {ticker, submitted_at, limit_price, quantity}
-# R-2: runtime CACHE only — the SSoT is the live_positions row written at
-# submission (status='pending', see Watchdog Polling Loop step 5c.iii).
-# populated by Watchdog Polling Loop immediately after limit order submission,
-# and rebuilt from live_positions WHERE status='pending' on a warm restart
-# (see "Session Restart (Warm Start)" below).
+in_flight_orders: dict[order_id, dict]
+# {ticker, side: 'entry'|'exit', submitted_at, limit_price,
+#  requested_quantity, cum_filled_qty, weighted_avg_price}
+# R-2: runtime CACHE only — the SSoT is the live_positions row (status
+# 'pending'/'partial_open' for entries, 'exiting' for exits). Populated at
+# submission, and rebuilt from live_positions WHERE status IN
+# ('pending','partial_open','exiting') on a warm restart.
 ```
+
+**WS sequence lease.** The API permits two concurrent WS sequences. Price
+tracking (Exit Architecture) holds one for the whole session, since a
+position is almost always open and one sequence multiplexes up to 50
+tickers. The second is leased by refcount: acquired when in-flight entry
+orders go 0 → 1, released when they return to 0 after
+`fill_stream_linger_seconds` (a linger window, so a burst of entries does
+not thrash subscribe/unsubscribe). `fill_stream_mode: "dedicated"` is the
+same mechanism with the lease taken at session start and never released.
+
+Constraints this places on any FUTURE second consumer of that sequence
+(e.g. realtime quote monitoring): fill tracking preempts unconditionally,
+so such a consumer must tolerate being evicted at any moment and must not
+assume continuous observation. A use needing an unbroken series is not
+compatible with shared mode.
+
+**Exits are REST-only.** Exit fills are polled on this loop's existing
+cadence rather than leased onto the WS sequence. Order state is queryable,
+not a perishable event, so a missed push costs latency, not correctness —
+and unlike an entry (whose fill starts tp/sl monitoring), knowing an exit
+filled sooner changes no decision: the position is already closing and any
+unfilled remainder stays tracked either way. Keeping exits off the lease
+also removes the only unbounded holder, since an exit has no give-up
+timeout (below).
+
+**Fill accounting invariant.** For a given order_id, `cum_filled_qty` must
+always equal the broker's own count of that order's filled quantity — never
+a value arrived at by ADDING reports from different channels together. WS
+(primary) and REST (backstop) both report on the same underlying fills, so
+naive accumulation double-counts on the routine case of a WS event and a
+later REST poll describing the same fill, on WS reconnect if a missed event
+is replayed, and on Warm Restart when `in_flight_orders` is rebuilt from
+`live_positions` (whose `quantity` is already-filled shares) and then sees
+further reports that repeat pre-crash fills. Entry-side double-counting
+reaches `requested_quantity` early and confirms `open` on a wrong quantity;
+exit-side is worse — it reaches `position.quantity` early and marks
+`closed` while shares remain, and the remainder then has NO loop tracking
+it until the next session's Broker Reconcile (finding 12) surfaces it as an
+unknown broker position, exposed overnight in between. Failure in the
+opposite direction (under-counting) only delays `closed`/`open`, which
+stays tracked and is visible via the finding above — the two failure modes
+are not symmetric, which is why the mechanism below is structured to make
+over-counting impossible rather than merely unlikely.
+
+Primary mechanism, used when individual fills carry a stable, unique ID
+(api_contract_checklist.md T-7/T-8 confirm this before Pilot): maintain
+`seen_fills[order_id]`, a map from fill ID to (qty, price), idempotently
+updated by every report regardless of channel or whether it is a delta
+(one fill) or a bundle (several fills, as a REST query may return) —
+inserting under an already-seen ID is a no-op. `cum_filled_qty` and
+`weighted_avg_price` are RECOMPUTED from that map's current contents after
+each update, never incremented. This makes the result invariant to
+duplicate reports, out-of-order arrival, and which channel reported first,
+and it treats a WS delta and a REST bundle identically — both are just
+fills to fold into the same map. On Warm Restart, `live_positions.quantity`
+seeds a lower bound while `seen_fills` rebuilds from a fresh REST query, if
+that query is confirmed to return an order's complete fill history rather
+than a paginated or windowed slice.
+
+Fallback mechanism, for a vendor without stable per-fill IDs: treat each
+report's OWN cumulative fields, when present, as the current state rather
+than a delta to add — `cum_filled_qty = max(cum_filled_qty,
+reported_cum_qty)`, with `weighted_avg_price` taken from that SAME report
+(never averaged separately from a different report's quantity, which would
+pair a quantity and a price from different moments).
+
+Either mechanism is guarded by the same check: a computed `cum_filled_qty`
+that is LOWER than the value already held is never accepted — logged as a
+health_report finding instead. This does not fire under either mechanism's
+normal operation; it exists for the case an ID turns out not to be as
+stable as assumed (e.g. reissued after reconnect) or a bundle arrives
+truncated.
 
 ```
 loop every position_check_interval_seconds (config, default: 5s):
 
-  For each order_id in pending_entries:
-    order_status = query trading API for order_id status
-    if filled (fully or partially):
-        db_write: transition the live_positions row (this order_id) to
-            status='open' (fill_price, fill_second, quantity from the
-            fill)
-        remove from pending_entries cache → open a position for the
-            filled quantity (proceeds into the open-position handling
-            below)
+  For each order_id in in_flight_orders where side == 'exit':
+    # WS account fill events are primary; this poll is the backstop.
+    # Fold every fill into seen_fills[order_id] (or the fallback path) as
+    # described above; cum_filled_qty and weighted_avg_price are read from
+    # the result, never accumulated directly from the raw event.
+    if cum_filled_qty >= position.quantity:
+        db_write: transition the live_positions row to status='closed';
+            log the exit to trade_log with weighted_avg_price and
+            exit_date/exit_bar of the final fill
+        remove from in_flight_orders
+    else:
+        stay 'exiting' — NO give-up timeout. An entry may abandon its
+        unfilled remainder and settle for a smaller position, but an
+        unsold remainder is still exposed to the very risk that triggered
+        the exit, so the order stays tracked until fully filled.
+        # Observability, not policy: an exit order open beyond a
+        # configured age is surfaced as a health_report finding. Forced
+        # liquidation / re-submission is NOT designed here — see
+        # open_items_session4.md.
+
+  For each order_id in in_flight_orders where side == 'entry':
+    order_status from the WS account fill stream (primary) or a REST
+        order query on this cadence (backstop) — folded into
+        cum_filled_qty / weighted_avg_price via the same fill-tracking
+        mechanism as the exit branch above
+    if rejected (including a market order's insufficient-funds-at-actual-
+        price rejection, and any limit rejection):
+        db_write: transition the live_positions row to status='canceled'.
+            Subordinate to that same write, log trade_log row:
+            exit_reason='entry_rejected', quantity=0, fill_price=p_entry,
+            exit_bar=entry_bar, reject_reason = the broker's refusal text
+            verbatim. Never-opened family (db_schema.md): excluded from
+            fit_execution_params(), counted as a cooldown attempt.
+        remove from in_flight_orders
+    elif filled in full (cum_filled_qty == requested_quantity):
+        db_write: transition the live_positions row to status='open'
+            (fill_price = weighted_avg_price, fill_second, quantity =
+            cum_filled_qty)
+        remove from in_flight_orders → proceeds into the open-position
+            handling below
+    elif filled in part (0 < cum_filled_qty < requested_quantity):
+        db_write: transition the live_positions row to
+            status='partial_open' (quantity = cum_filled_qty so far;
+            requested_quantity unchanged). The filled shares are a real
+            position from this moment: they enter exit management and
+            count toward step 5c.0's caps, while the order itself stays
+            in_flight awaiting further fills.
+        # No 'full_open' status: the two ways partial_open ends — reaching
+        # requested_quantity, or abandoning the remainder at
+        # cancel_after_seconds — both mean "no longer awaiting fills",
+        # which is exactly 'open'. This matches backtest, where a
+        # partially-filled entry simply proceeds sized down.
     elif now - submitted_at >= config["execution"]["cancel_after_seconds"]:
         submit cancel request to trading API for order_id
         # race: cancel request may lose to a fill that happened moments
@@ -1023,16 +1396,22 @@ loop every position_check_interval_seconds (config, default: 5s):
         # attempt itself resolves this (a "too late, already filled"
         # response is treated as a fill, not a cancellation)
         if canceled (not a race-lost fill):
-            db_write: transition the live_positions row to
-                status='canceled' — THE SINGLE canceled-transition point
-                (R-2). Subordinate to that same write, log trade_log row:
-                exit_reason='entry_canceled', quantity=0, fill_price=p_entry,
-                exit_bar=entry_bar (see db_schema.md). Because the
-                transition is the single point (idempotent — a second
-                attempt to cancel an already-'canceled' row is a no-op),
-                a post-crash Broker Reconcile that also cancels this same
-                order cannot double-log entry_canceled.
-        remove from pending_entries cache
+            if cum_filled_qty == 0:
+                db_write: transition the live_positions row to
+                    status='canceled' — THE SINGLE canceled-transition point
+                    (R-2). Subordinate to that same write, log trade_log row:
+                    exit_reason='entry_canceled', quantity=0, fill_price=p_entry,
+                    exit_bar=entry_bar (see db_schema.md). Because the
+                    transition is the single point (idempotent — a second
+                    attempt to cancel an already-'canceled' row is a no-op),
+                    a post-crash Broker Reconcile that also cancels this same
+                    order cannot double-log entry_canceled.
+            else:
+                db_write: transition 'partial_open' → 'open' with
+                    quantity = cum_filled_qty. A partially-filled order is
+                    never 'canceled': shares were actually bought, so this
+                    is a smaller position, not a non-event.
+        remove from in_flight_orders
 
   For each open position:
     1. Fetch current bars from trading API (entry → now; the API always
@@ -1079,7 +1458,7 @@ loop every position_check_interval_seconds (config, default: 5s):
             alert (see health_report.md), tagged with signal_source for
             diagnosability (see health_report.md's new fallback-rate finding)
             → skip Steps 2-4 this iteration (no reliable price to act on)
-            # R-3: if now >= config["live_mode"]["session_close_exit_time"]
+            # R-3: if now >= config["execution"]["session_close_exit_time"]
             # (i.e. this position is skipping session_end specifically
             # because it cannot trade, not merely skipping an ordinary
             # mid-session iteration), log explicitly and write a
@@ -1118,7 +1497,7 @@ loop every position_check_interval_seconds (config, default: 5s):
            exit_reason = "take_profit" if breach_direction == "up" else "stop_loss"
        elif bars elapsed >= config["execution"]["max_hold_bars"]:
            exit_reason = "time_limit"        # wall-clock/bar-count — this loop, not WS
-       elif now >= config["live_mode"]["session_close_exit_time"]:
+       elif now >= config["execution"]["session_close_exit_time"]:
            exit_reason = "session_end"       # wall-clock — this loop, not WS
        else:
            continue to next position (no exit yet)
@@ -1157,8 +1536,12 @@ loop every position_check_interval_seconds (config, default: 5s):
 live_mode:
   poll_interval_seconds:          1
   position_check_interval_seconds: 5    # shared timing grid — see Position Manager Loop
-  max_positions:                  5
-  max_hold_bars:                  60
+  # max_positions removed — replaced by execution.max_tickers /
+  # execution.max_positions_per_ticker (two independent axes; a single
+  # global count could not express "5 positions, all on one ticker").
+  # max_hold_bars removed (R-6) — execution.max_hold_bars is the single
+  # source, already read by this file's restart_gap_exit / overnight_exit
+  # cutoff and by backtest's time-limit exit.
   session_start_workers:          8      # parallel workers for session_start_compute()
   indicator_cache_mode:           "memory"
   # "memory" (default): all CachingCalculator state held in RAM after session_start_compute()
@@ -1179,7 +1562,34 @@ live_mode:
   # — deliberately NOT on the WS path, see Exit Architecture's
   # "Time-based triggers" note. Matches backtest's 15:59 close-exit
   # convention.
-  session_close_exit_time:        "155900"
+  # session_close_exit_time removed — promoted to execution: (R-7), where
+  # BacktestEngine reads it too; a value both engines must agree on cannot be
+  # declared on one side only (same defect R-6 fixed for max_hold_bars).
+  fill_stream_mode:               "shared"   # "shared" | "dedicated" — see
+                                             # Position Manager Loop's WS
+                                             # sequence lease
+  fill_stream_linger_seconds:     30         # idle hold before releasing the
+                                             # leased sequence, so a burst of
+                                             # entries does not thrash
+                                             # subscribe/unsubscribe
+  clock_check:
+    source:                       "ntp_daemon"  # | "vendor_api" | "disabled"
+    max_offset_seconds:           1.0
+    on_exceed:                    "abort"       # | "warn"
+  retention_probe:
+    enabled:                      true
+    lookback_days:                14           # ask from further back than
+                                               # retention is expected to reach
+    assumed_days:                 5            # fallback when the probe fails
+  margin_ratio_url:               "http://trading-api/margin"
+  margin_ratio_fallback:          4.0        # used only if the query above
+                                             # fails — see Session Start
+                                             # Probes for why this is not 1.0
+  exit_order_stuck_minutes:       10         # health_report finding 18's age
+                                             # threshold
+  api_max_tickers_per_second:     100        # assumed throughput ceiling used
+                                             # for chunk sizing — UNVERIFIED,
+                                             # see api_contract_checklist.md
 
   # Halt detection (Position Manager Loop only — see is_tradable() in
   # execution_common.md for the separate, unrelated new-entry rename gate).
@@ -1236,7 +1646,21 @@ live_mode:
   Inferencer only returns InferenceResult
 - All inference_log writes include the active run_id
 - LiveModeRunner does not modify DuckDB historical data — only reads for session init
-  (exception: inference_log and entry_points INSERT via Inferencer)
+  (exception: entry_points INSERT via Inferencer; inference_log, below)
+- inference_log has SPLIT ownership by event, not one writer: Inferencer
+  INSERTs the inference-stage events (no_detection, preload_fail,
+  bars_trimmed, no_signal, suppressed); LiveModeRunner INSERTs
+  event='signal_fired' rows, once, the instant the step-5c.0 gate sequence
+  ends — never by a later UPDATE (see db_schema.md's gate_result). This
+  split is not a convenience, it is forced: every gate reads
+  LiveModeRunner's own runtime state (freeze_reasons, live position counts
+  from the DB, the cooldown cache, the breaker counters, the queried
+  balance), none of which Inferencer has visibility into at the moment it
+  returns an InferenceResult — so LiveModeRunner is the only party that
+  can ever know how a signal_fired row ends. Multiple writers on one table
+  already has a precedent (entry_points: Preprocessor and Inferencer, both
+  INSERT OR IGNORE) — what's new here is splitting ownership by EVENT VALUE
+  within a single table rather than by row-existence.
 - session_start_compute() parallelized across workers; thread-safety per-ticker guaranteed
   (no shared state between CachingCalculator instances)
 - Eager Pool bars loading (Step 3) uses `utils.load_ohlcv_with_history()`, not a raw

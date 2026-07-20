@@ -52,6 +52,19 @@ disabled) to a small nonzero fraction for the pilot period, then relax back
 toward `0` (or a larger deliberate ceiling) at Stage 3. `shadow_mode: false`
 from this stage onward.
 
+**Circuit-breaker thresholds must be set on entering this stage (R-4).**
+`execution.intraday_loss_limit_pct`, `consecutive_loss_limit` and
+`entries_per_hour_limit` all default to `0` = no limit, which leaves the entire
+trip path — the `'breaker_trip'` freeze reason, `gate_result='breaker'`, the
+immediate alert — dormant. Entering Pilot on those defaults means real capital
+runs with stop-losses and cash exhaustion as the only brakes, over code paths
+that have never once executed. Calibrate from two sources: backtest's
+entries-per-hour distribution (available now that BacktestEngine simulates
+chronologically per date and counts gate rejections — 09_backtest_engine.md),
+and health_report.md's three breaker metrics, which are computed every session
+regardless of whether the thresholds are armed. Same class of stage
+precondition as Stage 3's "at least one successful fit_execution_params()".
+
 **Execution-parameter calibration** (`buy_rate`, `sell_rate_tp`,
 `sell_rate_sl`, `cancel_after_seconds` — see execution_common.md's
 `execution:` config). Real fills only exist from this stage onward, which
@@ -93,6 +106,24 @@ other three (if their own gates are met) still refit independently.
 entry-count denominator for `buy_rate`/`cancel_after_seconds` — a fully-
 unfilled entry is itself a direct, relevant observation for those two
 parameters, not noise to exclude.
+
+`exit_reason='entry_rejected'` rows (R-7) are **excluded** from that same
+denominator — the opposite treatment, for the opposite reason. A rejection
+comes from the broker or the account (restriction, insufficient funds at
+the actual price, a non-permitted ticker), never from how the market
+absorbed the order, so it carries no evidence about participation rate or
+about whether `cancel_after_seconds` is set too tight. Both labels belong
+to the never-opened family in db_schema.md and both count as cooldown
+attempts in live; they diverge only here, at what they are evidence FOR.
+
+Fill-rate inputs read `trade_log.requested_quantity`, which is the quantity
+actually SUBMITTED — i.e. after `check_funds_available()` has sized the
+order down. A funds-driven reduction therefore never reaches this
+calibration; only market-driven shortfall does. This matters in practice
+rather than in principle: full deployment is the intended operating point,
+so the funds gate truncates routinely near the end of a session, and
+measuring against the pre-gate size would bias `buy_rate` downward exactly
+when the book is fullest.
 
 **Relative-bound check (N-7)**, applied to each parameter that clears its
 sample-size gate above, before it is written:
@@ -243,6 +274,11 @@ is now a LiveModeRunner in-process task, not a cron entry — see
 metadata_crawler.md's "Dual Schedule", N-1/N-3 — 09:30 regular session
 open, 15:59 session close, 17:00 ET evening batch run) are wall-clock
 America/New_York times, which observe DST. The deployment host/container
+must be NTP-synchronised as well (R-8): Bar-Close Authority's wall-clock
+deadlines and the Feed Outage trigger assume sub-second skew against exchange
+time, and this is enforced rather than merely recommended — LiveModeRunner's
+`clock_check` probe aborts the session by default when the offset exceeds
+`max_offset_seconds`. The host
 must set its system TZ to `America/New_York` (not a fixed UTC offset), so
 that all cron schedules, the in-process recheck's scheduled time, and
 bar-close authority (see live_mode_runner.md)

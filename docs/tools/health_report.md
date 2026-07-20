@@ -13,10 +13,25 @@ in logs and tables: `batch_runs` status, `ticker_cik_map` suspended count,
 per-run log files. No new infrastructure — everything read here already
 exists for another purpose (see db_schema.md, metadata_crawler.md).
 
-Two invocations per session: once at session start (reports on the
+Two scheduled invocations per session: once at session start (reports on the
 overnight/premarket batches feeding into Health Gate 1/2 — see
 live_mode_runner.md), once at session end (reports on the session's own
 inference/trade activity).
+
+EVENT-DRIVEN invocations fire outside that schedule, always at `abort`
+severity so delivery happens even under `alert_level: "abort_only"`. Two
+triggers exist:
+- A circuit-breaker trip (R-4) — entries are frozen for the rest of the
+  session at that point, worth knowing immediately rather than at session
+  end.
+- A `clock_check` abort (R-8) at session start — this one fires BEFORE the
+  scheduled session-start invocation above (the clock fault stops the
+  session before it opens), so without it a clock-fault day and an
+  ordinary quiet day would be indistinguishable to the operator from
+  outside.
+Neither needs new infrastructure — the Discord and email channels below
+already existed and were simply never wired to a mid-session or
+pre-session event.
 
 ---
 
@@ -28,8 +43,28 @@ def gather_findings(db_conn, today_date, log_dir) -> dict:
     1. batch_runs — status of every stage for today_date; a stage with no
        row at all (not even 'running') is reported distinctly from a
        'failed' row.
-    2. ticker_cik_map — COUNT(*) WHERE status='suspended', with the
-       (cik, ticker, suspend_reason) list for the console/detail view.
+    2. ticker_cik_map — entry-blocked ticker count and detail (rewritten:
+       the original `status`/`suspend_reason` columns this finding named
+       were removed by N-2's restructure into two independent columns,
+       `rename_pending` and `quarantine_reason` — see db_schema.md).
+       Predicate is is_tradable()'s own gate, inverted:
+       `WHERE rename_pending = TRUE OR quarantine_reason IS NOT NULL`.
+       (`rename_pending IS NOT NULL` — the naive column-rename translation
+       — is always true, since the column is `NOT NULL DEFAULT FALSE`, and
+       would report the table's total row count instead of a blocked
+       count.)
+       Reported as COUNT(DISTINCT ticker), not COUNT(*): the PK is
+       (cik, ticker), so a ticker under rename ambiguity legitimately holds
+       multiple rows, and COUNT(*) over-counts exactly the case
+       `rename_pending` exists to flag.
+       The two columns are independent and a ticker can have both set, so
+       report the union count above alongside — not summed with — a
+       per-column tally: `rename_pending` count and `quarantine_reason`
+       count. `quarantine_reason` is further broken out by its own value
+       (currently only 'corporate_event_anomaly', but the column is
+       explicitly reserved for future reasons — see db_schema.md), so a
+       new reason registers here without a schema or finding change.
+       Detail view: `(cik, ticker, rename_pending, quarantine_reason)`.
     3. inference_log — preload_fail rate for today's run_id:
        COUNT(*) FILTER (WHERE event='preload_fail') / COUNT(*)
        Alert threshold: TBD — not yet set (same deferral status as findings
@@ -142,6 +177,110 @@ def gather_findings(db_conn, today_date, log_dir) -> dict:
         practical evidence for whether
         quarantine.corporate_event_value_tolerance is set sensibly
         (see metadata_crawler.md's upsert_corporate_event()).
+    17. Never-opened entry outcomes (R-5/R-7) — this session's counts of
+        exit_reason='entry_canceled' (submitted, never filled, canceled at
+        cancel_after_seconds) and exit_reason='entry_rejected' (the broker
+        or the account refused the submission), reported as two separate
+        tallies within one finding. Kept apart from findings 13/15's
+        operational family (restart_gap_exit / overnight_exit /
+        reconcile_ghost) because the two families are excluded from PnL for
+        different reasons and mean different things: the operational ones
+        held a real position that was closed for a non-strategy reason,
+        while these never opened at all (see db_schema.md's two exclusion
+        families). A rising entry_canceled count points at buy_rate /
+        cancel_after_seconds being too tight and is calibration evidence
+        (fit_execution_params() consumes it); a rising entry_rejected count
+        points at the account or the broker and is not — it is excluded
+        from that calibration (see shadow_retraining.md). The
+        entry_rejected tally is broken out by trade_log.reject_reason
+        (R-8), stored as the broker returned it: insufficient margin, a
+        non-permitted ticker and a malformed order call for three
+        different responses, and under the risk-based intraday margin
+        regime that replaced the PDT rule in June 2026 a rejection count
+        that rises with exposure is normal — without the reason there is
+        nothing to separate that from a real fault.
+    18. Exit order still in flight (R-7) — exit orders whose in_flight age
+        exceeds live_mode.exit_order_stuck_minutes without completing, with the
+        (ticker, order_id, age, cum_filled_qty / quantity) detail. An exit
+        has no give-up timeout by design — an unsold remainder stays
+        exposed to the very risk that triggered the exit — so on a thin
+        name an order can in principle stay open indefinitely. This finding
+        exists to make that observable; forced liquidation or re-submission
+        is deliberately NOT designed (see open_items_session4.md).
+    19. Entries lost at the entry gates (R-5) — today's inference_log rows
+        with event='signal_fired', grouped by gate_result: 'submitted' plus
+        one bucket per gate ('freeze', 'cap_tickers', 'cap_per_ticker',
+        'cooldown', 'not_tradable', 'sizing_zero', 'funds'). Read straight
+        from the table, NOT passed in from LiveModeRunner — unlike findings
+        5 and 8, whose aggregates travel in memory only because tier_used
+        and signal_source have nowhere to be stored, gate_result has a
+        column of its own (db_schema.md), so the query survives a crash and
+        needs no in-session tally threaded through this call.
+        A candidate stopped at a gate produces no trade_log row, so these
+        rows are the only record it existed; the cap buckets in particular
+        are the sole evidence for whether execution.max_tickers and
+        execution.max_positions_per_ticker are set sensibly, since whether a
+        given candidate hit a cap depends on the concurrent-position state
+        at that instant and is not reconstructible afterwards.
+        Not an error signal on its own — nonzero simply means the gates bind
+        in practice. The same bucket names appear as BacktestEngine summary
+        counters (09_backtest_engine.md), so a live session and a backtest
+        over the same window are directly comparable; 'freeze' and
+        'not_tradable' are live-only, by design rather than omission.
+        A broker rejection is NOT one of these buckets: it occurs after
+        submission, so it is counted under 'submitted' here and surfaces in
+        finding 17 as exit_reason='entry_rejected'.
+
+    20. Circuit-breaker metrics (R-4) — the session's peak realised loss,
+        longest run of consecutive losing exits, and peak rolling-hour entry
+        count. Computed EVERY session whether or not the thresholds are
+        armed: they all default to 0 (no limit), and Pilot is expected to
+        calibrate them, which requires the numbers to have been accumulating
+        beforehand. Same shape as findings 3/6/7/8 — the quantity is always
+        measured, only the warn cutoff is deferred. In shadow mode this
+        finding also carries the would-have-tripped record, which cannot be
+        read from gate_result (nothing is enforced there, so gate_result
+        stays 'submitted').
+        Also reports current UNREALISED drawdown — sum of (current price −
+        entry price) over open/exiting positions — as a separate, clearly
+        labelled observation. NOT a trip input (the three thresholds above
+        stay realised-only, since unrealised swings would trip on ordinary
+        intraday movement — see live_mode_runner.md's Circuit Breaker); this
+        exists because the realised-only design has a structural blind spot
+        when an exit cannot fill (no give-up timeout — see finding 18): no
+        trade_log row is written, so realised loss, the consecutive counter,
+        and this finding's own trip logic all stay silent regardless of how
+        large the position's unrealised loss grows. This observation is
+        what lets Pilot judge whether the realised-only thresholds leave
+        that gap too wide, without changing what actually trips.
+        On restart, a trip found via `live_session_state.breaker_tripped_at`
+        (see live_mode_runner.md's Warm Restart) is reported as RESTORED,
+        distinct from a fresh trip this session — the underlying cause and
+        its timing are what the earlier trip already established, not a new
+        event to investigate.
+    21. Session-start probe results (R-7/R-8) — the measured clock offset,
+        margin_ratio, and retention_boundary, one line each. Recording the
+        clock offset at session END as well catches an NTP daemon that died
+        after the start gate passed, and gives a drift trend; periodic
+        re-checking is unnecessary if the daemon is alive. A probe that fell
+        back (margin_ratio to execution.margin_ratio_fallback, retention to
+        assumed_days) is flagged distinctly from one that succeeded — the
+        fallbacks are safe but they silently change sizing and gap-fill
+        behaviour. Each measurement also fills in its row in
+        api_contract_checklist.md from ordinary operation.
+    22. inference_log rows dropped (R-8) — count of diagnostic log writes
+        discarded by INSERT OR IGNORE on a PK collision, plus any suppressed
+        by the write-failure guard. This is what makes INSERT OR IGNORE
+        acceptable: the content of a dropped row is gone, but the fact that
+        rows are being dropped is not. Nonzero after the R-8 key and
+        timestamp changes indicates a real defect (duplicate logging, a clock
+        moving backwards, a retry loop), not ordinary contention.
+    23. Broker rejections without a recognised reason (R-8) — entry_rejected
+        rows whose reject_reason has not been seen before. reject_reason is
+        stored verbatim because the broker's vocabulary is an unverified
+        contract (api_contract_checklist.md); this finding is how that
+        vocabulary is actually discovered, so it feeds the checklist rather
+        than signalling a fault on its own.
 
     Returns: dict of {finding_name: {severity: 'ok'|'warn'|'abort', detail: ...}}
     """
@@ -282,6 +421,16 @@ alerting:
   separate from each other — a degraded halt-status endpoint, a model
   drift, and an execution-fill drift are three distinct failure modes with
   three distinct responses.
+- Date-scoped queries over `trade_log` use `exit_date`, not `date`, wherever
+  the question is "what did this session close". `date` is the ENTRY date,
+  so a position carried across the boundary — dead position Case A, and
+  live's `overnight_exit` — would otherwise be attributed to the day it was
+  opened and vanish from the report for the day it was actually liquidated
+  (see db_schema.md's `trade_log.exit_date`). Entry-side questions still
+  read `date`
+- Findings 17 and 18 are session-scoped and always computable — no pilot
+  accumulation gate, unlike findings 6/7/9. Finding 18's age threshold is
+  the only TBD among them
 - Finding 9 (execution-parameter fit rejections) has nothing to report
   before Pilot stage produces its first fit_execution_params() run, but
   unlike findings 6/7 has no further threshold to defer once Pilot begins

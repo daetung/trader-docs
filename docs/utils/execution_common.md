@@ -84,6 +84,17 @@ def can_enter(
 Cooldown is applied continuously across the full time axis regardless of
 session boundaries. No cooldown reset at the pre-market/regular session boundary.
 
+**Cooldown across DATE boundaries: reset.** A different axis from the
+session rule above, and not to be conflated with it — `last_entry_hour` is
+reset to `None` at every date boundary. `hour_to_minutes()` is
+minutes-since-midnight and carries no date, so a `last_entry_hour` carried
+over from a late prior-day entry makes `current_min - last_min` NEGATIVE
+for the next morning's candidates: the guard then returns False and blocks
+that ticker for essentially the whole following day. LiveModeRunner gets
+this for free, since the state is session-scoped and a session is one date;
+BacktestEngine must reset explicitly as it advances from one date to the
+next (see 09_backtest_engine.md's Chronological Simulation).
+
 ---
 
 ### Tradability Gate
@@ -169,9 +180,19 @@ def compute_position_size(
         fill_price:          slippage-adjusted entry price
         t_bar_volume:        ohlcv_1min volume of the t bar
         ticker_notional:     sum(entry_price_i * quantity_i) across this
-                             ticker's currently-open positions
-        total_notional:      sum(entry_price_i * quantity_i) across all
-                             currently-open positions (any ticker)
+                             ticker's currently-open positions, PLUS its
+                             submitted-but-unfilled ones (R-5: live
+                             live_positions status 'pending'/'partial_open'
+                             — priced at limit_price, or p_entry for a
+                             market order). Pending notional is reserved
+                             capacity: excluding it lets a burst of
+                             simultaneous submissions breach the cap on
+                             aggregate fill, which is inert only while
+                             per_ticker_share_cap_pct is 0 and becomes real
+                             the moment Pilot sets it. BacktestEngine has no
+                             pending state, so there the two sums coincide.
+        total_notional:      the same sum across all positions, any ticker,
+                             on the same open-plus-pending basis
         position_size_cash_pct:   fraction of balance per trade (cash leg)
         position_size_vol_pct:    fraction of t bar volume per trade
                              (liquidity leg)
@@ -202,8 +223,14 @@ def check_funds_available(
     session progresses even though the caps did not change — this
     function keeps that a pure availability check instead.
 
-    backtest: available_cash is the sequentially-decremented remaining_cash
-              tracked by the caller across the run.
+    backtest: available_cash is remaining_cash — the caller's REVOLVING
+              capital: decremented by the amount actually committed when an
+              entry fills, and credited back when the position closes (see
+              09_backtest_engine.md's Chronological Simulation). Not a
+              one-way budget; a monotonically-decreasing remaining_cash
+              models a single deployment rather than a book that turns
+              over, and silently stops trading partway through any run
+              with initial_cash > 0.
     live:     available_cash is queried fresh from the trading API
               immediately before this check.
 
@@ -233,6 +260,106 @@ execution:
   position_size_vol_pct:    0.10   # 10% of t bar volume
   per_ticker_share_cap_pct: 0.0    # 0 = disabled; >0 = fraction of balance
   exposure_cap_pct:         0.0    # 0 = disabled; >0 = fraction of balance
+  max_tickers:               10    # R-5: max DISTINCT tickers held at once
+                                   # (open + pending). 0 = unlimited, and
+                                   # BacktestEngine only — LiveModeRunner
+                                   # clamps 0 to 50, the WS price-tracking
+                                   # sequence's vendor ticker limit, which is
+                                   # not a configurable choice.
+  max_positions_per_ticker:   2    # R-5: max concurrent positions on ONE
+                                   # ticker. 0 = unlimited, backtest only —
+                                   # live clamps 0 to floor(max_hold_bars /
+                                   # entry_cooldown_minutes), the largest
+                                   # same-ticker stack the cooldown can admit
+                                   # inside one position's maximum hold.
+                                   # Both clamps are derived, not
+                                   # configurable — same character as
+                                   # get_execution_param()'s hard bounds.
+                                   # Replaces the former live_mode
+                                   # .max_positions, which was a single
+                                   # global count and so could not express
+                                   # "N positions, all on one ticker".
+  max_hold_bars:             60    # R-6: single source. Backtest's
+                                   # time-limit exit and live's
+                                   # restart_gap_exit / overnight_exit cutoff
+                                   # both read this one key.
+  entry_cooldown_minutes:     5    # R-5/R-6: single source — can_enter()'s
+                                   # cooldown_minutes for both engines.
+                                   # entry_cooldown_minutes * 60 >=
+                                   # cancel_after_seconds must hold: live's
+                                   # submission-time cooldown is what stops a
+                                   # re-flagged ticker double-submitting while
+                                   # its own order is still in flight, and
+                                   # that protection follows from these two
+                                   # values' relative size, not from any
+                                   # structural guard.
+  session_close_exit_time: "155900"  # R-7: single source. Was declared under
+                                   # live_mode: while 09_backtest_engine.md
+                                   # carried the bare literal — the same
+                                   # one-sided declaration of a value both
+                                   # engines must agree on that R-6 fixed for
+                                   # max_hold_bars.
+  ws_ticker_limit:           50    # R-7: tickers one WS sequence can carry.
+                                   # A VENDOR fact, not a preference — kept in
+                                   # config rather than as a literal because
+                                   # it varies by broker and is measured, not
+                                   # chosen. See api_contract_checklist.md,
+                                   # which names this key as where its
+                                   # measurement is recorded. max_tickers: 0
+                                   # (unlimited) clamps to this in live.
+  sizing_basis:          "equity"  # R-8: "equity" | "buying_power". LIVE ONLY
+                                   # — backtest has no margin and no
+                                   # margin_ratio to query, so BacktestEngine
+                                   # ignores this key and always sizes on
+                                   # initial_cash directly.
+                                   # "equity": divide the broker's reported
+                                   # balance by the session's margin_ratio
+                                   # before passing it as compute_position_size
+                                   # ()'s `balance`, so "fully deployed" means
+                                   # 100% of OWN capital.
+                                   # Default is equity because the failure is
+                                   # one-sided: what the balance endpoint
+                                   # returns is still unverified
+                                   # (api_contract_checklist.md), and reading
+                                   # buying power as if it were cash silently
+                                   # multiplies intended exposure by the
+                                   # leverage factor.
+  # R-4 circuit-breaker thresholds. All THREE default to 0 = NO LIMIT, matching
+  # exposure_cap_pct / per_ticker_share_cap_pct's "off until Pilot" pattern.
+  # 0 is unambiguous for each: "trip after 0 consecutive losses" or "after a 0%
+  # loss" has no sensible reading other than disabled.
+  # These are not three views of one signal — they fire at different points on
+  # the failure timeline. A feature bug that emits garbage entries shows up
+  # first as an entry-rate spike (before any loss exists), then as a run of
+  # losing exits, and only last as accumulated realised loss.
+  intraday_loss_limit_pct:   0.0   # realised loss for the session, as a
+                                   # fraction of the same equity basis used for
+                                   # sizing. Realised only: unrealised swings
+                                   # would trip on ordinary intraday movement.
+                                   # Accept that this makes it a LAGGING
+                                   # signal — if the model breaks, positions
+                                   # are already at full exposure before any of
+                                   # them closes. The other two cover that
+                                   # window; this one is the backstop.
+  consecutive_loss_limit:      0   # consecutive LOSING exits (pnl_pct < 0),
+                                   # not consecutive stop-losses, and reset
+                                   # only by a PROFITABLE exit. What is being
+                                   # detected is "the model is systematically
+                                   # wrong", for which the exit label is
+                                   # incidental: a time_limit exit at -0.3% is
+                                   # equally evidence. Under a stop-loss-only
+                                   # reading, "3 stops, one small time_limit
+                                   # loss, 3 stops" never reaches any
+                                   # threshold while the account bleeds.
+                                   # PnL-excluded exits (operational family)
+                                   # and never-opened rows neither increment
+                                   # nor reset — they are not the strategy's
+                                   # verdict on anything.
+  entries_per_hour_limit:      0   # ROLLING 60 minutes, not clock-hour
+                                   # buckets: bucketing lets 59 entries at
+                                   # 10:59 and 59 more at 11:00 both pass.
+                                   # The only one of the three that can fire
+                                   # before any loss is realised.
   use_all_cash:              true  # see check_funds_available() — size down
                                    # to fit remaining cash instead of
                                    # skipping when funds are insufficient
@@ -257,9 +384,11 @@ execution:
   # Moved from 09_backtest_engine.md's former `backtest:` block — backtest
   # and live must not carry independently-configurable copies of values
   # that are supposed to be identical between them. `backtest:` retains
-  # only backtest-simulation-specific keys (initial_cash, max_hold_bars,
-  # entry_cooldown_minutes, entry_threshold, suppress_threshold,
-  # dead_position_penalty_pct) — see 09_backtest_engine.md.
+  # only backtest-simulation-specific keys (initial_cash, entry_threshold,
+  # suppress_threshold, dead_position_penalty_pct) — see
+  # 09_backtest_engine.md. max_hold_bars (R-6) and entry_cooldown_minutes
+  # (R-5) moved here too: LiveModeRunner reads both, so neither was ever
+  # backtest-simulation-specific.
 
   # N-7: rejection multiplier for fit_execution_params()'s relative-bound
   # check (see shadow_retraining.md) — a refit landing outside

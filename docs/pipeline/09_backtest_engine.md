@@ -56,8 +56,14 @@ class BacktestEngine:
                       not by BacktestEngine itself.
 
         summary_dict keys:
+            # Denominators below count OPENED trades only. Rows in the
+            # never-opened family (exit_reason 'entry_canceled', and live's
+            # 'entry_rejected' — see db_schema.md) have quantity=0 and
+            # pnl_pct=NULL: no position ever existed, so counting them
+            # would dilute winning_rate with non-events. They remain in
+            # trade_log and stay visible via trades_by_exit.
             winning_rate        : float  — winning_trades / total_trades
-            total_trades        : int
+            total_trades        : int    — opened trades only
             winning_trades      : int
             avg_pnl_pct         : float
             total_pnl_abs       : float
@@ -65,6 +71,49 @@ class BacktestEngine:
             dead_position_count : int
             dead_position_rate  : float
             suppressed_count    : int    — entries blocked by suppress_threshold
+            # Entry-gate rejection counters (R-5), one per gate of the
+            # Chronological Simulation's admission sequence. A candidate
+            # stopped at a gate produces NO trade_log row, so these are its
+            # only record. Diagnostic only — best_config() ranks on
+            # winning_rate alone. Five, not nine: `gate_result` has nine
+            # non-'submitted' values; 'freeze'/'not_tradable' have no
+            # backtest concept (N-5), 'breaker' is evaluated but never
+            # enforced here (see breaker_* below, not a blocked-count,
+            # which would wrongly imply enforcement), and 'error' has no
+            # analogue since backtest makes no network calls. Key names use
+            # inference_log.gate_result's own values so live and backtest
+            # are directly comparable.
+            gate_blocked_cap_tickers     : int  — execution.max_tickers
+            gate_blocked_cap_per_ticker  : int  — execution
+                                                  .max_positions_per_ticker
+            gate_blocked_cooldown        : int  — can_enter()
+            gate_blocked_sizing_zero     : int  — compute_position_size() → 0
+            gate_blocked_funds           : int  — check_funds_available()
+                                           # returned proceed=False. Always 0
+                                           # when initial_cash == 0, because
+                                           # the gate is never called — that
+                                           # is "did not run", not "blocked
+                                           # nothing". Counts only the full
+                                           # skip; under use_all_cash: true a
+                                           # short-on-cash candidate is
+                                           # usually sized DOWN and proceeds,
+                                           # which shows up in
+                                           # trade_log.requested_quantity
+                                           # instead.
+            # R-4 breaker metrics — COMPUTED every run, same as live,
+            # but NEVER ENFORCED (see "Circuit Breaker" note below this
+            # table). Reporting the raw metrics rather than a trip count is
+            # deliberate: with the thresholds defaulting to 0 (no limit), a
+            # trip count would read zero on every run regardless of how
+            # close a run came, telling Pilot nothing about where to set
+            # them.
+            breaker_max_realized_loss_abs   : float  — always populated
+            breaker_max_realized_loss_pct   : float | None  — None when
+                                           # initial_cash == 0 (inf mode has
+                                           # no equity basis to divide by;
+                                           # 0.0 would misread as "no loss")
+            breaker_max_consecutive_losses  : int
+            breaker_peak_entries_per_hour   : int
             trades_by_signal    : dict   — {signal: {count, win_rate, avg_pnl}}
             trades_by_exit      : dict   — {exit_reason: count}
         """
@@ -127,6 +176,13 @@ WHERE ticker = ? AND event_date > ? AND event_date <= ?
 Queried only when Case A/D resolution is reached — not on every trade.
 Same window and rationale as Labeler's equivalent lookup (see `05_labeler.md`).
 
+**Iteration order is DATE-major, not ticker-major.** The concurrency caps
+(`execution.max_tickers` / `execution.max_positions_per_ticker`) and the
+cash-ordering rule below are both properties of a moment in time across
+ALL tickers, so neither can be evaluated inside a per-ticker pass. Loading
+stays keyed by (ticker, date) as below — only the ORDER of processing
+changes. See "Chronological Simulation" for the loop itself.
+
 For each (ticker, date) group, the following data is loaded from DuckDB once
 and passed down to internal methods:
 
@@ -182,10 +238,14 @@ initial_cash:   float   # from config; fixed for the entire run — the
                         # `balance` argument to compute_position_size().
                         # 0 = unlimited (inf mode): position_size_cash_pct
                         # leg is skipped, sizing is vol_based-only.
-remaining_cash: float   # runtime value, starts at initial_cash, decremented
-                        # by check_funds_available()'s caller as trades fill
-                        # (or partially decremented — see
-                        # execution.use_all_cash). NEVER passed as
+remaining_cash: float   # runtime value, starts at initial_cash. REVOLVING:
+                        # decremented by the actually-committed amount when
+                        # an entry fills, and credited back when the
+                        # position closes (see Chronological Simulation).
+                        # A one-way budget would model a single deployment
+                        # rather than a book that turns over, and would
+                        # silently stop trading partway through any run with
+                        # initial_cash > 0. NEVER passed as
                         # `balance` — see execution_common.md's Constraints
                         # for why sizing and funds-availability must not
                         # share the same value.
@@ -243,9 +303,14 @@ Procedure:
     if not proceed:
         → skip entry (insufficient funds even sized down, or use_all_cash=False
           and full quantity unaffordable)
-    remaining_cash -= quantity * p_entry   # provisional; see Cash deduction
-                                            # order note below for the
-                                            # use_all_cash interaction
+    # Cash is NOT deducted here. It is deducted once, after the fill below
+    # resolves, as total_filled * weighted_avg_fill_price — the only amount
+    # actually committed. The former provisional quantity * p_entry
+    # deduction over-charged every partially-filled entry and permanently
+    # consumed capital on a fully-unfilled one (entry_canceled), with no
+    # reconciliation step anywhere in the spec. Safe to defer because the
+    # chronological simulation carries each candidate through its own fill
+    # before advancing to the next event.
 
     limit_price = None if config["execution"]["entry_order_type"] == "market" \
         else (p_entry * (1 + config["execution"]["entry_gap_value"])
@@ -308,10 +373,77 @@ LiveModeRunner (previously backtest-only by virtue of only being defined
 here). See execution_common.md for the full spec and the
 session_mode="combined" cross-boundary behavior.
 
-### Cash deduction order (when initial_cash > 0)
-Entry candidates at the same bar are processed in the order they appear
-in the predictions DataFrame (sort by ticker alphabetically as tiebreak).
-Cash is deducted sequentially until exhausted.
+### Chronological Simulation
+
+One pass per DATE. Positions never span dates in normal flow (see
+data_boundary.md — a dead position is resolved against D+1 data but holds
+no slot into D+1; see Dead Position), so a date is a complete unit and
+per-date processing bounds how much tick data must be resident at once.
+
+```
+for each date, in ascending order:
+  merge into one time-ordered stream:
+     - entry candidates for this date (all tickers)
+     - scheduled exit events from positions opened earlier this date
+     - revive credits scheduled by dead positions on earlier dates
+  same-bar ties: predictions DataFrame order (ticker alphabetical tiebreak)
+  reset last_entry_hour to None for every ticker (see Cooldown guard)
+  active_positions = {}
+
+  for event in the stream:
+    exit event    -> remove from active_positions
+                     remaining_cash += realized proceeds
+    revive credit -> remaining_cash += the scheduled amount
+    entry cand.   -> gates, in LiveModeRunner's step-5c.0 order:
+                       1. distinct tickers in active_positions <
+                          execution.max_tickers (skipped when this ticker
+                          is already held)
+                       2. this ticker's own count <
+                          execution.max_positions_per_ticker
+                       3. can_enter(...)   [cooldown]
+                       4. compute_position_size(...)  [current notionals]
+                       5. check_funds_available(...)  [current cash]
+                     admitted -> resolve the trade (Entry Slippage Model +
+                     Exit Logic), deduct the committed cash, add to
+                     active_positions, and schedule its exit event at the
+                     resolved exit_hour
+                     blocked at any gate -> increment that gate's own
+                     counter (gate_blocked_cap_tickers,
+                     gate_blocked_cap_per_ticker, gate_blocked_cooldown,
+                     gate_blocked_sizing_zero, gate_blocked_funds); no
+                     trade_log row, since nothing was attempted. Gates 1
+                     and 2 cannot both fire for one candidate — gate 1 only
+                     applies when the ticker is not already held, gate 2
+                     only when it is — so the counters never double-count
+                     the same candidate
+
+  Circuit breaker (R-4): after each exit event closes a position (same
+  point live updates its own counters — see live_mode_runner.md's Circuit
+  Breaker), update breaker_max_consecutive_losses and
+  breaker_max_realized_loss_abs/_pct from that closed trade, and
+  breaker_peak_entries_per_hour from the rolling window on each admitted
+  entry. COMPUTED for every run, exactly as live computes them, but NEVER
+  ENFORCED — no candidate is ever blocked by these values, regardless of
+  what execution.intraday_loss_limit_pct / consecutive_loss_limit /
+  entries_per_hour_limit are set to. The three thresholds live in the
+  shared execution: block because backtest reads them as the SAME
+  measurement basis live uses (so the two are comparable), not because
+  backtest gates on them. Same policy as R-4's shadow-mode treatment, for
+  the same reason: backtest is evaluating a known-good model against
+  history, so it has no failure to catch, and a real trip would truncate
+  exactly the data a run exists to score — see live_mode_runner.md's
+  Circuit Breaker for the fuller argument, which applies here unchanged.
+```
+
+A revive credit whose date is never processed (no candidates that day)
+applies at the start of the next processed date — no capital is lost, and
+nothing could have consumed it in the interval anyway.
+
+`inf mode` note: with `initial_cash == 0` the cash leg and
+`check_funds_available()` are both skipped, so sizing is `vol_based` only.
+The caps then bound the NUMBER of concurrent positions but not their SIZE.
+`total_pnl_abs` is therefore only meaningful when `initial_cash > 0`; use
+`avg_pnl_pct` to compare configurations.
 
 **Interaction with `execution.use_all_cash`** (see execution_common.md's
 `check_funds_available()`): with the default `use_all_cash: true`,
@@ -409,7 +541,7 @@ separate small follow-up when this section is actually applied.
 ### Session close exit (priority over time-limit)
 
 ```python
-if current bar hour == "155900":
+if current bar hour == config["execution"]["session_close_exit_time"]:
     exit immediately at 15:59 bar close
     exit_reason = "session_end"
     if 15:59 bar is halt/no_data:
@@ -423,7 +555,8 @@ exit_price is the bar close (or after-market tick fallback).
 ### Time-limit exit
 
 ```python
-if 60 valid bars elapsed since entry (via build_effective_bar_sequence):
+if config["execution"]["max_hold_bars"] valid bars elapsed since entry
+   (via build_effective_bar_sequence):
     exit_price = close of last valid bar
     exit_reason = "time_limit"
 ```
@@ -462,17 +595,27 @@ Case A — next trading day has_data=True AND ticker exists in ticker_data_cover
     exit_reason = "dead_position"
     is_dead_position = True
     pnl = (exit_price - adjusted_p_entry) / adjusted_p_entry
+    exit_bar / exit_date = the timestamp of whichever source actually
+        resolved exit_price (pre-market first tick, or the first bar open
+        on fallback) — NOT a fixed hour. This is the only Case whose
+        exit_date is D+1.
 
 Case B — next trading day has_data=True AND ticker NOT in ticker_data_coverage:
     pnl = -1.0  (full loss — possible delisting)
     exit_price = 0
     exit_reason = "dead_position_delisted"
     is_dead_position = True
+    exit_bar = 155900, exit_date = D
 
 Case C — next trading day not in dataset (dataset boundary):
-    exit_price = p_entry * (1 - 0.5)
+    exit_price = p_entry * (1 - config["backtest"]["dead_position_boundary_pct"])
+                 # R-7: was a bare 0.5 literal while the sibling
+                 # dead_position_penalty_pct was already config — same kind of
+                 # value, two different treatments
     exit_reason = "dead_position_no_data"
     is_dead_position = True
+    exit_bar = 155900, exit_date = D — the synthetic exit_price needs no
+        D+1 data, so it is already known at D's close
 
 Case D — Case A path entered, but exit_price unresolvable after fallback
          (pre-market first tick AND next-day first bar open both unavailable
@@ -481,8 +624,33 @@ Case D — Case A path entered, but exit_price unresolvable after fallback
     exit_price = 0
     exit_reason = "dead_position_extended_halt"
     is_dead_position = True
+    exit_bar = 155900, exit_date = D
     (mirrors Labeler's Case D — see 05_labeler.md — same mechanism as Case B)
 ```
+
+**Capital treatment.** At D's close the position releases its slot (it no
+longer counts toward `execution.max_tickers` /
+`execution.max_positions_per_ticker`) but returns NO cash — the whole
+committed amount is written off at that moment. Cash comes back only as a
+scheduled revive credit, under one rule with no per-Case special casing:
+
+    revive amount = quantity * exit_price
+    revive moment = that row's own exit_date / exit_bar
+
+which resolves per Case without further rules: A revives at its D+1
+resolution timestamp; C revives immediately at D's close, since its
+synthetic price needs no D+1 data; B and D have `exit_price = 0`, so the
+formula yields zero and the write-off is simply the result rather than a
+special case. This is what keeps `total_pnl_abs` reconcilable against the
+cash ledger in every Case — crediting cash back at D's close while
+recording pnl = -1.0 (B/D) or -0.5 (C) would break that identity.
+
+Only the credit is deferred across the date boundary, never the position:
+the trade row is written complete at D's close (BacktestEngine already
+reads D+1 data to resolve Case A), and the queue carries just
+`(exit_date, exit_bar, quantity * exit_price)`. No slot is held and no exit
+evaluation is pending, so the per-date decomposition of the Chronological
+Simulation holds.
 
 Dead position trades are included in the winning_rate denominator.
 
@@ -499,10 +667,9 @@ PnL with flat penalty for the unfilled portion. Diagnostic via `trade_log.unfill
 backtest:
   initial_cash: 0                    # 0 = unlimited; fixed `balance` for
                                       # execution_common.compute_position_size()
-  max_hold_bars:   60
-  entry_cooldown_minutes: 5
   entry_threshold:    0.5
   suppress_threshold: 0.5            # null = suppression disabled
+  dead_position_boundary_pct: 0.5    # Case C write-down (dataset boundary)
   dead_position_penalty_pct: 0.05    # exit-side unfilled-quantity penalty only —
                                       # entry-side unfilled remainder is sized
                                       # down, not penalized (see Entry Slippage Model)
@@ -523,12 +690,27 @@ weighted_avg_exit_price  DOUBLE,    -- volume-weighted average fill price across
 partial_fills_count      INTEGER,   -- number of tick bundles used for exit fills
 unfilled_quantity        INTEGER,   -- shares remaining after ticks exhausted (0 = fully closed)
 is_ambiguous             BOOLEAN,   -- True if simultaneous bundle-level tp/sl breach
+exit_date                VARCHAR,   -- 'YYYYMMDD'; equals `date` for every exit resolved
+                                    -- on the entry date. Differs only for dead position
+                                    -- Case A (D+1) and live's overnight_exit — see
+                                    -- db_schema.md. NOT NULL: an always-populated column
+                                    -- keeps every date-scoped query free of COALESCE.
+requested_quantity       INTEGER,   -- quantity actually SUBMITTED, i.e. after
+                                    -- check_funds_available() sized it down. The fill-rate
+                                    -- denominator (quantity / requested_quantity) therefore
+                                    -- measures market participation only; a funds-driven
+                                    -- reduction never enters it — same reason
+                                    -- entry_rejected is excluded from fit_execution_params()
 ```
 
 ---
 
 ## Constraints
 
+- `execution.intraday_loss_limit_pct` / `consecutive_loss_limit` /
+  `entries_per_hour_limit` (R-4) are read here as a measurement basis only —
+  BacktestEngine computes the same three metrics live does but never gates
+  an entry on them (see Chronological Simulation's Circuit Breaker note)
 - BacktestEngine accesses DuckDB directly — callers do not pass ohlcv/ticks as arguments
 - `db_conn` injected via constructor for testability (mock DB in tests)
 - OHLCV loaded once per ticker for all its entry dates
@@ -548,7 +730,10 @@ is_ambiguous             BOOLEAN,   -- True if simultaneous bundle-level tp/sl b
   `is_dead_position` remains False; diagnostic via `trade_log.unfilled_quantity`
 - sell_rate_tp > sell_rate_sl: rising-market exits have more available buy-side depth
 - Entry slippage search window: entry_hour to entry_hour + 100s (not limited to 1-minute t bar)
-- Cooldown applied continuously across full time axis; no reset at session boundaries
+- Cooldown applied continuously across full time axis; no reset at session
+  boundaries, but RESET at every date boundary — see execution_common.md's
+  Cooldown Guard for why a carried-over `last_entry_hour` blocks the whole
+  next day (hour_to_minutes() carries no date, so the delta goes negative)
 - `entry_bar` stored as int via `utils.hour_to_int(entry_hour)`. `exit_bar` stored
   as int via `utils.hour_to_int(effective_second)`, which is now simply
   `exit_hour` itself (P-10 revised, R-2 — the poll-delay alignment was
@@ -559,6 +744,14 @@ is_ambiguous             BOOLEAN,   -- True if simultaneous bundle-level tp/sl b
   distinct exit moment for a trade that never opened.
 - `trades_by_signal` and `trades_by_exit` JSON-serialized before writing to `experiment_log`
 - Dead position trades included in winning_rate denominator
+- Never-opened rows (exit_reason 'entry_canceled'; live also 'entry_rejected')
+  excluded from winning_rate / total_trades / avg_pnl_pct / total_pnl_abs —
+  quantity=0 and pnl_pct=NULL mean no position existed. Still written to
+  trade_log and counted in trades_by_exit; no separate summary column is
+  added, since that JSON already carries the per-reason counts
+- Processing is date-major and chronological, not ticker-major — the
+  concurrency caps and the cash ordering are cross-ticker properties of a
+  moment in time (see Chronological Simulation)
 - Suppressed entries (suppress_threshold) not logged to trade_log
 - `suppressed_count` tracked in summary for diagnostics
 - `run()` returns `tuple[pd.DataFrame, dict]` — trade_log_df and summary_dict;
