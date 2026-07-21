@@ -69,15 +69,9 @@ model_dir: Path | None  # directory containing trained model artifacts (optional
        dead_case_dist = test_df[test_df["is_dead_position"]]["dead_position_case"].value_counts()
 9. Print results to stdout
 10. Write trade_log to DuckDB trade_log table
-11. Write experiment_log row to DuckDB:
-        run_id, optimizer_run_id, run_at,
-        fold_idx, outer_fold_idx, eval_type,
-        fold_test_start, fold_test_end,
-        winning_rate, total_trades, winning_trades,
-        avg_pnl_pct, total_pnl_abs, avg_slippage_pct,
-        dead_position_count, dead_position_rate,
-        suppressed_count,
-        trades_by_signal (JSON), trades_by_exit (JSON)
+11. Write experiment_log row to DuckDB — full field list in
+        "experiment_log Write" below (kept 1:1 with summary_dict; see
+        Constraints)
 ```
 
 ---
