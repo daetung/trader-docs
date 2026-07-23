@@ -1,4 +1,5 @@
 session_handoff.md
 .compare/
 .patch/
+.api_raw/
 *.patch
