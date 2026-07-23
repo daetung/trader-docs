@@ -131,11 +131,11 @@ def gather_findings(db_conn, today_date, log_dir) -> dict:
     10. investing.com match rate (item N) — per run, the fraction of
         scraped investing.com calendar rows that FAILED to match
         active_ticker_universe. A rising rate signals symbology drift
-        between investing.com and our universe (the naive-match interim —
-        see the ticker-normalization open item, open_items_session4.md).
-        Surfaced specifically so that normalization gap is observable
-        before a normalization layer exists. Threshold TBD, same deferral
-        status as finding 8's warn cutoff.
+        beyond what query-time normalization (metadata_crawler.md's
+        crawl_corporate_events_investing()) already resolves — kept in
+        place after that normalization was added, since best-effort
+        matching does not guarantee zero residual mismatches. Threshold
+        TBD, same deferral status as finding 8's warn cutoff.
     11. Session end marker missing (R-2) — set when the evening job's
         DuckDB-lock liveness probe (see metadata_crawler.md's "Evening job
         start gate") finds LiveModeRunner dead with no clean shutdown
@@ -263,7 +263,7 @@ def gather_findings(db_conn, today_date, log_dir) -> dict:
         clock offset at session END as well catches an NTP daemon that died
         after the start gate passed, and gives a drift trend; periodic
         re-checking is unnecessary if the daemon is alive. A probe that fell
-        back (margin_ratio to execution.margin_ratio_fallback, retention to
+        back (margin_ratio to live_mode.margin_ratio_fallback, retention to
         assumed_days) is flagged distinctly from one that succeeded — the
         fallbacks are safe but they silently change sizing and gap-fill
         behaviour. Each measurement also fills in its row in

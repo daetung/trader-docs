@@ -124,9 +124,12 @@ Standalone scripts:
 | `pipeline/09_backtest_engine.md` | DB-direct backtest, tick_10 slippage, dead position handling (has_data=TRUE) |
 | `models/base_model.md` | Abstract base class for model trainers |
 | `optimization/pipeline_optimizer.md` | Training endpoint, nested validation, successive halving, regime holdout |
+| `ops/api_contract_checklist.md` | Unverified vendor-contract assumptions inventory (trading API, yfinance, investing.com), graded by blast radius, tracked to verification before Pilot |
+| `ops/shadow_retraining.md` | Shadow mode design, execution-parameter fitting (fit_execution_params()), retraining cadence |
 | `scripts/run_preprocess.md` | Preprocessor class, return_data, training pipeline only |
 | `scripts/run_train.md` | Trainer class, session_mode filter, train_log |
 | `scripts/run_backtest.md` | Backtester class, sole experiment_log writer |
+| `utils/execution_common.md` | Execution-time decisions shared between BacktestEngine and LiveModeRunner — signal resolution, cooldown guard, entry/exit fill simulation, position sizing |
 | `utils/utils.md` | Shared utilities: bar sequence, signal resolution, slippage/fill simulation, label breach detection, encoding maps, trading calendar, REFERENCE_SESSION stats (populate + load), corporate-event adjustment (cum_split_ratio, adjust_bars_for_corporate_events, adjust_tick_derived_series_for_corporate_events, estimate_historical_meta, ticker rename stitching) |
 | `inferencer/inferencer.md` | Live inference service object — _prepare_bars, infer/infer_batch, inference_log |
 | `inferencer/live_mode_runner.md` | Live mode execution orchestrator — watchdog loop, position manager loop, session lifecycle |
@@ -134,6 +137,7 @@ Standalone scripts:
 | `tools/migration_tool.md` | JSON → DuckDB migration, trading_calendar/coverage init, precomputed_session_stats population |
 | `tools/detection_benchmark.md` | Entry detection threshold tuning + timing benchmark |
 | `tools/metadata_crawler.md` | Daily metadata fetch, new data ingestion, session stats daily update |
+| `tools/health_report.md` | Findings gathering, log/Discord/email alert delivery, alert-level config |
 | `visualization/viz_connector.md` | Abstract base class for visualization backends |
 
 ---
@@ -170,12 +174,16 @@ stock-scalping/
 │   │   └── base_model.md
 │   ├── optimization/
 │   │   └── pipeline_optimizer.md
+│   ├── ops/
+│   │   ├── api_contract_checklist.md
+│   │   └── shadow_retraining.md
 │   ├── scripts/
 │   │   ├── run_preprocess.md
 │   │   ├── run_train.md
 │   │   └── run_backtest.md
 │   ├── utils/
-│   │   └── utils.md
+│   │   ├── utils.md
+│   │   └── execution_common.md
 │   ├── inferencer/
 │   │   ├── inferencer.md
 │   │   ├── live_mode_runner.md
@@ -183,7 +191,8 @@ stock-scalping/
 │   ├── tools/
 │   │   ├── migration_tool.md
 │   │   ├── detection_benchmark.md
-│   │   └── metadata_crawler.md
+│   │   ├── metadata_crawler.md
+│   │   └── health_report.md
 │   └── visualization/
 │       └── viz_connector.md
 ├── models/                        # trained model artifacts (.lgb, _meta.json)

@@ -142,10 +142,15 @@ def crawl_corporate_events_investing(date: str, db_conn) -> int:
         SPLIT_CALENDAR_URL     = <TBD placeholder>
         DIVIDEND_CALENDAR_URL  = <TBD placeholder>
 
-    Filters scraped rows to active_ticker_universe (NAIVE symbol match for
-    now — investing.com symbology may differ from ours; see the
-    ticker-normalization open item), then writes each row through the
-    shared upsert_corporate_event() helper below with source='investing'.
+    Filters scraped rows to active_ticker_universe via query-time symbol
+    normalization — the same case/separator/class-suffix rules
+    detect_rename_candidates() already applies, reused here rather than
+    reimplemented, since both are "does this vendor's symbol string
+    identify a ticker we track" problems (resolved this design pass; no
+    longer a naive exact match). Normalization is best-effort, not a
+    guarantee — health_report.md finding 10 keeps tracking the residual
+    mismatch rate — then writes each row through the shared
+    upsert_corporate_event() helper below with source='investing'.
     Does NOT write corporate_events directly: the one-row-per-event
     invariant (see db_schema.md) and the vendor-disagreement handling both
     live in that helper, so neither vendor's crawler can bypass them.
@@ -164,7 +169,11 @@ Notes:
 - Also called forward-looking, for the next trading day, during the
   evening run (investing.com's calendar is populated ahead of the
   effective date)
-- Symbol matching is naive for now — see open_items_session4.md
+- Symbol matching applies the same query-time normalization rules as
+  ticker-rename detection (case/separator/class-suffix) — no longer naive
+  exact matching. Best-effort, not a guarantee: residual mismatches stay
+  visible via health_report.md finding 10's match-rate tracking rather
+  than being treated as a solved-and-closed gap.
 - Coverage assumption: investing.com's calendar is assumed to span the
   full US-listed universe this system trades, not a large-cap subset —
   observed as such this session but not independently verified against a

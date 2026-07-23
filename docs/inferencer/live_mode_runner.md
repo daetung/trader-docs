@@ -108,10 +108,15 @@ PLACEHOLDER: whether the trading API exposes a server clock is itself
 unverified (api_contract_checklist.md), so the option exists to be selected
 later, not to be implemented now.
 
-1.0s is not arbitrary. Bar-Close Authority judges in whole seconds, and the
-Feed Outage trigger fires when >50% of the watchlist misses its deadline in
-the same minute — past ~1s of skew EVERY ticker misses simultaneously, so 1s
-is the boundary at which a clock fault starts impersonating a feed outage.
+1.0s is not arbitrary. Bar-Close Authority judges in whole seconds, scoped to
+each cycle's own `candidates` (see Feed Outage Recovery's trigger condition
+2, not the full watchlist) — past ~1s of skew, EVERY candidate in a cycle
+misses simultaneously, so 1s is the boundary at which a clock fault starts
+impersonating a feed outage, in any cycle large enough
+(`len(candidates) >= min_watchlist_size`) for condition 2 to evaluate at
+all. Below that floor this particular impersonation risk is moot for the
+cycle — condition 2 does not fire regardless of clock health, leaving
+condition 1 (explicit connection failure) as the only detector.
 
 `abort` is the default because a skewed clock disguises itself as other
 faults: it looks like a dead feed, it freezes exits along with entries, and it
@@ -130,7 +135,7 @@ mechanism Circuit Breaker uses below, reused rather than duplicated.
 **Margin ratio (R-8).** Queried from its own endpoint (config key for the path;
 see api_contract_checklist.md) and held as a session constant, consumed by
 `execution.sizing_basis` (execution_common.md). On failure: fall back to
-`execution.margin_ratio_fallback` (default 4.0, a typical day-trading
+`live_mode.margin_ratio_fallback` (default 4.0, a typical day-trading
 buying-power multiple) plus a health_report finding. Never aborts: this
 refines sizing, it does not authorise trading.
 
@@ -1602,8 +1607,8 @@ loop every position_check_interval_seconds (config, default: 5s):
 
         Once per Position Manager Loop iteration (not once per position —
         same single-shared-loop batching principle as the global polling
-        design above; `max_positions` is small by design, so this bulk
-        call is always small too):
+        design above; `execution.max_tickers × execution.max_positions_per_ticker`
+        is small by design, so this bulk call is always small too):
         ```
         halt_status = utils.query_halt_status(
             tickers=[p.ticker for p in open_positions] +
@@ -1619,7 +1624,10 @@ loop every position_check_interval_seconds (config, default: 5s):
             # bulk_api_chunk_size defined once in metadata_crawler.md's
             # Config Keys (shared pipeline_config.yaml) — barely matters
             # here since open_positions is small (bounded by
-            # max_positions), almost always one chunk regardless of value.
+            # execution.max_tickers × execution.max_positions_per_ticker,
+            # the two axes that replaced the old single max_positions —
+            # see execution_common.md's Config Keys), almost always one
+            # chunk regardless of value.
         )
         ```
 

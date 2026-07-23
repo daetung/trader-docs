@@ -147,7 +147,11 @@ CREATE TABLE tick_bar_aggregates (
 CREATE TABLE bid_ask_snapshots (
     ticker          VARCHAR NOT NULL,
     date            VARCHAR NOT NULL,   -- 'YYYYMMDD'
-    hour            INTEGER NOT NULL,   -- HHMMSS
+    hour            VARCHAR NOT NULL,   -- 'HHMMSS' — same type as tick_10 /
+                                        -- ohlcv_1min / tick_bar_aggregates,
+                                        -- so joins against tick_10 (the
+                                        -- signal_time_rest capture point's
+                                        -- own timestamp source) need no cast
     seq_id          INTEGER NOT NULL,   -- same convention as tick_10
     source          VARCHAR NOT NULL,   -- 'signal_time_rest' | 'ws_tick_piggyback'
 

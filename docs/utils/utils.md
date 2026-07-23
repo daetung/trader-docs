@@ -1229,7 +1229,8 @@ def query_halt_status(
     have different fallback signals available:
         - live_mode_runner.md's Position Manager Loop: falls back to the
           existing tick-rate heuristic per position. Its own tickers list
-          is small (bounded by max_positions), so chunk_size barely
+          is small (bounded by execution.max_tickers ×
+          execution.max_positions_per_ticker), so chunk_size barely
           matters there — almost always one chunk regardless of value.
         - metadata_crawler.md's check_corporate_event_anomaly(): no
           live-tick fallback exists in that offline batch context: treats

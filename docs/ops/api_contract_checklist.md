@@ -152,9 +152,12 @@ answer is known.
 | I-1 | Corporate-events calendar pages: exact endpoints, and scraping is permitted by the terms of service | `metadata_crawler.md` forward check | **C** | Read the ToS; confirm page structure | — | |
 | I-2 | Symbol format matches `active_ticker_universe` closely enough for naive matching | Forward-check row matching | **C** | Self-measuring — `health_report.md`'s investing.com match-rate finding | — | |
 
-**I-2 is deliberately observable rather than solved.** Naive matching is an
-interim; the match-rate finding exists so the gap is visible until a
-normalisation layer is designed. See the ticker-normalisation open item.
+**I-2 is deliberately observable rather than solved.** Matching now applies
+query-time normalization (`metadata_crawler.md`'s
+`crawl_corporate_events_investing()`, the same rules as ticker-rename
+detection) rather than a naive exact match, but the match-rate finding
+(`health_report.md` finding 10) stays in place — normalization is
+best-effort, not a guarantee, so the residual gap remains worth tracking.
 
 ---
 
