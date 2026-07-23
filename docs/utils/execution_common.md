@@ -381,6 +381,23 @@ execution:
                                     # positive = willing to pay up to that much
                                     # more. percentage: p_entry*(1+value);
                                     # absolute: p_entry+value
+  exit_order_type:       "market"  # "market" | "limit" — symmetric to
+                                    # entry_order_type. NOT hard-fixed to
+                                    # "market": an unprotected market order
+                                    # carries slippage risk of unmeasured
+                                    # size (same one-sided-error posture as
+                                    # margin_ratio_fallback choosing 4.0 over
+                                    # 1.0 — see Session Start Probes). No
+                                    # gap_type/gap_value counterpart: when
+                                    # "limit", the resting price is tracked
+                                    # against live bid/ask rather than a
+                                    # fixed offset from a reference price —
+                                    # see live_mode_runner.md's Exit
+                                    # Architecture. Either setting escalates
+                                    # to a market order at
+                                    # live_mode.exit_order_stuck_minutes as a
+                                    # final backstop, regardless of the
+                                    # initial type.
   # Moved from 09_backtest_engine.md's former `backtest:` block — backtest
   # and live must not carry independently-configurable copies of values
   # that are supposed to be identical between them. `backtest:` retains

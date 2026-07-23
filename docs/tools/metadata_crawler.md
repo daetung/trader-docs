@@ -636,6 +636,68 @@ writes later in the same `--premarket-open` process (see "Two distinct
 call patterns" above). LiveModeRunner's Health Gate 1 reads both (see
 live_mode_runner.md).
 
+## Premarket Trading-API Symbol Map
+
+Runs at premarket, immediately after Premarket Ticker Rename Detection
+(Step 1) within the same `--premarket-open` process, so matching reads
+that day's just-refreshed rename state. A different problem from the
+rename mechanism above: rename detection tracks a CIK's symbol changing
+over time within our own universe, while this step maps our symbol to the
+trading API's own symbol for that same, unchanged identity — needed
+because the two vendors need not format a ticker the same way (e.g. a
+class-suffix ticker rendered differently by each).
+
+```python
+def build_trading_api_symbol_map(db_conn) -> list[dict]:
+    """
+    1. Three bulk calls to the trading API's own ticker-master endpoint,
+       one per listing exchange (NYSE, NASDAQ, AMEX) — a single call each,
+       full universe returned per call, no per-ticker round trip. Exchange
+       is the call's own input parameter, not a response field: every
+       ticker returned by a given call is tagged with that call's exchange
+       directly, never parsed out of the response.
+    2. Match each returned ticker to a ticker_cik_map row: exact match
+       first, then the same normalization rules as
+       detect_rename_candidates() (case, separator, class-suffix handling)
+       — reused rather than reimplemented, since both are "does this
+       vendor's symbol string identify a row we already track" problems.
+    3. Matched: UPDATE ticker_cik_map SET trading_api_symbol = ?,
+       trading_api_exchange = ? WHERE cik=? AND ticker=? (see
+       db_schema.md — trading_api_symbol stores the raw code only, never
+       an exchange-prefixed form; the prefix is assembled at the point of
+       an actual trading-API call, from trading_api_exchange, so a future
+       change to the prefix convention touches only that call site, not
+       stored data).
+    4. Unmatched after normalization: log to
+       tools/trading_api_symbol_candidates.log for manual review — same
+       "automated first pass, manual fallback for the residue" shape as
+       detect_rename_candidates(), resolved via
+       --register-trading-api-symbol (see CLI Usage).
+    5. No active_ticker_universe filter anywhere above: a ticker absent
+       from ticker_cik_map simply has no row to match against and is
+       skipped at step 2 by construction — universe scoping is an
+       entry-point-detection concern (01_entry_detection.md), not this
+       step's; every ticker the trading API supports is in scope here.
+
+    Full-universe overwrite every run, not a delta: all three calls return
+    the complete current set each time, so there is nothing to track
+    between runs and no separate delta-detection logic exists.
+    """
+```
+
+**Partial-failure handling.** If any of the three per-exchange calls fails,
+the whole step is reported to `batch_runs` as `status='failed'` for
+`stage='premarket_trading_api_symbol_map'` — a 2-of-3 success is not
+written as a partial update. Yesterday's `trading_api_symbol` /
+`trading_api_exchange` values are left untouched either way, never cleared
+on failure — the same "preserve the last-known-good value rather than
+silently run on an incomplete refresh" posture as the quarantine and
+corporate-events handling elsewhere in this file.
+
+Writes its own `batch_runs` row (`stage='premarket_trading_api_symbol_map'`,
+`date=today`) — `status='running'` at start, `status='success'`/`'failed'`
+at completion, same convention as the other premarket stages.
+
 ## Evening Ticker Rename Self-Correction
 
 Runs during the evening full run, after ingestion:
@@ -859,6 +921,14 @@ python tools/collect_daily.py --list-rename-candidates
 
 # Manually register a rename (SEC-unmatched tickers only)
 python tools/collect_daily.py --register-rename OLD_TICKER NEW_TICKER 20260715
+
+# List unresolved trading-API symbol match candidates for manual review
+# (see "Premarket Trading-API Symbol Map")
+python tools/collect_daily.py --list-trading-api-symbol-candidates
+
+# Manually register a trading-API symbol match the automated pass could
+# not resolve
+python tools/collect_daily.py --register-trading-api-symbol TICKER TRADING_API_SYMBOL EXCHANGE
 
 # Refresh metadata for specific tickers
 python tools/collect_daily.py \
@@ -1131,7 +1201,8 @@ quarantine:
   whole did.
 - `--premarket-open` (N-1; replaces running `--ticker-rename-only` and
   `--corporate-events-only` as two separate cron processes at 04:00 ET)
-  runs `detect_rename_candidates()` → `bulk_fetch_today_first_price()` +
+  runs `detect_rename_candidates()` → `build_trading_api_symbol_map()` →
+  `bulk_fetch_today_first_price()` +
   `utils.query_halt_status()` → `crawl_corporate_events()` for all tickers
   → `check_corporate_event_anomaly()`, as one sequential process — no
   metadata fields, no ingestion, no calendar/session-stats steps. Two
@@ -1139,6 +1210,7 @@ quarantine:
   slot was a DuckDB single-writer collision risk (P-5) — merging into one
   process removes the collision class entirely rather than coordinating
   around it. Writes `batch_runs` rows for `stage='premarket_rename'`,
+  `stage='premarket_trading_api_symbol_map'`,
   `stage='premarket_corporate_events'`, and `stage='premarket_quarantine_check'`
   sequentially as each internal step completes, preserving the same
   per-stage failure granularity Health Gate 1 relies on (see

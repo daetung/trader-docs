@@ -126,6 +126,47 @@ CREATE TABLE tick_bar_aggregates (
     PRIMARY KEY (ticker, date, hour, indicator)
 );
 
+-- Bid/ask auxiliary signal collection (Real-time bid/ask spread open item).
+-- Two sources, deliberately not normalized to a common shape — each stores
+-- only what it actually provides; a source's columns it does not supply
+-- are NULL on its own rows, not zero-filled or derived:
+--   'signal_time_rest'  : fired async, fire-and-forget, at entry-signal
+--                         detection (Watchdog Polling Loop step 5c, before
+--                         gate evaluation — every signal, gated or not,
+--                         real or shadow). Full 5-level book.
+--   'ws_tick_piggyback'  : extracted from the same inbound tick handler
+--                         Exit Architecture already processes (2-print
+--                         guard) for a position's live tick subscription —
+--                         no new subscription, no new call. Only covers
+--                         the window a position is tracked, and only
+--                         1st-level price with side-total size, not a
+--                         5-level book.
+-- Neither source's spread is stored — ask_price_1 - bid_price_1, computed
+-- at query time, same convention as OHLCV storing O/H/L/C rather than a
+-- derived range.
+CREATE TABLE bid_ask_snapshots (
+    ticker          VARCHAR NOT NULL,
+    date            VARCHAR NOT NULL,   -- 'YYYYMMDD'
+    hour            INTEGER NOT NULL,   -- HHMMSS
+    seq_id          INTEGER NOT NULL,   -- same convention as tick_10
+    source          VARCHAR NOT NULL,   -- 'signal_time_rest' | 'ws_tick_piggyback'
+
+    -- 'signal_time_rest' only — 5-level book; NULL on 'ws_tick_piggyback' rows
+    bid_price_1 DOUBLE, bid_price_2 DOUBLE, bid_price_3 DOUBLE, bid_price_4 DOUBLE, bid_price_5 DOUBLE,
+    ask_price_1 DOUBLE, ask_price_2 DOUBLE, ask_price_3 DOUBLE, ask_price_4 DOUBLE, ask_price_5 DOUBLE,
+    bid_size_1  DOUBLE, bid_size_2  DOUBLE, bid_size_3  DOUBLE, bid_size_4  DOUBLE, bid_size_5  DOUBLE,
+    ask_size_1  DOUBLE, ask_size_2  DOUBLE, ask_size_3  DOUBLE, ask_size_4  DOUBLE, ask_size_5  DOUBLE,
+
+    -- 'ws_tick_piggyback' only; NULL on 'signal_time_rest' rows (there,
+    -- level-1 price is bid_price_1/ask_price_1 above — not duplicated here)
+    bid_size_total DOUBLE,   -- side-total resting size, not tied to one level
+    ask_size_total DOUBLE,
+    cum_bid_volume DOUBLE,   -- session-cumulative, buy-side filled volume
+    cum_ask_volume DOUBLE,   -- session-cumulative, sell-side filled volume
+
+    PRIMARY KEY (ticker, date, hour, seq_id, source)
+);
+
 -- Stock metadata (crawled daily; append-only per date — see metadata_crawler.md)
 -- PRIMARY KEY includes date: a row exists only for dates actually crawled.
 -- Dates before schema deployment, or individual fields that failed to crawl on
@@ -182,6 +223,23 @@ CREATE TABLE ticker_cik_map (
     rename_pending    BOOLEAN NOT NULL DEFAULT FALSE,
     quarantine_reason VARCHAR,            -- NULL | 'corporate_event_anomaly' today;
                                           -- reserved for future reasons (see above)
+    trading_api_symbol   VARCHAR,         -- raw ticker code as the trading API's own
+                                          -- master list returns it (NO exchange
+                                          -- prefix — that is a call-time-only
+                                          -- concatenation, never stored; see
+                                          -- metadata_crawler.md's Trading-API
+                                          -- Symbol Map). NULL until matched.
+    trading_api_exchange VARCHAR,         -- 'NYSE' | 'NASDAQ' | 'AMEX' — which of the
+                                          -- three per-exchange bulk calls returned
+                                          -- this ticker; tagged from the call's own
+                                          -- input parameter, not parsed from the
+                                          -- response. Source of whatever exchange
+                                          -- prefix the trading API's own symbol
+                                          -- format requires at call time (exact
+                                          -- prefix mapping: TBD, pending the
+                                          -- normalization pass over the trading
+                                          -- API's symbol-format documentation).
+                                          -- NULL until matched.
     PRIMARY KEY (cik, ticker)
 );
 
@@ -273,7 +331,9 @@ CREATE TABLE ticker_data_coverage (
 --     LiveModeRunner's own 'live_session_end' row gates the evening stage's
 --     start — see live_mode_runner.md and metadata_crawler.md.
 CREATE TABLE batch_runs (
-    stage        VARCHAR   NOT NULL,  -- 'premarket_rename' | 'premarket_corporate_events' |
+    stage        VARCHAR   NOT NULL,  -- 'premarket_rename' |
+                                      -- 'premarket_trading_api_symbol_map' |
+                                      -- 'premarket_corporate_events' |
                                       -- 'premarket_quarantine_check' |
                                       -- 'premarket_quarantine_recheck' |
                                       -- 'evening_ingestion' | 'evening_tick_bar_aggregates' |
@@ -951,6 +1011,18 @@ CREATE TABLE live_positions (
     signal       VARCHAR NOT NULL,   -- 'up5' | 'up3'
     status       VARCHAR NOT NULL,   -- 'pending'|'partial_open'|'open'|'halted'|
                                      --   'exiting'|'closed'|'canceled'
+    exiting_since VARCHAR,           -- 'YYYYMMDD_HHMMSS' — set once, the FIRST
+                                     --   instant status transitions to 'exiting';
+                                     --   never overwritten thereafter, including
+                                     --   by a stuck-timeout market escalation or a
+                                     --   halt-clear resubmission (see
+                                     --   live_mode_runner.md's In-flight order
+                                     --   tracking) that assigns this position a
+                                     --   new order_id. exit_order_stuck_minutes
+                                     --   is measured against THIS column, not
+                                     --   submitted_at, precisely so a resubmission
+                                     --   cannot reset the clock. NULL until the
+                                     --   first 'exiting' transition.
     fill_price   DOUBLE,             -- NULL until first fill; weighted average across
                                      --   partial fills once there is more than one
     fill_second  INTEGER,            -- HHMMSS of the first fill, NULL until then

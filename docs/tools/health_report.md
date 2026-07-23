@@ -281,6 +281,35 @@ def gather_findings(db_conn, today_date, log_dir) -> dict:
         contract (api_contract_checklist.md); this finding is how that
         vocabulary is actually discovered, so it feeds the checklist rather
         than signalling a fault on its own.
+    24. Fill-stream staleness (account-wide WS channel) — flags when the
+        REST backstop poll on Position Manager Loop's existing
+        `position_check_interval_seconds` cadence reports fill progress for
+        an in-flight order that the WS account fill stream has not yet
+        delivered, sustained across more than one consecutive cycle while
+        in-flight orders exist. No new freeze reason and no new polling —
+        this reuses the REST call already made every cycle as fill
+        tracking's backstop, comparing it against `seen_fills`'s WS-derived
+        state. Warn severity only: correctness is unaffected (the same
+        fill-accounting mechanism folds in whichever channel reports
+        first), so this is a latency/observability signal, not a
+        correctness one. Unrelated to Bar-Close Authority and the Feed
+        Outage trigger — those judge the separate bar/price-data channel;
+        this finding is scoped entirely to the account-wide fill-event
+        stream and does not interact with `freeze_reasons`.
+    25. In-flight exit order gone at halt-clear (R-2-style resumption
+        handling) — count of times a ticker's halted→tradable transition
+        (Position Manager Loop Step 1a) found an in-flight exit order for
+        that ticker had disappeared on immediate re-query, meaning the
+        broker canceled it during the halt. Distinct from finding 18: that
+        one is duration-based (still open past an age threshold); this one
+        is event-based (gone at the specific instant a halt clears) and
+        fires regardless of how long the halt lasted. Not an error signal
+        on its own — the disappearance triggers automatic immediate
+        resubmission (see live_mode_runner.md), so a nonzero count reports
+        that the safety-net path ran, not that anything went unhandled.
+        Self-measuring for api_contract_checklist.md's T-12: a nonzero
+        count is direct evidence the broker does NOT always preserve a
+        resting order through a halt.
 
     Returns: dict of {finding_name: {severity: 'ok'|'warn'|'abort', detail: ...}}
     """

@@ -633,6 +633,14 @@ loop every poll_interval_seconds:
             session_stats=calculators[ticker]._session_stats
         )
      c. If signal (up5 / up3):
+        Fire an async, fire-and-forget REST bid/ask query for this ticker
+        (5-level book) → `bid_ask_snapshots` (`source='signal_time_rest'`).
+        Every confirmed signal, gate outcome and shadow/real status both
+        irrelevant — a candidate the gates go on to block is exactly the
+        kind of observation the execution-gate path of the bid/ask open
+        item needs. Not on the entry-submission critical path: this call
+        is not awaited before gate evaluation or order submission below
+        proceed.
         0.  Entry gates (R-5) — evaluated in this order, before every step
             below. Enforced identically in shadow mode; unlike R-4's
             breaker (evaluate-but-don't-enforce in shadow), a shadow run
@@ -724,6 +732,17 @@ loop every poll_interval_seconds:
                  log hypothetical entry to trade_log (is_shadow=TRUE, quantity=filled)
                  # entry_order_type is simulated the same way in shadow as
                  # in backtest — see execution_common.md's price-gate logic
+                 if filled > 0:
+                     subscribe to this ticker's realtime trade stream NOW
+                         (see Exit Architecture's "Primary — WebSocket tick
+                         stream") — same "submission, not fill, is the
+                         trigger" principle as the real branch below, but
+                         simplified: simulate_entry_fill() already resolved
+                         filled/unfilled synchronously, so there is no
+                         async pending window to subscribe ahead of, and no
+                         separate zero-fill unsubscribe path is needed —
+                         a hypothetical position simply is not opened, and
+                         no subscription is ever made, when filled == 0.
              else:
                  order_id = submit order via trading API: quantity=`quantity`,
                      order_type=config["execution"]["entry_order_type"],
@@ -748,6 +767,15 @@ loop every poll_interval_seconds:
                  # permitted, malformed order); a market order's
                  # insufficient-funds-at-actual-price rejection and every
                  # limit rejection surface later on the fill channel.
+                 subscribe to this ticker's realtime trade stream NOW —
+                     acceptance of the submission, not a fill, is the
+                     trigger (see Exit Architecture's "Primary — WebSocket
+                     tick stream"; moved earlier than the fill it used to
+                     wait for, so a position is tracked for the entire
+                     window it carries risk, not just from its first fill
+                     onward). Skipped if already subscribed (a second
+                     position opening on an already-tracked ticker shares
+                     the existing subscription, unchanged from before).
                  if submission rejected structurally:
                      no order_id exists and no live_positions row is
                      written — nothing was accepted. Log trade_log row:
@@ -769,6 +797,56 @@ loop every poll_interval_seconds:
 
 ---
 
+## Bar-Close Authority
+
+Judges, once per Watchdog Polling Loop cycle, whether each ticker in THAT
+cycle's `candidates` (not the full tradable universe, and not the
+cumulative set of tickers ever flagged this session — see the loop's own
+note on what `candidates` means) has a bar for the most recently
+fully-elapsed minute, at whole-second precision. Scoped to `candidates`
+deliberately: a bar is only ever fetched (Step 2a) for a ticker the
+watchdog just flagged, so a ticker that simply has not been re-flagged
+recently has nothing to judge — checking against the full active
+watchlist would misread ordinary watchdog silence as a missed deadline.
+
+```
+On every poll_interval_seconds cycle, after Step 2a's bar fetch:
+
+  expected_minute = floor(now to the minute) - 1 minute   # the most
+      # recently fully-elapsed minute; NOT the current, still-forming one
+  deadline = (end of expected_minute) + bar_close_grace_seconds
+
+  if now < deadline:
+      skip this check this cycle — expected_minute's own grace window has
+      not elapsed yet; checking earlier would just re-detect the same
+      ordinary poll-to-poll lag every single cycle
+
+  else:
+      missed = [ticker for ticker in candidates
+                if last_bar_hour[ticker] < expected_minute]
+      # last_bar_hour[ticker]: this ticker's own most recent bar hour as
+      # actually returned by Step 2a, tracked per ticker across cycles —
+      # read directly off the fetch response, not derived from
+      # calculators[ticker], since that already absorbs Step 3's replay
+      # and would hide exactly the lag being measured here
+```
+
+`bar_close_grace_seconds` (config, seed value — see
+api_contract_checklist.md's T-13: how promptly the vendor typically has a
+minute's bar ready is itself unverified) is why 1.0s of clock skew (see
+Session Start Probes' `clock_check`) is the boundary at which a clock
+fault starts impersonating a feed outage: the deadline above is wall-clock
+derived, so a skewed local clock shifts every ticker's `expected_minute`
+identically and simultaneously, not just one.
+
+Individually, one ticker in `missed` is routine — this is exactly the case
+Feed Outage Recovery (below) leaves un-frozen, caught up whenever that
+ticker's next bar arrives via Step 3's ordinary multi-bar replay.
+`missed` becomes a candidate systemic signal only in aggregate — see Feed
+Outage Recovery's trigger condition 2, next.
+
+---
+
 ## Feed Outage Recovery
 
 Distinct from the routine per-ticker catch-up already built into the
@@ -781,9 +859,20 @@ lost.
 **Trigger** (either condition):
 - An explicit connection/API-level failure (exception, timeout, non-200
   response) from the trading API or watchdog service itself, or
-- More than 50% of the active watchlist simultaneously misses its
-  wall-clock bar-close deadline (see Bar-Close Authority) within the same
-  minute — a systemic signal even without a hard connection error.
+- `len(candidates) >= live_mode.min_watchlist_size` AND more than 50% of
+  THIS cycle's `candidates` are in Bar-Close Authority's `missed` set —
+  a systemic signal even without a hard connection error. The size floor
+  exists because a bare percentage is only a meaningful systemic signal
+  once the sample is large enough that a few individually-quiet tickers
+  coinciding by chance cannot clear it on their own; below the floor, a
+  cycle's candidate count is too small to support the claim either way,
+  and this condition simply does not evaluate (condition 1 above remains
+  the only detector for that cycle). Both `min_watchlist_size` and
+  `bar_close_grace_seconds` are seed values, deliberately set conservative
+  (harder to trigger) until measured — the vendor's actual quiet-minute
+  behavior (whether a thin ticker with zero trades gets a zero-volume bar
+  at all, or no bar) bears directly on how large a "normal" miss rate can
+  be, and this condition is set with that in mind.
 
 **Recovery procedure**, on detecting the trigger:
 ```
@@ -997,17 +1086,26 @@ so a re-crash during recovery re-enters warm restart on the same signature.
 
 3. Start Position Manager exit-only immediately — exits are
    indicator-independent (WS/REST tick driven; no Eager-Pool state needed
-   to manage an exit). For each adopted open position:
+   to manage an exit). For each position with an active subscription
+   pre-crash — status IN ('pending','partial_open','open','halted'); all
+   four now carry a live tick subscription, since Exit Architecture's
+   subscribe point moved to order submission rather than first fill, not
+   just the fully-open pair this step originally covered:
      a. WS re-subscribe FIRST (see Exit Architecture), THEN
      b. REST gap-fill for the crash gap, deduped against the WS buffer by
         the global tick-dedup rule (see utils.md's stitch_ticks()). Doing
         (a) before (b) guarantees no realtime tick is lost in the seam.
-     c. Apply the 2-print guard over gap-fill + live ticks; if a tp/sl
-        breach is found within the gap, liquidate at current price,
-        exit_reason='restart_gap_exit' (see db_schema.md). If the
-        position's elapsed hold already exceeds
+     c. status IN ('open','halted'): apply the 2-print guard over gap-fill
+        + live ticks; if a tp/sl breach is found within the gap, liquidate
+        at current price, exit_reason='restart_gap_exit' (see
+        db_schema.md). If the position's elapsed hold already exceeds
         config["execution"]["max_hold_bars"], skip retro-detection and
         liquidate immediately (still 'restart_gap_exit').
+        status IN ('pending','partial_open'): no `fill_price` yet, so no
+        breach evaluation — same as the ordinary (non-restart) guard in
+        Exit Architecture. Gap-filled ticks are retained by the dedup
+        layer only; this order's own fill state is resolved by Step 1's
+        Broker Reconcile, independently of this tick catch-up.
 
 4. Entries stay frozen — add 'restart_warmup' to freeze_reasons
    (entry_submission scope only, so step 3's exit-only management above
@@ -1150,27 +1248,55 @@ tp/sl detection for OPEN POSITIONS ONLY (entry-side watchdog over the full
 universe, below, is unchanged — a different problem at a different scale).
 Feeds the exit-decision consumed by Position Manager Loop Step 2.
 
-**Primary — WebSocket tick stream.** On fill, subscribe to that ticker's
-realtime trade stream. Subscriptions are per TICKER, not per position, so
-several positions on one ticker share one subscription; the bound is
-`execution.max_tickers` against `execution.ws_ticker_limit`,
-NOT a position count. Price tracking holds one of the two WS sequences the
-API permits for the whole session; see "WS sequence lease" under Position
+**Primary — WebSocket tick stream.** Subscribed at entry order submission
+(gate-passed, order accepted — see Watchdog Polling Loop step 5c), not on
+fill: a position carries the risk this stream exists to watch from the
+moment an order is live, not just from its first fill, and this also
+folds the ticker-cap accounting together — the subscription count and
+`execution.max_tickers`'s count of `status IN ('pending', ...)` rows now
+move in lockstep by construction, so subscriptions can never exceed
+`execution.ws_ticker_limit` on their own. Subscriptions are per TICKER,
+not per position, so several positions on one ticker share one
+subscription. Price tracking holds one of the two WS sequences the API
+permits for the whole session; see "WS sequence lease" under Position
 Manager Loop for how the second one is shared.
-Immediately after subscribing, REST gap-fill the short window between fill
-and subscription-active, deduped by the global tick-dedup rule (see
-utils.md's `stitch_ticks()`). Each inbound tick:
+Immediately after the subscribe call, REST gap-fill the short window
+between the subscribe request and the subscription actually going active —
+pure network/handshake latency now, not the fill-to-subscribe gap this
+covered before subscription moved earlier — deduped by the global
+tick-dedup rule (see utils.md's `stitch_ticks()`). Each inbound tick:
 ```
 breach_up = price >= fill_price * (1 + tp_pct)
 breach_dn = price <= fill_price * (1 - stop_loss_pct)
 ```
+Ticks are received and deduped from the moment of subscription, but the
+two lines above are only evaluated once `fill_price` is known (the
+position's first fill has landed) — a tick arriving while
+`status='pending'` has no reference price to compare against yet and is
+simply not evaluated, not lost (the dedup layer has already recorded it,
+so nothing arriving before the first fill needs a separate backfill once
+`fill_price` becomes available).
+
+Piggybacked on this same inbound-tick handler, no new subscription or
+call: level-1 price, side-total resting size, and session-cumulative
+filled volume are extracted from every tick into `bid_ask_snapshots`
+(`source='ws_tick_piggyback'`) — see db_schema.md.
+
 **2-print guard**: a breach fires only when the SAME direction breaches on
 two consecutive raw ticks (no halt-resumption special case). Rationale: in
 this universe, a single bad print (odd-lot / out-of-sequence correction)
 tripping a stop-loss is a worse risk than a one-tick delay on a real move.
 On a confirmed breach: set `status='exiting'` atomically (guards against
-double submission) and submit the sell (shadow: record hypothetical).
-Unsubscribe on position close.
+double submission), setting `live_positions.exiting_since = now` if it is
+not already set (db_schema.md — never overwritten once populated), and
+submit the sell (shadow: record hypothetical; order-type/pricing logic —
+market vs. limit-at-bid — lives in Position Manager Loop Step 2/3, shared
+with the time_limit/session_end exit paths rather than duplicated here).
+Unsubscribe when either: the position closes (as before), or the entry
+order ends with zero shares filled (`entry_rejected` / `entry_canceled` —
+nothing was ever exposed to track). A fill of any size
+(`partial_open` or beyond) keeps the subscription regardless of what
+becomes of the unfilled remainder.
 
 **Backstop — periodic-loop REST tick polling (WS-dead only).** When the WS
 stream for a position is down, the Position Manager Loop polls that
@@ -1305,6 +1431,23 @@ stays tracked and is visible via the finding above — the two failure modes
 are not symmetric, which is why the mechanism below is structured to make
 over-counting impossible rather than merely unlikely.
 
+**Fill-stream staleness detection.** No new freeze reason and no new
+polling schedule — this reuses the REST backstop call this loop already
+makes every `position_check_interval_seconds` cycle for every order in
+`in_flight_orders`. On each such call, before folding the result into
+`seen_fills` as described above: if the REST response's own
+`cum_filled_qty` is AHEAD of what `seen_fills`'s WS-derived state currently
+reflects for that order_id, sustained across more than one consecutive
+cycle, that is evidence the WS account fill stream has gone quiet while
+REST keeps working — surfaced as `health_report.md` finding 24, warn
+severity. Deliberately NOT a `freeze_reasons` trigger and NOT related to
+Bar-Close Authority above: those judge the separate bar/price-data
+channel, while this is scoped entirely to the account-wide fill-event
+stream, and correctness here is already unaffected regardless — the same
+fold-into-`seen_fills` mechanism absorbs whichever channel reports a given
+fill first, so a stale WS stream costs detection latency, not correctness,
+exactly as the REST backstop was already designed to tolerate.
+
 Primary mechanism, used when individual fills carry a stable, unique ID
 (api_contract_checklist.md T-7/T-8 confirm this before Pilot): maintain
 `seen_fills[order_id]`, a map from fill ID to (qty, price), idempotently
@@ -1353,9 +1496,43 @@ loop every position_check_interval_seconds (config, default: 5s):
         unsold remainder is still exposed to the very risk that triggered
         the exit, so the order stays tracked until fully filled.
         # Observability, not policy: an exit order open beyond a
-        # configured age is surfaced as a health_report finding. Forced
-        # liquidation / re-submission is NOT designed here — see
-        # open_items_session4.md.
+        # configured age is surfaced as a health_report finding (18).
+        # Forced liquidation / re-submission was deliberately deferred
+        # past this observability-only baseline in an earlier session —
+        # see below for what ended up designed on top of it.
+
+        stuck_age = now - live_positions.exiting_since   # NOT submitted_at
+                                                          # — see db_schema.md;
+                                                          # a resubmission below
+                                                          # must not reset this
+        if stuck_age >= config["live_mode"]["exit_order_stuck_minutes"]:
+            if this order_id's own type != "market":
+                cancel this order_id; submit a new market order for the
+                    remaining (position.quantity - cum_filled_qty) shares;
+                    update in_flight_orders to the new order_id
+                # Final backstop, regardless of exit_order_type
+                # (execution_common.md) — an escalation, not a reset:
+                # live_positions.exiting_since is untouched, so stuck_age
+                # keeps accumulating against the original clock.
+            # else: already market — nothing left to escalate to. Stays
+            # tracked exactly as before; finding 18 keeps surfacing it.
+
+        elif config["execution"]["exit_order_type"] == "limit" and this
+             order_id's own type == "limit":
+            bid = REST query, this ticker's current bid (one call, folded
+                into this loop's existing position_check_interval_seconds
+                cadence — no separate polling schedule; exits are always a
+                sell in this system, so the resting price tracks the bid,
+                never the ask)
+            if bid != this order_id's current resting limit_price:
+                amend this order_id's price to bid — a single order
+                    amendment, not cancel-and-resubmit, so the order_id
+                    (and therefore fill tracking against it) is undisturbed
+            # Re-quoted every cycle unconditionally, whether or not the
+            # market moved much since the last check — the simplest
+            # correct behavior. A move-triggered variant (skip the amend
+            # call inside some tolerance band) is a possible later
+            # refinement, not designed here.
 
   For each order_id in in_flight_orders where side == 'entry':
     order_status from the WS account fill stream (primary) or a REST
@@ -1429,7 +1606,14 @@ loop every position_check_interval_seconds (config, default: 5s):
         call is always small too):
         ```
         halt_status = utils.query_halt_status(
-            tickers=[p.ticker for p in open_positions],
+            tickers=[p.ticker for p in open_positions] +
+                    [o["ticker"] for o in in_flight_orders.values()
+                     if o["side"] == "exit"],
+            # In-flight exit tickers folded into the SAME bulk call rather
+            # than a second query — see "Halt-clear handling for an
+            # in-flight exit order" below for why this list needed
+            # extending at all. Deduplicated: a ticker already covered via
+            # open_positions is not queried twice.
             trading_api_url=config["live_mode"]["trading_api_url"],
             chunk_size=config["live_mode"]["bulk_api_chunk_size"],
             # bulk_api_chunk_size defined once in metadata_crawler.md's
@@ -1489,6 +1673,56 @@ loop every position_check_interval_seconds (config, default: 5s):
         same reasoning as Entry Slippage Model's limit-order option
         existing for the analogous entry-side concern.)
 
+        **Halt-clear handling for an in-flight exit order.** A different
+        problem from the above: that section governs a position that has
+        NOT yet had an exit submitted (status still 'open'/'halted');
+        this covers a position ALREADY `status='exiting'`, with a real
+        order outstanding in `in_flight_orders`, whose ticker halts and
+        then clears while that order is still unfilled. Whether the
+        broker preserves, cancels, or cross-executes a resting order
+        through a halt is unverified (api_contract_checklist.md T-12), so
+        this is built to be correct under any of the three:
+
+        ```
+        last_halt_state: dict[ticker, bool]   # runtime only, this
+            # iteration's is_halted vs. the PRIOR iteration's, per ticker
+            # in the combined query above — not persisted; on a warm
+            # restart the first post-restart iteration simply has no
+            # "prior" to compare against, so at most one clear-edge event
+            # is missed per crash, not a correctness gap (the order is
+            # still tracked and re-evaluated on the next ordinary cycle
+            # regardless)
+
+        for ticker in in_flight_exit_tickers:
+            was_halted = last_halt_state.get(ticker, False)
+            is_halted  = halt_status.get(ticker, was_halted)  # missing
+                # from the response this cycle → assume unchanged, do not
+                # manufacture a spurious clear-edge from a partial response
+            if was_halted and not is_halted:
+                # clear edge — re-query THIS order's own status immediately,
+                # not waiting for the next position_check_interval_seconds
+                # cycle's ordinary fill-tracking pass
+                order_status = REST query, this order_id's current state
+                if order_status says the order no longer exists:
+                    # broker canceled it during the halt — T-12's "auto-
+                    # canceled" branch confirmed for this event
+                    submit a replacement order via the same exit_order_type
+                        branching as initial submission (Position Manager
+                        Loop Step 2/3) — market or limit-at-current-bid,
+                        for the remaining unfilled quantity; update
+                        in_flight_orders to the new order_id
+                    # live_positions.exiting_since is NOT touched — this is
+                    # a resubmission, not a new exit; exit_order_stuck_minutes
+                    # keeps counting from the original clock (see In-flight
+                    # order tracking's exit-side loop)
+                    health_report.md finding 25 += 1
+                # else: order still exists (survived the halt, or already
+                # filled/partially filled through the resumption cross) —
+                # no action; the ordinary fill-tracking pass on this same
+                # loop's next cycle picks up whatever state it is in
+            last_halt_state[ticker] = is_halted
+        ```
+
     2. Exit decision for this position:
        # R-2: tp/sl breach comes from the Exit Architecture below
        # (WS-primary / REST-backstop, 2-print guard) — NOT from
@@ -1503,7 +1737,11 @@ loop every position_check_interval_seconds (config, default: 5s):
            continue to next position (no exit yet)
        # Ordering when a tp/sl breach and session_close both become true in
        # the same iteration: tp/sl wins. status='exiting' (see Exit
-       # Architecture) guarantees a single submission either way.
+       # Architecture) guarantees a single submission either way, and sets
+       # live_positions.exiting_since = now if not already set — the
+       # time_limit/session_end paths reach 'exiting' here rather than in
+       # Exit Architecture, so the same "first time only" write applies at
+       # this transition too (db_schema.md).
 
     3. if config["live_mode"]["shadow_mode"]:
            sell_rate = config["execution"]["sell_rate_tp"] if exit_reason == "take_profit" \
@@ -1517,8 +1755,23 @@ loop every position_check_interval_seconds (config, default: 5s):
            also recorded alongside the simulated fill for future
            realized-vs-simulated comparison
        else:
-           submit sell order via trading API (real fill from broker;
-           breach_price still logged for the same comparison purpose)
+           if config["execution"]["exit_order_type"] == "market":
+               order_id = submit order via trading API: quantity=`position.quantity`
+                   - `cum_filled_qty so far` (0 for a fresh exit), order_type="market"
+           else:  # "limit"
+               bid = REST query, this ticker's current bid (one call;
+                   exits are always a sell in this system, so the resting
+                   price tracks the bid — see execution_common.md's
+                   exit_order_type)
+               order_id = submit order via trading API: quantity=`position.quantity`
+                   - `cum_filled_qty so far`, order_type="limit", limit_price=bid
+           # Re-priced every position_check_interval_seconds cycle
+           # thereafter while still outstanding (limit case only) — see
+           # In-flight order tracking's exit-side loop below. Escalates
+           # unconditionally to a market order at
+           # live_mode.exit_order_stuck_minutes regardless of which branch
+           # above was taken — same section.
+           breach_price still logged for the same comparison purpose
            # R-2: breach_price here is now the OBSERVED price of the
            # confirming (2nd) breach tick from the WS/REST stream — a real
            # observation, not a bundle interpolation — improving the
@@ -1587,6 +1840,21 @@ live_mode:
                                              # Probes for why this is not 1.0
   exit_order_stuck_minutes:       10         # health_report finding 18's age
                                              # threshold
+  min_watchlist_size:             30         # seed value — Feed Outage
+                                             # trigger condition 2's sample-
+                                             # size floor (see "Feed Outage
+                                             # Recovery"); below this many
+                                             # candidates in a poll cycle,
+                                             # the percentage check does not
+                                             # evaluate at all
+  bar_close_grace_seconds:        5          # seed value — Bar-Close
+                                             # Authority's per-ticker
+                                             # miss deadline; how long past
+                                             # a minute's close a bar is
+                                             # tolerated before counting as
+                                             # missed (UNVERIFIED vendor
+                                             # latency, see
+                                             # api_contract_checklist.md T-13)
   api_max_tickers_per_second:     100        # assumed throughput ceiling used
                                              # for chunk sizing — UNVERIFIED,
                                              # see api_contract_checklist.md

@@ -73,6 +73,24 @@ outranks a shaky one that degrades gracefully.
 | T-9 | Subscribe/unsubscribe acknowledgement latency | `fill_stream_linger_seconds` default | **C** | Time the round trip under load | `live_mode.fill_stream_linger_seconds` | |
 | T-10 | The broker's rejection reason vocabulary | `trade_log.reject_reason`; any future normalisation | **C** | Self-measuring — `health_report.md`'s unrecognised-reason finding accumulates it | — (stored verbatim; no enum until this is known) | |
 | T-11 | Whether a server-clock endpoint exists | `clock_check.source: "vendor_api"` | **C** | Endpoint documentation | `live_mode.clock_check.source` | |
+| T-12 | Whether a resting order survives a trading halt on its ticker, is auto-canceled by the halt, or executes at the halt-resumption cross/auction | `live_mode_runner.md` Position Manager Loop — halt-clear handling for an in-flight exit order | **C** | Self-measuring — `health_report.md` finding 25 records every case where an in-flight exit order was found gone at halt-clear | — (no key; the design branches at halt-clear regardless of the answer — see below) | |
+| T-13 | How long after a minute closes the trading API's bar endpoint typically has that minute's bar ready | `live_mode_runner.md` Bar-Close Authority (Feed Outage trigger condition 2) | **B** | Observe actual bar arrival latency relative to minute-close under normal operation | `live_mode.bar_close_grace_seconds` | |
+
+**T-12 is deliberately answer-agnostic.** The halt-clear handling for an
+in-flight exit order re-queries that order's status the instant the halt
+clears, rather than assuming any of the three outcomes above — so it stays
+correct whichever one turns out to be true. Verifying this row does not
+unblock anything; it only allows removing the immediate re-query as a
+now-provably-unnecessary step, should finding 25 accumulate enough
+halt-clear events with zero disappearances to trust "always survives."
+
+**T-13's failure direction is asymmetric.** A `bar_close_grace_seconds`
+set shorter than the vendor's real typical latency makes Bar-Close
+Authority over-count ordinary lag as a "missed deadline" — which, combined
+with `min_watchlist_size`, risks a spurious Feed Outage freeze under
+normal operation. Set longer than necessary, it only slows genuine-outage
+detection. The seed value is chosen accordingly: conservative (higher)
+until measured, the same one-sided-error posture as `margin_ratio_fallback`.
 
 **T-1 and T-7 are the grade A rows.** Both back a stated correctness
 guarantee rather than a tunable value — a wrong answer means the design
@@ -151,7 +169,7 @@ normalisation layer is designed. See the ticker-normalisation open item.
 - Where a row names a config key, the measured value belongs in
   `pipeline_config.yaml` under that key — recording it only in this table
   leaves the code running on its default
-- The self-measuring rows (T-2, T-10, I-2) are filled in by
+- The self-measuring rows (T-2, T-10, T-12, I-2) are filled in by
   `health_report.md` findings during ordinary operation, and do not need a
   separate measurement exercise
 - A grade-A row that cannot be verified before Pilot is a reason not to enter
