@@ -204,9 +204,14 @@ def gather_findings(db_conn, today_date, log_dir) -> dict:
         (ticker, order_id, age, cum_filled_qty / quantity) detail. An exit
         has no give-up timeout by design — an unsold remainder stays
         exposed to the very risk that triggered the exit — so on a thin
-        name an order can in principle stay open indefinitely. This finding
-        exists to make that observable; forced liquidation or re-submission
-        is deliberately NOT designed (see open_items_session4.md).
+        name an order can in principle stay open indefinitely. The same
+        threshold now also drives an automatic response: past it,
+        live_mode_runner.md's In-flight order tracking escalates the order
+        to market as a final backstop (a no-op if already market). This
+        finding still fires independently of that escalation — it reports
+        exposure duration, not whether an escalation attempt has occurred,
+        so a row here may be pre- or post-escalation depending on whether
+        the market order has filled by report time.
     19. Entries lost at the entry gates (R-5) — today's inference_log rows
         with event='signal_fired', grouped by gate_result: 'submitted' plus
         one bucket per gate ('freeze', 'cap_tickers', 'cap_per_ticker',
