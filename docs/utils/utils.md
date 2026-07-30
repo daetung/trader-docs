@@ -1255,6 +1255,51 @@ def query_halt_status(
 
 ---
 
+### Health Event Recording
+
+```python
+def record_health_event(
+    finding_name: str,
+    occurred_at: str,
+    ticker: str | None,
+    detail: dict,
+    write_fn: Callable[[str, tuple], None],
+) -> str:
+    """
+    Append one row to `health_events` (see db_schema.md) and return the
+    generated `event_id`.
+
+    Sole access point for health-event writes — no detection site mints its
+    own identifier, for the same single-source-of-truth reason
+    `query_halt_status()` is the sole halt-status-endpoint access point.
+
+    `event_id` format: '{YYYYMMDD}_{HHMMSSmmm}_{4 random chars}' — the same
+    date_time shape as `run_id` elsewhere, extended to millisecond precision
+    plus a random suffix so that two events in the same millisecond, or two
+    processes writing this table (a live session and the evening batch — see
+    metadata_crawler.md), cannot collide without coordination.
+
+    Takes `write_fn`, NOT a `db_conn`. In a live session every write must go
+    through LiveModeRunner's `db_write()` funnel (see live_mode_runner.md);
+    a function handed a raw connection would bypass `write_lock`, which is
+    exactly the defect `persist_to_db()` carried until R-2 GAP-FIX 9. Offline
+    callers pass a direct wrapper.
+
+    A write failure is caught here and never propagated — a diagnostic write
+    must not abort trading (db_schema.md states this as a general principle
+    for every diagnostic write in this system). The failure is counted, and
+    the returned `event_id` stays valid for the caller's own alert payload,
+    which reaches the operator whether or not the row landed.
+
+    Called by:
+        - live_mode_runner.md's Bar-Close Authority, on a negative bar-latency
+          sample (health_report.md finding 27)
+    """
+    ...
+```
+
+---
+
 ### Tick Stitching (R-2)
 
 ```python

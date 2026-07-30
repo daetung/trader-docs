@@ -569,9 +569,11 @@ CREATE TABLE experiment_log (
     -- Column naming: gate_blocked_* / breaker_* prefixes group these at a
     -- glance as the table grows, and gate_blocked_* matches
     -- inference_log.gate_result's own values name-for-name.
-    -- Five counters, not nine: `gate_result` has nine non-'submitted'
-    -- values, but four have no counter here — 'freeze' and 'not_tradable'
-    -- have no backtest concept at all (N-5, see execution_common.md);
+    -- Five counters, not ten: `gate_result` has ten non-'submitted'
+    -- values, but five have no counter here — 'freeze', 'not_tradable' and
+    -- 'bar_integrity' have no backtest concept at all (N-5, see
+    -- execution_common.md; 'bar_integrity' is a live bar-arrival-latency
+    -- verdict, and backtest has no bar arrival to be late);
     -- 'breaker' is evaluated in backtest but never enforced (see
     -- breaker_* below, which reports the underlying metrics instead of a
     -- blocked-count that would imply enforcement); 'error' has no
@@ -856,6 +858,28 @@ CREATE TABLE inference_log (
                                        --                      .max_positions_per_ticker
                                        --   'cooldown'       : can_enter()
                                        --   'not_tradable'   : is_tradable()
+                                       --   'bar_integrity'  : this ticker is in
+                                       --                      the bar-integrity
+                                       --                      exclusion set — a
+                                       --                      negative bar-latency
+                                       --                      sample was observed
+                                       --                      for it, so its
+                                       --                      incremental
+                                       --                      indicators may have
+                                       --                      absorbed a
+                                       --                      not-yet-complete bar
+                                       --                      (live_mode_runner.md's
+                                       --                      Bar-Close Authority;
+                                       --                      health_report.md
+                                       --                      finding 27). Blocks
+                                       --                      NEW ENTRIES for that
+                                       --                      ticker only —
+                                       --                      existing positions
+                                       --                      keep being managed
+                                       --                      and exited, since
+                                       --                      tp/sl runs off the WS
+                                       --                      tick stream, not the
+                                       --                      bar channel.
                                        --   'sizing_zero'    : quantity resolved to 0
                                        --   'funds'          : check_funds_available()
                                        -- A COLUMN rather than new event values,
@@ -1093,6 +1117,221 @@ CREATE TABLE live_session_state (
                                           -- restored from here, not
                                           -- re-queried).
     PRIMARY KEY (date)
+);
+
+-- Bar-arrival latency accumulation (T-13 self-measurement — see
+-- api_contract_checklist.md and health_report.md finding 26). One row per
+-- (date, sample_class).
+-- WHY A TABLE and not an in-memory tally handed to health_report.py the way
+-- findings 5/8 are: those have nowhere to be stored; this does, and it needs
+-- somewhere for two independent reasons.
+--   (a) Crash loss is NOT random with respect to what is being measured. A
+--       crash correlates with feed trouble — i.e. with exactly the
+--       high-latency days — so losing those sessions biases the curve
+--       optimistic, which is the one direction this measurement must not err.
+--   (b) The process restarts every session, so a months-long accumulation —
+--       which is what recalibrating bar_close_grace_seconds actually needs —
+--       cannot live in memory at all.
+-- Same reasoning finding 19 gives for reading gate_result from its own column
+-- rather than being passed a tally.
+-- Retention: NEVER purged. This table's whole value is its multi-month
+-- accumulation; a retention window would delete the thing it exists to build.
+-- Sample admission and the meaning of `d` are defined in live_mode_runner.md's
+-- Bar-Close Authority, not here: d = now - (bar.hour + 60s), measured at the
+-- Step 2a fetch that FIRST returned that bar, and a sample is admitted only
+-- when its own error bound e = min(delta, d) is within
+-- live_mode.bar_latency_max_error_seconds (delta = age of the prior successful
+-- fetch for that ticker; absent on a first poll, where e = d).
+CREATE TABLE bar_latency_daily (
+    date          VARCHAR NOT NULL,   -- 'YYYYMMDD' — the trading day the WRITING
+                                      --   PROCESS started on, fixed once at start
+                                      --   and never re-evaluated (same rule
+                                      --   metadata_crawler.md's Constraints state
+                                      --   for the evening batch). A live session
+                                      --   does not cross midnight, so here this is
+                                      --   a consistency rule, not a live hazard.
+    sample_class  VARCHAR NOT NULL,   -- 'poll_continuous' : e <= poll interval, the
+                                      --                     tightest samples
+                                      -- 'wide_error'      : admitted, but e larger
+                                      -- 'negative'        : d < 0 — see below; NOT
+                                      --                     a latency sample at all
+
+    -- Latency distribution in whole-second buckets: bucket_k counts samples with
+    -- floor(d) = k, bucket_overflow counts d >= 10s. Whole seconds because
+    -- bar_close_grace_seconds is itself judged in whole seconds, so finer
+    -- resolution could not change any decision this feeds.
+    -- Read as a CUMULATIVE curve ("what fraction was ready within X seconds"),
+    -- not as a density histogram. Every sample is an UPPER BOUND on the vendor's
+    -- true publish latency (d overstates it by at most e, never understates it),
+    -- so "97% within 5s" is a conservative floor on the truth — whereas reading
+    -- bucket_5 as "these took 5s" would claim more than the data supports.
+    -- Uniform 1s buckets rather than boundaries aligned to candidate grace
+    -- values: uniform buckets cover the entire decision space and stay correct
+    -- if the candidate set ever changes.
+    -- On a 'negative' row these same buckets hold the |d| distribution instead:
+    -- a pile-up near 60s means the vendor timestamps bars by CLOSE while
+    -- Bar-Close Authority assumes OPEN (structural, every judgement off by one
+    -- bar), while small scattered values mean premature publication of a
+    -- still-forming bar or a clock fault. The distinction is diagnostically
+    -- decisive and costs no extra columns.
+    bucket_0        INTEGER NOT NULL DEFAULT 0,
+    bucket_1        INTEGER NOT NULL DEFAULT 0,
+    bucket_2        INTEGER NOT NULL DEFAULT 0,
+    bucket_3        INTEGER NOT NULL DEFAULT 0,
+    bucket_4        INTEGER NOT NULL DEFAULT 0,
+    bucket_5        INTEGER NOT NULL DEFAULT 0,
+    bucket_6        INTEGER NOT NULL DEFAULT 0,
+    bucket_7        INTEGER NOT NULL DEFAULT 0,
+    bucket_8        INTEGER NOT NULL DEFAULT 0,
+    bucket_9        INTEGER NOT NULL DEFAULT 0,
+    bucket_overflow INTEGER NOT NULL DEFAULT 0,   -- d >= 10s
+
+    max_observed_d  INTEGER,            -- tail size, in seconds. Merged with
+                                        --   GREATEST(existing, incoming) on flush,
+                                        --   NOT summed — see the flush rule below.
+                                        --   max|d| on a 'negative' row.
+
+    -- Samples REJECTED for e > live_mode.bar_latency_max_error_seconds, split by
+    -- why the bound was loose, because the two point at different things:
+    excluded_no_prior_fetch INTEGER NOT NULL DEFAULT 0,  -- no prior successful
+                                        --   fetch for the ticker, so e = d and d
+                                        --   was already large: the candidate
+                                        --   entered late relative to bar close
+    excluded_both_wide      INTEGER NOT NULL DEFAULT 0,  -- delta AND d both large:
+                                        --   a stretched poll cycle coinciding with
+                                        --   a slow bar
+                                        -- Both are 0 on 'poll_continuous' rows by
+                                        --   construction: the threshold is a
+                                        --   multiple of the poll interval, so a
+                                        --   sample with e <= one interval can never
+                                        --   exceed it.
+
+    bar_gap_samples INTEGER NOT NULL DEFAULT 0,   -- admitted samples whose bar
+                                        --   timestamp skipped >1 minute since the
+                                        --   ticker's previous bar. Paired with the
+                                        --   latency buckets this separates
+                                        --   structural non-publication (large gap,
+                                        --   small d — a thin ticker that gets no
+                                        --   zero-volume bar) from genuine vendor
+                                        --   lag (large gap, large d).
+
+    PRIMARY KEY (date, sample_class)
+);
+-- Flush rule (live_mode_runner.md holds the counters between flushes): the
+-- in-memory tally holds only the UN-FLUSHED DELTA and is zeroed after each
+-- flush, and the flush is an ADDITIVE upsert. A tally holding the session total
+-- against an additive upsert would re-add everything already written on every
+-- flush. max_observed_d is the sole exception, merged with GREATEST rather than
+-- added — two merge semantics in one row, so a blanket `+=` across all columns
+-- is wrong. This is also what makes a warm restart consistent with no extra
+-- logic: what was flushed is in the table, and only the un-flushed delta (under
+-- one flush interval) is lost.
+
+-- Health-event log — one row per discrete diagnostic event (health_report.md).
+-- Different in kind from bar_latency_daily above: that aggregates NORMAL
+-- samples by the tens of thousands, this records individual ABNORMAL events.
+-- Written ONLY through utils.record_health_event() — no detection site mints
+-- its own event_id and none writes this table directly, the same
+-- single-access-point discipline utils.query_halt_status() has.
+-- WHY: a finding that reports "N occurrences today" loses WHEN they occurred,
+-- and the when is frequently the diagnosis. It also makes an alert traceable
+-- back to the specific events it reported (see alert_log.event_ids below).
+-- Retention: NEVER purged, same reasoning as bar_latency_daily.
+-- SCOPE, deliberately wider than today's use: the schema accepts any
+-- event-shaped finding, but as of this design only finding 27 writes here.
+-- Converting the other event-shaped findings (12, 13, 14, 15, 18, 25) is
+-- deferred to its own item — the table is defined at full width now because a
+-- schema is cheap to define once and expensive to widen later.
+CREATE TABLE health_events (
+    event_id     VARCHAR NOT NULL,   -- '{YYYYMMDD}_{HHMMSSmmm}_{4 random chars}',
+                                     --   generated inside record_health_event()
+                                     --   (see utils.md): time-sortable, and
+                                     --   collision-free across the two processes
+                                     --   that can write here — a live session and
+                                     --   the evening batch — without coordination
+    date         VARCHAR NOT NULL,   -- 'YYYYMMDD', writing process's start day,
+                                     --   same rule as bar_latency_daily.date
+    finding_name VARCHAR NOT NULL,   -- health_report.md's finding KEY, not its
+                                     --   documentation number: the number is list
+                                     --   order and shifts, the key does not
+    occurred_at  VARCHAR NOT NULL,   -- 'YYYYMMDD_HHMMSSmmm' — when the EVENT
+                                     --   happened, not when this row was written;
+                                     --   the two differ whenever a write is
+                                     --   retried or batched
+    ticker       VARCHAR,            -- NULL for session-scoped events
+    detail       VARCHAR,            -- JSON. Shape is per-finding and deliberately
+                                     --   unconstrained — findings differ too much
+                                     --   for a shared column set to fit any of them
+    PRIMARY KEY (event_id)
+);
+
+-- Alert delivery log — one row per delivery ATTEMPT, i.e. per (alert, channel).
+-- Fills a gap that stood until this design: a SUCCESSFUL send was recorded
+-- nowhere at all. write_to_log() records what was FOUND, and
+-- event=alert_delivery_failed records failures, so "what actually reached the
+-- operator, and when" was not reconstructible — which left a silently
+-- degrading channel invisible and gave an alert no traceable link to the events
+-- it reported.
+-- outcome deliberately covers the NON-sends too: an alert held back by rate
+-- limiting, or dropped from a full queue, is precisely a thing that did not
+-- reach the operator, and those are the cases a delivery log exists to account
+-- for. Counting them in aggregate is not enough — that records the fact but
+-- loses the content.
+-- Retention: NEVER purged, same reasoning as the two tables above.
+-- ONE EXCEPTION, structural: the evening job's hard-deadline abort
+-- (metadata_crawler.md's evening job start gate) cannot write here at all — it
+-- is aborting precisely BECAUSE it never acquired the DB lock, which a hung
+-- LiveModeRunner still holds. That alert is file-log-only by necessity, not by
+-- choice. Deferring its row to whichever process next holds the lock was
+-- considered and rejected: a pending-alert-write queue is new infrastructure
+-- for the one case where a human is already reading the log.
+CREATE TABLE alert_log (
+    alert_id         VARCHAR NOT NULL,   -- same format and generator style as
+                                         --   health_events.event_id. One id per
+                                         --   ATTEMPT, so a report going to two
+                                         --   channels produces two ids
+    date             VARCHAR NOT NULL,   -- 'YYYYMMDD', writing process's start day
+    alert_key        VARCHAR NOT NULL,   -- the INVOCATION PATH, not the finding:
+                                         --   'session_start' | 'session_end' |
+                                         --   'breaker_trip' | 'clock_check_abort' |
+                                         --   'bar_close_premise_violation' |
+                                         --   'evening_liveness_probe' |
+                                         --   'evening_deadline_abort' |
+                                         --   'log_write_failed'.
+                                         --   Path-keyed rather than finding-keyed
+                                         --   because an event-driven invocation
+                                         --   delivers a REPORT, not one finding —
+                                         --   so suppression is keyed on
+                                         --   (alert_key, channel) as well
+    channel          VARCHAR NOT NULL,   -- 'discord' | 'email'
+    severity         VARCHAR NOT NULL,   -- 'ok' | 'warn' | 'abort' — the MAXIMUM
+                                         --   severity across the findings this
+                                         --   alert carried. A transport grade
+                                         --   only; it implies no operational
+                                         --   response (see health_report.md's
+                                         --   Constraints)
+    dispatched_at    VARCHAR NOT NULL,   -- 'YYYYMMDD_HHMMSSmmm', queue entry time
+    completed_at     VARCHAR,            -- NULL until the background sender
+                                         --   resolves. Still written for a
+                                         --   drain-timeout drop, because the DB
+                                         --   connection deliberately outlives the
+                                         --   drain (see health_report.md's
+                                         --   shutdown order)
+    outcome          VARCHAR,            -- 'sent' | 'failed' | 'suppressed' |
+                                         --   'dropped_queue' | 'dropped_drain'.
+                                         --   NULL only while genuinely in flight
+    suppressed_count INTEGER,            -- alerts suppressed on this
+                                         --   (alert_key, channel) since its last
+                                         --   send. Legitimately DIFFERS between
+                                         --   channels for the same alert_key,
+                                         --   since each channel carries its own
+                                         --   timeout — not an inconsistency
+    event_ids        VARCHAR,            -- JSON array of health_events.event_id.
+                                         --   Forward: which events this alert
+                                         --   reported. Reverse (a scan of this
+                                         --   column): which alert, if any, ever
+                                         --   carried a given event
+    PRIMARY KEY (alert_id)
 );
 ```
 

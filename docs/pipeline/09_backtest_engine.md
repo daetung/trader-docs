@@ -75,9 +75,11 @@ class BacktestEngine:
             # Chronological Simulation's admission sequence. A candidate
             # stopped at a gate produces NO trade_log row, so these are its
             # only record. Diagnostic only — best_config() ranks on
-            # winning_rate alone. Five, not nine: `gate_result` has nine
-            # non-'submitted' values; 'freeze'/'not_tradable' have no
-            # backtest concept (N-5), 'breaker' is evaluated but never
+            # winning_rate alone. Five, not ten: `gate_result` has ten
+            # non-'submitted' values; 'freeze'/'not_tradable'/'bar_integrity'
+            # have no backtest concept (N-5 — 'bar_integrity' is a live
+            # bar-arrival-latency signal, so there is nothing for backtest
+            # to detect), 'breaker' is evaluated but never
             # enforced here (see breaker_* below, not a blocked-count,
             # which would wrongly imply enforcement), and 'error' has no
             # analogue since backtest makes no network calls. Key names use

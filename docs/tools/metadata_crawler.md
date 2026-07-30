@@ -791,7 +791,7 @@ def collect_fundamentals_incremental(db_conn) -> int:
 
 ## Dual Schedule: Evening Full Run + Premarket Corporate-Events Refresh
 
-The evening run (17:00 ET, below) computes `precomputed_session_stats` for
+The evening run (21:00 ET, below) computes `precomputed_session_stats` for
 tomorrow using corporate_events as crawled at that time. This ordering must
 not change — moving the full crawl to premarket would mean session_stats
 baselines are computed BEFORE that day's own corporate_events refresh,
@@ -1085,7 +1085,7 @@ loop:
               inputs are runner-independent, so the run is valid.
         if open FAILS (lock held):
             → runner still alive (or hung). Sleep and retry, BUT: if now >
-              evening_wait_hard_deadline (config, default 21:00 ET): alert
+              evening_wait_hard_deadline (config, default 23:30 ET): alert
               + abort this evening run (manual intervention). A hung-past-
               deadline run aborts loudly tonight; tomorrow's Health Gate 1a
               then correctly aborts tomorrow on missing session stats — the
@@ -1100,9 +1100,11 @@ proceeds once the lock is free, either via the clean-shutdown marker or
 via the lock-probe fallback above.
 
 ```bash
-# Run after market close daily (weekdays only), 17:00 ET
+# Run after the day's JSON dump completes (weekdays only), 21:00 ET — NOT
+# merely after market close: the dump ends at 20:00 ET, which is also the
+# ingestion range's own upper bound (see Constraints)
 # Full run: metadata + corporate events + ingest + calendar update + session stats
-0 17 * * 1-5 cd /path/to/stock-scalping && \
+0 21 * * 1-5 cd /path/to/stock-scalping && \
     source .venv/bin/activate && \
     python tools/collect_daily.py \
         --db-path data/market.duckdb \
@@ -1142,7 +1144,11 @@ fmp_api_key: "your_key_here"
 # R-2: hard deadline for the evening job's lock-probe wait (see Cron /
 # Scheduler Setup's "Evening job start gate"). A lock-held (hung-runner)
 # evening job aborts with an alert past this wall-clock time.
-evening_wait_hard_deadline: "21:00"   # ET
+# Sized against the 21:00 ET start, not independently: a deadline at the
+# start time itself would leave no wait at all, and exceeding it costs two
+# days of operation (this run aborts, and tomorrow's Health Gate 1a then
+# aborts on missing session stats), so a transient lock must not reach it.
+evening_wait_hard_deadline: "23:30"   # ET
 
 # Bulk today-vs-yesterday price quote endpoint for
 # check_corporate_event_anomaly() (P-8) — a distinct endpoint from
@@ -1270,6 +1276,19 @@ quarantine:
   session that day, not the presence or absence of a `batch_runs` row.
 - Failed metadata tickers do not block ingestion — two steps are independent
 - No session time filter on ingested data — all periods (040000~200000) stored
+- The evening cron must not start before that day's JSON dump has finished.
+  The ingestion range's upper bound (`200000`) and the dump's completion are
+  the same instant by construction, so the 21:00 ET slot is derived from that
+  boundary rather than chosen independently — if the dump moves, this cron
+  moves with it. This is load-bearing because the duplicate-skip rule above
+  is keyed on `(ticker, date)`: a date ingested while its after-market window
+  was still being written is skipped by every later run, so the truncation is
+  permanent rather than self-healing.
+- The evening run may cross midnight while the lock probe waits — with the
+  deadline at 23:30 ET that is an ordinary outcome, not an anomaly. The date
+  basis is therefore fixed once at process start and never re-evaluated:
+  `--date today` resolves to the trading day the process began on, for every
+  stage and every `batch_runs` row the run writes.
 - US stock splits and ex-dividend adjustments always take effect before market
   open — no intra-session event handling needed
 - Vendor update latency (yfinance not yet reflecting a same-day corporate

@@ -680,8 +680,9 @@ loop every poll_interval_seconds:
             Whichever gate stops the candidate, write its reason to
             inference_log.gate_result on THIS candidate's own
             event='signal_fired' row — 'freeze' | 'cap_tickers' |
-            'cap_per_ticker' | 'cooldown', and likewise 'not_tradable'
-            (step i), 'sizing_zero' / 'funds' (step ii) below. A candidate
+            'cap_per_ticker' | 'cooldown', and likewise 'not_tradable' and
+            'bar_integrity' (step i), 'sizing_zero' / 'funds' (step ii)
+            below. A candidate
             reaching submission in step iii records 'submitted'. If step
             ii's check_funds_available() call raises (the one network call
             in this sequence — timeout, connection error) rather than
@@ -702,6 +703,13 @@ loop every poll_interval_seconds:
             to be threaded through to it.
         i.  is_tradable(ticker, db_conn) — execution_common.md gate.
             False (ticker_cik_map.status = 'suspended') → skip, no order.
+            Then, in the same step because it is the other per-ticker
+            eligibility verdict: skip if this ticker is in the
+            bar_integrity exclusion set (see Bar-Close Authority's
+            Bar-Arrival Latency Measurement) → gate_result='bar_integrity'.
+            A runtime set membership test, so it costs nothing to place
+            here rather than earlier; unlike the freeze_reasons check in
+            step 0, it is per-ticker rather than session-wide.
         ii. quantity = execution_common.compute_position_size(
                 balance=session_start_cash, fill_price=entry["p_entry"],
                 t_bar_volume=..., ticker_notional=..., total_notional=...,
@@ -849,6 +857,137 @@ Feed Outage Recovery (below) leaves un-frozen, caught up whenever that
 ticker's next bar arrives via Step 3's ordinary multi-bar replay.
 `missed` becomes a candidate systemic signal only in aggregate — see Feed
 Outage Recovery's trigger condition 2, next.
+
+### Bar-Arrival Latency Measurement (T-13)
+
+`bar_close_grace_seconds` is a seed value because nobody has measured what
+it is guarding against. This measurement is what turns it into an observed
+quantity, satisfying api_contract_checklist.md's T-13 without a separate
+verification exercise. It measures only bars that DO arrive; `missed` above
+covers the ones that do not, and the two are reported together (finding 26)
+because neither is interpretable alone.
+
+Measured at Step 2a, where `last_bar_hour[ticker]` is updated — NOT in Step
+3 — for the same reason `last_bar_hour` is read off the fetch response
+rather than from `calculators[ticker]`: Step 3 absorbs multi-bar replay and
+would hide the very lag being measured. Two further properties fall out of
+that placement: the loop's hottest path (Step 3's `on_bar_close()` replay)
+is untouched, and at most one sample per ticker per cycle is structurally
+guaranteed, so a single slow bar cannot be counted repeatedly.
+
+```
+At Step 2a, for each candidate whose fetch returned a newer bar than
+last_bar_hour[ticker] held:
+
+  d     = now - (newest bar's hour + 60s)     # whole seconds
+  delta = now - last_fetch_time[ticker]       # absent on a first poll
+  e     = min(delta, d)                       # this sample's error bound
+
+  if d < 0:
+      negative sample — see "Premise violation" below. Not a latency
+      sample; e is meaningless when d is.
+  elif e <= live_mode.bar_latency_max_error_seconds:
+      admit: bucket floor(d), class 'poll_continuous' if
+      e <= poll_interval_seconds else 'wide_error'
+  else:
+      reject: count as excluded_no_prior_fetch (no delta) or
+      excluded_both_wide (delta and d both large)
+
+  last_fetch_time[ticker] = now      # every successful fetch, admitted
+                                     # sample or not
+```
+
+**Why `e`, and why it needs the prior fetch.** `d` overstates the vendor's
+true publish latency by however long the bar sat unobserved before we asked.
+Knowing the ticker was fetched `delta` ago bounds that overstatement at
+`delta`; on a first poll only the bar's own close bounds it, at `d` itself.
+Taking the smaller of the two is what keeps a sample honest, and it is why
+`last_fetch_time` exists at all: without it a bar that had been ready for 40
+seconds before the first poll reached it would be recorded as 40 seconds of
+vendor latency. The bound matters because the error is bounded at 60s
+otherwise — a fetch returns only the newest bar, so the overstatement does
+not grow with how long the ticker was away, but 60s dwarfs the 5s value
+being calibrated.
+
+Deliberately NOT filtered on bar-timestamp continuity, which was the obvious
+alternative: a thin ticker that gets no zero-volume bar for a minute (see
+Feed Outage Recovery's trigger condition 2 on exactly this uncertainty)
+produces a bar whose timestamp skipped a minute but which arrived perfectly
+on time. Rejecting those would discard valid samples from precisely the
+thinnest tickers — the ones a vendor is slowest on — biasing the curve
+optimistic. Such samples are admitted and separately counted
+(`bar_gap_samples`), which is also what distinguishes structural
+non-publication (large gap, small `d`) from real vendor lag (large gap,
+large `d`).
+
+`last_fetch_time` is runtime-only, same convention as `last_halt_state`: a
+warm restart costs at most one skipped sample per ticker, on its first
+post-restart fetch. Every exclusion case — session first appearance,
+candidacy re-entry, post-outage recovery, an individual failed fetch — skips
+exactly one cycle for that ticker, not a window.
+
+Counters accumulate in memory as the UN-FLUSHED DELTA ONLY and are flushed
+additively into `bar_latency_daily` (db_schema.md, which carries the merge
+rule) through `db_write()`, once per minute at an in-minute offset rather
+than on the minute boundary — the boundary is where bar arrival, Step 3's
+replay, and `infer()` all land. The delta is zeroed after each flush,
+including a forced one, so the periodic timer is reset by a forced flush
+too; otherwise the next scheduled flush writes an empty delta. Runs
+unconditionally in shadow mode: the bar/price channel is identical in both
+modes, and this measures that channel, not the order path.
+
+**Premise violation (`d < 0`).** A negative sample means a bar exists for a
+minute that has not finished, which contradicts the `expected_minute`
+reasoning this whole section rests on. Two causes, and the `|d|`
+distribution in `bar_latency_daily` separates them: values near 60s mean the
+vendor timestamps bars by CLOSE while this spec assumes OPEN, in which case
+every `missed` verdict and every Feed Outage condition-2 evaluation is off by
+one bar; small scattered values mean premature publication of a still-forming
+bar, or a clock fault. Either way it is a design error, not a data blip, so
+it is recorded per event via `utils.record_health_event()` and reported as
+`health_report.md` finding 27, event-driven at abort severity rather than
+waiting for session end.
+
+On detection, in this order:
+```
+1. increment the negative counter (in-memory delta)
+2. add ticker to the bar_integrity exclusion set
+3. if len(exclusion set) >= live_mode.bar_integrity_freeze_ticker_count:
+       add 'bar_integrity' to freeze_reasons, scope entry_submission
+4. forced flush of bar_latency_daily (synchronous, via db_write)
+5. record_health_event() + health_report.py invocation, subset-scoped to
+   finding 27 (see health_report.md's Invocation Contract)
+```
+State changes precede the flush so the alert cannot report an exclusion set
+missing the very ticker that triggered it. The flush happens whether or not
+the alert itself is suppressed — the table is state, suppression is
+transport. The health_report call returns as soon as it has written its log;
+delivery is its own background concern (see health_report.md), so this loop
+is never blocked on a socket.
+
+**Why the exclusion is per-ticker and entry-only.** A prematurely-published
+bar is fed to `on_bar_close()`, whose CONTINUOUS-indicator updates are
+incremental and therefore irreversible for the session; that corrupted state
+reaches new entries through `infer()`. It does NOT reach existing positions:
+tp/sl runs off the WS tick stream (Exit Architecture), not the bar channel,
+so open positions keep being managed and exited normally. Corruption also
+cannot spread between tickers, since every affected structure is per-ticker.
+Blocking new entries for that ticker alone is therefore sufficient, and the
+session continues.
+
+Rebuilding the corrupted calculator via `scoped_recompute()` (the mechanism
+corporate-event handling uses above) is deliberately NOT done: with entries
+for that ticker already blocked, a rebuild buys nothing and adds a recovery
+path whose own correctness would need establishing.
+
+The promotion at step 3 exists because a timestamp-convention mismatch
+affects every ticker, so per-ticker exclusion would trip the whole watchlist
+one ticker at a time while leaving tickers not yet flagged unprotected. The
+promoted freeze blocks entry submission only and does not clear within the
+session — there is no way to verify recovery from corrupted incremental
+state, the same reason a breaker trip does not auto-clear. The exclusion set
+itself is runtime-only; after a warm restart a ticker is re-excluded on its
+next negative sample.
 
 ---
 
@@ -1347,8 +1486,10 @@ deliberately does not commit specific values beyond the defaults already in
 Config Keys and `execution:`. Any future change to R-4's circuit-breaker
 thresholds, R-5's entry-gate cap checks (Watchdog Polling Loop step 5c.0),
 or `compute_position_size()`'s notional/exposure sums must read the same
-config keys rather than hardcode a value independently — see
-open_items_session4.md for the forward note on R-4 until it is patched.
+config keys rather than hardcode a value independently. This is a standing
+rule for future edits, not a pointer to unfinished work: R-4's thresholds,
+freeze scope, and no-auto-clear behaviour are fully specified in Circuit
+Breaker above, with their values in `execution:`.
 
 Inf mode (`0`) on either cap means "unlimited" for BacktestEngine only.
 LiveModeRunner clamps: `max_tickers` 0 → 50 (the vendor limit above, which
@@ -1863,6 +2004,35 @@ live_mode:
                                              # missed (UNVERIFIED vendor
                                              # latency, see
                                              # api_contract_checklist.md T-13)
+  bar_latency_max_error_seconds:  3          # = 3 x poll_interval_seconds.
+                                             # Per-sample error bound for
+                                             # T-13's latency measurement
+                                             # (see Bar-Arrival Latency
+                                             # Measurement): admit a sample
+                                             # only if its own overstatement
+                                             # is within this. Anchored to
+                                             # poll_interval_seconds, NOT to
+                                             # bar_close_grace_seconds:
+                                             # deriving it from the value it
+                                             # helps calibrate would make an
+                                             # over-large grace admit
+                                             # over-loose samples that then
+                                             # confirm the over-large grace.
+                                             # Re-examined only when
+                                             # poll_interval_seconds changes,
+                                             # or when finding 26 reports
+                                             # heavy sample loss or a gap
+                                             # between its two error classes
+  bar_integrity_freeze_ticker_count: 5       # seed value — distinct tickers
+                                             # with a negative bar-latency
+                                             # sample (finding 27) before the
+                                             # per-ticker exclusion is
+                                             # promoted to a session-wide
+                                             # entry freeze. A timestamp-
+                                             # convention mismatch reaches
+                                             # this within a minute or two;
+                                             # isolated premature bars
+                                             # should not
   api_max_tickers_per_second:     100        # assumed throughput ceiling used
                                              # for chunk sizing — UNVERIFIED,
                                              # see api_contract_checklist.md

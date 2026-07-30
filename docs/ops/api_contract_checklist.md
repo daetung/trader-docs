@@ -74,7 +74,7 @@ outranks a shaky one that degrades gracefully.
 | T-10 | The broker's rejection reason vocabulary | `trade_log.reject_reason`; any future normalisation | **C** | Self-measuring — `health_report.md`'s unrecognised-reason finding accumulates it | — (stored verbatim; no enum until this is known) | |
 | T-11 | Whether a server-clock endpoint exists | `clock_check.source: "vendor_api"` | **C** | Endpoint documentation | `live_mode.clock_check.source` | |
 | T-12 | Whether a resting order survives a trading halt on its ticker, is auto-canceled by the halt, or executes at the halt-resumption cross/auction | `live_mode_runner.md` Position Manager Loop — halt-clear handling for an in-flight exit order | **C** | Self-measuring — `health_report.md` finding 25 records every case where an in-flight exit order was found gone at halt-clear | — (no key; the design branches at halt-clear regardless of the answer — see below) | |
-| T-13 | How long after a minute closes the trading API's bar endpoint typically has that minute's bar ready | `live_mode_runner.md` Bar-Close Authority (Feed Outage trigger condition 2) | **B** | Observe actual bar arrival latency relative to minute-close under normal operation | `live_mode.bar_close_grace_seconds` | |
+| T-13 | How long after a minute closes the trading API's bar endpoint typically has that minute's bar ready | `live_mode_runner.md` Bar-Close Authority (Feed Outage trigger condition 2) | **B** | Self-measuring — `health_report.md` finding 26 accumulates the observed bar-arrival latency as a cumulative curve (whole-second buckets), so the value is read from ordinary operation rather than measured in a separate exercise | `live_mode.bar_close_grace_seconds` | |
 
 **T-12 is deliberately answer-agnostic.** The halt-clear handling for an
 in-flight exit order re-queries that order's status the instant the halt
@@ -172,8 +172,11 @@ best-effort, not a guarantee, so the residual gap remains worth tracking.
 - Where a row names a config key, the measured value belongs in
   `pipeline_config.yaml` under that key — recording it only in this table
   leaves the code running on its default
-- The self-measuring rows (T-2, T-10, T-12, I-2) are filled in by
+- The self-measuring rows (T-2, T-10, T-12, T-13, I-2) are filled in by
   `health_report.md` findings during ordinary operation, and do not need a
-  separate measurement exercise
+  separate measurement exercise. T-13 is the only one of these that still
+  names a config key and is graded above C — self-measuring describes how
+  the value is obtained, not what its being wrong costs, so it does not
+  lower a grade
 - A grade-A row that cannot be verified before Pilot is a reason not to enter
   Pilot, not a reason to assume in its favour
