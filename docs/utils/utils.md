@@ -1294,6 +1294,20 @@ def record_health_event(
     Called by:
         - live_mode_runner.md's Bar-Close Authority, on a negative bar-latency
           sample (health_report.md finding 27)
+        - live_mode_runner.md's Broker Reconcile, on an unmatched broker order
+          or position (finding 12)
+        - live_mode_runner.md's Position Manager Loop Step 1a, when a halted
+          position is carried past session_end (finding 14), and when a
+          halted→tradable transition finds the in-flight exit order gone
+          (finding 25)
+        - live_mode_runner.md's in-flight exit tracking, on an order's FIRST
+          crossing of exit_order_stuck_minutes (finding 18)
+        - live_mode_runner.md's fill-stream staleness detection, on entry into
+          each stale episode (finding 24)
+    Findings 13 and 15 deliberately do NOT call this — each already writes its
+    own trade_log row, so a health_events row would be a second source for one
+    fact. The rule: an event is recorded here when it leaves no row anywhere
+    else. See db_schema.md's health_events SCOPE note.
     """
     ...
 ```
@@ -1349,8 +1363,7 @@ def stitch_ticks(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame
   detection is WS-primary / REST-backstop over the real tick stream (see
   live_mode_runner.md's Exit Architecture). The function's own contract is
   unchanged; only its live call site was removed. (Formerly also called by
-  LiveModeRunner's Position Manager Loop — see P-10 in the former
-  open_items_production_readiness.md for that history.)
+  LiveModeRunner's Position Manager Loop.)
 - `stitch_ticks()`'s tick-identity rule (hour + full OHLCV, not hour alone)
   applies wherever REST ticks are concatenated — see that function above.
 - `track_label_breach()` is the high-level wrapper for two-stage label detection (Labeler only)

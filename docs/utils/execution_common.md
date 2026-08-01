@@ -115,8 +115,7 @@ def is_tradable(ticker: str, db_conn) -> bool:
     reason about. Deliberately does NOT check tick-rate/staleness/halt —
     EntryPointDetector's own volume-gated filters (B/C/D — see
     01_entry_detection.md) already fail on a genuinely stale or halted
-    ticker, so a separate check here would be redundant (see the former
-    open_items_production_readiness.md P-6 countermeasure 3 discussion).
+    ticker, so a separate check here would be redundant.
 
     Returns:
         True if the ticker is tradable (rename_pending=FALSE AND

@@ -35,8 +35,7 @@ LiveModeRunner
 ## DB Connection Management (P-5)
 
 Two connections, not one — this is what makes the ad-hoc-operator-query and
-premarket-cron contention problem (see former open_items_production_readiness.md
-P-5) tractable without new infrastructure:
+premarket-cron contention problem tractable without new infrastructure:
 
 ```python
 read_only_conn:  opened with read_only=True — used for every SELECT this
@@ -183,7 +182,90 @@ measured value is also logged every session, which fills in
 api_contract_checklist.md's retention row from ordinary operation rather than
 from a one-off measurement.
 
+### session_diagnostics write protocol (R-9)
+
+The three probe results above, plus Health Gate 2's tier-fallback summary
+and two running counters, are persisted to
+`live_session_state.session_diagnostics` (JSON — see db_schema.md) instead
+of being held as in-memory tallies handed to `health_report.py` at session
+end. A crashed session previously lost findings 5, 8, 21 and 22 outright;
+in the table the evening liveness probe can recover them.
+
+**Always write-only whole-value replacement.** The runner accumulates the
+diagnostics dict in memory and replaces the column with it. There is never
+a read-modify-write of the JSON, at any of the write points below, so no
+atomicity question arises.
+
+Write points:
+```
+(a) immediately after the probes above, BEFORE Health Gate 2
+      clock_offset_start, clock_offset_end=null, margin_ratio,
+      retention_boundary; each probe flagged 'disabled' | 'succeeded' |
+      'fell_back' so "never ran" and "ran and fell back" stay distinct
+(b) immediately after Health Gate 2
+      adds the tier-fallback summary (finding 5)
+(c) on the existing bar_latency_daily flush cadence
+      refreshes the running counters — halt-check signal_source counts
+      (finding 8) and inference_log dropped-row count (finding 22)
+(d) at Session Shutdown
+      fills clock_offset_end (finding 21)
+```
+(a) must precede Gate 2 rather than being folded into (b): `clock_check`
+with `on_exceed: "abort"` terminates the session before Gate 2 is reached,
+and the measured offset is the only evidence for why. The evening probe
+recovers the crash FACT (finding 11) but never the measurements.
+
+`clock_offset_end` is written as `null` at (a) rather than left absent, so
+its absence at report time reads as "session did not reach shutdown" rather
+than as a missing key.
+
+A flush failure at (c) is swallowed per db_schema.md's standing rule, and
+must NOT increment finding 22's own counter — otherwise a persistent write
+fault feeds itself.
+
+**On warm restart**, the probe values at (a) are OVERWRITTEN with the newly
+measured ones and `restart_count` increments. They are current operating
+settings, not a session baseline — unlike `session_start_cash`, which R-2
+restores rather than re-queries precisely because it IS the baseline. The
+counters at (c) RESUME from the persisted values instead of resetting to
+zero; they are session totals.
+
 ## Session Shutdown
+
+**Exit trigger (R-9).** The process exits at whichever of these comes
+first:
+```
+(a) all positions are flat AND now >= config["execution"]["session_close_exit_time"]
+(b) now >= config["live_mode"]["session_hard_exit_time"]   # hard cap
+```
+(a) is the ordinary path — on a normal day the 15:59 `session_end` exits
+fill within minutes and the process leaves shortly after 16:00. (b) exists
+because submitting an exit is not the same as filling one: a limit exit is
+re-priced every `position_check_interval_seconds` and escalates to market
+at `exit_order_stuck_minutes`, and exit tracking has NO give-up timeout, so
+without a cap a single unfillable position would keep the process alive
+indefinitely.
+
+`session_hard_exit_time` defaults to `"20:00"` ET. This is not a new
+number: it is the after-market ingestion boundary (`200000`, see
+db_schema.md's Ingestion Rules) and it is the value health_report.md's
+`drain_timeout_seconds` was already sized against — roughly 50 minutes of
+margin before the 21:00 evening batch. Making it a config key turns that
+arithmetic's assumption into a declared value.
+
+**Positions still open at the hard cap** are NOT force-liquidated. They are
+left as `live_positions` rows and handed to the next session's Broker
+Reconcile under the Unified Overnight Policy (see below) — the same path a
+halt-through-close position already takes. Forcing a market exit into
+after-hours liquidity would be strictly worse than the overnight carry it
+is trying to avoid, and the row is durable (R-2), so the next session
+adopts it rather than discovering an orphan.
+
+**In-flight exit orders are canceled at shutdown**, before the markers
+below. An order left resting after the process dies could fill overnight
+with nothing watching it, and the position's state would then be wrong at
+the next session's reconcile. Note this is a wider cancellation than Broker
+Reconcile's, which cancels pending ENTRY orders only.
 
 LiveModeRunner's last action before process exit, after both loops have
 been signaled to stop and any final position/order state has settled:
@@ -486,9 +568,8 @@ LiveModeRunner.start_session(today_date):
          fallback_rate = (tier_tally[2] + tier_tally[3]) / total if total > 0 else None
 
          fallback_rate is None → no lookback-configured indicator exists yet;
-             check trivially passes (see P-2 in the former
-             open_items_production_readiness.md — all 9 tick-derived
-             indicators currently ship precalculate_bars: 0)
+             check trivially passes (all 9 tick-derived indicators
+             currently ship precalculate_bars: 0)
          fallback_rate > 0.20 → WARN + proceed (self-healing case, but batch
              likely failed — alert operator)
 
@@ -597,6 +678,36 @@ watchdog service just flagged," not "all actively-tracked tickers" —
 this is why bar/tick fetching below (Step 2) only concerns itself with
 that ticker being flagged again, not with continuously polling every
 ticker in the watchlist.
+
+**Loop termination (R-9).** This loop runs only while entries are
+structurally possible. At the top of every cycle, before Step 1:
+```
+if now >= config["execution"]["session_close_exit_time"]:
+    break        # exit the loop; the process itself lives on until
+                 # Session Shutdown's exit trigger fires
+```
+Breaking between cycles rather than mid-cycle means no partial fetch or
+half-applied `on_bar_close()` replay. Past that time no entry can be
+submitted anyway (after-market bars are excluded from entry detection in
+every mode, and `max_entry_hour` has long since cut off), so nothing is
+lost — but the loop is stopped explicitly rather than left polling an
+external service whose after-hours behaviour is not part of this system's
+contract and whose responses would be exercising the candidate path for no
+possible benefit. Close-out continues on the Position Manager Loop, which
+is independent of this one and does its own bar/tick fetching.
+
+A warm restart that lands after `session_close_exit_time` still starts this
+loop (Session Lifecycle Step 8) and it self-terminates on its first cycle
+through the same guard — no separate branch is needed.
+
+Two accepted consequences: Bar-Close Authority and its Bar-Arrival Latency
+sampling (finding 26) stop collecting at `session_close_exit_time`, and
+watchdog-triggered Feed Outage Recovery stops evaluating there too. The
+first is fine because the day's curve is finalised by the final
+`bar_latency_daily` flush in Session Shutdown; the second because close-out
+runs off wall-clock triggers and the WS/REST tick stream, not the bar
+channel Feed Outage Recovery protects, and every remaining position is
+already exiting.
 
 ```
 loop every poll_interval_seconds:
@@ -1145,8 +1256,9 @@ view (open orders + open positions) against `live_positions` rows.
     "Pending limit-entry tracking," R-2) — the same idempotent path an
     ordinary cancel-after-timeout uses, so re-running this step (e.g. a
     re-crash mid-recovery) is safe and cannot double-log.
-  - A broker order with no matching pending row → "unknown broker order"
-    health_report finding.
+  - A broker order with no matching pending row → record_health_event(
+    finding_name='unknown_broker_order_or_position', detail={call_site,
+    kind: 'order', order_id, ticker}) — see health_report.md finding 12.
 
 **Positions** (broker open positions):
   - Match to `live_positions` rows (`status` `'open'`|`'halted'`).
@@ -1157,6 +1269,9 @@ view (open orders + open positions) against `live_positions` rows.
     or adopt exit-only (Warm Restart, per R-2).
   - Broker position with NO matching row → adopt conservatively; entry
     time is unknown, so treat as overnight (immediate liquidation, below).
+    Also record_health_event(finding_name=
+    'unknown_broker_order_or_position', detail={call_site, kind:
+    'position', order_id: NULL, ticker}).
   - `live_positions` row `status='open'` with NO broker position →
     **reconcile_ghost**: transition the row to `'closed'`, trade_log
     `exit_reason='reconcile_ghost'`, `quantity=0`, PnL-excluded — there was
@@ -1166,6 +1281,17 @@ view (open orders + open positions) against `live_positions` rows.
 **Cold-start note:** at cold start nothing has opened today, so ANY broker
 position found is by definition an overnight orphan — it always routes to
 the Unified Overnight Policy below.
+
+**Health-event writes (R-9).** Both branches above call
+`utils.record_health_event()` with `write_fn=db_write` — never a raw
+`db_conn`, which would bypass `write_lock` (see utils.md). `call_site` is
+one of `'session_start'` | `'warm_restart'` | `'feed_outage'`, so one
+implementation serving three call sites stays distinguishable in the
+table. Because this procedure is idempotent and re-runnable after a
+mid-recovery re-crash, a repeat run legitimately re-records the same
+condition; the events are timestamped occurrences, not a deduplicated set.
+Per db_schema.md's standing rule, a failure of either write is swallowed
+and must not abort the reconcile.
 
 ## Unified Overnight Policy — R-3
 
@@ -1505,8 +1631,7 @@ as `get_execution_param()`'s hard bounds.
 
 Monitors open positions independently of the watchdog loop. A single
 shared loop serves all open positions on one global timing grid (not a
-per-position independent timer) — see open_items_production_readiness.md's
-former P-10 discussion for why a shared clock beats per-position phase
+per-position independent timer) — a shared clock beats per-position phase
 alignment on every axis measured (compute batching, backtest reproducibility,
 debuggability), with no compensating benefit found for per-position timing.
 
@@ -1586,7 +1711,14 @@ makes every `position_check_interval_seconds` cycle for every order in
 reflects for that order_id, sustained across more than one consecutive
 cycle, that is evidence the WS account fill stream has gone quiet while
 REST keeps working — surfaced as `health_report.md` finding 24, warn
-severity. Deliberately NOT a `freeze_reasons` trigger and NOT related to
+severity. Recorded via `record_health_event(finding_name=
+'fill_stream_staleness', detail={order_id, entered_at, sustained_cycles})`
+with `write_fn=db_write` (R-9), ONCE PER STALE EPISODE: written on entry
+into the stale state and armed again once the state clears, so a second
+episode on the same order IS recorded. This deliberately differs from
+finding 18's once-per-order rule — an order with several fills can go
+stale, recover, and go stale again, and that recurrence is precisely the
+signal. Deliberately NOT a `freeze_reasons` trigger and NOT related to
 Bar-Close Authority above: those judge the separate bar/price-data
 channel, while this is scoped entirely to the account-wide fill-event
 stream, and correctness here is already unaffected regardless — the same
@@ -1637,10 +1769,16 @@ loop every position_check_interval_seconds (config, default: 5s):
             exit_date/exit_bar of the final fill
         remove from in_flight_orders
     else:
-        stay 'exiting' — NO give-up timeout. An entry may abandon its
-        unfilled remainder and settle for a smaller position, but an
-        unsold remainder is still exposed to the very risk that triggered
-        the exit, so the order stays tracked until fully filled.
+        stay 'exiting' — NO give-up timeout WITHIN the session. An entry may
+        abandon its unfilled remainder and settle for a smaller position, but
+        an unsold remainder is still exposed to the very risk that triggered
+        the exit, so the order stays tracked for as long as the session runs.
+        # The one bound is the process itself (R-9): at
+        # live_mode.session_hard_exit_time the order is canceled and the
+        # position is handed to the next session's Broker Reconcile under
+        # the Unified Overnight Policy — see Session Shutdown. That is a
+        # process-level cap, not a per-order give-up: nothing here abandons
+        # an unfilled remainder while the session is still running.
         # Observability, not policy: an exit order open beyond a
         # configured age is surfaced as a health_report finding (18).
         # Forced liquidation / re-submission was deliberately deferred
@@ -1652,6 +1790,18 @@ loop every position_check_interval_seconds (config, default: 5s):
                                                           # a resubmission below
                                                           # must not reset this
         if stuck_age >= config["live_mode"]["exit_order_stuck_minutes"]:
+            if this order_id has not already been recorded as stuck:
+                record_health_event(finding_name='exit_order_stuck',
+                    detail={order_id, age_seconds, cum_filled_qty,
+                    quantity}) via write_fn=db_write
+                # R-9 — ONCE per order_id, on the FIRST crossing. This
+                # loop re-satisfies the condition every
+                # position_check_interval_seconds, so an unconditional
+                # write would emit hundreds of rows for one stuck order.
+                # health_report.md finding 18 pairs this event count with
+                # its existing point-in-time snapshot of orders still
+                # outstanding at report time — the event answers "how
+                # often", the snapshot "what is open right now".
             if this order_id's own type != "market":
                 cancel this order_id; submit a new market order for the
                     remaining (position.quantity - cum_filled_qty) shares;
@@ -1794,14 +1944,21 @@ loop every position_check_interval_seconds (config, default: 5s):
             # R-3: if now >= config["execution"]["session_close_exit_time"]
             # (i.e. this position is skipping session_end specifically
             # because it cannot trade, not merely skipping an ordinary
-            # mid-session iteration), log explicitly and write a
-            # health_report finding ("position held overnight: halted
-            # through close") — the live_positions row stays
+            # mid-session iteration), log explicitly and
+            # record_health_event(finding_name='overnight_halt_carry',
+            # detail={ticker, position identifier}) via write_fn=db_write
+            # (R-9 — see health_report.md finding 14) — the live_positions
+            # row stays
             # status='halted' and is picked up by the next session's
             # Broker Reconcile under the Unified Overnight Policy (see
             # "Broker Reconcile (shared procedure)" below). The silent
             # skip becomes an owned, visible handoff instead of quietly
             # carrying a position no health check would otherwise surface.
+            # Recorded once per position at the carry, not once per
+            # iteration: the condition stays true on every subsequent
+            # cycle. The same position is counted again by finding 15 when
+            # it is liquidated next session — two moments of one carry,
+            # deliberately not merged.
         else:
             position.status = 'active' (clears automatically once either
             signal recovers — no separate resumption-detection logic needed)
@@ -1864,7 +2021,12 @@ loop every position_check_interval_seconds (config, default: 5s):
                     # a resubmission, not a new exit; exit_order_stuck_minutes
                     # keeps counting from the original clock (see In-flight
                     # order tracking's exit-side loop)
-                    health_report.md finding 25 += 1
+                    record_health_event(finding_name=
+                        'inflight_exit_gone_at_halt_clear',
+                        detail={ticker, order_id}) via write_fn=db_write
+                    # R-9 — see health_report.md finding 25. A failure of
+                    # this write is swallowed and must not break the
+                    # halt-clear resubmission above.
                 # else: order still exists (survived the halt, or already
                 # filled/partially filled through the resumption cross) —
                 # no action; the ordinary fill-tracking pass on this same
@@ -1989,6 +2151,16 @@ live_mode:
                                              # Probes for why this is not 1.0
   exit_order_stuck_minutes:       10         # health_report finding 18's age
                                              # threshold
+  session_hard_exit_time:         "20:00"    # R-9: process hard cap — see
+                                             # "Session Shutdown". Wall-clock
+                                             # America/New_York. Matches the
+                                             # after-market ingestion boundary
+                                             # (200000) and is the value
+                                             # health_report.md's
+                                             # drain_timeout_seconds was sized
+                                             # against. Ordinary exit is
+                                             # earlier: all-flat past
+                                             # execution.session_close_exit_time.
   min_watchlist_size:             30         # seed value — Feed Outage
                                              # trigger condition 2's sample-
                                              # size floor (see "Feed Outage

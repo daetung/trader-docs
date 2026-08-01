@@ -134,6 +134,7 @@ Standalone scripts:
 | `inferencer/inferencer.md` | Live inference service object — _prepare_bars, infer/infer_batch, inference_log |
 | `inferencer/live_mode_runner.md` | Live mode execution orchestrator — watchdog loop, position manager loop, session lifecycle |
 | `inferencer/caching_calculator.md` | CachingIndicatorCalculator — Layer 1/2 cache, fibonacci deque, sr_levels per-entry-point |
+| `tools/init_db.md` | Schema bootstrap CLI — creates every table from db_schema.md's canonical DDL; `--verify` reports schema drift read-only. Sole DDL-issuing component; prerequisite for migration_tool |
 | `tools/migration_tool.md` | JSON → DuckDB migration, trading_calendar/coverage init, precomputed_session_stats population |
 | `tools/detection_benchmark.md` | Entry detection threshold tuning + timing benchmark |
 | `tools/metadata_crawler.md` | Daily metadata fetch, new data ingestion, session stats daily update |
@@ -189,6 +190,7 @@ stock-scalping/
 │   │   ├── live_mode_runner.md
 │   │   └── caching_calculator.md
 │   ├── tools/
+│   │   ├── init_db.md
 │   │   ├── migration_tool.md
 │   │   ├── detection_benchmark.md
 │   │   ├── metadata_crawler.md
@@ -236,6 +238,7 @@ stock-scalping/
 │   ├── run_train.py
 │   └── run_backtest.py
 ├── tools/
+│   ├── init_db.py
 │   ├── migrate_json_to_duckdb.py
 │   ├── collect_daily.py
 │   └── detection_benchmark.py

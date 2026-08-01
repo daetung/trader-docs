@@ -65,9 +65,55 @@ Field mapping (applies to both 1min and 10tick):
 
 ## Table Definitions
 
+**Implementation contract (R-9).** The `sql` fence below is the CANONICAL
+DDL REGION — the single source of truth for the schema, and the only part
+of this document that becomes executable code. `tools/init_db.py` (see
+init_db.md) is its sole consumer; no other component in the system issues
+DDL. Any `sql` fence elsewhere in this document is illustrative and is NOT
+an init target.
+
+Transcription into `init_db.py`'s `SCHEMA_STATEMENTS` is mechanical, so
+that implementing it requires no judgement: copy each statement verbatim,
+drop `--` comments, preserve document order, split per statement. Never
+rewrite, reorder, or normalise anything on the way through. Because the
+transcription strips `--` to end of line, no string literal in this region
+may contain `--`.
+
+Statements are written `CREATE TABLE IF NOT EXISTS` rather than leaving
+idempotency for the transcription to decide: re-running init against an
+existing database is a per-table no-op.
+
+What init does NOT do is alter a table that already exists. If this
+document later changes a column or a key, init is silent about it — the
+change is applied deliberately by the operator, not discovered at runtime.
+`init_db.py --verify` exists to make that silence visible: it reports drift
+read-only and alters nothing.
+
+**Retention.** Every table below carries a `-- Retention:` line in one of
+three states — structurally excluded (the purge code holds no reference to
+the table and cannot reach it), session-scoped (owns its purge, already
+implemented), or purge-registry member (listed in metadata_crawler.md's
+evening purge stage, every one initialised to `retention_days: inf`, so
+nothing is deleted until an operator sets a real window against observed
+growth).
+
+Structural exclusion is reserved for data whose loss would be
+UNRECOVERABLE AND MATERIALLY HARMFUL — the training corpus, the P&L record,
+historical facts that cannot be re-derived, and training-reproducibility
+artifacts. It exists so that no misconfiguration can reach them, which is
+why it is a structural property rather than an infinite default. Diagnostic
+and operational tables do NOT qualify: losing diagnostics costs visibility,
+not correctness, and it is recoverable in the sense that the system keeps
+working. They are registry members at `inf` instead — identical behaviour
+today, but the door stays open once growth has actually been measured.
+Where a window would cost something specific, that table's own comment says
+so.
+
 ```sql
 -- 1-minute OHLCV bars (all sessions: pre-market, regular, after-market)
-CREATE TABLE ohlcv_1min (
+-- Retention: NEVER purged — structurally excluded from the purge registry
+--   (training corpus).
+CREATE TABLE IF NOT EXISTS ohlcv_1min (
     ticker   VARCHAR      NOT NULL,
     date     VARCHAR      NOT NULL,  -- 'YYYYMMDD'
     hour     VARCHAR      NOT NULL,  -- 'HHMMSS', bar open time
@@ -82,7 +128,9 @@ CREATE TABLE ohlcv_1min (
 -- 10-tick data (all sessions: pre-market, regular, after-market)
 -- hour: HHMMSS representing the LAST tick timestamp of each 10-tick bundle (second precision)
 -- seq_id: sequential counter assigned per (ticker, date, hour) at ingestion time
-CREATE TABLE tick_10 (
+-- Retention: NEVER purged — structurally excluded from the purge registry
+--   (training corpus).
+CREATE TABLE IF NOT EXISTS tick_10 (
     ticker   VARCHAR      NOT NULL,
     date     VARCHAR      NOT NULL,
     hour     VARCHAR      NOT NULL,  -- 'HHMMSS', last tick of bundle (second precision)
@@ -112,7 +160,9 @@ CREATE TABLE tick_10 (
 -- (same one used for bars) so gaps surface as explicit NaN, never a silently
 -- shortened window (see 02_indicator_calculator.md Tick-Derived Indicator
 -- Scale Sensitivity).
-CREATE TABLE tick_bar_aggregates (
+-- Retention: NEVER purged — structurally excluded from the purge registry
+--   (permanent historical store).
+CREATE TABLE IF NOT EXISTS tick_bar_aggregates (
     ticker      VARCHAR NOT NULL,
     date        VARCHAR NOT NULL,
     hour        VARCHAR NOT NULL,   -- bar open time, 'HHMMSS'
@@ -144,7 +194,9 @@ CREATE TABLE tick_bar_aggregates (
 -- Neither source's spread is stored — ask_price_1 - bid_price_1, computed
 -- at query time, same convention as OHLCV storing O/H/L/C rather than a
 -- derived range.
-CREATE TABLE bid_ask_snapshots (
+-- Retention: purge-registry member — date_column `date`, retention_days: inf
+--   (see metadata_crawler.md's evening purge stage).
+CREATE TABLE IF NOT EXISTS bid_ask_snapshots (
     ticker          VARCHAR NOT NULL,
     date            VARCHAR NOT NULL,   -- 'YYYYMMDD'
     hour            VARCHAR NOT NULL,   -- 'HHMMSS' — same type as tick_10 /
@@ -184,7 +236,9 @@ CREATE TABLE bid_ask_snapshots (
 --     available snapshot regardless of entry date (accepted approximation)
 -- FeatureExtractor's MetaFeatures and EntryPointDetector's filter E (condition E)
 -- share this same fallback utility rather than each implementing their own.
-CREATE TABLE stock_meta (
+-- Retention: NEVER purged — structurally excluded from the purge registry
+--   (per-date snapshots; estimate_historical_meta() reads them back).
+CREATE TABLE IF NOT EXISTS stock_meta (
     ticker             VARCHAR   NOT NULL,
     date               VARCHAR   NOT NULL,   -- 'YYYYMMDD', date actually crawled
     sector             VARCHAR,
@@ -219,7 +273,9 @@ CREATE TABLE stock_meta (
 -- non-'corporate_event_anomaly' reasons without another schema change —
 -- rename_pending stays BOOLEAN since the rename case has exactly one
 -- reason by construction (there is no second way to become rename-pending).
-CREATE TABLE ticker_cik_map (
+-- Retention: NEVER purged — structurally excluded from the purge registry
+--   (reference data).
+CREATE TABLE IF NOT EXISTS ticker_cik_map (
     cik               VARCHAR NOT NULL,
     ticker            VARCHAR NOT NULL,
     first_seen_date   VARCHAR NOT NULL,   -- 'YYYYMMDD', first observed
@@ -251,7 +307,9 @@ CREATE TABLE ticker_cik_map (
 -- `metric` values register without a schema change). Sourced via
 -- ticker_cik_map. Point-in-time correctness depends on `filed_date`, not
 -- `fiscal_period_end` — see data_boundary.md.
-CREATE TABLE fundamentals_quarterly (
+-- Retention: NEVER purged — structurally excluded from the purge registry
+--   (historical fact, not reconstructable).
+CREATE TABLE IF NOT EXISTS fundamentals_quarterly (
     ticker            VARCHAR NOT NULL,
     cik               VARCHAR NOT NULL,
     fiscal_period_end VARCHAR NOT NULL,   -- 'YYYYMMDD', reporting period end
@@ -284,7 +342,9 @@ CREATE TABLE fundamentals_quarterly (
 -- --register-rename / --list-rename-candidates).
 -- Used by utils.get_ticker_history() / load_ohlcv_with_history() to stitch
 -- pre-rename bars into a continuous series addressed under the current symbol.
-CREATE TABLE ticker_history (
+-- Retention: NEVER purged — structurally excluded from the purge registry
+--   (historical fact, not reconstructable).
+CREATE TABLE IF NOT EXISTS ticker_history (
     current_ticker  VARCHAR NOT NULL,   -- current (post-rename) symbol
     previous_ticker VARCHAR NOT NULL,   -- prior symbol
     effective_date  VARCHAR NOT NULL,   -- 'YYYYMMDD', first date current_ticker is used
@@ -293,7 +353,9 @@ CREATE TABLE ticker_history (
 );
 
 -- Trading halts (crawled from NYSE, refreshed daily)
-CREATE TABLE trading_halts (
+-- Retention: NEVER purged — structurally excluded from the purge registry
+--   (historical fact, not reconstructable).
+CREATE TABLE IF NOT EXISTS trading_halts (
     ticker        VARCHAR   NOT NULL,
     date          VARCHAR   NOT NULL,   -- 'YYYYMMDD'
     halt_start    VARCHAR   NOT NULL,   -- 'HHMMSS'
@@ -303,13 +365,17 @@ CREATE TABLE trading_halts (
 );
 
 -- US market holidays (NYSE calendar)
-CREATE TABLE us_holidays (
+-- Retention: NEVER purged — structurally excluded from the purge registry
+--   (reference data).
+CREATE TABLE IF NOT EXISTS us_holidays (
     date          VARCHAR   PRIMARY KEY,  -- 'YYYYMMDD'
     holiday_name  VARCHAR
 );
 
 -- Trading calendar — all dates with trading day status and data availability
-CREATE TABLE trading_calendar (
+-- Retention: NEVER purged — structurally excluded from the purge registry
+--   (reference data).
+CREATE TABLE IF NOT EXISTS trading_calendar (
     date            VARCHAR   PRIMARY KEY,  -- 'YYYYMMDD'
     is_trading_day  BOOLEAN   NOT NULL,
     is_holiday      BOOLEAN   NOT NULL,
@@ -318,7 +384,9 @@ CREATE TABLE trading_calendar (
 );
 
 -- Ticker-level data coverage per date
-CREATE TABLE ticker_data_coverage (
+-- Retention: NEVER purged — structurally excluded from the purge registry
+--   (coverage index over the corpus).
+CREATE TABLE IF NOT EXISTS ticker_data_coverage (
     ticker      VARCHAR   NOT NULL,
     date        VARCHAR   NOT NULL,
     has_1min    BOOLEAN   NOT NULL,
@@ -334,7 +402,9 @@ CREATE TABLE ticker_data_coverage (
 --     stage's completion marker gates LiveModeRunner's session start, and
 --     LiveModeRunner's own 'live_session_end' row gates the evening stage's
 --     start — see live_mode_runner.md and metadata_crawler.md.
-CREATE TABLE batch_runs (
+-- Retention: purge-registry member — date_column `date`, retention_days: inf
+--   (see metadata_crawler.md's evening purge stage).
+CREATE TABLE IF NOT EXISTS batch_runs (
     stage        VARCHAR   NOT NULL,  -- 'premarket_rename' |
                                       -- 'premarket_trading_api_symbol_map' |
                                       -- 'premarket_corporate_events' |
@@ -364,7 +434,9 @@ CREATE TABLE batch_runs (
 -- first row lands here for a given param_name; BacktestEngine and
 -- LiveModeRunner both read the latest row per param_name at session start
 -- in preference to the config seed — this table is never written by hand.
-CREATE TABLE execution_params (
+-- Retention: NEVER purged — structurally excluded from the purge registry
+--   (fitted-parameter history).
+CREATE TABLE IF NOT EXISTS execution_params (
     param_name   VARCHAR   NOT NULL,  -- 'buy_rate' | 'sell_rate_tp' | 'sell_rate_sl' |
                                       -- 'cancel_after_seconds'
     value        DOUBLE    NOT NULL,
@@ -393,7 +465,9 @@ CREATE TABLE execution_params (
 -- entry-date-direct correction of tick-derived indicator series, and by
 -- gap_percentile() / dead-position pnl (labeler.md, backtest_engine.md) for
 -- scalar dividend/split adjustment across overnight boundaries.
-CREATE TABLE corporate_events (
+-- Retention: NEVER purged — structurally excluded from the purge registry
+--   (historical fact, not reconstructable).
+CREATE TABLE IF NOT EXISTS corporate_events (
     ticker      VARCHAR NOT NULL,
     event_date  VARCHAR NOT NULL,   -- 'YYYYMMDD' (effective date, before market open)
     event_type  VARCHAR NOT NULL,   -- 'split' | 'reverse_split' | 'dividend'
@@ -437,7 +511,9 @@ CREATE TABLE corporate_events (
 -- disagreed about this split/dividend" is a recoverable fact rather than
 -- something a blind overwrite silently discarded. Surfaced by
 -- health_report.md.
-CREATE TABLE corporate_event_conflicts (
+-- Retention: NEVER purged — structurally excluded from the purge registry
+--   (historical fact, not reconstructable).
+CREATE TABLE IF NOT EXISTS corporate_event_conflicts (
     ticker        VARCHAR   NOT NULL,
     event_date    VARCHAR   NOT NULL,   -- 'YYYYMMDD'
     event_type    VARCHAR   NOT NULL,   -- 'split' | 'reverse_split' | 'dividend'
@@ -451,7 +527,9 @@ CREATE TABLE corporate_event_conflicts (
 
 -- Entry points (output of EntryPointDetector)
 -- Written by Preprocessor (training) and Inferencer (live) via INSERT OR IGNORE
-CREATE TABLE entry_points (
+-- Retention: NEVER purged — structurally excluded from the purge registry
+--   (training reproducibility).
+CREATE TABLE IF NOT EXISTS entry_points (
     ticker      VARCHAR      NOT NULL,
     date        VARCHAR      NOT NULL,
     hour        VARCHAR      NOT NULL,  -- t bar open time
@@ -471,7 +549,9 @@ CREATE TABLE entry_points (
 --               10-tick bundle during Stage 1 of track_label_breach().
 --               Label is still assigned (via ambiguity_priority rule).
 --               ClassBalancer can exclude these from train; Trainer can down-weight them.
-CREATE TABLE labeled_samples (
+-- Retention: NEVER purged — structurally excluded from the purge registry
+--   (training reproducibility).
+CREATE TABLE IF NOT EXISTS labeled_samples (
     ticker              VARCHAR      NOT NULL,
     date                VARCHAR      NOT NULL,
     hour                VARCHAR      NOT NULL,
@@ -503,7 +583,9 @@ CREATE TABLE labeled_samples (
 -- is_pruned:      TRUE if this row is the last round of a Successive Halving pruned trial
 -- feature_config: JSON of active hyperparameter config (optimizer trials) or
 --                 full config snapshot (standalone). Never NULL.
-CREATE TABLE train_log (
+-- Retention: purge-registry member — date_column `run_at`, retention_days: inf
+--   (see metadata_crawler.md's evening purge stage).
+CREATE TABLE IF NOT EXISTS train_log (
     run_id              VARCHAR      NOT NULL,
     optimizer_run_id    VARCHAR,
     run_at              VARCHAR      NOT NULL,
@@ -540,7 +622,11 @@ CREATE TABLE train_log (
 --   Optimizer context: derived from fold_meta["fold_test_start/end"].
 --   Standalone mode:   derived from test_df["date"].min() and .max() (never NULL).
 -- suppressed_count: entries blocked by suppress_threshold during backtest.
-CREATE TABLE experiment_log (
+-- Retention: purge-registry member — date_column `run_at`, retention_days: inf
+--   (see metadata_crawler.md's evening purge stage). fold_test_start/end are
+--   the DATA window, never the run time — using them here would delete rows
+--   the moment an old period is backtested.
+CREATE TABLE IF NOT EXISTS experiment_log (
     run_id               VARCHAR      NOT NULL,
     optimizer_run_id     VARCHAR,
     run_at               VARCHAR      NOT NULL,
@@ -637,7 +723,9 @@ CREATE TABLE experiment_log (
 -- Trade log (output of BacktestEngine — one row per executed trade;
 -- also written by LiveModeRunner in shadow mode — see is_shadow below and
 -- live_mode_runner.md's Shadow Mode section)
-CREATE TABLE trade_log (
+-- Retention: NEVER purged — structurally excluded from the purge registry
+--   (the P&L record).
+CREATE TABLE IF NOT EXISTS trade_log (
     run_id                  VARCHAR      NOT NULL,
     ticker                  VARCHAR      NOT NULL,
     date                    VARCHAR      NOT NULL,
@@ -802,7 +890,9 @@ CREATE TABLE trade_log (
 );
 
 -- Inference log (live mode inference events and preload failures)
-CREATE TABLE inference_log (
+-- Retention: purge-registry member — date_column `date`, retention_days: inf
+--   (see metadata_crawler.md's evening purge stage).
+CREATE TABLE IF NOT EXISTS inference_log (
     logged_at     VARCHAR  NOT NULL,   -- 'YYYYMMDD_HHMMSS_ffffff' (R-8) — microsecond
                                        -- suffix. This is a FORMAT change on a VARCHAR,
                                        -- not a TIMESTAMP precision change; fixed-width
@@ -964,7 +1054,9 @@ CREATE TABLE inference_log (
 -- as_of_date=D: baselines computed from sessions [D-1, D-2, ..., D-N], intended for use on D.
 --              Inserted by collect_daily.py the evening before D (after market close D-1).
 --              LiveModeRunner queries WHERE as_of_date = today at session_start.
-CREATE TABLE precomputed_session_stats (
+-- Retention: NEVER purged — structurally excluded from the purge registry
+--   (historical baselines).
+CREATE TABLE IF NOT EXISTS precomputed_session_stats (
     ticker      VARCHAR  NOT NULL,
     as_of_date  VARCHAR  NOT NULL,   -- 'YYYYMMDD': baseline for this trading date
     hour        VARCHAR  NOT NULL,   -- 'HHMMSS': time slot; '000000' for day-level metrics
@@ -1010,7 +1102,12 @@ CREATE TABLE precomputed_session_stats (
 -- Loaded per-ticker on first watchdog event via load_from_db() ("db" mode),
 -- or by a warm restart (any mode — R-2, see live_mode_runner.md).
 -- session_stats are NOT stored here — sourced from precomputed_session_stats separately.
-CREATE TABLE indicator_cache (
+-- Retention: session-scoped, its own mechanism — NOT in the purge registry.
+-- Current session_date only, purged per ticker inside persist_to_db() at COLD
+-- session_start. On a WARM RESTART (crash recovery, R-2 — see
+-- live_mode_runner.md) the purge is SKIPPED — today's backup must survive so a
+-- re-crash during recovery can re-restore from it.
+CREATE TABLE IF NOT EXISTS indicator_cache (
     session_date  VARCHAR  NOT NULL,   -- 'YYYYMMDD'
     ticker        VARCHAR  NOT NULL,
     layer         VARCHAR  NOT NULL,   -- 'layer1' | 'layer2'
@@ -1018,17 +1115,15 @@ CREATE TABLE indicator_cache (
     cache_data    BLOB     NOT NULL,   -- serialized numpy array / DataFrame (Arrow IPC or pickle)
     PRIMARY KEY (session_date, ticker, layer, indicator)
 );
--- Retention: current session_date only, purged at COLD session_start. On a
--- WARM RESTART (crash recovery, R-2 — see live_mode_runner.md) the purge
--- is SKIPPED — today's backup must survive so a re-crash during recovery
--- can re-restore from it.
 
 -- Real (non-shadow) position lifecycle, persisted so a mid-session crash
 -- is recoverable (R-2). The 'pending' row is written at ORDER SUBMISSION
 -- time (not fill), so a limit order pending across a crash is
 -- reconcilable by order_id, and the submission-vs-fill window is covered
 -- even for market orders.
-CREATE TABLE live_positions (
+-- Retention: purge-registry member — date_column `date`, retention_days: inf
+--   (see metadata_crawler.md's evening purge stage).
+CREATE TABLE IF NOT EXISTS live_positions (
     run_id       VARCHAR NOT NULL,
     ticker       VARCHAR NOT NULL,
     date         VARCHAR NOT NULL,   -- 'YYYYMMDD'
@@ -1088,7 +1183,9 @@ CREATE TABLE live_positions (
 --   in live mode, so no "t-bar ticks" field is needed here.
 
 -- One row per session date; preserves the sizing basis across a restart.
-CREATE TABLE live_session_state (
+-- Retention: purge-registry member — date_column `date`, retention_days: inf
+--   (see metadata_crawler.md's evening purge stage).
+CREATE TABLE IF NOT EXISTS live_session_state (
     date               VARCHAR NOT NULL,
     run_id             VARCHAR NOT NULL,
     session_start_cash DOUBLE  NOT NULL,
@@ -1116,6 +1213,53 @@ CREATE TABLE live_session_state (
                                           -- purpose (session_start_cash is
                                           -- restored from here, not
                                           -- re-queried).
+    session_diagnostics JSON,             -- R-9: crash-durable home for the
+                                          -- findings that used to be in-memory
+                                          -- tallies handed to health_report.py
+                                          -- at session end and lost outright if
+                                          -- the session crashed (5, 8, 21, 22).
+                                          -- ONE JSON column, not ~10 scalar
+                                          -- ones: finding 21 is a set of probe
+                                          -- measurements that grows as
+                                          -- api_contract_checklist.md rows are
+                                          -- filled in, and finding 8 is a
+                                          -- multi-valued numerator/denominator
+                                          -- (halt-check counts per
+                                          -- signal_source), neither of which is
+                                          -- a scalar. Not health_events either:
+                                          -- that table is scoped to individual
+                                          -- ABNORMAL events, while 21 records
+                                          -- SUCCESSFUL probes and 8 counts
+                                          -- mostly-normal checks — putting them
+                                          -- there would dissolve the
+                                          -- distinction it is built on.
+                                          -- Keys: clock_offset_start,
+                                          -- clock_offset_end, margin_ratio,
+                                          -- retention_boundary (each probe also
+                                          -- flagged 'disabled' | 'succeeded' |
+                                          -- 'fell_back', so "never ran" and
+                                          -- "ran and fell back" stay distinct —
+                                          -- the fallbacks are safe but they
+                                          -- silently change sizing and gap-fill
+                                          -- behaviour); the finding-5
+                                          -- tier-fallback summary; finding 8's
+                                          -- halt-check source counts; finding
+                                          -- 22's dropped-row count; and
+                                          -- restart_count.
+                                          -- clock_offset_end is written NULL at
+                                          -- session start rather than left
+                                          -- absent, so its absence at report
+                                          -- time reads as "never reached
+                                          -- shutdown" instead of as a missing
+                                          -- key.
+                                          -- Written ONLY by whole-value
+                                          -- replacement, never read-modify-
+                                          -- write — see live_mode_runner.md's
+                                          -- "session_diagnostics write
+                                          -- protocol" for the four write points
+                                          -- and the warm-restart rule
+                                          -- (probe values overwritten, counters
+                                          -- resumed).
     PRIMARY KEY (date)
 );
 
@@ -1134,15 +1278,21 @@ CREATE TABLE live_session_state (
 --       cannot live in memory at all.
 -- Same reasoning finding 19 gives for reading gate_result from its own column
 -- rather than being passed a tally.
--- Retention: NEVER purged. This table's whole value is its multi-month
--- accumulation; a retention window would delete the thing it exists to build.
+-- Retention: purge-registry member — date_column `date`, retention_days: inf
+-- (see metadata_crawler.md's evening purge stage). NOT structurally excluded:
+-- losing latency history is recoverable and harmless, unlike the corpus or the
+-- P&L record. But this table's value IS its multi-month accumulation, so any
+-- window an operator eventually sets must be LONGER than the recalibration
+-- horizon for bar_close_grace_seconds — a short one would delete the thing the
+-- table exists to build. Rows are ~2-3 per day, so there is little to gain by
+-- setting one at all.
 -- Sample admission and the meaning of `d` are defined in live_mode_runner.md's
 -- Bar-Close Authority, not here: d = now - (bar.hour + 60s), measured at the
 -- Step 2a fetch that FIRST returned that bar, and a sample is admitted only
 -- when its own error bound e = min(delta, d) is within
 -- live_mode.bar_latency_max_error_seconds (delta = age of the prior successful
 -- fetch for that ticker; absent on a first poll, where e = d).
-CREATE TABLE bar_latency_daily (
+CREATE TABLE IF NOT EXISTS bar_latency_daily (
     date          VARCHAR NOT NULL,   -- 'YYYYMMDD' — the trading day the WRITING
                                       --   PROCESS started on, fixed once at start
                                       --   and never re-evaluated (same rule
@@ -1236,13 +1386,23 @@ CREATE TABLE bar_latency_daily (
 -- WHY: a finding that reports "N occurrences today" loses WHEN they occurred,
 -- and the when is frequently the diagnosis. It also makes an alert traceable
 -- back to the specific events it reported (see alert_log.event_ids below).
--- Retention: NEVER purged, same reasoning as bar_latency_daily.
+-- Retention: purge-registry member — date_column `date`, retention_days: inf
+-- (see metadata_crawler.md's evening purge stage). Of the tables here this is
+-- the one whose growth rate can actually matter: R-9 widened its writers from
+-- one finding to six, and findings 18 and 24 both emit repeatedly during a
+-- broker-latency episode. Its purpose — WHEN an occurrence happened, and
+-- alert traceability via alert_log.event_ids — is short-horizon, so a window is
+-- legitimate here once growth has been observed. The DB health observation
+-- (health_report.md) reports its row count for exactly that purpose.
 -- SCOPE, deliberately wider than today's use: the schema accepts any
--- event-shaped finding, but as of this design only finding 27 writes here.
--- Converting the other event-shaped findings (12, 13, 14, 15, 18, 25) is
--- deferred to its own item — the table is defined at full width now because a
--- schema is cheap to define once and expensive to widen later.
-CREATE TABLE health_events (
+-- event-shaped finding. Findings 12, 14, 18, 24, 25 and 27 write here (R-9).
+-- Findings 13 and 15 deliberately do NOT: each already writes its own
+-- trade_log row (exit_reason='restart_gap_exit' / 'overnight_exit' /
+-- 'reconcile_ghost') carrying the occurrence and its time, so recording them
+-- here too would be a second source for one fact — the defect
+-- corporate_events' one-row invariant exists to prevent. The rule the split
+-- follows: an event belongs here when it leaves no row anywhere else.
+CREATE TABLE IF NOT EXISTS health_events (
     event_id     VARCHAR NOT NULL,   -- '{YYYYMMDD}_{HHMMSSmmm}_{4 random chars}',
                                      --   generated inside record_health_event()
                                      --   (see utils.md): time-sortable, and
@@ -1277,7 +1437,12 @@ CREATE TABLE health_events (
 -- reach the operator, and those are the cases a delivery log exists to account
 -- for. Counting them in aggregate is not enough — that records the fact but
 -- loses the content.
--- Retention: NEVER purged, same reasoning as the two tables above.
+-- Retention: purge-registry member — date_column `date`, retention_days: inf
+-- (see metadata_crawler.md's evening purge stage), same reasoning as the two
+-- tables above: delivery history is operational, not a record whose loss is
+-- unrecoverable. Note a window here also orphans older health_events.event_ids
+-- references, which is a reason to keep any window no shorter than
+-- health_events'.
 -- ONE EXCEPTION, structural: the evening job's hard-deadline abort
 -- (metadata_crawler.md's evening job start gate) cannot write here at all — it
 -- is aborting precisely BECAUSE it never acquired the DB lock, which a hung
@@ -1285,7 +1450,7 @@ CREATE TABLE health_events (
 -- choice. Deferring its row to whichever process next holds the lock was
 -- considered and rejected: a pending-alert-write queue is new infrastructure
 -- for the one case where a human is already reading the log.
-CREATE TABLE alert_log (
+CREATE TABLE IF NOT EXISTS alert_log (
     alert_id         VARCHAR NOT NULL,   -- same format and generator style as
                                          --   health_events.event_id. One id per
                                          --   ATTEMPT, so a report going to two

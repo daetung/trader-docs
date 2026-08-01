@@ -9,8 +9,16 @@
 
 One-time (and incremental) migration of existing JSON files into DuckDB.
 Supports both directory and zip formats. Skips already-imported data.
-After migration, initializes `trading_calendar`, `ticker_data_coverage`,
+After migration, populates `trading_calendar`, `ticker_data_coverage`,
 and `precomputed_session_stats` tables.
+
+**Prerequisite — the database and its tables must already exist.** This
+tool issues no DDL: its processing steps INSERT into tables and call the
+populate helpers, all of which assume those tables are present. Creating
+them is `tools/init_db.py`'s job (see `init_db.md`), so the new-database
+workflow is `init_db.py` first, then this tool. The two are peers with the
+same concurrency assumption below — neither imports the other, and this
+tool does not defensively re-create anything.
 
 **Concurrency assumption**: this tool is run manually/rarely, never on an
 automated schedule, and is assumed to never run concurrently with a live
@@ -360,6 +368,8 @@ Failed files are logged to `tools/migration_errors.log` with filename and except
 ## Constraints
 
 - Must be runnable independently from the pipeline (no src/ imports required, except utils.py)
+- Issues no DDL — `tools/init_db.py` (see `init_db.md`) must have created the
+  schema first; this tool only INSERTs and populates
 - Duplicate skip is at `(ticker, date)` granularity per table — entire file skipped if any row exists
 - Zip files: extract to tempdir, process, clean up — do not leave temp files
 - Time range filter: `hour >= '040000' AND hour <= '200000'` (no session filtering)

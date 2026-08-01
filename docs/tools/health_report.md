@@ -106,9 +106,12 @@ def gather_findings(db_conn, today_date, log_dir,
        A stage with a batch_runs 'success'/'failed' row but no matching
        SUMMARY line is flagged as a logging-mismatch finding on its own —
        distinct from the batch's own status.
-    5. tick_bar_aggregates Tier-2/3 fallback rate — read directly from
-       LiveModeRunner's Health Gate 2 result for the current session
-       (passed in, not recomputed here — see live_mode_runner.md).
+    5. tick_bar_aggregates Tier-2/3 fallback rate — LiveModeRunner's Health
+       Gate 2 result for the current session, not recomputed here (see
+       live_mode_runner.md). Read (R-9) from
+       live_session_state.session_diagnostics rather than passed in as an
+       in-memory tally, so a crashed session's value survives and the evening
+       liveness probe can recover it.
     6. Live winning-rate divergence vs. backtest — placeholder only;
        method not yet defined (see the shadow/retraining spec doc for the
        comparison methodology once shadow mode has run).
@@ -125,11 +128,13 @@ def gather_findings(db_conn, today_date, log_dir,
        (see live_mode_runner.md's Step 1a) tagged
        signal_source='tick_rate_fallback' vs. 'api'. Not recomputed here —
        LiveModeRunner tallies signal_source per check as the session runs
-       and passes the aggregate in at each of health_report.py's two daily
-       invocations, the same way Health Gate 2's tier_used tally already
-       reaches finding 5 (see live_mode_runner.md's Health Gate 2 — this is
-       the same pattern, a second aggregate threaded through the same
-       existing call). Unlike findings 6/7, this is NOT a placeholder — no
+       and persists the counts (R-9) to
+       live_session_state.session_diagnostics on the bar_latency_daily flush
+       cadence, the same place Health Gate 2's tier_used summary reaches
+       finding 5. Stored as counts per source rather than a precomputed
+       fraction — a multi-valued numerator/denominator is why
+       session_diagnostics is JSON and not a scalar column. Loss on a crash
+       is bounded by one flush interval instead of the whole session. Unlike findings 6/7, this is NOT a placeholder — no
        pilot-stage accumulation is needed, since the signal is tagged on
        every check from the day P-1's halt-status endpoint integration
        ships. A high fallback rate means the halt-status endpoint is
@@ -179,6 +184,22 @@ def gather_findings(db_conn, today_date, log_dir,
         outage). Should not occur under normal operation; a nonzero count
         points at a gap in the reconcile/adopt logic, not at strategy
         performance.
+        Source (R-9): aggregated from health_events where
+        finding_name='unknown_broker_order_or_position', not from a passed-in
+        tally. detail carries call_site ('session_start' | 'warm_restart' |
+        'feed_outage'), kind ('order' | 'position'), order_id and ticker, so
+        the three call sites stay distinguishable and each occurrence keeps
+        its own time.
+    Findings 13 and 15 stay on their existing `trade_log` queries rather than
+    moving to `health_events` with the other event-shaped findings (R-9).
+    Each already writes its own row — `exit_reason='restart_gap_exit'` /
+    `'overnight_exit'` / `'reconcile_ghost'` — carrying both the occurrence
+    and its time, and those rows already survive a crash and already reach the
+    operator through the ordinary report and the evening liveness probe.
+    Recording them in `health_events` as well would create a second source for
+    one fact, which is the defect `corporate_events`' one-row invariant exists
+    to prevent. The rule the split follows: an event belongs in `health_events`
+    when it leaves no row anywhere else.
     13. restart_gap_exit count (R-2) — positions liquidated on warm restart
         for a tp/sl breach detected retroactively within the crash gap, or
         liquidated immediately because the gap already exceeded
@@ -190,6 +211,12 @@ def gather_findings(db_conn, today_date, log_dir,
         were carried to the next session's Broker Reconcile. Surfaces what
         was previously a silent skip (see live_mode_runner.md's Position
         Manager Loop Step 1a).
+        Source (R-9): aggregated from health_events where
+        finding_name='overnight_halt_carry'; detail carries ticker and the
+        position identifier. Recorded once per position at the carry, not per
+        loop iteration. The same position is counted again by finding 15 when
+        it is liquidated next session — two moments of one carry, deliberately
+        not merged.
     15. Overnight position liquidated at session start (R-3) — count of
         `exit_reason='overnight_exit'` liquidations from the Unified
         Overnight Policy, this session. Includes the `reconcile_ghost`
@@ -243,6 +270,17 @@ def gather_findings(db_conn, today_date, log_dir,
         exposure duration, not whether an escalation attempt has occurred,
         so a row here may be pre- or post-escalation depending on whether
         the market order has filled by report time.
+        TWO TALLIES (R-9), reported together. (a) EVENT COUNT — how many
+        times the threshold was crossed this session, aggregated from
+        health_events where finding_name='exit_order_stuck'; detail carries
+        order_id, age_seconds and cum_filled_qty/quantity, and the event is
+        written ONCE per order_id on its first crossing (the 5s loop
+        re-satisfies the condition every cycle). (b) SNAPSHOT — the existing
+        point-in-time query above, listing what is still outstanding at report
+        time. The event answers "how often", the snapshot "what is open right
+        now"; an order that got stuck and then filled before the report exists
+        only in (a). Same shape as finding 15 carrying reconcile_ghost as a
+        distinct tally.
     19. Entries lost at the entry gates (R-5) — today's inference_log rows
         with event='signal_fired', grouped by gate_result: 'submitted' plus
         one bucket per gate ('freeze', 'cap_tickers', 'cap_per_ticker',
@@ -309,6 +347,22 @@ def gather_findings(db_conn, today_date, log_dir,
         fallbacks are safe but they silently change sizing and gap-fill
         behaviour. Each measurement also fills in its row in
         api_contract_checklist.md from ordinary operation.
+        Read (R-9) from live_session_state.session_diagnostics. The probe
+        values are written there immediately after the probes and BEFORE
+        Health Gate 2, because clock_check's on_exceed:"abort" terminates
+        ahead of Gate 2 and the measured offset is the only evidence for that
+        abort — the evening liveness probe recovers the crash FACT (finding
+        11) but never the measurements. clock_offset_end is stored null at
+        session start and filled at shutdown, so its absence reads as "never
+        reached shutdown" rather than as a missing key. A warm restart
+        overwrites the probe values with the newly measured ones and
+        increments restart_count: these are current operating settings, not a
+        session baseline. restart_count is reported alongside, and it
+        legitimately disagrees with findings 11 and 13 — all three observe
+        restart/crash from different angles (11 = a crash never cleanly
+        resumed, 13 = positions liquidated because of a restart,
+        restart_count = how many restarts occurred), so a restart with no open
+        positions gives restart_count > 0 with finding 13 at zero.
     22. inference_log rows dropped (R-8) — count of diagnostic log writes
         discarded by INSERT OR IGNORE on a PK collision, plus any suppressed
         by the write-failure guard. This is what makes INSERT OR IGNORE
@@ -316,6 +370,10 @@ def gather_findings(db_conn, today_date, log_dir,
         rows are being dropped is not. Nonzero after the R-8 key and
         timestamp changes indicates a real defect (duplicate logging, a clock
         moving backwards, a retry loop), not ordinary contention.
+        Read (R-9) from live_session_state.session_diagnostics, refreshed on
+        the bar_latency_daily flush cadence. A failure of that flush is
+        swallowed and does NOT increment this counter — otherwise a persistent
+        write fault would feed itself.
     23. Broker rejections without a recognised reason (R-8) — entry_rejected
         rows whose reject_reason has not been seen before. reject_reason is
         stored verbatim because the broker's vocabulary is an unverified
@@ -337,6 +395,13 @@ def gather_findings(db_conn, today_date, log_dir,
         Outage trigger — those judge the separate bar/price-data channel;
         this finding is scoped entirely to the account-wide fill-event
         stream and does not interact with `freeze_reasons`.
+        Source (R-9): aggregated from health_events where
+        finding_name='fill_stream_staleness'; detail carries order_id,
+        entered_at and sustained_cycles. Written ONCE PER STALE EPISODE — on
+        entry into the stale state, re-armed when it clears — so a second
+        episode on the same order IS counted. Deliberately unlike finding 18's
+        once-per-order rule: an order with several fills can go stale, recover
+        and go stale again, and that recurrence is the signal.
     25. In-flight exit order gone at halt-clear (R-2-style resumption
         handling) — count of times a ticker's halted→tradable transition
         (Position Manager Loop Step 1a) found an in-flight exit order for
@@ -351,6 +416,9 @@ def gather_findings(db_conn, today_date, log_dir,
         Self-measuring for api_contract_checklist.md's T-12: a nonzero
         count is direct evidence the broker does NOT always preserve a
         resting order through a halt.
+        Source (R-9): aggregated from health_events where
+        finding_name='inflight_exit_gone_at_halt_clear'; detail carries ticker
+        and order_id.
     26. Bar-arrival latency (`bar_arrival_latency`, T-13) — read from
         `bar_latency_daily` (db_schema.md), not passed in: same reasoning as
         finding 19, the values have a table of their own. Severity always
@@ -410,6 +478,40 @@ def gather_findings(db_conn, today_date, log_dir,
     """
     ...
 ```
+
+---
+
+## DB Health Observation (R-9)
+
+A read-only summary emitted once at each FIRST-DB-ACCESS point: live session
+start, evening batch start, and premarket batch start. It reports:
+
+- the `data/market.duckdb` file size
+- row counts for the ten purge-registry tables (see db_schema.md) and for
+  the structurally-excluded corpus tables
+- the latest `date` value present in each
+
+**This is not a finding and not a Health Gate.** It is not collected by
+`gather_findings()`, has no severity, no threshold, and no warn cutoff, and
+it never blocks a session start — adding a new failure point to the
+premarket path to report disk usage would be a poor trade. It is pure
+observation, logged and printed.
+
+Its purpose is to make the purge registry's `retention_days: inf` defaults
+resolvable. Every registry entry starts at `inf` precisely because no growth
+rate has ever been measured; this is what measures them, so an operator
+eventually sets a window against data instead of a guess. `health_events` is
+the entry most worth watching — R-9 widened its writers from one finding to
+six, and findings 18 and 24 both emit repeatedly during a broker-latency
+episode.
+
+**Delivered on its own alert stream**, `alert_key: 'db_health_observation'`,
+so it lands in `alert_log` like any other delivery and its remote arrival is
+verifiable by querying `alert_log.outcome` rather than by asking someone
+whether the mail showed up. Because suppression is per `(alert_key,
+channel)`, this stream can only ever displace itself — it cannot mask a
+session-start or breaker-trip alert, and those cannot mask it. It fires at
+most three times a day, so `rate_limited` is not expected to engage.
 
 ---
 
@@ -569,11 +671,14 @@ before draining would leave that invariant false for up to the drain timeout.
 Delaying them costs nothing: a crash leaves no marker at all, which is what
 crash detection keys on.
 
-Timing: the session process runs to ~20:00 ET and the evening batch starts at
-21:00, so a 600s drain leaves roughly 50 minutes' margin. That margin is why
-`drain_timeout_seconds` cannot simply be raised — and it is stated here
-because the LiveModeRunner process shutdown time it depends on is itself not
-yet specified (see open items).
+Timing: the session process runs to `live_mode.session_hard_exit_time`
+(default 20:00 ET — see live_mode_runner.md's Session Shutdown) and the
+evening batch starts at 21:00, so a 600s drain leaves roughly 50 minutes'
+margin. That margin is why `drain_timeout_seconds` cannot simply be raised.
+The two values are coupled: raising `session_hard_exit_time` eats the same
+margin as raising the drain, and the ordinary exit is earlier still (all
+positions flat past `execution.session_close_exit_time`), so the 50 minutes
+is a floor rather than the typical case.
 
 Steps 2-4 failing does NOT stop 5-6. Holding the DB open on an alerting
 failure would make the evening batch wait to its own deadline and abort,
@@ -639,29 +744,41 @@ across three files and drifted.
 
 | Path | `alert_key` | `findings_subset` | `suppressible` | DB | `log_dir` | `live_aggregates` |
 |---|---|---|---|---|---|---|
-| Scheduled, session start | `session_start` | None | False | yes | yes | yes |
-| Scheduled, session end | `session_end` | None | False | yes | yes | yes |
-| Breaker trip (R-4) | `breaker_trip` | None | False | yes | yes | yes |
-| `clock_check` abort (R-8) | `clock_check_abort` | None | False | yes | yes | partial |
-| Negative bar-latency sample | `bar_close_premise_violation` | finding 27 | True | yes | yes | no |
-| Evening liveness probe | `evening_liveness_probe` | DB-only findings | False | yes | yes | no |
-| Evening deadline abort | `evening_deadline_abort` | finding 28 | False | **no** | yes | no |
+| Scheduled, session start | `session_start` | None | False | yes | yes | — |
+| Scheduled, session end | `session_end` | None | False | yes | yes | — |
+| Breaker trip (R-4) | `breaker_trip` | None | False | yes | yes | — |
+| `clock_check` abort (R-8) | `clock_check_abort` | None | False | yes | yes | — |
+| Negative bar-latency sample | `bar_close_premise_violation` | finding 27 | True | yes | yes | — |
+| Evening liveness probe | `evening_liveness_probe` | DB-only findings | False | yes | yes | — |
+| Evening deadline abort | `evening_deadline_abort` | finding 28 | False | **no** | yes | — |
 
 `log_write_failed` is an eighth `alert_key` but not a path — it is injected
 into whichever delivery is in flight (see Log Writing) and is never
-suppressed.
+suppressed. `db_health_observation` (R-9) is a ninth: it is a delivery
+stream, not a findings-gathering path, so it appears in `alert_log` and in
+the suppression key space but has no row above — it passes no
+`findings_subset` because it collects no findings at all (see DB Health
+Observation).
 
 **Requirement axes — three, not two.** Beyond the DB and `live_aggregates`,
 `gather_findings()` also reads the crawler log FILES under `log_dir`, which
 is neither. All three axes had been invisible until now because every call
 gathered everything from inside a session, where all three were always
 present.
-- **`live_aggregates`**: findings 5, 8, 12, 21, 22, 24, 25. These have no
-  column anywhere, so they are unobtainable outside the owning session — and
-  they are lost outright if it crashes.
+- **`live_aggregates`**: EMPTY as of R-9 — no finding is computed this way
+  any more. Findings 5, 8, 21 and 22 now read
+  live_session_state.session_diagnostics, and 12, 24 and 25 now aggregate
+  health_events, so all seven moved to the DB axis and none is lost when a
+  session crashes. The axis and its column above are KEPT rather than
+  deleted: it is a real requirement a future finding could have, and
+  retaining it means the classification does not have to be rebuilt then.
+  Every path's entry is `—` for now, including `clock_check_abort`, whose
+  former `partial` described exactly the case R-9 removed — an abort before
+  Gate 2 now leaves its probe measurements in the DB rather than in memory.
 - **`log_dir` files**: findings 4, 10, and the missing-`SUMMARY` finding.
   Readable without the DB, which is why path (7) can produce anything at all.
-- **DB**: findings 1, 2, 3, 9, 13, 14, 15, 16, 17, 18, 19, 20, 23, 26, 27.
+- **DB**: findings 1, 2, 3, 5, 8, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+  22, 23, 24, 25, 26, 27.
 - **Neither**: findings 6, 7 (placeholders) and 28.
 - Finding 11 is produced BY the evening liveness probe rather than gathered
   during it — it is that path's own conclusion, not a query result.
@@ -672,9 +789,11 @@ happened and its findings were never alerted anywhere — and the next
 session-start call reads a different date. Sweeping every DB-computable
 finding recovers the ones that survived in tables (12's orphans are
 rediscovered by tomorrow's reconcile anyway, but 13, 17, 18 and 19 would
-simply never be seen). This is PARTIAL recovery, not full: the
-`live_aggregates` findings above are gone for good. Restoring those is its
-own open item.
+simply never be seen). As of R-9 this recovery is COMPLETE rather than
+partial: findings 5, 8, 12, 21, 22, 24 and 25 were the ones it could not
+reach, and all seven are now DB-computable, so a crashed session loses only
+what the flush cadence had not yet written — at most one flush interval of
+the running counters (findings 8 and 22).
 If `live_session_start` has no row for the date, the session never started —
 an ordinary non-trading outcome, not a crash — and the subset narrows to
 finding 1. Reporting the full sweep there would emit an all-zero report that
@@ -686,9 +805,24 @@ state for the evening batch, which matters because that batch can now cross
 midnight while waiting on the lock.
 
 **Errors, not silent skips.** An unknown name in `findings_subset`, a subset
-naming a `live_aggregates` finding with none supplied, or one naming a DB
-finding in a no-DB context, all raise. Skipping quietly would turn a typo
-into an empty alert that looks like good news.
+naming a DB finding in a no-DB context, or — should the axis ever regain a
+member — one naming a `live_aggregates` finding with none supplied, all
+raise. Skipping quietly would turn a typo into an empty alert that looks like
+good news.
+
+**Absent is not zero (R-9).** Findings 5, 8, 21 and 22 read
+`live_session_state.session_diagnostics`, and that table is LIVE-ONLY: no row
+exists for a date no live session ran, and none ever exists on the
+backtest side. Where the row is absent these four report NOT APPLICABLE —
+never an error, and never 0. Both alternatives are wrong in the same
+direction: raising would make an ordinary backtest invocation fail, and 0
+would assert a measurement that was never taken ("no halt checks fell back to
+the tick-rate heuristic" reads as healthy when in fact nothing was checked).
+Same boundary handling as `gate_result`'s five live-only values being
+excluded in backtest (see db_schema.md). This applies per finding, not per
+call: a live session that crashed before its first flush has a row with the
+counters absent, and those specific keys report not-applicable while the
+probe values in the same row report normally.
 
 ---
 

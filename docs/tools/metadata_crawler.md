@@ -563,6 +563,63 @@ ordering-sensitive session-stats step rather than before it. Writes
 
 ---
 
+## Retention Purge (R-9) — final evening stage
+
+The last stage of the evening run, after every other stage has completed.
+Driven by an explicit registry — a table absent from it is UNREACHABLE by
+this code, which is the whole point: structural exclusion rather than an
+infinite default means no misconfiguration can delete the training corpus or
+the P&L record (see db_schema.md's Retention note).
+
+```python
+# {table: (date_column, retention_days)} — the ONLY tables this stage can touch
+PURGE_REGISTRY = {
+    "inference_log":      ("date",   float("inf")),
+    "live_positions":     ("date",   float("inf")),
+    "live_session_state": ("date",   float("inf")),
+    "batch_runs":         ("date",   float("inf")),
+    "bid_ask_snapshots":  ("date",   float("inf")),
+    "bar_latency_daily":  ("date",   float("inf")),
+    "health_events":      ("date",   float("inf")),
+    "alert_log":          ("date",   float("inf")),
+    "train_log":          ("run_at", float("inf")),
+    "experiment_log":     ("run_at", float("inf")),
+}
+
+for table, (date_column, retention_days) in PURGE_REGISTRY.items():
+    if retention_days == float("inf"):
+        continue                      # nothing deleted; still counted below
+    cutoff = today_date - retention_days
+    db_write(f"DELETE FROM {table} WHERE {date_column} < ?", [cutoff])
+```
+
+**Every entry ships at `inf`, so this stage deletes nothing today.** That is
+deliberate, not a placeholder: no growth rate for these tables has ever been
+measured, so any window set now would be a guess, and deletion is not
+reversible. health_report.md's DB Health Observation is what measures them;
+an operator sets a real window once there is data to set it against. Writing
+the mechanism now rather than later means that change is a config edit, not a
+new stage built under disk pressure.
+
+`date_column` differs per table because the tables date themselves
+differently — `train_log` and `experiment_log` use `run_at` (execution time),
+NOT `fold_test_start`/`fold_test_end`, which are the DATA window: backtesting
+an old period writes a row whose data window is years old, and purging on
+that would delete a row the moment it was created.
+
+Runs inside the evening batch's existing writer connection — no separate
+connection and no new lock interaction — and writes its own `batch_runs`
+`stage='evening_retention_purge'` row (`'running'` at start,
+`'success'`/`'failed'` at completion). Logs one line per table
+(`"N tables scanned, 0 rows deleted"` while every window is `inf`), so the
+stage's own no-op is visible rather than silent.
+
+Placed last because it is the only destructive stage: everything that reads
+this evening's data has already run, and a failure here cannot cost the run's
+actual work.
+
+---
+
 ## Tick Bar Aggregates Update (Daily)
 
 Runs after ingestion and before Session Stats Update, populating
@@ -1083,6 +1140,14 @@ loop:
               missing — LiveModeRunner did not shut down cleanly"), and
               run the evening batch normally — ingestion / session-stats
               inputs are runner-independent, so the run is valid.
+              # R-9: the DB-only findings subset swept here now also
+              # recovers 5, 8, 12, 21, 22, 24 and 25. Those were the
+              # in-memory tallies this probe could never reach; findings
+              # 5/8/21/22 now live in
+              # live_session_state.session_diagnostics and 12/24/25 in
+              # health_events, so a crashed session's findings are
+              # recovered in full rather than in part — see
+              # health_report.md's Invocation Contract.
         if open FAILS (lock held):
             → runner still alive (or hung). Sleep and retry, BUT: if now >
               evening_wait_hard_deadline (config, default 23:30 ET): alert
@@ -1205,8 +1270,10 @@ quarantine:
   `stage='evening_ingestion'` (around Steps 3-4 above), `stage='evening_tick_bar_aggregates'`
   (Tick Bar Aggregates Update), `stage='evening_session_stats'` (Session Stats
   Update), and `stage='evening_investing_forward_check'` (Evening
-  Forward-Looking Corporate-Events Check, item N — last, after session
-  stats) — each `status='running'` at its own start, `'success'`/`'failed'`
+  Forward-Looking Corporate-Events Check, item N), then
+  `stage='evening_retention_purge'` (Retention Purge, R-9 — last, after
+  every other stage, being the only destructive one) — each
+  `status='running'` at its own start, `'success'`/`'failed'`
   at its own completion, independent of the others. Each also writes its own
   `SUMMARY` line to the run log (see Output / Logging), since
   `health_report.md` treats a missing `SUMMARY` for a stage that has a
