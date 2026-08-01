@@ -413,6 +413,7 @@ CREATE TABLE IF NOT EXISTS batch_runs (
                                       -- 'evening_ingestion' | 'evening_tick_bar_aggregates' |
                                       -- 'evening_session_stats' |
                                       -- 'evening_investing_forward_check' |
+                                      -- 'evening_retention_purge' |
                                       -- 'live_session_start' | 'live_session_end'
     date         VARCHAR   NOT NULL,  -- 'YYYYMMDD' — the trading day this batch targets
     status       VARCHAR   NOT NULL,  -- 'running' | 'success' | 'failed'
@@ -1462,7 +1463,16 @@ CREATE TABLE IF NOT EXISTS alert_log (
                                          --   'bar_close_premise_violation' |
                                          --   'evening_liveness_probe' |
                                          --   'evening_deadline_abort' |
-                                         --   'log_write_failed'.
+                                         --   'log_write_failed' |
+                                         --   'db_health_observation'.
+                                         --   The last two are NOT paths:
+                                         --   log_write_failed is injected into a
+                                         --   delivery already in flight, and
+                                         --   db_health_observation (R-9) is a
+                                         --   standalone delivery stream that
+                                         --   gathers no findings at all — see
+                                         --   health_report.md's Invocation
+                                         --   Contract, where neither has a row.
                                          --   Path-keyed rather than finding-keyed
                                          --   because an event-driven invocation
                                          --   delivers a REPORT, not one finding —

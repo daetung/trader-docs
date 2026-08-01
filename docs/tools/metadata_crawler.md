@@ -612,7 +612,11 @@ connection and no new lock interaction — and writes its own `batch_runs`
 `stage='evening_retention_purge'` row (`'running'` at start,
 `'success'`/`'failed'` at completion). Logs one line per table
 (`"N tables scanned, 0 rows deleted"` while every window is `inf`), so the
-stage's own no-op is visible rather than silent.
+stage's own no-op is visible rather than silent. That per-table line is IN
+ADDITION TO this stage's `SUMMARY` line, not a substitute for it — every
+stage writes one (see Output / Logging and Constraints), and omitting it
+here would make health_report.md's finding 4 report an abnormal termination
+every evening for a stage that ran perfectly.
 
 Placed last because it is the only destructive stage: everything that reads
 this evening's data has already run, and a failure here cannot cost the run's
@@ -1266,11 +1270,11 @@ quarantine:
   single evening run must not change; the premarket refresh is intentionally
   a separate, later, supplementary crawl that session_stats does NOT re-read
 - `populate_trading_calendar()`, `populate_ticker_coverage()`, and `populate_precomputed_session_stats()` sourced from `utils.py`
-- The evening run writes four `batch_runs` rows as it progresses —
+- The evening run writes five `batch_runs` rows as it progresses —
   `stage='evening_ingestion'` (around Steps 3-4 above), `stage='evening_tick_bar_aggregates'`
   (Tick Bar Aggregates Update), `stage='evening_session_stats'` (Session Stats
-  Update), and `stage='evening_investing_forward_check'` (Evening
-  Forward-Looking Corporate-Events Check, item N), then
+  Update), `stage='evening_investing_forward_check'` (Evening
+  Forward-Looking Corporate-Events Check, item N), and finally
   `stage='evening_retention_purge'` (Retention Purge, R-9 — last, after
   every other stage, being the only destructive one) — each
   `status='running'` at its own start, `'success'`/`'failed'`
