@@ -298,7 +298,7 @@ execution:
                                    # one-sided declaration of a value both
                                    # engines must agree on that R-6 fixed for
                                    # max_hold_bars.
-  ws_ticker_limit:           50    # R-7: tickers one WS sequence can carry.
+  ws_ticker_limit:           50    # R-7: tickers ONE WS CONNECTION can carry.
                                    # A VENDOR fact, not a preference — kept in
                                    # config rather than as a literal because
                                    # it varies by broker and is measured, not
@@ -388,15 +388,29 @@ execution:
                                     # margin_ratio_fallback choosing 4.0 over
                                     # 1.0 — see Session Start Probes). No
                                     # gap_type/gap_value counterpart: when
-                                    # "limit", the resting price is tracked
-                                    # against live bid/ask rather than a
-                                    # fixed offset from a reference price —
-                                    # see live_mode_runner.md's Exit
-                                    # Architecture. Either setting escalates
-                                    # to a market order at
-                                    # live_mode.exit_order_stuck_minutes as a
-                                    # final backstop, regardless of the
-                                    # initial type.
+                                    # "limit", the resting price is a SPREAD
+                                    # POSITION tracked against live bid/ask
+                                    # (see Exit Limit Pricing below) rather
+                                    # than a fixed offset from a reference
+                                    # price. Escalation past
+                                    # live_mode.exit_order_stuck_minutes is a
+                                    # market order INSIDE the regular session
+                                    # and a spread-position ladder outside it,
+                                    # since the venue refuses a market order
+                                    # outside regular hours (see Session Phase
+                                    # and Order Types below).
+  use_loo:                   false  # RESERVED, not implemented. A future
+                                    # premarket entry path submitting a
+                                    # limit-on-open order at the 09:19 bar
+                                    # (the vendor's cutoff is 10 minutes
+                                    # before the open). Premarket entry is
+                                    # not enabled in this phase, and the
+                                    # constraints are already known: 09:19
+                                    # precedes the 09:20 premarket recheck
+                                    # that gates quarantine, gap_pct does not
+                                    # exist until the 09:30 bar confirms, and
+                                    # an open-price fill has no
+                                    # simulate_entry_fill() counterpart.
   # Moved from 09_backtest_engine.md's former `backtest:` block — backtest
   # and live must not carry independently-configurable copies of values
   # that are supposed to be identical between them. `backtest:` retains
@@ -573,6 +587,72 @@ def simulate_entry_fill(
     """
     ...
 ```
+
+---
+
+### Session Phase and Order Types
+
+**Single source. Every submission site consults this** — entry submission,
+exit submission, the stuck-exit escalation, the halt-clear replacement, and
+the Unified Overnight Policy's liquidation (all in `live_mode_runner.md`).
+The vendor permits order types by session phase:
+
+| Phase (America/New_York) | limit | market |
+|---|---|---|
+| Premarket 04:00–09:30 | yes | no |
+| Regular 09:30–16:00 | yes | yes |
+| After-hours 16:00–20:00 | yes | no |
+
+**The authority is wall clock, not a market-data field.** The trade stream
+carries a session marker, but a tick-borne signal is unavailable exactly
+when no tick arrives — the same ground on which R-3 rejected putting
+`session_end` on the WS path. Phase is evaluated against
+America/New_York wall clock under the same `clock_check` discipline as
+`session_close_exit_time` and `session_hard_exit_time`.
+
+Two consequences worth stating, because both were verified against vendor
+documentation rather than assumed:
+
+- **A market BUY is submitted as a limit** at a price unfavourable to the
+  buyer, with the reference price set high, so orderable quantity is lower
+  than for an equivalent limit order. `check_funds_available()` and
+  `simulate_entry_fill()` both size against this, and the entry-side
+  rejection path already anticipates an insufficient-funds-at-actual-price
+  refusal (`live_mode_runner.md`).
+- **A market SELL is not converted.** The vendor states the conversion for
+  buys only and its reason is buy-specific, so the exit-side escalation's
+  final-backstop guarantee holds wherever a market order is permitted at
+  all.
+
+### Exit Limit Pricing
+
+A limit exit rests at a SPREAD POSITION, anchored at the ask:
+
+```
+price = ask1 - k * (ask1 - bid1)
+```
+
+| k | price | |
+|---|---|---|
+| 0.0 | ask1 | least aggressive |
+| 0.5 | midpoint | `live_mode.exit_ladder_seed` |
+| 1.0 | bid1 | immediately marketable |
+| >1.0 | below bid1 | sweeps deeper resting bids |
+
+**k is monotonic in aggression because a sell limit fills against buyers at
+or above its price** — so LOWER is the aggressive direction, and anchoring
+at the ask makes increasing k mean increasing aggression.
+
+An `entry_gap_value`-style offset was rejected for this: the midpoint's
+distance from the bid is proportional to the spread, which a fixed offset
+from one side cannot express, and a percentage offset would read 0.5 as
+50% below the bid.
+
+The ladder that advances k while an exit is stuck, and its seed/increment/
+cap keys, live under `live_mode:` rather than here — BacktestEngine has no
+bid/ask model to mirror them. If backtest is later extended to replay
+`bid_ask_snapshots` history, they move here for the same reason
+`max_hold_bars` and `session_close_exit_time` did.
 
 ---
 

@@ -7,9 +7,11 @@
 
 ## Role
 
-Five responsibilities combined into one daily-run tool, split across two
+Seven responsibilities combined into one daily-run tool, split across two
 schedule points (see "Dual Schedule" below — evening full run, plus a
-lightweight premarket corporate-events refresh):
+lightweight premarket corporate-events refresh), with a third, unrelated
+schedule entry for the overnight token refresh (see "Overnight Token
+Refresh"):
 
 1. **Metadata crawling** — fetch and upsert stock metadata (sector, market cap,
    shares outstanding, 52w high/low, avg volume) for all active tickers
@@ -680,9 +682,10 @@ def detect_rename_candidates(db_conn) -> list[dict]:
        log to tools/rename_candidates.log for manual review
 
     Fallback path (not integrated here): for cases SEC's company_tickers.json
-    alone leaves ambiguous, a cross-check against the trading service API
-    (the same API already queried in live_mode_runner.md's Session Lifecycle
-    Step 1 for today's tradable ticker list) is intended as a secondary
+    alone leaves ambiguous, a cross-check against the watchdog service
+    (the same service already queried in live_mode_runner.md's Session
+    Lifecycle Step 1 for today's tradable ticker list — NOT the trading
+    API) is intended as a secondary
     signal. Noted as a planned path only — the specific endpoint/call
     contract for this cross-check is not defined in this spec; SEC's
     company_tickers.json is the sole source actually implemented above.
@@ -847,6 +850,61 @@ def collect_fundamentals_incremental(db_conn) -> int:
     tag priority. Skipped if --skip-fundamentals.
     """
 
+
+---
+
+## Overnight Token Refresh
+
+**Not a crawl. It shares this tool's process and scheduler, nothing else** —
+placed here because a scheduled entry point already exists, and a bare cron
+job would have no `batch_runs` marker and so no way to be noticed when it
+fails.
+
+The trading API's access token lives 24 hours from issuance, and a reissue
+inside that window returns the SAME token with the SAME expiry — the only
+way to obtain a fresh 24 hours is to revoke and reissue. Left alone, the
+expiry therefore drifts a little each day and eventually lands inside a
+trading session. Refreshing at a FIXED time removes that class of failure
+outright: expiry becomes a constant, always the same wall-clock time on the
+following day, and never inside a session.
+
+```bash
+# Overnight token refresh — config token_refresh_time (this file's Config
+# Keys), default "03:00" America/New_York.
+python tools/collect_daily.py \
+    --db-path data/market.duckdb \
+    --token-refresh
+```
+
+**Why after midnight, and why that early.** After midnight because the
+previous evening run can overrun past its own deadline, and because
+`batch_runs.date` must then be the trading day the stage targets rather
+than the previous one. That early because refresh cadence and token
+lifetime are both 24 hours, so the outgoing token expires at the very
+moment the new one is requested — there is no previous token to fall back
+on, and a failed refresh blocks the entire day. The only remedy is retry
+against a one-per-minute issuance limit, which makes lead time the sole
+recovery capacity; the dead window between the evening batch and the
+premarket batch is where the most of it is available.
+
+**Idempotency.** Writes `stage='overnight_token_refresh'` — `'running'` at
+its start, then `'success'` or `'failed'` — and is SKIPPED when today's row
+for that stage already exists. A duplicate revoke-and-reissue would spend
+the issuance budget and can leave no usable token at all.
+
+**Not a gate.** The marker is for observability and the skip above, not for
+blocking. A failed refresh followed by a batch's own automatic reissue
+leaves a token that genuinely covers the session, and
+`live_mode_runner.md`'s session-start gate tests that requirement directly
+rather than inferring it from this stage's status. The failure still
+surfaces through finding 1.
+
+**Blast radius is bounded by P-5, not by luck.** Revocation is
+account-wide, but the premarket batch, the live session and the evening
+batch are already strictly serialised by their completion markers, so no
+other API consumer exists at 03:00. Batch entry points keep the SDK's
+automatic reissue enabled, having no WebSocket connection to disturb; the
+live session does not (see `live_mode_runner.md`).
 
 ---
 
@@ -1218,6 +1276,17 @@ fmp_api_key: "your_key_here"
 # days of operation (this run aborts, and tomorrow's Health Gate 1a then
 # aborts on missing session stats), so a transient lock must not reach it.
 evening_wait_hard_deadline: "23:30"   # ET
+
+# Wall-clock time of the overnight token refresh (see "Overnight Token
+# Refresh"). America/New_York, like every other time in this system.
+# AFTER MIDNIGHT deliberately: the evening run can overrun past its own
+# deadline above, and batch_runs.date must be the trading day the stage
+# targets rather than the previous one. Early rather than close to the
+# session because refresh cadence and token lifetime are both 24h, so a
+# failed refresh has no previous token to fall back on and its only remedy
+# is retry against a one-per-minute issuance limit — lead time IS recovery
+# capacity.
+token_refresh_time: "03:00"           # ET
 
 # Bulk today-vs-yesterday price quote endpoint for
 # check_corporate_event_anomaly() (P-8) — a distinct endpoint from

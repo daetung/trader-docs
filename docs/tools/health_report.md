@@ -264,12 +264,15 @@ def gather_findings(db_conn, today_date, log_dir,
         exposed to the very risk that triggered the exit — so on a thin
         name an order can in principle stay open indefinitely. The same
         threshold now also drives an automatic response: past it,
-        live_mode_runner.md's In-flight order tracking escalates the order
-        to market as a final backstop (a no-op if already market). This
+        live_mode_runner.md's In-flight order tracking escalates the
+        order — to market inside the regular session (a no-op if already
+        market), and outside it, where the venue refuses a market order, by
+        advancing the exit limit's spread position one step per cycle
+        toward and past the bid. This
         finding still fires independently of that escalation — it reports
         exposure duration, not whether an escalation attempt has occurred,
         so a row here may be pre- or post-escalation depending on whether
-        the market order has filled by report time.
+        the escalated order has filled by report time.
         TWO TALLIES (R-9), reported together. (a) EVENT COUNT — how many
         times the threshold was crossed this session, aggregated from
         health_events where finding_name='exit_order_stuck'; detail carries
@@ -323,9 +326,10 @@ def gather_findings(db_conn, today_date, log_dir,
         stay realised-only, since unrealised swings would trip on ordinary
         intraday movement — see live_mode_runner.md's Circuit Breaker); this
         exists because the realised-only design has a structural blind spot
-        when an exit cannot fill (see finding 18 — a stuck exit now escalates
-        to market at the age threshold, but a market order that still cannot
-        fill has nothing left to escalate to, so the blind spot narrows
+        when an exit cannot fill (see finding 18 — a stuck exit now
+        escalates at the age threshold, but a market order that still
+        cannot fill has nothing left to escalate to, and the after-hours
+        ladder reaches a configured ceiling, so the blind spot narrows
         rather than closing): no
         trade_log row is written, so realised loss, the consecutive counter,
         and this finding's own trip logic all stay silent regardless of how
@@ -381,14 +385,16 @@ def gather_findings(db_conn, today_date, log_dir,
         vocabulary is actually discovered, so it feeds the checklist rather
         than signalling a fault on its own.
     24. Fill-stream staleness (account-wide WS channel) — flags when the
-        REST backstop poll on Position Manager Loop's existing
+        REST backstop on Position Manager Loop's existing
         `position_check_interval_seconds` cadence reports fill progress for
         an in-flight order that the WS account fill stream has not yet
         delivered, sustained across more than one consecutive cycle while
         in-flight orders exist. No new freeze reason and no new polling —
-        this reuses the REST call already made every cycle as fill
-        tracking's backstop, comparing it against `seen_fills`'s WS-derived
-        state. Warn severity only: correctness is unaffected (the same
+        this reuses the calls already made every cycle as fill tracking's
+        backstop, comparing them against `seen_fills`'s WS-derived state.
+        That backstop is ACCOUNT-WIDE rather than per-order (the vendor's
+        fill inquiry takes no order number), so its cost does not scale
+        with the number of outstanding orders and this finding adds none. Warn severity only: correctness is unaffected (the same
         fill-accounting mechanism folds in whichever channel reports
         first), so this is a latency/observability signal, not a
         correctness one. Unrelated to Bar-Close Authority and the Feed

@@ -300,10 +300,27 @@ its own first stage begins — see metadata_crawler.md's Dual Schedule.
 ```
 LiveModeRunner.start_session(today_date):
 
-  1. Fetch today's tradable ticker list from trading service API
+  1. Fetch today's tradable ticker list from the watchdog service
          all_tickers: list[str]
          (tickers with prior-day data but no trading access today
           are automatically excluded by the API response)
+
+  1a. Token coverage gate. Read the cached access token's expiry and
+      require it to cover today's `live_mode.session_hard_exit_time`.
+      Insufficient coverage ABORTS the session; nothing here refreshes the
+      token. Refresh happens only in its own scheduled stage
+      (metadata_crawler.md) — refreshing at session start would spend the
+      one-per-minute issuance budget with the session waiting on it, and
+      would turn a loud batch failure into a quiet one.
+      Tests EXPIRY, not presence: the SDK's revoke swallows a failed
+      revocation while still clearing the local cache, so a reissue can
+      return the SAME token with the SAME expiry and a presence check
+      would pass on a refresh that never happened (see
+      docs/api/sdk_dependency.md).
+      This session's client runs with the SDK's automatic token reissue
+      DISABLED — batch entry points keep it enabled, having no WS
+      connection to disturb, but here an uncoordinated revoke would drop
+      both WS connections mid-session.
 
   1b. Query account balance from trading API:
          session_start_cash: float
@@ -1297,8 +1314,10 @@ and must not abort the reconcile.
 
 Any adopted position dated to a PRIOR trading day (halt-through-close,
 unfilled/rejected EOD exit, crash orphan, or an unmatched broker position
-of unknown date) is liquidated at market as soon as the ticker is
-tradable, `exit_reason='overnight_exit'`, PnL-excluded. `exit_date` is the
+of unknown date) is liquidated as soon as the ticker is tradable, at
+whichever order type the current session phase permits (execution_common.md
+— market is regular-session-only), `exit_reason='overnight_exit'`,
+PnL-excluded. `exit_date` is the
 date of that liquidation, NOT the row's `date` (the entry date) — these are
 by definition different for this label, and may differ by more than one day
 across a weekend, holiday, or multi-day halt. See db_schema.md's
@@ -1527,9 +1546,9 @@ folds the ticker-cap accounting together — the subscription count and
 move in lockstep by construction, so subscriptions can never exceed
 `execution.ws_ticker_limit` on their own. Subscriptions are per TICKER,
 not per position, so several positions on one ticker share one
-subscription. Price tracking holds one of the two WS sequences the API
-permits for the whole session; see "WS sequence lease" under Position
-Manager Loop for how the second one is shared.
+subscription. Price tracking owns the quote connection for the whole
+session; see "WS connections" under Position Manager Loop for the
+two-connection topology and why nothing is leased or shared.
 Immediately after the subscribe call, REST gap-fill the short window
 between the subscribe request and the subscription actually going active —
 pure network/handshake latency now, not the fill-to-subscribe gap this
@@ -1560,7 +1579,8 @@ On a confirmed breach: set `status='exiting'` atomically (guards against
 double submission), setting `live_positions.exiting_since = now` if it is
 not already set (db_schema.md — never overwritten once populated), and
 submit the sell (shadow: record hypothetical; order-type/pricing logic —
-market vs. limit-at-bid — lives in Position Manager Loop Step 2/3, shared
+market vs. limit at the ladder's spread position — lives in Position
+Manager Loop Step 2/3, shared
 with the time_limit/session_end exit paths rather than duplicated here).
 Unsubscribe when either: the position closes (as before), or the entry
 order ends with zero shares filled (`entry_rejected` / `entry_canceled` —
@@ -1659,29 +1679,68 @@ in_flight_orders: dict[order_id, dict]
 # ('pending','partial_open','exiting') on a warm restart.
 ```
 
-**WS sequence lease.** The API permits two concurrent WS sequences. Price
-tracking (Exit Architecture) holds one for the whole session, since a
-position is almost always open and one sequence multiplexes up to 50
-tickers. The second is leased by refcount: acquired when in-flight entry
-orders go 0 → 1, released when they return to 0 after
-`fill_stream_linger_seconds` (a linger window, so a burst of entries does
-not thrash subscribe/unsubscribe). `fill_stream_mode: "dedicated"` is the
-same mechanism with the lease taken at session start and never released.
+**WS connections.** TWO connections, both opened at session start and
+held for the whole session: one carrying the quote stream (Exit
+Architecture's price tracking, up to `execution.ws_ticker_limit` tickers)
+and one carrying the account fill stream.
 
-Constraints this places on any FUTURE second consumer of that sequence
-(e.g. realtime quote monitoring): fill tracking preempts unconditionally,
-so such a consumer must tolerate being evicted at any moment and must not
-assume continuous observation. A use needing an unbroken series is not
-compatible with shared mode.
+They cannot be combined. A connection carries ONE subscription type:
+sending an account registration on a connection already carrying quote
+subscriptions converts that connection and silently stops quote delivery
+(measured against both production and demo accounts;
+api_contract_checklist.md T-6). The realtime orderbook stream is the same
+type as the quote stream and could share its connection, but is not
+subscribed — the per-connection ticker budget goes to price tracking.
+
+There is no lease, no refcount, no linger and no preemption. Two
+connections are the account limit and exactly two are needed, so nothing
+contends for one and there is no eviction rule to state.
+
+**The subscription set is DERIVED, never held as independent state** — it
+is `live_positions WHERE status IN ('pending','partial_open','exiting')`,
+the same query that rebuilds `in_flight_orders`. One consequence covers
+three cases with one mechanism: warm restart, re-establishment after the
+escalation below, and the SDK clearing its own subscription list when its
+receive loop exits.
+
+**Reconnect.** The vendor caps connection attempts per minute but counts
+in a one-second window, so an opening burst is legal provided attempts are
+spaced above one second; the schedule is a burst followed by a fixed 10s
+interval, and it is OURS rather than the SDK's (docs/api/sdk_dependency.md
+explains why the SDK's own pacer is replaced). After
+`live_mode.ws_reconnect_max_attempts` consecutive failures the ladder
+escalates; there is NO permanent give-up within a session, the only bound
+being the process itself at `live_mode.session_hard_exit_time` — the same
+principle already applied to an unfilled exit order below.
+
+**Escalation ladder**, on repeated reconnect failure:
+1. Retry to `ws_reconnect_max_attempts`. Absorbs transient loss and an
+   orphaned session timing out on its own.
+2. Clear the account's WS sessions and re-establish BOTH connections.
+   This is SESSION-scoped, not connection-scoped: the vendor's
+   session-reset call clears every WS session on the token's account, so
+   escalating a failed quote connection also drops a healthy fill
+   connection. Accepted on stream asymmetry — the collateral lands on the
+   fill stream, whose REST substitute is lossless (order state is
+   queryable, so latency costs nothing there), not on the tick stream,
+   whose REST backstop preserves correctness but not timing.
+   Rejected alternative: dropping the fill connection alone to free a
+   slot. It does not converge — an orphaned session still holds the
+   second slot, so the fill connection is locked out indefinitely.
+3. Still failing after that is not a session-state problem; hand it to
+   the existing Feed Outage machinery rather than inventing a new one.
+
+A server-side subscription REJECTION is not observable through the stock
+SDK, which is why the vendored copy exposes it — see
+docs/api/sdk_dependency.md. Without it a position can open with no price
+stream watching it while the subscription count still looks correct.
 
 **Exits are REST-only.** Exit fills are polled on this loop's existing
-cadence rather than leased onto the WS sequence. Order state is queryable,
+cadence rather than carried on the account connection. Order state is queryable,
 not a perishable event, so a missed push costs latency, not correctness —
 and unlike an entry (whose fill starts tp/sl monitoring), knowing an exit
 filled sooner changes no decision: the position is already closing and any
-unfilled remainder stays tracked either way. Keeping exits off the lease
-also removes the only unbounded holder, since an exit has no give-up
-timeout (below).
+unfilled remainder stays tracked either way.
 
 **Fill accounting invariant.** For a given order_id, `cum_filled_qty` must
 always equal the broker's own count of that order's filled quantity — never
@@ -1704,8 +1763,9 @@ over-counting impossible rather than merely unlikely.
 
 **Fill-stream staleness detection.** No new freeze reason and no new
 polling schedule — this reuses the REST backstop call this loop already
-makes every `position_check_interval_seconds` cycle for every order in
-`in_flight_orders`. On each such call, before folding the result into
+makes every `position_check_interval_seconds` cycle — account-wide, so
+one call covers every order in `in_flight_orders` at once (see the
+exit-side loop below). On each such call, before folding the result into
 `seen_fills` as described above: if the REST response's own
 `cum_filled_qty` is AHEAD of what `seen_fills`'s WS-derived state currently
 reflects for that order_id, sustained across more than one consecutive
@@ -1758,8 +1818,21 @@ truncated.
 ```
 loop every position_check_interval_seconds (config, default: 5s):
 
+  # The exit-side backstop is ACCOUNT-WIDE, not per-order: the vendor's
+  # fill inquiry takes a date range, an optional ticker and a filled/
+  # outstanding filter, with no order-number input. TWO scoped calls per
+  # cycle, both feeding the pass below (see docs/api/trading_api.md):
+  #   (a) FILLED, itemised, newest-first, first page only — feeds
+  #       seen_fills. An unscoped itemised query re-reads the whole day
+  #       every cycle and grows into continuation paging by afternoon.
+  #   (b) OUTSTANDING — the orders still live at the broker.
+  # (b) cannot replace (a): a fully filled order also disappears from
+  # (b), so absence there alone does not separate cancellation from
+  # completion.
+
   For each order_id in in_flight_orders where side == 'exit':
-    # WS account fill events are primary; this poll is the backstop.
+    # WS account fill events are primary; the two calls above are the
+    # backstop.
     # Fold every fill into seen_fills[order_id] (or the fallback path) as
     # described above; cum_filled_qty and weighted_avg_price are read from
     # the result, never accumulated directly from the raw event.
@@ -1802,26 +1875,44 @@ loop every position_check_interval_seconds (config, default: 5s):
                 # its existing point-in-time snapshot of orders still
                 # outstanding at report time — the event answers "how
                 # often", the snapshot "what is open right now".
-            if this order_id's own type != "market":
+            if market orders are permitted in the CURRENT session phase
+               (execution_common.md — regular session only) and this
+               order_id's own type != "market":
                 cancel this order_id; submit a new market order for the
                     remaining (position.quantity - cum_filled_qty) shares;
                     update in_flight_orders to the new order_id
-                # Final backstop, regardless of exit_order_type
-                # (execution_common.md) — an escalation, not a reset:
-                # live_positions.exiting_since is untouched, so stuck_age
-                # keeps accumulating against the original clock.
-            # else: already market — nothing left to escalate to. Stays
-            # tracked exactly as before; finding 18 keeps surfacing it.
+                # Final backstop inside regular hours, regardless of
+                # exit_order_type (execution_common.md) — an escalation,
+                # not a reset: live_positions.exiting_since is untouched,
+                # so stuck_age keeps accumulating against the original
+                # clock.
+            elif market orders are NOT permitted in the current phase:
+                k = min(k + config["live_mode"]["exit_ladder_increment"],
+                        config["live_mode"]["exit_ladder_cap"])
+                # Outside regular hours a market order is refused by the
+                # venue, so the escalation is a LADDER on k rather than a
+                # single step. It converges to market-order equivalence as
+                # k grows — a sell limit fills against resting buyers at
+                # THEIR prices — so the final-backstop property survives
+                # the after-hours window. The cap bounds a runaway on
+                # malformed or empty book data, not fill risk.
+            # else: already market inside regular hours — nothing left to
+            # escalate to. Stays tracked exactly as before; finding 18
+            # keeps surfacing it.
 
-        elif config["execution"]["exit_order_type"] == "limit" and this
-             order_id's own type == "limit":
-            bid = REST query, this ticker's current bid (one call, folded
-                into this loop's existing position_check_interval_seconds
-                cadence — no separate polling schedule; exits are always a
-                sell in this system, so the resting price tracks the bid,
-                never the ask)
-            if bid != this order_id's current resting limit_price:
-                amend this order_id's price to bid — a single order
+        if this order_id's own type == "limit":
+            # k governs the exit limit price THROUGHOUT, not just during
+            # escalation: submitted at exit_ladder_seed, re-quoted at the
+            # current k every cycle, and advanced by the ladder above once
+            # past exit_order_stuck_minutes. This replaces the former
+            # "amend to bid every cycle" rule.
+            bid, ask = REST orderbook query, this ticker's current level-1
+                (one call, folded into this loop's existing
+                position_check_interval_seconds cadence — no separate
+                polling schedule; both sides come back from the one call)
+            target = ask - k * (ask - bid)     # execution_common.md
+            if target != this order_id's current resting limit_price:
+                amend this order_id's price to target — a single order
                     amendment, not cancel-and-resubmit, so the order_id
                     (and therefore fill tracking against it) is undisturbed
             # Re-quoted every cycle unconditionally, whether or not the
@@ -1829,6 +1920,29 @@ loop every position_check_interval_seconds (config, default: 5s):
             # correct behavior. A move-triggered variant (skip the amend
             # call inside some tolerance band) is a possible later
             # refinement, not designed here.
+            # An order originally submitted as MARKET is assumed NOT
+            # amendable into a limit (the vendor does not document whether
+            # its amend path permits an order-type change). It is expected
+            # to be cancelled by the venue at the after-hours boundary in
+            # any case, which the vanished-order rule below already covers.
+
+        # Vanished-order rule — applies every cycle, not only at a halt
+        # clear. If this order_id is absent from the OUTSTANDING call AND
+        # is not accounted for by the FILLED call, submit a replacement for
+        # the remaining quantity at the current phase's permitted type and
+        # the current k; update in_flight_orders to the new order_id, and
+        # leave live_positions.exiting_since untouched — a resubmission,
+        # not a new exit.
+        # One mechanism, four causes: cancellation during a halt
+        # (api_contract_checklist.md T-12), cancellation by the venue at a
+        # session-phase boundary, a cancel-and-resubmit whose second step
+        # failed, and arbitrary broker cancellation.
+        # DELIBERATELY ASYMMETRIC: absence from OUTSTANDING alone never
+        # triggers a replacement. A replacement is irreversible and would
+        # land on a possibly-closed position, whereas a delayed one is
+        # recovered on a later cycle — seen_fills is fill-ID idempotent, so
+        # a fill missed by one page folds in unchanged when it appears on
+        # the next.
 
   For each order_id in in_flight_orders where side == 'entry':
     order_status from the WS account fill stream (primary) or a REST
@@ -1935,6 +2049,11 @@ loop every position_check_interval_seconds (config, default: 5s):
             tick_rate_per_min = len(ticks) * (60 / halt_check_window_seconds)
             is_halted = tick_rate_per_min < halt_heuristic_tpm (config, default: 10)
             signal_source = "tick_rate_fallback"
+            # DISABLED in premarket: normal premarket liquidity in this
+            # universe sits below halt_heuristic_tpm, so the heuristic
+            # would report a session-wide halt. Outside the regular
+            # session the fallback yields is_halted = False and the API
+            # signal is the only halt authority.
 
         if is_halted:
             position.status = 'halted'
@@ -2008,19 +2127,17 @@ loop every position_check_interval_seconds (config, default: 5s):
                 # clear edge — re-query THIS order's own status immediately,
                 # not waiting for the next position_check_interval_seconds
                 # cycle's ordinary fill-tracking pass
-                order_status = REST query, this order_id's current state
-                if order_status says the order no longer exists:
+                run the exit-side loop's OUTSTANDING/FILLED pair for
+                    this order immediately, rather than waiting for the
+                    next position_check_interval_seconds cycle
+                if the vanished-order rule finds it gone:
                     # broker canceled it during the halt — T-12's "auto-
                     # canceled" branch confirmed for this event
-                    submit a replacement order via the same exit_order_type
-                        branching as initial submission (Position Manager
-                        Loop Step 2/3) — market or limit-at-current-bid,
-                        for the remaining unfilled quantity; update
-                        in_flight_orders to the new order_id
-                    # live_positions.exiting_since is NOT touched — this is
-                    # a resubmission, not a new exit; exit_order_stuck_minutes
-                    # keeps counting from the original clock (see In-flight
-                    # order tracking's exit-side loop)
+                    the replacement is submitted by that rule (In-flight
+                        order tracking's exit-side loop), at the current
+                        phase's permitted type and the current k — this
+                        site adds no separate resubmission path, only the
+                        immediate re-query that shortens the delay
                     record_health_event(finding_name=
                         'inflight_exit_gone_at_halt_clear',
                         detail={ticker, order_id}) via write_fn=db_write
@@ -2070,18 +2187,19 @@ loop every position_check_interval_seconds (config, default: 5s):
                order_id = submit order via trading API: quantity=`position.quantity`
                    - `cum_filled_qty so far` (0 for a fresh exit), order_type="market"
            else:  # "limit"
-               bid = REST query, this ticker's current bid (one call;
-                   exits are always a sell in this system, so the resting
-                   price tracks the bid — see execution_common.md's
-                   exit_order_type)
+               bid, ask = REST orderbook query, this ticker's current
+                   level-1 (one call; both sides come back together)
+               k = config["live_mode"]["exit_ladder_seed"]
                order_id = submit order via trading API: quantity=`position.quantity`
-                   - `cum_filled_qty so far`, order_type="limit", limit_price=bid
+                   - `cum_filled_qty so far`, order_type="limit",
+                   limit_price=`ask - k * (ask - bid)` (execution_common.md)
            # Re-priced every position_check_interval_seconds cycle
            # thereafter while still outstanding (limit case only) — see
-           # In-flight order tracking's exit-side loop below. Escalates
-           # unconditionally to a market order at
-           # live_mode.exit_order_stuck_minutes regardless of which branch
-           # above was taken — same section.
+           # In-flight order tracking's exit-side loop below, which also
+           # advances k past live_mode.exit_order_stuck_minutes. The
+           # escalation is a market order INSIDE regular hours and a k
+           # ladder outside them, since the venue refuses a market order
+           # outside the regular session (execution_common.md).
            breach_price still logged for the same comparison purpose
            # R-2: breach_price here is now the OBSERVED price of the
            # confirming (2nd) breach tick from the WS/REST stream — a real
@@ -2129,13 +2247,30 @@ live_mode:
   # session_close_exit_time removed — promoted to execution: (R-7), where
   # BacktestEngine reads it too; a value both engines must agree on cannot be
   # declared on one side only (same defect R-6 fixed for max_hold_bars).
-  fill_stream_mode:               "shared"   # "shared" | "dedicated" — see
-                                             # Position Manager Loop's WS
-                                             # sequence lease
-  fill_stream_linger_seconds:     30         # idle hold before releasing the
-                                             # leased sequence, so a burst of
-                                             # entries does not thrash
-                                             # subscribe/unsubscribe
+  # fill_stream_mode / fill_stream_linger_seconds removed: a connection
+  # carries one subscription type, so the fill stream needs a connection of
+  # its own for the whole session. Nothing is leased, so there is no idle
+  # hold to configure and no shared/dedicated choice to make — only the
+  # former "dedicated" topology is achievable. See Position Manager Loop's
+  # "WS connections".
+  ws_reconnect_max_attempts:      5          # consecutive reconnect failures
+                                             # before the escalation ladder
+                                             # advances — see "WS connections"
+  exit_ladder_seed:               0.5        # spread position of a limit exit
+                                             # at submission: ask - k*(ask-bid)
+                                             # (execution_common.md). 0.5 = the
+                                             # midpoint
+  exit_ladder_increment:          0.1        # k advance per
+                                             # position_check_interval_seconds
+                                             # once past
+                                             # exit_order_stuck_minutes
+  exit_ladder_cap:                1.5        # k ceiling. Bounds a runaway on
+                                             # malformed or empty book data,
+                                             # not fill risk — k > 1.0 rests
+                                             # below the bid deliberately.
+                                             # Under live_mode:, not execution:,
+                                             # because BacktestEngine has no
+                                             # bid/ask model to mirror it
   clock_check:
     source:                       "ntp_daemon"  # | "vendor_api" | "disabled"
     max_offset_seconds:           1.0
@@ -2239,7 +2374,7 @@ live_mode:
 
 ## Constraints
 
-- Ticker list is sourced from trading service API at session_start — not from DuckDB ohlcv_1min
+- Ticker list is sourced from the watchdog service at session_start — not from DuckDB ohlcv_1min
   (today's tradable tickers only; prior-day data for non-tradable tickers is irrelevant)
 - US stock splits always take effect before market open — no intra-session split handling needed
 - LiveModeRunner maintains one CachingIndicatorCalculator per ticker in the tradable universe

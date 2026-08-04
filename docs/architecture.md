@@ -88,7 +88,7 @@ Live inference endpoint: LiveModeRunner (execution orchestrator)
                          │
                          ├── Watchdog polling loop  (1s interval)
                          │       query watchdog service → ticker candidates
-                         │       trading API fetch (bars + ticks) → on_bar_close()
+                         │       TradingAPI fetch (bars + ticks) → on_bar_close()
                          │       detect → infer → buy order
                          │
                          └── Position manager loop  (independent interval)
@@ -129,6 +129,8 @@ Standalone scripts:
 | `scripts/run_preprocess.md` | Preprocessor class, return_data, training pipeline only |
 | `scripts/run_train.md` | Trainer class, session_mode filter, train_log |
 | `scripts/run_backtest.md` | Backtester class, sole experiment_log writer |
+| `api/trading_api.md` | TradingAPI — the single caller-facing layer over the vendored trading-API SDK. Result contract (a rejected order returns HTTP 200), symbol/exchange encoding, async boundary. No other module imports the SDK |
+| `api/sdk_dependency.md` | The vendored SDK as an external artifact — adoption form, the two fork modifications and why neither could be avoided, and the costs accepted with it |
 | `utils/execution_common.md` | Execution-time decisions shared between BacktestEngine and LiveModeRunner — signal resolution, cooldown guard, entry/exit fill simulation, position sizing |
 | `utils/utils.md` | Shared utilities: bar sequence, signal resolution, slippage/fill simulation, label breach detection, encoding maps, trading calendar, REFERENCE_SESSION stats (populate + load), corporate-event adjustment (cum_split_ratio, adjust_bars_for_corporate_events, adjust_tick_derived_series_for_corporate_events, estimate_historical_meta, ticker rename stitching) |
 | `inferencer/inferencer.md` | Live inference service object — _prepare_bars, infer/infer_batch, inference_log |
@@ -182,6 +184,9 @@ stock-scalping/
 │   │   ├── run_preprocess.md
 │   │   ├── run_train.md
 │   │   └── run_backtest.md
+│   ├── api/
+│   │   ├── trading_api.md
+│   │   └── sdk_dependency.md
 │   ├── utils/
 │   │   ├── utils.md
 │   │   └── execution_common.md
@@ -229,6 +234,8 @@ stock-scalping/
 │   │   ├── inferencer.py
 │   │   ├── live_mode_runner.py
 │   │   └── caching_calculator.py
+│   ├── api/
+│   │   └── trading_api.py
 │   ├── utils/
 │   │   └── utils.py
 │   └── visualization/
@@ -243,6 +250,14 @@ stock-scalping/
 │   ├── collect_daily.py
 │   └── detection_benchmark.py
 ├── tests/
+├── vendor/
+│   └── dbsec-open-api/            # vendored trading-API SDK (see
+│                                  #   docs/api/sdk_dependency.md).
+│                                  #   Installed editable BY THE USER, never
+│                                  #   by an agent. Deliberately outside src/:
+│                                  #   the docs/ ↔ src/ correspondence does
+│                                  #   not extend to it, and it has no
+│                                  #   counterpart spec
 ├── configs/
 │   ├── pipeline_config.yaml
 │   ├── sector_map.json

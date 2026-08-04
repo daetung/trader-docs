@@ -24,8 +24,8 @@ measured and the config is what is running — reconcile deliberately, do not
 assume either is authoritative for the other's purpose.
 
 **This file accumulates; it is not reset per session.** Unlike
-`open_items_session*.md`, a verified row is not deleted — its measured value is
-filled in and it stays. Switching brokers, or a vendor changing its own
+`open_items.md`, which holds only what is still unresolved, a verified row is
+not deleted — its measured value is filled in and it stays. Switching brokers, or a vendor changing its own
 contract, makes the whole table live again, and a row that was deleted on
 verification would have to be rediscovered from scratch.
 
@@ -67,10 +67,10 @@ outranks a shaky one that degrades gracefully.
 | T-3 | Throughput ceiling, assumed ~100 tickers/sec | Chunked fetches; Eager Pool | **B** | Ramp until rate limiting appears; measure both the 09:20–09:25 overlap and steady state | `live_mode.api_max_tickers_per_second` | |
 | T-4 | What the balance query returns: cash, buying power, or settled funds | `session_start_cash` → `compute_position_size()` | **B** | Compare the returned figure against the broker's own statement | `execution.sizing_basis` selects the interpretation | |
 | T-5 | A margin-ratio endpoint exists and returns the current requirement | Session Start Probes → `sizing_basis: "equity"` | **B** | Endpoint documentation; confirm the value moves with position state | `live_mode.margin_ratio_url` | |
-| T-6 | One WS sequence carries up to 50 tickers, and at most 2 sequences may be open | Exit Architecture; WS sequence lease | **B** | Subscribe past both limits and observe the failure | `execution.ws_ticker_limit` | |
+| T-6 | WS connection limits: tickers per connection, connections per account, subscription types per connection, connections per IP per port | Exit Architecture; WS connections | **B** | Subscribe and connect past each limit and observe the failure | `execution.ws_ticker_limit` | **Measured** — 50 tickers per connection; 2 connections per account; ONE subscription type per connection (an account registration sent on a quote connection converts it and silently stops quote delivery); 30 connections per IP per port. Confirmed against production AND demo accounts |
 | T-7 | Account-wide fill event stream: whether individual fills carry a stable, unique ID; schema; heartbeat; reconnect; whether events missed while disconnected are replayed | In-flight order tracking (fill accounting invariant) | **A** | See the fill-accounting sub-items below the table | — | |
 | T-8 | A REST order-status endpoint suitable as the exit-fill backstop, and whether it returns a given order's COMPLETE fill history or a paginated/windowed slice (shared checkpoint with T-7 — see below) | In-flight order tracking (exits are REST-only) | **C** | Endpoint documentation; poll a known order; check for pagination on an order with many fills | — | |
-| T-9 | Subscribe/unsubscribe acknowledgement latency | `fill_stream_linger_seconds` default | **C** | Time the round trip under load | `live_mode.fill_stream_linger_seconds` | |
+| T-9 | Subscribe acknowledgement latency | Exit Architecture's post-subscribe REST gap-fill window | **C** | Time the round trip under load | — (no key; the gap-fill covers the window rather than a configured value sizing it) | |
 | T-10 | The broker's rejection reason vocabulary | `trade_log.reject_reason`; any future normalisation | **C** | Self-measuring — `health_report.md`'s unrecognised-reason finding accumulates it | — (stored verbatim; no enum until this is known) | |
 | T-11 | Whether a server-clock endpoint exists | `clock_check.source: "vendor_api"` | **C** | Endpoint documentation | `live_mode.clock_check.source` | |
 | T-12 | Whether a resting order survives a trading halt on its ticker, is auto-canceled by the halt, or executes at the halt-resumption cross/auction | `live_mode_runner.md` Position Manager Loop — halt-clear handling for an in-flight exit order | **C** | Self-measuring — `health_report.md` finding 25 records every case where an in-flight exit order was found gone at halt-clear | — (no key; the design branches at halt-clear regardless of the answer — see below) | |
@@ -91,6 +91,37 @@ with `min_watchlist_size`, risks a spurious Feed Outage freeze under
 normal operation. Set longer than necessary, it only slows genuine-outage
 detection. The seed value is chosen accordingly: conservative (higher)
 until measured, the same one-sided-error posture as `margin_ratio_fallback`.
+
+**T-6 was re-anchored, not merely measured.** Its original phrasing
+described a "WS sequence lease" that no longer exists: subscription types
+turn out to be mutually exclusive per connection, so the two connections
+this system opens are both held for the whole session and nothing is leased,
+shared or preempted. The row now records the connection limits themselves,
+which is what the design actually rests on.
+
+**T-9 lost its config key rather than its purpose.** It originally sized
+`fill_stream_linger_seconds`, a key deleted with the lease. Subscribe
+acknowledgement latency still has a live consumer — Exit Architecture
+REST-gap-fills the window between the subscribe call and the subscription
+going active — so the row stays, re-anchored, with the key column cleared.
+
+**No row exists for market-sell conversion, deliberately.** The vendor
+converts a market BUY into an unfavourably-priced limit; whether it does the
+same to a market SELL was an open question, and it is CLOSED from vendor
+documentation rather than deferred here: the rule is stated for buys only
+and its stated reason (the reference price is set high, shrinking orderable
+quantity) is buy-specific. Recorded so the question is not re-raised as a
+gap.
+
+**T-7 and T-8 have a partial documentary answer.** The vendor's fill
+inquiry exposes an itemised mode alongside a summarised one, so per-fill
+rows ARE retrievable — which is what decides whether `seen_fills`' fill-ID
+primary mechanism is available at all. This is an input, not a closure: the
+ID's stability across reconnects, and whether the WS stream and the REST
+endpoint share one ID scheme, are still open and are sub-items 1 and 3
+below. The same inquiry is account-wide rather than per-order, which is why
+`live_mode_runner.md`'s exit backstop is one pair of scoped calls per cycle
+rather than one call per outstanding order.
 
 **T-1 and T-7 are the grade A rows.** Both back a stated correctness
 guarantee rather than a tunable value — a wrong answer means the design

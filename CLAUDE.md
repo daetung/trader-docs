@@ -25,6 +25,8 @@ Venv         source .venv/bin/activate  ← run at session start
 
 1. `docs/architecture.md` — full pipeline overview and docs index
 2. `docs/data/data_boundary.md` — **data leakage rules shared by all modules**
+3. `docs/api/sdk_dependency.md` — before touching anything under `vendor/`,
+   or any code that reaches the trading API
 
 For each module, read only the corresponding `docs/pipeline/0N_*.md` file.
 Do not load other module docs unless checking an interface boundary.
@@ -261,6 +263,12 @@ Output: prose explanation + recommendation only.
 - Never define indicator calculation logic outside `indicator_calculator.py`
 - Never invoke @python-reviewer before @tdd-guide passes
 - Never mark a task complete without @python-reviewer APPROVED verdict
+- **Never install a package or otherwise modify the environment.** Every
+  installation — the vendored trading-API SDK and third-party libraries
+  alike — is performed by the user. If something is missing, say so and
+  stop; do not `pip install`, do not edit the venv, do not add a
+  dependency file entry and install from it. SDK-specific detail lives in
+  `docs/api/sdk_dependency.md`
 
 ---
 

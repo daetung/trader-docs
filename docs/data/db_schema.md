@@ -414,6 +414,7 @@ CREATE TABLE IF NOT EXISTS batch_runs (
                                       -- 'evening_session_stats' |
                                       -- 'evening_investing_forward_check' |
                                       -- 'evening_retention_purge' |
+                                      -- 'overnight_token_refresh' |
                                       -- 'live_session_start' | 'live_session_end'
     date         VARCHAR   NOT NULL,  -- 'YYYYMMDD' — the trading day this batch targets
     status       VARCHAR   NOT NULL,  -- 'running' | 'success' | 'failed'
@@ -421,6 +422,13 @@ CREATE TABLE IF NOT EXISTS batch_runs (
     finished_at  TIMESTAMP,           -- NULL while status='running'
     PRIMARY KEY (stage, date)
 );
+-- 'overnight_token_refresh': written by metadata_crawler.md's third
+-- schedule entry, after midnight, so its `date` is the trading day it
+-- covers. Observability and same-day idempotency only — NOT a Health Gate
+-- blocking condition: a failed refresh followed by a batch's own automatic
+-- reissue can still leave a token that covers the session, and
+-- live_mode_runner.md's token coverage gate tests that requirement
+-- directly.
 -- 'live_session_start' (R-2): written 'running' at Session Lifecycle Step
 -- 1c, flipped to 'success' at clean Session Shutdown alongside
 -- 'live_session_end'. A today row still 'running' with no
