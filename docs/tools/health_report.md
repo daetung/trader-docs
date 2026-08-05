@@ -480,6 +480,28 @@ def gather_findings(db_conn, today_date, log_dir,
         tomorrow's session on missing session stats. That is the intended
         fail-safe, reached loudly.
 
+    29. Watchdog working set empty during the regular session
+        (`watchdog_empty_working_set`) — `watchdog.get_candidates()`
+        returned an empty list inside the regular session. The watchdog's
+        filter conditions make an all-day zero impossible, so emptiness is
+        a fault signal rather than a quiet market. Scoped to the regular
+        session because the working set carries over already full from
+        premarket, which is why no grace-window config key exists: 09:30
+        is the boundary.
+        Observation only — no freeze and no Feed Outage trigger. A dead
+        watchdog costs entries, not correctness, and a false freeze over an
+        open position costs more than a session that trades nothing.
+        Level: warn. Correctness is unaffected and no position is touched,
+        so not critical; but the state costs a whole session's entries, so
+        not info either.
+        Source (R-9): aggregated from health_events where
+        finding_name='watchdog_empty_working_set'. The working set is
+        persisted nowhere, so nothing at report time could reconstruct it.
+        Written once on entry into each empty episode and re-armed when the
+        list refills, the same discipline as finding 24 — and for the same
+        reason, that a watchdog recovering and failing again is itself the
+        signal.
+
     Returns: dict of {finding_name: {severity: 'ok'|'warn'|'abort', detail: ...}}
     """
     ...

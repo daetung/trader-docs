@@ -686,15 +686,67 @@ open RW. Manual use is for non-session contexts.
 
 ## Watchdog Polling Loop
 
-Polls external watchdog service at `poll_interval_seconds` (default: 1s).
-The watchdog service is a separate external system, not part of this
-codebase — it applies its own entry-point-condition matching against the
-live feed and pushes a ticker's name into the candidate list the instant
-its own criteria are met. "Candidates" therefore means "tickers the
-watchdog service just flagged," not "all actively-tracked tickers" —
-this is why bar/tick fetching below (Step 2) only concerns itself with
-that ticker being flagged again, not with continuously polling every
-ticker in the watchlist.
+Polls the watchdog at `poll_interval_seconds` (default: 1s). The watchdog
+remains a separate external system applying its own entry-point-condition
+matching against the live feed; what this codebase holds is the ACCESS
+SURFACE to it — a project-internal module whose entire interface is one
+call:
+
+```python
+import watchdog
+watchdog.get_candidates() -> list[str]
+```
+
+No URL, no config key: it is a module call, not an HTTP request.
+
+**What it returns is a CUMULATIVE WORKING SET, not a per-cycle delta.**
+Up to 50 tickers, ordered most-recently-fired first, no duplicates; a
+ticker that fires again moves to the top rather than being appended. A
+ticker therefore stays in the list long after the event that put it
+there, and the list is nearly always full during the regular session.
+
+**Caller-side delta computation is impossible, not merely lossy.** When
+the top-of-list ticker re-fires, the returned list is IDENTICAL to the
+previous cycle's — same members, same order. No comparison of successive
+snapshots can observe that event. Set difference misses every re-fire;
+scanning down to the previous top misses a re-fire of the previous top
+itself, and misses cases where the top and another ticker both update
+within one poll interval. The list is state, not an event stream.
+
+**Consequence — the model is inverted.** The watchdog list is the WORKING
+SET and a bar close is the evaluation trigger, rather than a watchdog flag
+triggering a fetch of that ticker's bar. Re-evaluation is driven by bars
+arriving, which is the shape the rest of the pipeline already has:
+`EntryPointDetector.detect()` operates on a bar sequence, and
+`on_bar_close()`, the 2-print guard and `CachingIndicatorCalculator` are
+all bar-driven. The watchdog edge was the exception, and it was never
+observable.
+
+Two concerns dissolve with the inversion rather than needing handling: no
+warm-up baseline cycle is required, because nothing is diffed; and the
+50-entry cap loses nothing, because an evicted ticker simply leaves the
+working set rather than taking an unobserved event with it.
+
+**A failing watchdog returns an empty list rather than raising.** Its
+filter conditions make an all-day zero impossible, so an empty working set
+inside the regular session is a fault signal rather than a quiet market —
+recorded as `health_report.md` finding 29. Observation only: no freeze and
+no Feed Outage trigger, since a dead watchdog costs entries, not
+correctness, and a false freeze over an open position costs more than a
+session that trades nothing. The regular-session scope is what removes the
+need for a grace window — the list carries over already full from
+premarket, so 09:30 is the boundary.
+
+⚠️ **NOT EXECUTABLE AS SPECIFIED.** The working-set model needs a bar for
+up to 50 tickers every cycle. Per-ticker fetching cannot deliver that
+inside `poll_interval_seconds` at the chart endpoint's published rate —
+the SDK paces at a minimum interval rather than allowing a burst, so 50
+tickers serialise into an order of magnitude more time than the loop has.
+A bulk quote call accepting up to 50 symbols exists, but returns a price
+snapshot rather than OHLCV, so it does not directly serve
+`on_bar_close()`. This is not a tuning gap; the loop as written cannot be
+built until the call-budget item resolves it (`open_items.md`). An
+implementation session must not read this loop as buildable.
 
 **Loop termination (R-9).** This loop runs only while entries are
 structurally possible. At the top of every cycle, before Step 1:
@@ -729,9 +781,11 @@ already exiting.
 ```
 loop every poll_interval_seconds:
 
-  1. Query watchdog service → list of ticker candidates for this bar
-     (tickers the watchdog service's own entry-condition matching just
-     flagged — see note above)
+  1. watchdog.get_candidates() → the current working set (cumulative,
+     most-recently-fired first — see note above; NOT this cycle's new
+     arrivals, which are not observable)
+     If empty AND inside the regular session: record finding 29
+        (once per episode, re-armed when the list refills)
 
   2. For each ticker in candidates:
      a. Fetch current bars from trading API (1min chart up to now —
@@ -940,15 +994,21 @@ loop every poll_interval_seconds:
 
 ## Bar-Close Authority
 
-Judges, once per Watchdog Polling Loop cycle, whether each ticker in THAT
-cycle's `candidates` (not the full tradable universe, and not the
-cumulative set of tickers ever flagged this session — see the loop's own
-note on what `candidates` means) has a bar for the most recently
-fully-elapsed minute, at whole-second precision. Scoped to `candidates`
-deliberately: a bar is only ever fetched (Step 2a) for a ticker the
-watchdog just flagged, so a ticker that simply has not been re-flagged
-recently has nothing to judge — checking against the full active
-watchlist would misread ordinary watchdog silence as a missed deadline.
+Judges, once per Watchdog Polling Loop cycle, whether each ticker in the
+current working set (not the full tradable universe — see the loop's own
+note on what the watchdog returns) has a bar for the most recently
+fully-elapsed minute, at whole-second precision. Scoped to the working set
+deliberately: a bar is fetched (Step 2a) for exactly those tickers, so
+nothing outside it has anything to judge, and checking the full active
+watchlist would report a missed deadline for tickers nobody is fetching.
+
+The working set is CUMULATIVE, so it carries tickers that fired hours ago
+and are legitimately quiet now. `missed` therefore mixes two causes — a
+feed fault, and a minute with no trade in a thin name — and the second is
+concentrated in the older, lower-ranked entries. Bar-Close Authority still
+judges the whole working set, which keeps finding 26's latency sample
+broad; it is Feed Outage's ratio test that is scoped to the recent end of
+the list, for exactly this reason (see that section).
 
 ```
 On every poll_interval_seconds cycle, after Step 2a's bar fetch:
@@ -1125,20 +1185,26 @@ Distinct from the routine per-ticker catch-up already built into the
 Watchdog Polling Loop (Step 3's multi-bar replay) and Bar-Close Authority —
 those handle an individual ticker going quiet for a while, gracefully and
 without any freeze. This section covers the qualitatively different case:
-LiveModeRunner's own connectivity to the trading API/watchdog service is
-lost.
+LiveModeRunner's own connectivity to the trading API is lost. The
+watchdog is NOT covered here: it is reached as a module call, which has no
+connection to lose, and its own failure mode is an empty working set,
+handled by finding 29 without a freeze.
 
 **Trigger** (either condition):
 - An explicit connection/API-level failure (exception, timeout, non-200
-  response) from the trading API or watchdog service itself, or
-- `len(candidates) >= live_mode.min_watchlist_size` AND more than 50% of
-  THIS cycle's `candidates` are in Bar-Close Authority's `missed` set —
-  a systemic signal even without a hard connection error. The size floor
-  exists because a bare percentage is only a meaningful systemic signal
-  once the sample is large enough that a few individually-quiet tickers
-  coinciding by chance cannot clear it on their own; below the floor, a
-  cycle's candidate count is too small to support the claim either way,
-  and this condition simply does not evaluate (condition 1 above remains
+  response) from the trading API, or
+- More than 50% of the working set's MOST-RECENTLY-FIRED
+  `live_mode.min_watchlist_size` tickers are in Bar-Close Authority's
+  `missed` set — a systemic signal even without a hard connection error.
+  Scoped to the recent end of the list because the working set is
+  cumulative: an unscoped ratio counts tickers that fired hours ago and
+  are legitimately quiet, which in this low-liquidity universe would
+  produce false freezes as a matter of course. MRU rank is information
+  from OUTSIDE the feed, which is why this scope does not fail the way a
+  recent-BAR-activity scope would — that would empty its own population
+  exactly when the feed dies. `min_watchlist_size` accordingly serves two
+  roles now: the sample size, and the minimum working-set length below
+  which this condition does not evaluate (condition 1 above remains
   the only detector for that cycle). Both `min_watchlist_size` and
   `bar_close_grace_seconds` are seed values, deliberately set conservative
   (harder to trigger) until measured — the vendor's actual quiet-minute
@@ -1164,7 +1230,7 @@ lost.
    exit_submission. Exit *evaluation* is never frozen — it keeps running
    and accumulating bars/ticks; only order *submission* is held.
 
-2. Reconnect: retry the trading API/watchdog service connection
+2. Reconnect: retry the trading API connection
    (backoff policy TBD — not specified here).
 
 3. Catch up: once reconnected, this does NOT require a separate vendor
@@ -2232,9 +2298,27 @@ live_mode:
   #                     session_start_compute(); RAM released; loaded per-ticker on
   #                     first watchdog event (50~200ms overhead).
   #                     Use for memory-constrained environments.
-  watchdog_url:                   "http://watchdog-service/candidates"
-  trading_api_url:                "http://trading-api"
-  trading_api_ticker_url:         "http://trading-api/tickers/today"
+  # watchdog_url removed: the watchdog is a module call
+  # (watchdog.get_candidates()), not an HTTP endpoint, so neither a URL
+  # value nor a _url name was ever true of it.
+  #
+  # The two keys below are SUPERSEDED by the vendored SDK, which owns both
+  # the base URL and every endpoint path (docs/api/sdk_dependency.md);
+  # docs/api/trading_api.md's boundary test puts endpoint addressing on the
+  # far side of the API layer from callers. They are RETAINED rather than
+  # deleted because trading_api_url still has a live consumer in
+  # query_halt_status() and what replaces it cannot be stated before the
+  # call-point inventory exists. Disposal belongs to open_items.md's
+  # API-layer item, together with the configuration-ownership boundary
+  # between pipeline_config.yaml and the SDK's own Config.
+  trading_api_url:                "http://trading-api"     # SUPERSEDED
+  trading_api_ticker_url:         "http://trading-api/tickers/today"  # SUPERSEDED
+                                             # the trading API's ticker-master
+                                             # endpoint (SDK: stock-ticker
+                                             # search, exchange as an input
+                                             # parameter) — NOT the watchdog,
+                                             # and not Session Lifecycle
+                                             # Step 1's source
 
   # R-1: 09:20 recheck moved in-process (see "In-Process Premarket
   # Recheck" below) — no longer a cron. wall-clock America/New_York.

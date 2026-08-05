@@ -1088,6 +1088,15 @@ python tools/collect_daily.py \
 python tools/collect_daily.py \
     --db-path data/market.duckdb \
     --premarket-recheck
+
+# Overnight token refresh (see "Overnight Token Refresh" above and the cron
+# entry below). Unlike its neighbours in this section, which are manual,
+# debug or partial-run flags, this one's primary use is the scheduled
+# entry — it is listed here for completeness, not because it is normally
+# invoked by hand.
+python tools/collect_daily.py \
+    --db-path data/market.duckdb \
+    --token-refresh
 ```
 
 ---
@@ -1242,6 +1251,17 @@ via the lock-probe fallback above.
 # --corporate-events-only cron entries previously here, both at 04:00 ET
 # (see "Dual Schedule" above and Constraints for the collision this
 # merge removes)
+# Overnight token refresh — 03:00 ET, weekdays
+# Weekday-only is correct: no API consumer exists at the weekend (both
+# other entries are 1-5), and Monday 03:00 has no token to revoke at all —
+# the one issued Friday expired Saturday — so it is a pure issue, which is
+# the safer path rather than a gap.
+0 3 * * 1-5 cd /path/to/stock-scalping && \
+    source .venv/bin/activate && \
+    python tools/collect_daily.py \
+        --db-path data/market.duckdb \
+        --token-refresh >> logs/collect_daily_token.log 2>&1
+
 0 4 * * 1-5 cd /path/to/stock-scalping && \
     source .venv/bin/activate && \
     python tools/collect_daily.py \
@@ -1292,6 +1312,10 @@ token_refresh_time: "03:00"           # ET
 # check_corporate_event_anomaly() (P-8) — a distinct endpoint from
 # trading_api_url / trading_api_ticker_url (see live_mode_runner.md),
 # since this crawler runs standalone, outside any LiveModeRunner session.
+# SUPERSEDED, like both of those, by the vendored SDK which owns base URL
+# and endpoint paths (docs/api/sdk_dependency.md); retained pending
+# open_items.md's API-layer item, which also has to draw the boundary
+# between this config surface and the SDK's own.
 # URL path and response schema: TBD (API spec sheet).
 trading_api_quotes_url: "http://trading-api/quotes/today"
 
@@ -1406,10 +1430,14 @@ quarantine:
   — grow unbounded. Low-cost operational gap, not a correctness one; a
   standard log-rotation tool (e.g. `logrotate`) applied externally is
   sufficient, no application-level change needed.
-- On a non-trading day (market holiday, weekend), all scheduled crons
+- On a non-trading day (market holiday, weekend), the two CRAWL crons
   above still fire and complete quickly as effective no-ops (no tickers
   to detect renames for, no new bars to crawl against) — each still
-  writes its normal `batch_runs` row with `status='success'`. This is
+  writes its normal `batch_runs` row with `status='success'`. The token
+  refresh is the exception and is NOT a no-op: it revokes and reissues on
+  any day it fires, which is intended. Skipping it on non-trading days was
+  rejected — that would add a `trading_calendar` dependency at 03:00 to
+  save one wasted issuance. This is
   intended: `trading_calendar`'s `is_trading_day` is what downstream
   consumers (Health Gate 1, LiveModeRunner's own start condition — not
   specified here, out of scope) check to decide whether to actually run a

@@ -249,6 +249,14 @@ stock-scalping/
 │   ├── migrate_json_to_duckdb.py
 │   ├── collect_daily.py
 │   └── detection_benchmark.py
+├── api_doc/                       # vendor API documentation (markdown).
+│                                  #   External read-only reference, not a
+│                                  #   spec file — the source for the
+│                                  #   session-phase order-type rules, the
+│                                  #   per-endpoint rate limits and the
+│                                  #   message-code vocabulary. Cited by
+│                                  #   docs/api/trading_api.md and
+│                                  #   docs/api/sdk_dependency.md
 ├── tests/
 ├── vendor/
 │   └── dbsec-open-api/            # vendored trading-API SDK (see

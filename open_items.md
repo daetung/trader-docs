@@ -29,11 +29,12 @@ confirmation that it still reads correctly.
 1. **`docs/api/trading_api.md` — the module's undesigned interior** comes
    first: the call-point inventory it contains is what every other API-side
    item is measured against, and two of them cannot start without it.
-2. **API call budget allocation** depends directly on 1 — a budget cannot be
-   divided among consumers before the consumers are enumerated.
-3. **Market-data tier and tick completeness** is independent of both and can
-   be taken at any point; it is placed here because its answer may change
-   what 2 has to budget for.
+2. **Market-data tier and tick completeness** is blocked on nothing and is
+   taken next because its answer may change what 3 has to budget for.
+3. **API call budget allocation** depends directly on 1 — a budget cannot be
+   divided among consumers before the consumers are enumerated — and is
+   now also load-bearing rather than optimising: the watchdog working-set
+   model leaves the polling loop unbuildable until it resolves.
 4. **Async boundary**, **early-close days** and **fill-inquiry page size** are
    independent of each other and of the above.
 5. **`api_contract_checklist.md` re-evaluation** goes last by construction —
@@ -69,6 +70,35 @@ each constrains the others:
 - **Whether the module stays one file** — the domain surface may split along
   the vendor's own quote/order/realtime axis. Fixing a file boundary before
   the call-point inventory exists would only require redrawing it.
+- **Configuration ownership** — which keys survive once the SDK owns base
+  URL and endpoint paths. `live_mode_runner.md`'s `trading_api_url` and
+  `trading_api_ticker_url` and `metadata_crawler.md`'s
+  `trading_api_quotes_url` are marked superseded but retained, because
+  `trading_api_url` still has a live consumer and what replaces it cannot
+  be stated before the call-point inventory. The SDK carries its own
+  `Config` (base URL, mode, credentials) whose path this project already
+  owns, so the boundary between the two config surfaces has to be drawn
+  rather than assumed.
+
+---
+
+## Market-data tier and tick completeness
+
+**Problem.** The vendor states that the FREE real-time market-data
+entitlement delivers roughly half of the trade prints, against the full
+feed. Exit Architecture's WS-primary tp/sl detection with its two-print
+guard, and the bar-latency finding that calibrates the bar-close grace
+window, both read the trade stream as if it were the whole tape.
+
+If the entitlement is what the account actually runs on, the two-print
+guard's time-to-detection and the REST backstop's share of the work both
+change, and this is close to what `api_contract_checklist.md`'s T-1 (a
+grade A row) already asks in a different form. Whether a paid tier exists,
+what it costs, and whether the delayed streams are relevant at all are
+unexamined.
+
+**Not yet designed.** Independent; may change what the budget-allocation
+item below has to plan for, which is why it is taken before it.
 
 ---
 
@@ -128,26 +158,6 @@ what the tick callback is allowed to do inline — is not designed.
 
 **Not yet designed.** Independent of the other items; can be taken at any
 point.
-
----
-
-## Market-data tier and tick completeness
-
-**Problem.** The vendor states that the FREE real-time market-data
-entitlement delivers roughly half of the trade prints, against the full
-feed. Exit Architecture's WS-primary tp/sl detection with its two-print
-guard, and the bar-latency finding that calibrates the bar-close grace
-window, both read the trade stream as if it were the whole tape.
-
-If the entitlement is what the account actually runs on, the two-print
-guard's time-to-detection and the REST backstop's share of the work both
-change, and this is close to what `api_contract_checklist.md`'s T-1 (a
-grade A row) already asks in a different form. Whether a paid tier exists,
-what it costs, and whether the delayed streams are relevant at all are
-unexamined.
-
-**Not yet designed.** Independent; may change what the budget-allocation
-item above has to plan for, which is why it is sequenced ahead of it.
 
 ---
 

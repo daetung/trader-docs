@@ -1304,6 +1304,9 @@ def record_health_event(
           crossing of exit_order_stuck_minutes (finding 18)
         - live_mode_runner.md's fill-stream staleness detection, on entry into
           each stale episode (finding 24)
+        - live_mode_runner.md's Watchdog Polling Loop, on entry into each
+          episode of an empty working set inside the regular session
+          (finding 29)
     Findings 13 and 15 deliberately do NOT call this — each already writes its
     own trade_log row, so a health_events row would be a second source for one
     fact. The rule: an event is recorded here when it leaves no row anywhere

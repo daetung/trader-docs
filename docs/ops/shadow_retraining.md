@@ -268,12 +268,23 @@ the current market regime.
 
 ## Operational Notes
 
-**Timezone / DST Discipline.** All schedule times in this system (04:00 ET
-`--premarket-open`, 09:20 ET `--premarket-recheck` — R-1: the 09:20 pass
-is now a LiveModeRunner in-process task, not a cron entry — see
+**Timezone / DST Discipline.** All schedule times in this system (03:00 ET
+`--token-refresh` — see metadata_crawler.md's "Overnight Token Refresh" —
+04:00 ET `--premarket-open`, 09:20 ET `--premarket-recheck` — R-1: the
+09:20 pass is now a LiveModeRunner in-process task, not a cron entry — see
 metadata_crawler.md's "Dual Schedule", N-1/N-3 — 09:30 regular session
-open, 15:59 session close, 21:00 ET evening batch run) are wall-clock
-America/New_York times, which observe DST. The deployment host/container
+open, 15:59 session close, 16:00 regular session close — past which the
+venue refuses market orders, so order type branches on it, see
+execution_common.md's session-phase table — 20:00 ET
+`session_hard_exit_time`, 21:00 ET evening batch run, 23:30 ET
+`evening_wait_hard_deadline`) are wall-clock America/New_York times, which
+observe DST. The set above is every wall-clock time the system schedules or
+gates behaviour against, whatever the mechanism — a cron entry, an
+in-process scheduled task, or a market boundary the code branches on; that
+criterion is why 09:20 stays listed after it ceased to be a cron. Authority
+for each value is its own config key, this enumeration being a convenience
+copy, so the two can be compared mechanically and a divergence resolved in
+the config's favour. The deployment host/container
 must be NTP-synchronised as well (R-8): Bar-Close Authority's wall-clock
 deadlines and the Feed Outage trigger assume sub-second skew against exchange
 time, and this is enforced rather than merely recommended — LiveModeRunner's
