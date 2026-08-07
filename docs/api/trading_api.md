@@ -118,6 +118,13 @@ item — see `open_items.md`.
   the vendor's own quote/order/realtime axis; deferred until the call-point
   inventory exists, since fixing a file boundary first would only require
   redrawing it.
+- **Configuration ownership.** Which of the caller specs' keys survive once
+  the SDK owns base URL and endpoint paths. `live_mode_runner.md`'s
+  `trading_api_url` and `trading_api_ticker_url` and `metadata_crawler.md`'s
+  `trading_api_quotes_url` are marked superseded but retained; the SDK
+  carries its own `Config`, whose path this project owns, so the boundary
+  between the two configuration surfaces has to be drawn rather than
+  assumed.
 
 ---
 

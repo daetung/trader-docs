@@ -22,7 +22,8 @@ LiveModeRunner
     ├── calculators: dict[str, CachingIndicatorCalculator]
     │       One instance per ticker in today's tradable universe.
     │       Populated eagerly at session_start via parallel session_start_compute().
-    │       Active watchlist populated lazily as watchdog events arrive.
+    │       Active watchlist populated lazily on a ticker's first appearance
+    │       in the watchdog working set.
     ├── FeatureExtractor              (uses CachingIndicatorCalculator via DI)
     ├── Inferencer                    (owns FeatureExtractor)
     ├── EntryPointDetector            (used internally by Inferencer)
@@ -300,7 +301,10 @@ its own first stage begins — see metadata_crawler.md's Dual Schedule.
 ```
 LiveModeRunner.start_session(today_date):
 
-  1. Fetch today's tradable ticker list from the watchdog service
+  1. Fetch today's tradable ticker list from the trading API — its
+     ticker-master endpoint, reached through TradingAPI (see
+     docs/api/trading_api.md). NOT the watchdog: that module returns the
+     entry-point working set, a different thing at a different scale.
          all_tickers: list[str]
          (tickers with prior-day data but no trading access today
           are automatically excluded by the API response)
@@ -615,7 +619,8 @@ calculators pool ("memory" mode):
   ~15,000 tickers × ~790KB (Layer1 + Layer2 + session_stats) ≈ ~11.9GB sustained
   Recommended server: 32GB+ RAM.
   For memory-constrained environments: use indicator_cache_mode = "db"
-  (50~200ms per-ticker load latency on first watchdog event).
+  (50~200ms per-ticker load latency on a ticker's first appearance in the
+  watchdog working set).
 ```
 
 ---
@@ -744,9 +749,20 @@ the SDK paces at a minimum interval rather than allowing a burst, so 50
 tickers serialise into an order of magnitude more time than the loop has.
 A bulk quote call accepting up to 50 symbols exists, but returns a price
 snapshot rather than OHLCV, so it does not directly serve
-`on_bar_close()`. This is not a tuning gap; the loop as written cannot be
+`on_bar_close()`. This is not a tuning gap; Step 2a as written cannot be
 built until the call-budget item resolves it (`open_items.md`). An
-implementation session must not read this loop as buildable.
+implementation session must not read STEP 2a'S FETCH as buildable. The rest
+of the loop — the working-set read, Step 3's multi-bar replay, the gate
+sequence and the submission path — is specified and is an implementation
+target.
+
+**Two different exclusions meet in this section and are not the same thing.**
+Step 2a's fetch is BLOCKED: a design answer is owed (`open_items.md`'s
+call-budget item) and the code cannot be written until it arrives. The
+watchdog module itself is OUT OF SCOPE: it is the access surface to a
+separate external system, specified here by its one call and nothing else,
+and is not an implementation target of this spec set. Everything else in this
+loop is neither, and is buildable now.
 
 **Loop termination (R-9).** This loop runs only while entries are
 structurally possible. At the top of every cycle, before Step 1:
@@ -800,15 +816,16 @@ loop every poll_interval_seconds:
              if 093000 bar just closed:
                  calculators[ticker].on_regular_session_open(bars_including_930)
          # Looping here (rather than assuming exactly one new bar) is what
-         # lets a ticker that drops out of candidacy for a while and later
-         # returns catch up correctly in the same step used for first entry
+         # lets a ticker evicted from the working set for a while and later
+         # returning catch up correctly in the same step used for first entry
          # — see "Watchlist Append" below. on_bar_close() itself is O(1)
          # per call for every CONTINUOUS indicator (see caching_calculator.md),
          # so looping over several missed bars here is cheap regardless of
          # how many accumulated.
 
   4. If ticker appears in candidates for the first time this session,
-     or is returning after one or more missed poll cycles
+     or is returning after one or more cycles absent (evicted past the
+     50-entry cap, then fired again)
      → see "Watchlist Append" below (Step 3's loop already replays any
      bars missed in between; this step only concerns first-time calculator
      setup when indicator_cache_mode="db")
@@ -1511,13 +1528,14 @@ so a re-crash during recovery re-enters warm restart on the same signature.
 
 ## Watchlist Append
 
-Called when a ticker appears in watchdog candidates for the first time this
-session, **or** is returning after one or more missed poll cycles (i.e. it
-was a candidate before, dropped out, and the watchdog service is flagging
-it again). Both cases use the same procedure — a ticker's absence from
-candidates for any stretch of time is not tracked or treated specially; the
-calculator's bar history simply catches up to however much was missed,
-same as it does for the ordinary first-time case:
+Called when a ticker appears in the watchdog working set for the first time
+this session, **or** is returning after one or more cycles absent (i.e. it
+had been evicted past the working set's 50-entry cap and has since fired
+again — eviction is the only way a ticker leaves the set, and is routine
+while the set is full). Both cases use the same procedure — a ticker's
+absence from the working set for any stretch of time is not tracked or
+treated specially; the calculator's bar history simply catches up to
+however much was missed, same as it does for the ordinary first-time case:
 
 ```
 When ticker X appears in candidates (first time this session, or again
@@ -2295,8 +2313,9 @@ live_mode:
   # "memory" (default): all CachingCalculator state held in RAM after session_start_compute()
   #                     Lowest latency; ~12GB sustained on 32GB+ server.
   # "db":               Indicator cache persisted to indicator_cache table after
-  #                     session_start_compute(); RAM released; loaded per-ticker on
-  #                     first watchdog event (50~200ms overhead).
+  #                     session_start_compute(); RAM released; loaded per-ticker
+  #                     on first appearance in the watchdog working set
+  #                     (50~200ms overhead).
   #                     Use for memory-constrained environments.
   # watchdog_url removed: the watchdog is a module call
   # (watchdog.get_candidates()), not an HTTP endpoint, so neither a URL
@@ -2316,9 +2335,13 @@ live_mode:
                                              # the trading API's ticker-master
                                              # endpoint (SDK: stock-ticker
                                              # search, exchange as an input
-                                             # parameter) — NOT the watchdog,
-                                             # and not Session Lifecycle
-                                             # Step 1's source
+                                             # parameter) — NOT the watchdog.
+                                             # This IS the endpoint Session
+                                             # Lifecycle Step 1 reads, but
+                                             # Step 1 reaches it through
+                                             # TradingAPI, not through this
+                                             # key — which is why the key
+                                             # itself still has no consumer
 
   # R-1: 09:20 recheck moved in-process (see "In-Process Premarket
   # Recheck" below) — no longer a cron. wall-clock America/New_York.
@@ -2381,12 +2404,18 @@ live_mode:
                                              # earlier: all-flat past
                                              # execution.session_close_exit_time.
   min_watchlist_size:             30         # seed value — Feed Outage
-                                             # trigger condition 2's sample-
-                                             # size floor (see "Feed Outage
-                                             # Recovery"); below this many
-                                             # candidates in a poll cycle,
-                                             # the percentage check does not
-                                             # evaluate at all
+                                             # trigger condition 2 (see "Feed
+                                             # Outage Recovery"). TWO roles,
+                                             # both moving with this one
+                                             # value: the ratio test reads the
+                                             # MRU top N of the working set,
+                                             # and a working set shorter than
+                                             # N does not evaluate condition 2
+                                             # at all. Read that section
+                                             # before tuning — the sample's
+                                             # composition and its size pull
+                                             # sensitivity in opposite
+                                             # directions
   bar_close_grace_seconds:        5          # seed value — Bar-Close
                                              # Authority's per-ticker
                                              # miss deadline; how long past
@@ -2458,13 +2487,14 @@ live_mode:
 
 ## Constraints
 
-- Ticker list is sourced from the watchdog service at session_start — not from DuckDB ohlcv_1min
+- Ticker list is sourced from the trading API at session_start (Session Lifecycle Step 1) —
+  not from the watchdog, and not from DuckDB ohlcv_1min
   (today's tradable tickers only; prior-day data for non-tradable tickers is irrelevant)
 - US stock splits always take effect before market open — no intra-session split handling needed
 - LiveModeRunner maintains one CachingIndicatorCalculator per ticker in the tradable universe
   (eager pool initialized at session_start via parallel session_start_compute())
 - Active watchlist (calculators with pending entry signals) is empty at session_start;
-  tickers are appended as watchdog events arrive — not pre-populated
+  tickers are appended on first appearance in the watchdog working set — not pre-populated
 - session_stats bulk load (Step 2): loaded at session_start for ALL tickers from precomputed_session_stats
   (WHERE as_of_date = today — inserted by collect_daily.py the previous evening);
   used during session_start_compute() (Step 5); released from RAM after Step 5 completes
@@ -2474,8 +2504,9 @@ live_mode:
   either. Health Gate 2 (Step 6) is separate and runs after Step 5 specifically
   because its input (tier_used) does not exist until Eager Pool has run —
   it cannot be folded into Health Gate 1
-- session_stats Phase 2 ("db" mode only): loaded per-ticker from DB on first watchdog event
-  via load_session_stats(); in "memory" mode, session_stats retained in calc._session_stats
+- session_stats Phase 2 ("db" mode only): loaded per-ticker from DB on first appearance in
+  the watchdog working set via load_session_stats(); in "memory" mode, session_stats
+  retained in calc._session_stats
 - Inferencer is instantiated once per session with the DI FeatureExtractor
 - on_bar_close() called by LiveModeRunner for each ticker per bar — not by IndicatorCalculator
 - Position manager loop runs independently of watchdog polling loop

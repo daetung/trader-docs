@@ -307,7 +307,8 @@ def load_from_db(
     Does NOT restore self._session_stats —
     caller must call set_session_stats() separately after this method.
 
-    Expected call sequence (db mode, first watchdog event for ticker):
+    Expected call sequence (db mode, on a ticker's first appearance in
+    the watchdog working set):
         calc = CachingIndicatorCalculator(config)
         calc.load_from_db(db_conn, today_date, ticker)
         stats = load_session_stats(db_conn, ticker, today_date, ...)

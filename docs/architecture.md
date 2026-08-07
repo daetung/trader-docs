@@ -87,7 +87,7 @@ Live inference endpoint: LiveModeRunner (execution orchestrator)
                          │       inference_log writes (DuckDB)
                          │
                          ├── Watchdog polling loop  (1s interval)
-                         │       query watchdog service → ticker candidates
+                         │       watchdog.get_candidates() → cumulative working set
                          │       TradingAPI fetch (bars + ticks) → on_bar_close()
                          │       detect → infer → buy order
                          │

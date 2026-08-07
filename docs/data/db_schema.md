@@ -731,7 +731,8 @@ CREATE TABLE IF NOT EXISTS experiment_log (
 
 -- Trade log (output of BacktestEngine — one row per executed trade;
 -- also written by LiveModeRunner in shadow mode — see is_shadow below and
--- live_mode_runner.md's Shadow Mode section)
+-- live_mode_runner.md's Position Manager / Watchdog Loop shadow_mode
+-- branches)
 -- Retention: NEVER purged — structurally excluded from the purge registry
 --   (the P&L record).
 CREATE TABLE IF NOT EXISTS trade_log (
@@ -1108,8 +1109,9 @@ CREATE TABLE IF NOT EXISTS precomputed_session_stats (
 -- "memory" mode the RAM copy stays authoritative for the running session
 -- and this backup is read only on a warm restart.
 -- Populated by CachingIndicatorCalculator.persist_to_db() at session_start.
--- Loaded per-ticker on first watchdog event via load_from_db() ("db" mode),
--- or by a warm restart (any mode — R-2, see live_mode_runner.md).
+-- Loaded per-ticker on its first appearance in the watchdog working set via
+-- load_from_db() ("db" mode), or by a warm restart (any mode — R-2, see
+-- live_mode_runner.md).
 -- session_stats are NOT stored here — sourced from precomputed_session_stats separately.
 -- Retention: session-scoped, its own mechanism — NOT in the purge registry.
 -- Current session_date only, purged per ticker inside persist_to_db() at COLD
@@ -1398,13 +1400,14 @@ CREATE TABLE IF NOT EXISTS bar_latency_daily (
 -- Retention: purge-registry member — date_column `date`, retention_days: inf
 -- (see metadata_crawler.md's evening purge stage). Of the tables here this is
 -- the one whose growth rate can actually matter: R-9 widened its writers from
--- one finding to six, and findings 18 and 24 both emit repeatedly during a
--- broker-latency episode. Its purpose — WHEN an occurrence happened, and
+-- one finding to six and finding 29 has since made seven, and findings 18 and
+-- 24 both emit repeatedly during a broker-latency episode. Its purpose — WHEN an occurrence happened, and
 -- alert traceability via alert_log.event_ids — is short-horizon, so a window is
 -- legitimate here once growth has been observed. The DB health observation
 -- (health_report.md) reports its row count for exactly that purpose.
 -- SCOPE, deliberately wider than today's use: the schema accepts any
--- event-shaped finding. Findings 12, 14, 18, 24, 25 and 27 write here (R-9).
+-- event-shaped finding. Findings 12, 14, 18, 24, 25 and 27 write here (R-9),
+-- and finding 29 does too.
 -- Findings 13 and 15 deliberately do NOT: each already writes its own
 -- trade_log row (exit_reason='restart_gap_exit' / 'overnight_exit' /
 -- 'reconcile_ghost') carrying the occurrence and its time, so recording them

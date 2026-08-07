@@ -102,7 +102,7 @@ def gather_findings(db_conn, today_date, log_dir,
        6 and 7's thresholds below; the rate itself is always computed and
        loggable, only the warn/abort cutoff is undecided).
     4. metadata_crawler structured logs — parse logs/metadata_crawler_{today_date}.log
-       for SUMMARY lines only (see metadata_crawler.md's Output/Logging).
+       for SUMMARY lines only (see metadata_crawler.md's Output / Logging).
        A stage with a batch_runs 'success'/'failed' row but no matching
        SUMMARY line is flagged as a logging-mismatch finding on its own —
        distinct from the batch's own status.
@@ -530,8 +530,8 @@ resolvable. Every registry entry starts at `inf` precisely because no growth
 rate has ever been measured; this is what measures them, so an operator
 eventually sets a window against data instead of a guess. `health_events` is
 the entry most worth watching — R-9 widened its writers from one finding to
-six, and findings 18 and 24 both emit repeatedly during a broker-latency
-episode.
+six and finding 29 has since made seven, and findings 18 and 24 both emit
+repeatedly during a broker-latency episode.
 
 **Delivered on its own alert stream**, `alert_key: 'db_health_observation'`,
 so it lands in `alert_log` like any other delivery and its remote arrival is
@@ -806,7 +806,7 @@ present.
 - **`log_dir` files**: findings 4, 10, and the missing-`SUMMARY` finding.
   Readable without the DB, which is why path (7) can produce anything at all.
 - **DB**: findings 1, 2, 3, 5, 8, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
-  22, 23, 24, 25, 26, 27.
+  22, 23, 24, 25, 26, 27, 29.
 - **Neither**: findings 6, 7 (placeholders) and 28.
 - Finding 11 is produced BY the evening liveness probe rather than gathered
   during it — it is that path's own conclusion, not a query result.

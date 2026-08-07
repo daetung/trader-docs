@@ -682,13 +682,13 @@ def detect_rename_candidates(db_conn) -> list[dict]:
        log to tools/rename_candidates.log for manual review
 
     Fallback path (not integrated here): for cases SEC's company_tickers.json
-    alone leaves ambiguous, a cross-check against the watchdog service
-    (the same service already queried in live_mode_runner.md's Session
-    Lifecycle Step 1 for today's tradable ticker list — NOT the trading
-    API) is intended as a secondary
-    signal. Noted as a planned path only — the specific endpoint/call
-    contract for this cross-check is not defined in this spec; SEC's
-    company_tickers.json is the sole source actually implemented above.
+    alone leaves ambiguous, a cross-check against the trading API's
+    ticker-master endpoint (the same source live_mode_runner.md's Session
+    Lifecycle Step 1 reads for today's tradable ticker list) is intended
+    as a secondary signal. Noted as a planned path only — the specific
+    endpoint/call contract for this cross-check is not defined in this
+    spec; SEC's company_tickers.json is the sole source actually
+    implemented above.
     """
 ```
 
@@ -1247,10 +1247,6 @@ via the lock-probe fallback above.
         --data-root /path/to/json/data \
         --date today >> logs/collect_daily.log 2>&1
 
-# Premarket open (N-1) — replaces separate --ticker-rename-only and
-# --corporate-events-only cron entries previously here, both at 04:00 ET
-# (see "Dual Schedule" above and Constraints for the collision this
-# merge removes)
 # Overnight token refresh — 03:00 ET, weekdays
 # Weekday-only is correct: no API consumer exists at the weekend (both
 # other entries are 1-5), and Monday 03:00 has no token to revoke at all —
@@ -1262,6 +1258,10 @@ via the lock-probe fallback above.
         --db-path data/market.duckdb \
         --token-refresh >> logs/collect_daily_token.log 2>&1
 
+# Premarket open (N-1) — replaces separate --ticker-rename-only and
+# --corporate-events-only cron entries previously here, both at 04:00 ET
+# (see "Dual Schedule" above and Constraints for the collision this
+# merge removes)
 0 4 * * 1-5 cd /path/to/stock-scalping && \
     source .venv/bin/activate && \
     python tools/collect_daily.py \

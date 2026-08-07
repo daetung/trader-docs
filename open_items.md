@@ -53,7 +53,7 @@ success test), symbol/exchange encoding at the point of call, the async
 boundary, and the orderbook call being in scope. Its interior is not
 designed, and the file marks the gap in its own "Not Yet Designed" section.
 
-**Not yet designed.** Four questions, deliberately deferred together because
+**Not yet designed.** Five questions, deliberately deferred together because
 each constrains the others:
 
 - **Call-point inventory** — which endpoints, with which arguments, derived
