@@ -562,6 +562,8 @@ ordering-sensitive session-stats step rather than before it. Writes
 `batch_runs` `stage='evening_investing_forward_check'`
 (`status='running'` at start, `'success'`/`'failed'` at completion).
 
+---
+
 ## Feed Coverage Analysis (`stage='evening_feed_coverage'`)
 
 Reads the day's raw per-second aggregates from

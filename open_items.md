@@ -251,12 +251,14 @@ has enough history; revisit then, not before.
 ## `api_contract_checklist.md` — verify before Pilot
 
 Not a new design problem — a pointer, so it isn't lost among the items
-above. `docs/ops/api_contract_checklist.md` holds **15 rows, of which 14 are
-unverified** assumptions, two graded **A** (T-1: REST/WS tick granularity;
-T-7: fill-event stream ID stability). The counts differ because T-3 was
-RETIRED IN PLACE rather than deleted — that file's Role and Constraints
-forbid deleting rows, so a broker change does not require rediscovering a
-question. Both A-graded rows must
+above. `docs/ops/api_contract_checklist.md` holds **16 rows, of which 14 are
+still unverified** assumptions, two graded **A** (T-1: REST/WS tick
+granularity; T-7: fill-event stream ID stability). The three numbers
+reconcile as 16 = 14 unverified + T-6 measured + T-3 retired, and the row
+count does not fall as questions are settled because that file's Role and
+Constraints forbid deleting rows — a broker change would make a settled
+question live again, and a deleted row would have to be rediscovered. Both
+A-graded rows must
 be verified, or their fallback paths confirmed sufficient, before Stage 2
 (Pilot) — see that file's own "When to use it" section. Not duplicated here;
 consult that file directly rather than letting a second copy of its contents
