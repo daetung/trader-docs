@@ -2404,6 +2404,27 @@ live_mode:
   ws_reconnect_max_attempts:      5          # consecutive reconnect failures
                                              # before the escalation ladder
                                              # advances — see "WS connections"
+  market_buy_price_margin:        1.05       # seed value — stage 1 of the
+                                             # market-BUY funds gate sizes
+                                             # against ask1 * this, since the
+                                             # vendor converts a market BUY to
+                                             # a limit at a reference price it
+                                             # does not disclose
+                                             # (execution_common.md's Session
+                                             # Phase). Under live_mode:, not
+                                             # execution:, for the same reason
+                                             # as the ladder keys below —
+                                             # BacktestEngine has no bid/ask
+                                             # model, so simulate_entry_fill()
+                                             # cannot read this and
+                                             # approximates from bar data.
+                                             # Set GENEROUS deliberately, the
+                                             # one-sided-error posture of
+                                             # margin_ratio_fallback: too high
+                                             # costs an occasionally
+                                             # under-sized entry, too low a
+                                             # vendor rejection the entry-side
+                                             # path already handles
   exit_ladder_seed:               0.5        # spread position of a limit exit
                                              # at submission: ask - k*(ask-bid)
                                              # (execution_common.md). 0.5 = the

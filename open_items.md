@@ -237,11 +237,23 @@ neither path is usable until enough history has accumulated.
 - **As an execution-time gate.** BacktestEngine still cannot replay a live
   bid/ask gate against historical data older than the collection start date.
 
-A third consumer appeared this session: the exit ladder's spread-position
-pricing lives under `live_mode:` rather than `execution:` precisely because
-BacktestEngine has no bid/ask model to mirror it. If backtest is ever
-extended to replay `bid_ask_snapshots`, those keys move alongside the two
-paths above.
+Two more consumers appeared. The exit ladder's spread-position pricing lives
+under `live_mode:` rather than `execution:` precisely because BacktestEngine
+has no bid/ask model to mirror it, and `market_buy_price_margin` joins it
+there for the same reason. If backtest is ever extended to replay
+`bid_ask_snapshots`, those keys move alongside the two paths above.
+
+- **As entry sizing.** The market-BUY funds gate prices against
+  `ask1 * market_buy_price_margin` in live mode, while `simulate_entry_fill()`
+  receives `ticks_entry`, `ohlcv_entry` and `p_entry` — never a book — and so
+  approximates the vendor's undisclosed conversion from bar data instead. The
+  two do not size identically and the gap is unquantified. This is NOT a
+  defect to fix by making one call the other: the live side uses the better
+  information and should, while the backtest side cannot. What is undesigned
+  is the backtest approximation itself — what it is, and how far it sits from
+  the live figure — and that cannot be settled without measurement against
+  accumulated `bid_ask_snapshots`, which is what the two paths above are
+  already waiting on.
 
 **Not yet designed** — still. Not actionable again until `bid_ask_snapshots`
 has enough history; revisit then, not before.

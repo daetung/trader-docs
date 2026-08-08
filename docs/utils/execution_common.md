@@ -375,20 +375,9 @@ execution:
                                     # accumulates (see shadow_retraining.md)
   cancel_after_seconds:        30   # seed value — same refinement path as buy_rate
   entry_order_type:      "market"  # "market" | "limit"
-  market_buy_price_margin:   1.05  # seed value — stage 1 of the market-BUY
-                                    # funds gate sizes against ask1 * this,
-                                    # because the vendor converts a market BUY
-                                    # into a limit at a reference price it does
-                                    # not disclose (see Session Phase above).
-                                    # Set GENEROUS on purpose, the same
-                                    # one-sided-error posture as
-                                    # margin_ratio_fallback: too high costs an
-                                    # occasionally under-sized entry, too low
-                                    # costs a vendor rejection the entry-side
-                                    # path already handles. Read by
-                                    # check_funds_available() and
-                                    # simulate_entry_fill() alike, so backtest
-                                    # and live size identically
+  # market_buy_price_margin lives under live_mode:, not here — it prices
+  # against ask1 and BacktestEngine has no bid/ask model, the same reason
+  # the exit ladder's keys sit there (live_mode_runner.md).
   entry_gap_type:    "percentage"  # "percentage" | "absolute" — limit only
   entry_gap_value:            0.0  # limit only. 0 = limit at p_entry exactly;
                                     # positive = willing to pay up to that much
@@ -632,12 +621,16 @@ documentation rather than assumed:
   than for an equivalent limit order. The vendor sets that reference by its
   own undisclosed criterion, so the number cannot be read from the response
   before submission — which leaves the funds check sizing against a quantity
-  the spec did not state. It is therefore TWO-STAGE. Stage 1, local:
-  `check_funds_available()` and `simulate_entry_fill()` size against the
-  observed `ask1` times `execution.market_buy_price_margin`, an observable
-  bound replacing an unquantified one — and it costs no extra API call,
-  since `signal_time_rest` already queries level-1 bid/ask at every entry
-  signal. Stage 2, authority: the vendor's own insufficient-funds refusal is
+  the spec did not state. It is therefore TWO-STAGE in live mode. Stage 1, local:
+  `check_funds_available()` sizes against the observed `ask1` times
+  `live_mode.market_buy_price_margin`, an observable bound replacing an
+  unquantified one — and it costs no extra API call, since
+  `signal_time_rest` already queries level-1 bid/ask at every entry signal.
+  `simulate_entry_fill()` does NOT read that key and cannot: it receives
+  `ticks_entry`, `ohlcv_entry` and `p_entry`, never a book, so BacktestEngine
+  approximates the conversion from bar data instead. The two therefore do not
+  size identically, and how far apart they are is unquantified — an open item,
+  entered alongside the other bid/ask asymmetries. Stage 2, authority: the vendor's own insufficient-funds refusal is
   the gate's real outcome, which the entry-side rejection path already
   anticipates (`live_mode_runner.md`). The margin is set GENEROUS
   deliberately — the same one-sided-error posture as `margin_ratio_fallback`
