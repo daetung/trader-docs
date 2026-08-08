@@ -264,11 +264,11 @@ be verified, or their fallback paths confirmed sufficient, before Stage 2
 consult that file directly rather than letting a second copy of its contents
 drift out of sync.
 
-The count fell from 16 because T-6 was MEASURED this session, against both
-production and demo accounts, and rewritten around what was actually found:
-subscription types are mutually exclusive per connection, which removed the
-"WS sequence lease" the row had been anchored to. T-9 kept its row but lost
-its config key, the key having been deleted with that lease.
+T-6 was MEASURED against both production and demo accounts, and rewritten
+around what was actually found: subscription types are mutually exclusive per
+connection, which removed the "WS sequence lease" the row had been anchored
+to. T-9 kept its row but lost its config key, the key having been deleted
+with that lease.
 
 **A re-evaluation pass is itself unresolved**, though it shrank. Three rows
 moved: T-3 retired outright, its premise gone once per-endpoint TPS turned
