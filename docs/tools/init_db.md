@@ -166,10 +166,10 @@ Plain stdout; no log file and no `batch_runs` row (this tool is outside the
 batch-marker scheme entirely — see the concurrency assumption above).
 
 ```
-init:   created 29 tables, 0 already present    # fresh database
-init:   created 1 table, 28 already present     # after a new table was added
-verify: 29 tables checked, 0 differences
-verify: 29 tables checked, 1 difference
+init:   created 30 tables, 0 already present    # fresh database
+init:   created 1 table, 29 already present     # after a new table was added
+verify: 30 tables checked, 0 differences
+verify: 30 tables checked, 1 difference
         live_session_state: column 'session_diagnostics' missing — ALTER needed
 ```
 

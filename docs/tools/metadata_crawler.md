@@ -337,26 +337,25 @@ only, cannot open the DB read-write during a live session):
        # inter-process coordination (see live_mode_runner.md)
 ```
 
-Both quotes/halt fetches are sequential (not parallel) within themselves
-— `utils.bulk_api_call_chunked()`'s chunking is already sequential per
-endpoint for the same reason (an assumed server-side throughput ceiling,
-not a per-connection one); running the two *different* endpoints (quotes,
-halt) concurrently was considered and rejected for the same reason —
-uncertain whether the trading API's request budget is shared across
-endpoints, and a wrong guess there risks throttling both. ~150s each,
-~300s combined, either pass — comfortably inside both passes' available
+Both quotes/halt fetches are sequential (not parallel) within themselves.
+The quotes side batches behind TradingAPI, which paces against the
+endpoint's published rate; the halt side is a different vendor entirely
+(`utils.query_halt_status()`), so nothing about the two is shared. Running
+them concurrently was considered and rejected: the gain is bounded by the
+slower of two independent budgets, while a wrong guess about either risks
+throttling both. Minutes each, comfortably inside both passes' available
 window (see Premarket Schedule).
 
 ```python
 def bulk_fetch_today_first_price(
     tickers: list[str],
-    trading_api_quotes_url: str,
-    chunk_size: int,
 ) -> dict[str, float]:
     """
-    Via utils.bulk_api_call_chunked() — NOT a true single call at universe
-    scale (~15k tickers against an assumed ~100 tickers/sec real-world
-    ceiling is ~150s even chunked; see that function).
+    Through TradingAPI (docs/api/trading_api.md), which owns endpoint
+    addressing and the batching the endpoint's symbol cap requires. Takes
+    no URL and no chunk size. NOT a true single call at universe scale —
+    ~15k tickers against the published per-endpoint rate still takes
+    minutes — but the caller does not express that.
 
     Returns {ticker: today_first_price} — a ticker with no premarket tick
     yet is absent, not 0/NaN; check_corporate_event_anomaly() already
@@ -563,6 +562,80 @@ ordering-sensitive session-stats step rather than before it. Writes
 `batch_runs` `stage='evening_investing_forward_check'`
 (`status='running'` at start, `'success'`/`'failed'` at completion).
 
+## Feed Coverage Analysis (`stage='evening_feed_coverage'`)
+
+Reads the day's raw per-second aggregates from
+`data/feed_coverage/{live,delayed}/YYYYMMDD.jsonl`, writes one
+`feed_coverage_daily` row per `(date, ticker)`, then disposes of the raw
+pair. The live side is written by LiveModeRunner and the delayed side by
+`auxiliary_stream.md`; each file has exactly one writer, so neither engages
+P-5's single-writer constraint — they are not database files.
+
+**Placed fifth, immediately before Retention Purge.** `feed_coverage_daily`
+is a purge-registry member, so running after the purge would leave the
+registry counting a table whose row for that date does not yet exist. It
+reads no DB table and depends on no other stage, so a failure here blocks
+nothing downstream.
+
+It runs after the delayed side is complete. That stream trails real time by
+roughly fifteen minutes against a 20:00 session end, which the 21:00 slot
+clears by about an hour.
+
+**SKIP and FAILURE are different outcomes, and conflating them breaks in one
+direction or the other** — treating a disabled feature as failure would
+accumulate a retry every day, while treating a dead auxiliary process as a
+skip would lose the data silently.
+
+| Condition | Outcome |
+|---|---|
+| `auxiliary_stream.enabled` is false | SKIP — no-op `batch_runs` row, the same shape the non-trading-day crons already write |
+| Neither file exists | SKIP |
+| Exactly one file exists | FAILURE — live-only means the auxiliary process died; delayed-only means LiveModeRunner never wrote its aggregates |
+| Either file fails to parse | FAILURE |
+| A file stops mid-session | SUCCESS — analysed for what it holds |
+
+A file stopping mid-session is not a failure because partial capture was
+accepted when the flush cadence was chosen: the callback holds sealed
+seconds in memory and an abrupt death loses the last interval.
+
+**The ticker population is the DELAYED side's.** A ticker present in live but
+absent from delayed would compute as total dropout, and that is
+indistinguishable from the auxiliary process having subscribed it late — so
+it is EXCLUDED rather than recorded as a 100% miss. The delayed stream
+carries the complete tape, which is what makes it the correct population. The
+excluded count goes to the log and to `health_report.md`'s observation
+section only; it does not get a `batch_runs` column, since a large count is
+already a signal without changing the schema for a diagnostic.
+
+**A partial failure writes nothing.** If some tickers aggregate and others
+fault, the whole date fails rather than being written short: this table
+exists to measure a coverage RATIO, and a partial write biases exactly the
+quantity it reports. Which tickers faulted, and why, go to the log and the
+observation section — visible without being recorded as data.
+
+**Disposal is carried in the filename, not in a table.** On success the raw
+pair is deleted. On failure it is renamed with a `.failed` suffix, and the
+next evening's stage picks up both that day's pair and any suffixed pair. A
+pair that fails while already suffixed is deleted: exactly one retry, with no
+counter to store and no unbounded accumulation, and the state is visible from
+a directory listing. **The two files are renamed and deleted TOGETHER,
+never independently** — otherwise the next run pairs a fresh file against a
+stale one. A pair found in mismatched state is squared up before analysis
+rather than analysed.
+
+**Memory.** The delayed side is loaded in full first, because the density
+buckets key on ITS prints-per-second and `live_zero_seconds_*` needs its
+second-set; the live side then streams against it. At the 50-ticker
+subscription ceiling this is roughly 1.2M entries, on the order of
+150–200 MB — stated rather than left implicit, in the manner of
+`live_mode_runner.md`'s Bulk Load Memory Profile. If that proves too large,
+the fallback is a per-ticker two pass: 50 file scans for negligible memory.
+
+**Re-running a date is safe.** The stage deletes that date's
+`feed_coverage_daily` rows and re-inserts, rather than merging — see
+`db_schema.md`, where the contrast with `bar_latency_daily`'s additive upsert
+is recorded.
+
 ---
 
 ## Retention Purge (R-9) — final evening stage
@@ -582,6 +655,7 @@ PURGE_REGISTRY = {
     "batch_runs":         ("date",   float("inf")),
     "bid_ask_snapshots":  ("date",   float("inf")),
     "bar_latency_daily":  ("date",   float("inf")),
+    "feed_coverage_daily": ("date",  float("inf")),
     "health_events":      ("date",   float("inf")),
     "alert_log":          ("date",   float("inf")),
     "train_log":          ("run_at", float("inf")),
@@ -1308,24 +1382,18 @@ evening_wait_hard_deadline: "23:30"   # ET
 # capacity.
 token_refresh_time: "03:00"           # ET
 
-# Bulk today-vs-yesterday price quote endpoint for
-# check_corporate_event_anomaly() (P-8) — a distinct endpoint from
-# trading_api_url / trading_api_ticker_url (see live_mode_runner.md),
-# since this crawler runs standalone, outside any LiveModeRunner session.
-# SUPERSEDED, like both of those, by the vendored SDK which owns base URL
-# and endpoint paths (docs/api/sdk_dependency.md); retained pending
-# open_items.md's API-layer item, which also has to draw the boundary
-# between this config surface and the SDK's own.
-# URL path and response schema: TBD (API spec sheet).
-trading_api_quotes_url: "http://trading-api/quotes/today"
-
-# Chunk size for utils.bulk_api_call_chunked() — shared by
-# bulk_fetch_today_first_price() (below) and, via the same physical
-# pipeline_config.yaml, live_mode_runner.md's query_halt_status() call
-# (see that file's Position Manager Loop Step 1a). Estimated against a
-# ~100 tickers/sec real-world throughput ceiling — TBD pending the actual
-# API spec sheet.
-bulk_api_chunk_size: 50
+# trading_api_quotes_url removed. The bulk today-vs-yesterday price quote
+# that check_corporate_event_anomaly() (P-8) uses is reached through
+# TradingAPI like every other vendor call; endpoint addressing is the SDK's
+# (docs/api/trading_api.md's Configuration Ownership). This crawler running
+# standalone, outside any LiveModeRunner session, does not change that — the
+# module is a layer, not a session-scoped object.
+#
+# bulk_api_chunk_size removed with it. Chunking sits behind TradingAPI,
+# which knows the endpoint's published symbol cap, so callers pass a ticker
+# list of any length. The key's own value was estimated against an assumed
+# ~100 tickers/sec ceiling — a figure the vendor publishes per endpoint and
+# the SDK paces against automatically.
 
 quarantine:
   price_anomaly_threshold: 0.40   # |today_first_price / yesterday_close - 1|
@@ -1363,11 +1431,12 @@ quarantine:
   single evening run must not change; the premarket refresh is intentionally
   a separate, later, supplementary crawl that session_stats does NOT re-read
 - `populate_trading_calendar()`, `populate_ticker_coverage()`, and `populate_precomputed_session_stats()` sourced from `utils.py`
-- The evening run writes five `batch_runs` rows as it progresses —
+- The evening run writes six `batch_runs` rows as it progresses —
   `stage='evening_ingestion'` (around Steps 3-4 above), `stage='evening_tick_bar_aggregates'`
   (Tick Bar Aggregates Update), `stage='evening_session_stats'` (Session Stats
   Update), `stage='evening_investing_forward_check'` (Evening
-  Forward-Looking Corporate-Events Check, item N), and finally
+  Forward-Looking Corporate-Events Check, item N),
+  `stage='evening_feed_coverage'` (Feed Coverage Analysis), and finally
   `stage='evening_retention_purge'` (Retention Purge, R-9 — last, after
   every other stage, being the only destructive one) — each
   `status='running'` at its own start, `'success'`/`'failed'`

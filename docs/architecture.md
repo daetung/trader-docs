@@ -140,6 +140,7 @@ Standalone scripts:
 | `tools/migration_tool.md` | JSON → DuckDB migration, trading_calendar/coverage init, precomputed_session_stats population |
 | `tools/detection_benchmark.md` | Entry detection threshold tuning + timing benchmark |
 | `tools/metadata_crawler.md` | Daily metadata fetch, new data ingestion, session stats daily update |
+| `tools/auxiliary_stream.md` | Host for non-trading WebSocket subscriptions on a separate account — delayed-quote capture for feed-coverage measurement is its first consumer |
 | `tools/health_report.md` | Findings gathering, log/Discord/email alert delivery, alert-level config |
 | `visualization/viz_connector.md` | Abstract base class for visualization backends |
 
@@ -199,7 +200,8 @@ stock-scalping/
 │   │   ├── migration_tool.md
 │   │   ├── detection_benchmark.md
 │   │   ├── metadata_crawler.md
-│   │   └── health_report.md
+│   │   ├── health_report.md
+│   │   └── auxiliary_stream.md
 │   └── visualization/
 │       └── viz_connector.md
 ├── models/                        # trained model artifacts (.lgb, _meta.json)
@@ -248,6 +250,7 @@ stock-scalping/
 │   ├── init_db.py
 │   ├── migrate_json_to_duckdb.py
 │   ├── collect_daily.py
+│   ├── collect_auxiliary_stream.py
 │   └── detection_benchmark.py
 ├── api_doc/                       # vendor API documentation (markdown).
 │                                  #   External read-only reference, not a

@@ -615,10 +615,20 @@ documentation rather than assumed:
 
 - **A market BUY is submitted as a limit** at a price unfavourable to the
   buyer, with the reference price set high, so orderable quantity is lower
-  than for an equivalent limit order. `check_funds_available()` and
-  `simulate_entry_fill()` both size against this, and the entry-side
-  rejection path already anticipates an insufficient-funds-at-actual-price
-  refusal (`live_mode_runner.md`).
+  than for an equivalent limit order. The vendor sets that reference by its
+  own undisclosed criterion, so the number cannot be read from the response
+  before submission — which leaves the funds check sizing against a quantity
+  the spec did not state. It is therefore TWO-STAGE. Stage 1, local:
+  `check_funds_available()` and `simulate_entry_fill()` size against the
+  observed `ask1` times `execution.market_buy_price_margin`, an observable
+  bound replacing an unquantified one — and it costs no extra API call,
+  since `signal_time_rest` already queries level-1 bid/ask at every entry
+  signal. Stage 2, authority: the vendor's own insufficient-funds refusal is
+  the gate's real outcome, which the entry-side rejection path already
+  anticipates (`live_mode_runner.md`). The margin is set GENEROUS
+  deliberately — the same one-sided-error posture as `margin_ratio_fallback`
+  choosing 4.0 over 1.0. Too large costs an occasionally under-sized entry;
+  too small costs a vendor rejection that is already handled.
 - **A market SELL is not converted.** The vendor states the conversion for
   buys only and its reason is buy-specific, so the exit-side escalation's
   final-backstop guarantee holds wherever a market order is permitted at

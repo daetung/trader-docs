@@ -64,9 +64,9 @@ outranks a shaky one that degrades gracefully.
 |---|---|---|---|---|---|---|
 | T-1 | The REST tick endpoint returns the same granularity and schema as the WS trade stream | `live_mode_runner.md` Exit Architecture | **A** | Pull the same window from both, compare tick counts and fields | — (no key; a mismatch needs a normalisation layer, not a value) | |
 | T-2 | Full-range-since-last-query retention: how far back, and what a first-ever query returns | Warm Restart gap-fill, Feed Outage Recovery | **B** | Self-measuring — the session-start retention probe records the oldest timestamp actually returned | `live_mode.retention_probe.assumed_days` (fallback only) | |
-| T-3 | Throughput ceiling, assumed ~100 tickers/sec | Chunked fetches; Eager Pool | **B** | Ramp until rate limiting appears; measure both the 09:20–09:25 overlap and steady state | `live_mode.api_max_tickers_per_second` | |
+| T-3 | ~~Throughput ceiling, assumed ~100 tickers/sec~~ | ~~Chunked fetches; Eager Pool~~ | **RETIRED** | Nothing to verify — see below | — (key deleted) | **Retired** — premise gone |
 | T-4 | What the balance query returns: cash, buying power, or settled funds | `session_start_cash` → `compute_position_size()` | **B** | Compare the returned figure against the broker's own statement | `execution.sizing_basis` selects the interpretation | |
-| T-5 | A margin-ratio endpoint exists and returns the current requirement | Session Start Probes → `sizing_basis: "equity"` | **B** | Endpoint documentation; confirm the value moves with position state | `live_mode.margin_ratio_url` | |
+| T-5 | Margin ratio is obtained PER TICKER from `inquiry/able-orderqty`, and combines with the account-level figure to yield the effective requirement | Position sizing — see `open_items.md`'s margin-ratio item | **B** | Call it for a ticker with and without an open position; confirm the returned figure moves, and reconcile against the account-level value | — (key deleted with `margin_ratio_url`) | |
 | T-6 | WS connection limits: tickers per connection, connections per account, subscription types per connection, connections per IP per port | Exit Architecture; WS connections | **B** | Subscribe and connect past each limit and observe the failure | `execution.ws_ticker_limit` | **Measured** — 50 tickers per connection; 2 connections per account; ONE subscription type per connection (an account registration sent on a quote connection converts it and silently stops quote delivery); 30 connections per IP per port. Confirmed against production AND demo accounts |
 | T-7 | Account-wide fill event stream: whether individual fills carry a stable, unique ID; schema; heartbeat; reconnect; whether events missed while disconnected are replayed | In-flight order tracking (fill accounting invariant) | **A** | See the fill-accounting sub-items below the table | — | |
 | T-8 | A REST order-status endpoint suitable as the exit-fill backstop, and whether it returns a given order's COMPLETE fill history or a paginated/windowed slice (shared checkpoint with T-7 — see below) | In-flight order tracking (exits are REST-only) | **C** | Endpoint documentation; poll a known order; check for pagination on an order with many fills | — | |
@@ -75,6 +75,31 @@ outranks a shaky one that degrades gracefully.
 | T-11 | Whether a server-clock endpoint exists | `clock_check.source: "vendor_api"` | **C** | Endpoint documentation | `live_mode.clock_check.source` | |
 | T-12 | Whether a resting order survives a trading halt on its ticker, is auto-canceled by the halt, or executes at the halt-resumption cross/auction | `live_mode_runner.md` Position Manager Loop — halt-clear handling for an in-flight exit order | **C** | Self-measuring — `health_report.md` finding 25 records every case where an in-flight exit order was found gone at halt-clear | — (no key; the design branches at halt-clear regardless of the answer — see below) | |
 | T-13 | How long after a minute closes the trading API's bar endpoint typically has that minute's bar ready | `live_mode_runner.md` Bar-Close Authority (Feed Outage trigger condition 2) | **B** | Self-measuring — `health_report.md` finding 26 accumulates the observed bar-arrival latency as a cumulative curve (whole-second buckets), so the value is read from ordinary operation rather than measured in a separate exercise | `live_mode.bar_close_grace_seconds` | |
+
+**T-3 is RETIRED, not verified.** Its premise was that a real-world
+throughput ceiling had to be measured because none was published. `api_doc/`
+publishes per-endpoint TPS and the vendored SDK carries them as a table it
+paces against automatically, so there is nothing left to measure. Client-side
+chunking moved behind `trading_api.md` with the rest of transport, and its
+config key was deleted rather than superseded. The row stays because this file
+does not delete rows — a broker change would make the question live again, and
+a deleted row would have to be rediscovered.
+
+**T-5 was re-anchored, not merely graded.** The original row assumed an
+account-level margin-ratio endpoint. The vendor catalogue publishes none: the
+balance-margin call returns `AstkMgn`, an AMOUNT rather than a ratio, and the
+per-ticker figure comes from `inquiry/able-orderqty` instead. That makes the
+ratio a per-ticker value rather than the session constant the spec set assumed,
+which is why the redesign is an open item rather than a config change. The
+row's own question survives in re-anchored form: whether the two figures
+combine as expected.
+
+**T-1 acquired a method, and is not thereby closer to closed.** The delayed
+quote stream (V10/V11) carries the COMPLETE tape without a separate
+application, against the free real-time stream's roughly 50% of prints, so
+comparing the two answers the granularity question with an instrument rather
+than an invented exercise — `auxiliary_stream.md` builds it. The row stays
+grade A and stays a Pilot precondition: having a method is not having a result.
 
 **T-12 is deliberately answer-agnostic.** The halt-clear handling for an
 in-flight exit order re-queries that order's status the instant the halt

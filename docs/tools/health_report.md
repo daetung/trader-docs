@@ -515,7 +515,7 @@ A read-only summary emitted once at each FIRST-DB-ACCESS point: live session
 start, evening batch start, and premarket batch start. It reports:
 
 - the `data/market.duckdb` file size
-- row counts for the ten purge-registry tables (see db_schema.md) and for
+- row counts for the eleven purge-registry tables (see db_schema.md) and for
   the structurally-excluded corpus tables
 - the latest `date` value present in each
 
@@ -532,6 +532,18 @@ eventually sets a window against data instead of a guess. `health_events` is
 the entry most worth watching — R-9 widened its writers from one finding to
 six and finding 29 has since made seven, and findings 18 and 24 both emit
 repeatedly during a broker-latency episode.
+
+**Feed coverage is reported the same way**, and for the same reason. When
+`auxiliary_stream.enabled` is true, the evening batch's coverage stage writes
+`feed_coverage_daily`, and this report carries the day's figures: total
+coverage ratio, the per-bucket dropout curve, and the two price-extreme
+counts. Like the observation above it is **not a finding** — not collected by
+`gather_findings()`, no severity, no threshold, no warn cutoff, never
+blocking. There is nothing to threshold against yet, which is the point: the
+2-print guard's constants stand exactly where `retention_days: inf` stands
+above, and this is what lets an operator set them against data instead of a
+guess. It is config-gated because it serves a characterisation that ends,
+rather than a standing operational need.
 
 **Delivered on its own alert stream**, `alert_key: 'db_health_observation'`,
 so it lands in `alert_log` like any other delivery and its remote arrival is

@@ -26,17 +26,19 @@ confirmation that it still reads correctly.
 
 ## Suggested order
 
-1. **`docs/api/trading_api.md` — the module's undesigned interior** comes
-   first: the call-point inventory it contains is what every other API-side
-   item is measured against, and two of them cannot start without it.
-2. **Market-data tier and tick completeness** is blocked on nothing and is
-   taken next because its answer may change what 3 has to budget for.
-3. **API call budget allocation** depends directly on 1 — a budget cannot be
-   divided among consumers before the consumers are enumerated — and is
-   now also load-bearing rather than optimising: the watchdog working-set
-   model leaves the polling loop unbuildable until it resolves.
-4. **Async boundary**, **early-close days** and **fill-inquiry page size** are
-   independent of each other and of the above.
+1. **API call budget allocation** comes first and is now UNBLOCKED: the
+   call-point inventory it waited on exists (`trading_api.md`), with each
+   endpoint's published TPS beside it. It is also load-bearing rather than
+   optimising — the watchdog working-set model leaves the polling loop
+   unbuildable until it resolves.
+2. **Margin-ratio computation** is blocked on nothing and touches sizing,
+   the schema and the budget at once, so its answer changes what 1 has to
+   plan for.
+3. **Halt-status source** is independent and blocks nothing else, but the
+   halt path has no primary signal until it lands.
+4. **Async boundary**, **early-close days**, **fill-inquiry page size** and
+   the **manual-intervention CLI** are independent of each other and of the
+   above.
 5. **`api_contract_checklist.md` re-evaluation** goes last by construction —
    it collects what the items above establish.
 6. **Real-time bid/ask spread** is blocked on calendar time, not design time,
@@ -44,61 +46,77 @@ confirmation that it still reads correctly.
 
 ---
 
-## `docs/api/trading_api.md` — the module's undesigned interior
+## Margin-ratio computation
 
-**Problem.** The module spec exists and states what was settled this session
-— its layer position over the vendored SDK, the result contract (a rejected
-order arrives as HTTP 200, so `rsp_cd == "00000"` is the only business
-success test), symbol/exchange encoding at the point of call, the async
-boundary, and the orderbook call being in scope. Its interior is not
-designed, and the file marks the gap in its own "Not Yet Designed" section.
+**Problem.** The spec set holds the margin ratio as a SESSION CONSTANT,
+probed once at session start (`live_mode_runner.md`'s R-8) and consumed as a
+scalar by `compute_position_size()` through `execution.sizing_basis`. The
+vendor publishes no account-level margin-ratio endpoint at all: the
+balance-margin call returns `AstkMgn`, an amount rather than a ratio, and the
+per-ticker figure comes from `inquiry/able-orderqty`. The effective
+requirement is the account-level figure and the per-ticker one taken
+together, so the quantity the design treats as one number per session is
+actually one number per ticker.
 
-**Not yet designed.** Five questions, deliberately deferred together because
-each constrains the others:
+The affected surface is wider than the probe: `live_session_state` stores a
+single `margin_ratio` column, `compute_position_size()` takes a scalar, and a
+per-ticker query at every entry signal is a NEW consumer on the API budget
+(`inquiry/able-orderqty`, TPS 2) that the budget item has to plan for.
+`api_contract_checklist.md`'s T-5 is re-anchored to this shape, and T-4
+(whether the balance figure is cash or buying power) is entangled with it —
+both feed the same sizing decision.
 
-- **Call-point inventory** — which endpoints, with which arguments, derived
-  from the caller specs' stated needs rather than from the vendor's
-  catalogue. The vendor publishes roughly two dozen for overseas equities;
-  the ones with a consumer here are closer to a dozen. A first pass exists
-  in session notes but was explicitly NOT treated as confirmed.
-- **Layer responsibility split** — which axes the module absorbs versus
-  leaves to callers, beyond the result contract and symbol encoding already
-  settled.
-- **Response normalization** — the vendor returns every numeric as a string,
-  order fields as fixed-width zero-padded values, and some fields as an
-  empty string, while the spec set assumes numeric types throughout.
-- **Whether the module stays one file** — the domain surface may split along
-  the vendor's own quote/order/realtime axis. Fixing a file boundary before
-  the call-point inventory exists would only require redrawing it.
-- **Configuration ownership** — which keys survive once the SDK owns base
-  URL and endpoint paths. `live_mode_runner.md`'s `trading_api_url` and
-  `trading_api_ticker_url` and `metadata_crawler.md`'s
-  `trading_api_quotes_url` are marked superseded but retained, because
-  `trading_api_url` still has a live consumer and what replaces it cannot
-  be stated before the call-point inventory. The SDK carries its own
-  `Config` (base URL, mode, credentials) whose path this project already
-  owns, so the boundary between the two config surfaces has to be drawn
-  rather than assumed.
+**Not yet designed.** Blocked on nothing.
 
 ---
 
-## Market-data tier and tick completeness
+## Halt-status source
 
-**Problem.** The vendor states that the FREE real-time market-data
-entitlement delivers roughly half of the trade prints, against the full
-feed. Exit Architecture's WS-primary tp/sl detection with its two-print
-guard, and the bar-latency finding that calibrates the bar-close grace
-window, both read the trade stream as if it were the whole tape.
+**Problem.** `utils.query_halt_status()` is specified as the single access
+point for trading-halt state, with `live_mode_runner.md`'s tick-rate
+heuristic as its FALLBACK. The primary does not exist: the dbsec vendor's
+catalogue publishes 20 REST endpoints across quote and trading and none
+returns halt state, so this cannot be served through `trading_api.md` at all.
+The intent is another vendor's API or a web source; which one is undecided.
 
-If the entitlement is what the account actually runs on, the two-print
-guard's time-to-detection and the REST backstop's share of the work both
-change, and this is close to what `api_contract_checklist.md`'s T-1 (a
-grade A row) already asks in a different form. Whether a paid tier exists,
-what it costs, and whether the delayed streams are relevant at all are
-unexamined.
+The SHAPE is open too, and it matters more than the identity. Halt data may
+be a market-wide feed rather than a per-ticker query, which would settle
+whether any chunking survives and whether the function's ticker list is a
+request or a filter. Until a source is chosen the function returns `None`
+unconditionally and both call sites take their fallback path, which is
+specified and buildable — so this blocks nothing, but the halt path runs on
+its fallback alone.
 
-**Not yet designed.** Independent; may change what the budget-allocation
-item below has to plan for, which is why it is taken before it.
+**Not yet designed.**
+
+---
+
+## Manual-intervention CLI
+
+**Problem.** A clean Session Shutdown cancels in-flight exit orders precisely
+because an order left resting after the process dies could fill overnight
+with nothing watching it. Broker Reconcile at the next session start cancels
+pending ENTRY orders only. A session that did not reach clean shutdown
+therefore leaves resting AFTER-MARKET exit limits covered by neither path —
+and that is exactly the state `health_report.md`'s finding 11 detects and
+asks for manual intervention in.
+
+The operator's only route today is the broker's own app, which the
+ghost-order rule made load-bearing-but-unenforceable when it adopted a
+60-second cancel threshold: a manual order placed outside this system is
+cancelled about a minute later. A CLI entry point over TradingAPI would give
+that intervention a tracked route.
+
+**Not yet designed.** At least four questions: whether it is a standalone
+entry point in the manner of `metadata_crawler.md`, which runs outside any
+LiveModeRunner session; whether it writes `live_positions` and in-flight
+state or only calls the API, since a cancellation invisible to the DB leaves
+the next reconcile with a stale picture; how it behaves when a runner IS
+alive and both are acting on the same orders; and whether running it
+alongside a live session is safe at all. The last two are entangled —
+restricting it to "only when the runner is dead" answers the third by
+construction, so the concurrency question should be settled before the
+interface is drawn.
 
 ---
 
@@ -137,7 +155,15 @@ stream is down. It would give defense-in-depth against a silently-failed
 subscription and remove the need to judge "is WS dead", but it is another
 draw on the same budget and cannot be decided separately from the rest.
 
-**Not yet designed.** Blocked on the call-point inventory above.
+**Not yet designed.** No longer blocked: `trading_api.md`'s call-point
+inventory now enumerates the consumers, with each endpoint's published TPS
+beside it. Two figures from it bear directly on the allocation. `chart/min`
+is TPS 4, so a per-ticker bar fetch across a full 50-ticker working set takes
+12.5s against a 1s loop — the order-of-magnitude gap, quantified. And
+cancellation is not a separate endpoint but `trading/…/order` with a
+discriminator, so cancels draw on the SAME TPS-10 bucket as submissions.
+Against that, filled and outstanding inquiries are ONE endpoint rather than
+two, and the margin-ratio item above may add a per-entry-signal consumer.
 
 ---
 
@@ -225,9 +251,12 @@ has enough history; revisit then, not before.
 ## `api_contract_checklist.md` — verify before Pilot
 
 Not a new design problem — a pointer, so it isn't lost among the items
-above. `docs/ops/api_contract_checklist.md` holds **15** unverified
-vendor-contract assumptions, two graded **A** (T-1: REST/WS tick
-granularity; T-7: fill-event stream ID stability). Both A-graded rows must
+above. `docs/ops/api_contract_checklist.md` holds **15 rows, of which 14 are
+unverified** assumptions, two graded **A** (T-1: REST/WS tick granularity;
+T-7: fill-event stream ID stability). The counts differ because T-3 was
+RETIRED IN PLACE rather than deleted — that file's Role and Constraints
+forbid deleting rows, so a broker change does not require rediscovering a
+question. Both A-graded rows must
 be verified, or their fallback paths confirmed sufficient, before Stage 2
 (Pilot) — see that file's own "When to use it" section. Not duplicated here;
 consult that file directly rather than letting a second copy of its contents
@@ -239,10 +268,17 @@ subscription types are mutually exclusive per connection, which removed the
 "WS sequence lease" the row had been anchored to. T-9 kept its row but lost
 its config key, the key having been deleted with that lease.
 
-**A re-evaluation pass is itself unresolved.** Several rows are now
-answerable from vendor documentation alone rather than from a live
-measurement exercise — the fill inquiry's paging behaviour and its itemised
-mode bear on T-7 and T-8, and the server-clock question is an
-enumeration rather than an experiment. Which rows have moved into the
-"answerable at a desk" category, and which genuinely still need the running
-service, has not been sorted through.
+**A re-evaluation pass is itself unresolved**, though it shrank. Three rows
+moved: T-3 retired outright, its premise gone once per-endpoint TPS turned
+out to be published and the SDK to pace against it; T-5 re-anchored from a
+non-existent account-level endpoint to the per-ticker one; and T-11's
+server-clock question answered negatively — no such endpoint is published,
+and the nearest substitute is the broker-stamped timestamp carried on every
+order and fill. Several rows remain answerable from vendor documentation
+alone rather than from a live exercise — the fill inquiry's paging behaviour
+and its itemised mode bear on T-7 and T-8. T-1 acquired a METHOD this
+session (the delayed stream carries the complete tape and is the instrument
+for comparing against the live one, which `auxiliary_stream.md` builds) but
+having a method is not having a result: it stays grade A and stays a Pilot
+precondition. Which of the rest are answerable at a desk has not been sorted
+through.

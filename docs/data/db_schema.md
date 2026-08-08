@@ -414,6 +414,7 @@ CREATE TABLE IF NOT EXISTS batch_runs (
                                       -- 'evening_session_stats' |
                                       -- 'evening_investing_forward_check' |
                                       -- 'evening_retention_purge' |
+                                      -- 'evening_feed_coverage' |
                                       -- 'overnight_token_refresh' |
                                       -- 'live_session_start' | 'live_session_end'
     date         VARCHAR   NOT NULL,  -- 'YYYYMMDD' — the trading day this batch targets
@@ -1387,6 +1388,87 @@ CREATE TABLE IF NOT EXISTS bar_latency_daily (
 -- is wrong. This is also what makes a warm restart consistent with no extra
 -- logic: what was flushed is in the table, and only the un-flushed delta (under
 -- one flush interval) is lost.
+
+-- Feed coverage — one row per (date, ticker), comparing the live trade
+-- stream against the delayed one. The vendor's free real-time entitlement
+-- carries roughly half the trade prints; the base entitlement is 15 minutes
+-- delayed but carries ALL of them, so the delayed stream is the only source
+-- that can say WHICH prints the live one is missing. Written by the evening
+-- batch from the day's raw JSONL (auxiliary_stream.md, metadata_crawler.md),
+-- which is purged once this row lands.
+--
+-- Row grain is PER TICKER, deliberately unlike bar_latency_daily's collapse
+-- to sample_class: at roughly 50 rows a day the cost argument does not hold,
+-- and if the omission is liquidity-dependent then ticker IS the axis the bias
+-- lives on — folding it would erase what this measures.
+--
+-- Purpose, in the manner of the DB Health Observation: make the 2-print
+-- guard's constants resolvable against data instead of a guess.
+CREATE TABLE IF NOT EXISTS feed_coverage_daily (
+    date          VARCHAR NOT NULL,   -- 'YYYYMMDD'
+    ticker        VARCHAR NOT NULL,
+
+    -- Totals. A "second" counts only if it carried at least one print on
+    -- the side in question.
+    delayed_seconds  INTEGER,
+    live_seconds     INTEGER,
+    delayed_prints   INTEGER,
+    live_prints      INTEGER,
+    delayed_volume   BIGINT,           -- summed exevol; mean print size across
+    live_volume      BIGINT,           --   the two sides detects size-correlated
+                                       --   omission, which price columns would
+                                       --   see only indirectly
+
+    -- Density buckets, keyed by the DELAYED side's prints-per-second:
+    -- d1 = 1, d2 = 2-3, d3 = 4-9, d4 = 10+.
+    delayed_prints_d1 INTEGER,
+    delayed_prints_d2 INTEGER,
+    delayed_prints_d3 INTEGER,
+    delayed_prints_d4 INTEGER,
+    live_prints_d1    INTEGER,
+    live_prints_d2    INTEGER,
+    live_prints_d3    INTEGER,
+    live_prints_d4    INTEGER,
+
+    -- Seconds present on the delayed side with ZERO live prints, per bucket.
+    -- Under independent per-print sampling at p~0.5 the expected share falls
+    -- steeply across the buckets — about 0.5, then 0.25-0.125, then
+    -- 0.06-0.002, then under 0.001. NORMALITY IS A FALLING CURVE, which is
+    -- what makes a flat one diagnostic. Note that TOTAL dropout is already
+    -- derivable as delayed_seconds - live_seconds, so the per-bucket split is
+    -- the only new information these four carry.
+    live_zero_seconds_d1 INTEGER,
+    live_zero_seconds_d2 INTEGER,
+    live_zero_seconds_d3 INTEGER,
+    live_zero_seconds_d4 INTEGER,
+
+    -- Price extremes. NO density buckets here, by derivation rather than
+    -- omission: if each print is included independently with probability p,
+    -- the chance of missing the second's maximum is 1-p regardless of how
+    -- many prints that second held. So comparing these against the observed
+    -- coverage ratio is already the whole test. High and low stay SEPARATE
+    -- because tp resolves on the high and sl on the low, so a one-sided
+    -- omission tells which side of exit detection is degraded.
+    live_missed_high_seconds INTEGER,
+    live_missed_low_seconds  INTEGER,
+
+    PRIMARY KEY (date, ticker)
+);
+-- No session-phase axis, considered and rejected: V60 is subscribed only
+-- while a position is open, so the sample concentrates in the regular
+-- session and premarket or after-hours rows would be too thin to read, at
+-- the cost of tripling row count.
+-- Re-run rule: DELETE the date's rows and re-INSERT — the OPPOSITE of
+-- bar_latency_daily's additive upsert above, and the difference follows from
+-- the source. That table accumulates an un-flushed delta from a live process,
+-- while this one is recomputed in full from the day's raw files, so an
+-- additive merge would double every retry. bar_latency_daily's own comment
+-- warns that a blanket `+=` across its columns is wrong; this is the same
+-- trap one table over, in the other direction.
+-- Retention: purge-registry member — date_column `date`, retention_days: inf.
+-- Growth is known in advance at roughly 50 rows/day — the first registry
+-- entry that arrives already resolvable, which is what the DB Health
+-- Observation exists to make the others.
 
 -- Health-event log — one row per discrete diagnostic event (health_report.md).
 -- Different in kind from bar_latency_daily above: that aggregates NORMAL

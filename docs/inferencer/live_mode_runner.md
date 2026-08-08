@@ -132,8 +132,17 @@ look identical from outside. On abort, send health_report immediately (at
 `abort` severity) before terminating — the same mid-session trigger
 mechanism Circuit Breaker uses below, reused rather than duplicated.
 
-**Margin ratio (R-8).** Queried from its own endpoint (config key for the path;
-see api_contract_checklist.md) and held as a session constant, consumed by
+**Margin ratio (R-8). UNDER REVIEW — see `open_items.md`.** The vendor
+publishes no account-level margin-ratio endpoint; the ratio is obtained PER
+TICKER from `inquiry/able-orderqty` and has to be combined with the
+account-level figure, so "held as a session constant" is structurally wrong
+and the surface that assumes it is wider than this probe — `live_session_state`
+stores one value per session, `compute_position_size()` takes a scalar, and a
+per-entry-signal query is a new draw on the API budget. The text below
+describes the CURRENT design, not a settled one, and is left in place rather
+than half-rewritten so the replacement is designed from the problem.
+
+Queried once at session start and held as a session constant, consumed by
 `execution.sizing_basis` (execution_common.md). On failure: fall back to
 `live_mode.margin_ratio_fallback` (default 4.0, a typical day-trading
 buying-power multiple) plus a health_report finding. Never aborts: this
@@ -643,7 +652,7 @@ watchdog and 5s position loops are not stalled):
 
 ```
 1. quotes      = bulk_fetch_today_first_price(...)   # trading API, chunked
-   halt_status = utils.query_halt_status(...)          # trading API, chunked
+   halt_status = utils.query_halt_status(...)          # NOT a dbsec call
    # sequential, same as the 04:00 pass (see metadata_crawler.md)
 
 2. check_corporate_event_anomaly(db_conn, config, quotes, halt_status)
@@ -1749,6 +1758,54 @@ position.bars_since_entry  = []   # grown each iteration; used for
 # track_price_breach() itself is unchanged and remains backtest-only.
 ```
 
+**Ghost orders — the mirror of the vanished-order rule.** That rule handles a
+TRACKED order that disappeared; this one handles an order present in the
+account-wide OUTSTANDING response that this system does not track. The
+detection material is already in hand every cycle, because the fill inquiry is
+account-wide rather than per-order, so a ghost necessarily appears in it.
+
+First observation records a first-seen instant per `order_id`, set ONCE and
+never reset by re-observation — the same posture `live_positions.exiting_since`
+already takes, so a resubmission cannot restart the clock. Held in memory, NOT
+persisted: the restart case already has an owner in Broker Reconcile, which
+queries broker outstanding orders at session start.
+
+Two thresholds under `live_mode:`, with unrelated justifications, which is why
+one strike count cannot serve:
+
+- `ghost_order_alert_cycles` (3) — suppresses the SUBMISSION RACE, the
+  unavoidable window between the vendor accepting an order and `order_id`
+  returning in the response. A few cycles is all it needs. Alert only.
+- `ghost_order_cancel_seconds` (60) — a settling interval before automatic
+  cancellation, sized to let a transient resolve itself and NOT to summon an
+  operator. Requiring human approval per occurrence costs more than cancelling
+  does, and during an incident it would compound alert fatigue with continuing
+  exposure.
+
+**Ordering is structural, not arithmetic: an order is never cancelled before
+it has been alerted.** The two thresholds carry different units, so a raised
+`position_check_interval_seconds` can push the lower past the upper — at 25s
+the lower reaches 75s against a 60s upper — which makes the alert a
+PRECONDITION of cancellation rather than a value that happens to be smaller.
+
+Auto-cancellation is the normal path, not a fallback for the unattended case,
+and is recorded under its own `alert_key` since the system is cancelling an
+order a human may have placed deliberately. The alert must name the rule and
+the cancelled `order_id` explicitly enough that an operator recognises the
+cause on first reading rather than re-placing the order — there is no
+suppression switch and no self-limiting counter, both of which were considered
+and rejected (a forgotten switch returns exposure to unbounded; a per-ticker
+counter adds another unmeasured threshold).
+
+**Manual intervention is to be routed through TradingAPI** so a manually
+placed order is tracked and never reads as a ghost. This is an OPERATOR
+CONVENTION and is unenforceable — the system cannot prevent an operator using
+the broker's own app, and the convention is likeliest to break during exactly
+the incident `health_report.md`'s finding 11 asks for manual intervention in.
+At a 60-second threshold there is effectively no human-in-the-loop grace,
+which is what makes the convention load-bearing. A CLI route for it is an open
+item.
+
 **In-flight order tracking** (real orders only — shadow mode has no real
 order): covers BOTH order types and BOTH sides. Fills are not returned by
 the order-submission API (R-7); they arrive on a separate channel, so every
@@ -2108,11 +2165,9 @@ loop every position_check_interval_seconds (config, default: 5s):
             # in-flight exit order" below for why this list needed
             # extending at all. Deduplicated: a ticker already covered via
             # open_positions is not queried twice.
-            trading_api_url=config["live_mode"]["trading_api_url"],
-            chunk_size=config["live_mode"]["bulk_api_chunk_size"],
-            # bulk_api_chunk_size defined once in metadata_crawler.md's
-            # Config Keys (shared pipeline_config.yaml) — barely matters
-            # here since open_positions is small (bounded by
+            # No URL and no chunk size: halt status is not a dbsec call and
+            # its source is undecided (utils.md, open_items.md). The list is
+            # small regardless (bounded by
             # execution.max_tickers × execution.max_positions_per_ticker,
             # the two axes that replaced the old single max_positions —
             # see execution_common.md's Config Keys), almost always one
@@ -2321,27 +2376,13 @@ live_mode:
   # (watchdog.get_candidates()), not an HTTP endpoint, so neither a URL
   # value nor a _url name was ever true of it.
   #
-  # The two keys below are SUPERSEDED by the vendored SDK, which owns both
-  # the base URL and every endpoint path (docs/api/sdk_dependency.md);
-  # docs/api/trading_api.md's boundary test puts endpoint addressing on the
-  # far side of the API layer from callers. They are RETAINED rather than
-  # deleted because trading_api_url still has a live consumer in
-  # query_halt_status() and what replaces it cannot be stated before the
-  # call-point inventory exists. Disposal belongs to open_items.md's
-  # API-layer item, together with the configuration-ownership boundary
-  # between pipeline_config.yaml and the SDK's own Config.
-  trading_api_url:                "http://trading-api"     # SUPERSEDED
-  trading_api_ticker_url:         "http://trading-api/tickers/today"  # SUPERSEDED
-                                             # the trading API's ticker-master
-                                             # endpoint (SDK: stock-ticker
-                                             # search, exchange as an input
-                                             # parameter) — NOT the watchdog.
-                                             # This IS the endpoint Session
-                                             # Lifecycle Step 1 reads, but
-                                             # Step 1 reaches it through
-                                             # TradingAPI, not through this
-                                             # key — which is why the key
-                                             # itself still has no consumer
+  # trading_api_url and trading_api_ticker_url removed. Endpoint addressing
+  # belongs to the vendored SDK, which owns both the base URL and every
+  # endpoint path (docs/api/sdk_dependency.md), and docs/api/trading_api.md's
+  # boundary test puts it on the far side of the API layer from callers.
+  # Session Lifecycle Step 1 reaches the ticker-master endpoint through
+  # TradingAPI, not through a key here; query_halt_status(), the only other
+  # consumer either key ever had, is not a dbsec call at all.
 
   # R-1: 09:20 recheck moved in-process (see "In-Process Premarket
   # Recheck" below) — no longer a cron. wall-clock America/New_York.
@@ -2387,10 +2428,15 @@ live_mode:
     lookback_days:                14           # ask from further back than
                                                # retention is expected to reach
     assumed_days:                 5            # fallback when the probe fails
-  margin_ratio_url:               "http://trading-api/margin"
-  margin_ratio_fallback:          4.0        # used only if the query above
-                                             # fails — see Session Start
-                                             # Probes for why this is not 1.0
+  # margin_ratio_url removed. The vendor publishes no account-level
+  # margin-ratio endpoint; the ratio is obtained PER TICKER from
+  # inquiry/able-orderqty and combined with the account-level figure, so the
+  # key named a path that does not exist. How the combined ratio is computed
+  # — and what that does to holding it as a session constant — is an open
+  # item (open_items.md); the probe below is flagged accordingly.
+  margin_ratio_fallback:          4.0        # used only if the query fails —
+                                             # see Session Start Probes for
+                                             # why this is not 1.0
   exit_order_stuck_minutes:       10         # health_report finding 18's age
                                              # threshold
   session_hard_exit_time:         "20:00"    # R-9: process hard cap — see
@@ -2453,15 +2499,18 @@ live_mode:
                                              # this within a minute or two;
                                              # isolated premature bars
                                              # should not
-  api_max_tickers_per_second:     100        # assumed throughput ceiling used
-                                             # for chunk sizing — UNVERIFIED,
-                                             # see api_contract_checklist.md
+  # api_max_tickers_per_second removed. Its only stated use was chunk
+  # sizing, which moved behind the API layer, and its value estimated
+  # something the vendor publishes per endpoint and the SDK paces against
+  # automatically. api_contract_checklist.md's T-3 is retired with it.
 
   # Halt detection (Position Manager Loop only — see is_tradable() in
   # execution_common.md for the separate, unrelated new-entry rename gate).
-  # trading_api_url above is the API-primary signal (see
-  # utils.query_halt_status()); the two keys below configure the
-  # tick-rate FALLBACK only, used when that call fails or omits a ticker.
+  # The dbsec vendor API publishes NO halt-status endpoint, so the primary
+  # signal cannot come from it; utils.query_halt_status()'s source is
+  # undecided and tracked in open_items.md, and it returns None until one is
+  # chosen. The two keys below configure the tick-rate FALLBACK, which is
+  # therefore the only specified path today.
   halt_check_window_seconds:      60
   halt_heuristic_tpm:             10      # ticks/min below this → position.status='halted'
 
