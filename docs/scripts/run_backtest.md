@@ -97,6 +97,7 @@ class Backtester:
         fold_test_start: str | None = None,
         fold_test_end:   str | None = None,
         eval_type:       str | None = None,
+        execution_variant: str | None = None,
     ) -> dict:
         """
         Run backtest, write trade_log and experiment_log.
@@ -120,6 +121,12 @@ class Backtester:
             eval_type:       None               → standard backtest (standalone or non-nested)
                              "outer_validation" → nested validation outer fold evaluation
                              "regime_holdout"   → regime holdout robustness check
+            execution_variant: JSON of the execution-key overrides this run
+                             was given, or None for the baseline. Set by
+                             PipelineOptimizer's execution_eval loop; always
+                             None from the CLI. An IDENTIFIER, not a metric —
+                             see Constraints on why it sits outside the 1:1
+                             rule.
 
         optimizer_run_id passed via constructor (None for standalone).
         """
@@ -143,7 +150,7 @@ Options:
 CLI always runs with:
 ```
 optimizer_run_id=None, fold_idx=-1, outer_fold_idx=-1,
-eval_type=None (standalone mode)
+eval_type=None, execution_variant=None (standalone mode)
 ```
 
 ---
@@ -162,6 +169,7 @@ experiment_log_row = {
     "outer_fold_idx":       outer_fold_idx,      # -1 if non-nested
     "eval_type":            eval_type,           # None | "outer_validation" |
                                                  # "regime_holdout"
+    "execution_variant":    execution_variant,   # None = baseline pass
     "fold_test_start":      fold_test_start,     # None → derived from test_df.date.min()
     "fold_test_end":        fold_test_end,       # None → derived from test_df.date.max()
     "winning_rate":         summary["winning_rate"],
@@ -272,6 +280,14 @@ Elapsed: 45.2s
 - `outer_fold_idx` default -1 for non-nested runs; 0-based for nested outer folds
 - `eval_type` default None for standalone; set explicitly by PipelineOptimizer
 - In standalone mode, `fold_test_start`/`fold_test_end` derived from test_df date range
+- `execution_variant` is an IDENTIFIER column, alongside `run_id`,
+  `fold_idx`, `outer_fold_idx` and `eval_type` — it sits OUTSIDE the 1:1
+  rule below, which binds `summary_dict` keys to METRIC columns only.
+  Worth stating because the distinction is easy to misread: a new column
+  that is not in `summary_dict` looks like a violation and is not one. It
+  is written by adding a column to an existing table, which is
+  `init_db.md`'s class 2 — re-transcribe, then `ALTER TABLE ... ADD COLUMN`
+  by hand; plain init will not do it
 - `summary_dict`'s key set and `experiment_log`'s metric columns are 1:1 —
   every key BacktestEngine's `run()` returns has a matching column here,
   and every metric column here is sourced from a `summary_dict` key. A name
@@ -281,7 +297,10 @@ Elapsed: 45.2s
   `gate_blocked_*` counters, and the four `breaker_*` metrics)
 - The `gate_blocked_*` and `breaker_*` metrics are diagnostic only —
   `PipelineOptimizer.best_config()` ranks on `winning_rate` and never reads
-  them. The gate counters exist so a run whose edge was capped out is
+  them. `best_execution_variant()` DOES rank on a metric column
+  (`avg_pnl_pct`), but only across rows sharing an `optimizer_run_id` and an
+  outer fold, so it compares execution variants rather than model configs
+  and does not change what `best_config()` selects. The gate counters exist so a run whose edge was capped out is
   distinguishable from one that simply produced few signals, which
   `winning_rate` alone cannot show; the breaker metrics exist so Pilot has
   real distributions to calibrate `execution.intraday_loss_limit_pct` /

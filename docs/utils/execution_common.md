@@ -64,6 +64,94 @@ def resolve_signal(
 
 ---
 
+### Late-Entry Residual Edge
+
+```python
+def late_entry_expected_return(
+    row: pd.Series,
+    p_ref: float,
+    p_now: float,
+) -> float:
+    """
+    Expected return of taking a signal LATE, at p_now, when its label anchor
+    is p_ref (the t bar's open).
+
+    Used by BacktestEngine and LiveModeRunner when execution
+    .late_entry_enabled is true. Both engines must compute it identically —
+    the gate is what decides whether a rotation-detected candidate is taken
+    at all, so a divergence here is a divergence in which trades exist.
+
+    Logic:
+        d = (p_now - p_ref) / p_ref          # drift since the anchor
+        S = sum over classes of P(class) * target_multiple(class)
+        return S / (1 + d) - 1
+
+    Enter iff the result exceeds execution.late_entry_min_expected_return_pct
+    — equivalently, iff S > (1 + theta) * (1 + d).
+
+    NOT a gate on drift itself. Drift correlates POSITIVELY with model
+    probability: a working model's high-probability points are the ones
+    about to move, and drift is the first seconds of that move, so a
+    drift threshold preferentially removes the model's strongest signals.
+    Dividing by (1 + d) instead prices the drift against the edge that
+    remains — a high-conviction signal tolerates a large d because its
+    remaining room is large, while a marginal one fails on a small one.
+
+    d < 0 is NOT blocked. Entering after a decline is arithmetically
+    FAVOURABLE against the same forward path, and the formula already
+    reflects that. Whether the conditional distribution ALSO degrades there
+    is a measurement, not an assumption, and no asymmetric floor is
+    imposed ahead of it.
+
+    Reads model output, so INFERENCE RUNS FIRST in both engines. Live can
+    afford this: late-entry candidates are the small rotation-detected
+    subset and are adjudicated mid-bar, outside the 5-second bar-close
+    deadline. Running inference first also preserves the instrumentation —
+    a rejected candidate still leaves an inference_log row, so the gate's
+    cost in blocked signals is measurable.
+    """
+    ...
+```
+
+**theta is DERIVED, not guessed.**
+
+```
+theta = Q_q({ E[r | 0] : on-time entries ACCEPTED in the baseline
+                         backtest pass })
+      = Q_q({ S_i - 1 })          since d = 0 for an on-time entry
+
+default q = optimizer.execution_eval.late_entry_theta_quantile (0.10)
+```
+
+It asks of a late entry only what an on-time entry already clears. Not
+simply `> 0`: `buy_rate` and slippage lift the real bar above zero, and a
+marginal trade consumes cash and a slot under `exposure_cap_pct` /
+`max_tickers` that a better on-time entry would otherwise use.
+
+**Anchoring is what makes it robust to calibration.** theta and S come from
+the same probability vector, so if probabilities are systematically
+inflated both sides inflate together and the inequality is largely
+preserved — absolute `E[r]` is biased, the COMPARISON is not. The same
+cancellation covers `target_multiple` being a label target rather than a
+realised return. This is a NEW dependency worth naming: until now the
+probability vector was used only for ranking (`resolve_signal()`'s
+threshold comparisons), and here it enters an expected-value arithmetic
+directly.
+
+**Derivation is circular unless ordered**, so evaluation is two-pass: pass 1
+runs `late_entry_enabled: false` and collects the accepted on-time
+`E[r | 0]` distribution, theta is resolved from it per grid quantile, then
+passes 2..n run. See `pipeline_optimizer.md`'s `execution_eval`.
+
+**TWO config keys, not one.**
+`execution.late_entry_min_expected_return_pct` holds the RESOLVED scalar and
+is what both engines read — live must never recompute theta at run time or
+it diverges from backtest — while
+`optimizer.execution_eval.late_entry_theta_quantile` is derivation-only and
+is read by the offline utility and the grid alone.
+
+---
+
 ### Cooldown Guard
 
 ```python
@@ -374,6 +462,52 @@ execution:
                                     # pilot-stage predicted-vs-actual data
                                     # accumulates (see shadow_retraining.md)
   cancel_after_seconds:        30   # seed value — same refinement path as buy_rate
+  entry_fill_delay_seconds:     5   # seconds after the t bar's open that an
+                                    # entry is expected to be ON. ONE quantity
+                                    # read by both engines, which is why it
+                                    # sits here beside the rest of the fill
+                                    # family rather than under backtest: —
+                                    # BacktestEngine models the fill AT it,
+                                    # while live treats it as the reference
+                                    # its own submission is measured against
+                                    # (live_scan_daily's stage timings) and as
+                                    # the ordering key entry submissions carry
+                                    # into trading_api.md's dispatch queue.
+                                    # NOT A HARD DEADLINE on the live side: an
+                                    # entry past it is still submitted and
+                                    # counted as entry_submit_late, because
+                                    # backtest models late DETECTION but not
+                                    # late SUBMISSION and dropping would
+                                    # diverge in an unmodelled direction too.
+                                    # It WILL move — live's inference time is
+                                    # unmeasured, so the 5 is a design target.
+                                    # Read from CONFIG ONLY, not through
+                                    # get_execution_param()/execution_params,
+                                    # despite sitting beside keys that are:
+                                    # a runtime override would desync live
+                                    # from the backtest run that produced the
+                                    # model it is trading
+  late_entry_enabled:       false  # take a rotation-detected candidate at
+                                   # p_now instead of dropping its bar. Read
+                                   # by BOTH engines: backtest's
+                                   # late-detection model branches on it
+                                   # (09_backtest_engine.md) and live's scan
+                                   # gates on it (live_mode_runner.md).
+                                   # Unlike market_buy_price_margin this
+                                   # belongs here rather than under
+                                   # live_mode: — p_now comes from the
+                                   # rotation slot's second-resolution close
+                                   # in live and from tick_10 in backtest,
+                                   # so there is no bid/ask dependency to
+                                   # keep it out of the shared block
+  late_entry_min_expected_return_pct: null
+                                   # RESOLVED theta — see Late-Entry
+                                   # Residual Edge. null = the gate admits
+                                   # nothing, so late_entry_enabled: true
+                                   # with theta unset is inert rather than
+                                   # unbounded. Derived offline from a
+                                   # baseline backtest pass; never computed
+                                   # at run time by either engine
   entry_order_type:      "market"  # "market" | "limit"
   # market_buy_price_margin lives under live_mode:, not here — it prices
   # against ask1 and BacktestEngine has no bid/ask model, the same reason
@@ -693,6 +827,15 @@ bid/ask model to mirror them. If backtest is later extended to replay
 - `check_funds_available()`'s `use_all_cash` defaults to `True` — the default
   behavior sizes a trade down to fit remaining cash rather than skipping it
   outright; set `False` to restore the older all-or-nothing behavior
+- `p_entry`'s three roles SPLIT when `late_entry_enabled` is true, having
+  coincided until now. As the `entry_points` primary-key component and
+  detection record: t-bar open, UNCHANGED. As the label anchor in
+  `labeled_samples`: t-bar open, UNCHANGED — moving it would redefine past
+  labels and contaminate the training corpus. As the SIZING input: `p_now`,
+  the actual expected fill. The entry-side call order below pins
+  `compute_position_size(fill_price=p_entry, ...)`, so the DEFINITION of the
+  value passed there changes even though the signature does not.
+  `trade_log` already records the real fill and needs nothing
 - Entry-side call order, LiveModeRunner ONLY (N-5 — deliberately not
   BacktestEngine; see below): `is_tradable()` →
   `compute_position_size(fill_price=p_entry, ...)` →

@@ -332,6 +332,46 @@ for outer_train_df, _, outer_test_df, outer_fold_meta in balancer.generate_folds
         eval_type="outer_validation",
     )
 
+    # --- Execution-variant evaluation (optimizer.execution_eval) ---
+    # Same model, same fold, same data — only execution keys differ, so the
+    # comparison is statistically PAIRED. Runs here and not in the inner
+    # loop because execution parameters change neither the training set nor
+    # the model: AUC is identical across their settings, and Successive
+    # Halving prunes on AUC, so a flag toggled there would be pruned at
+    # random. Cost is per outer fold, not per trial, and a backtest is far
+    # cheaper than a training run.
+    if config["optimizer"]["execution_eval"]["enabled"]:
+        # PASS 1 IS THE BASELINE AND MUST RUN FIRST — theta is the q-th
+        # quantile of E[r|0] over the on-time entries this pass ACCEPTS, so
+        # any grid combination with late_entry_enabled: true is
+        # underivable until it has completed. See execution_common.md's
+        # Late-Entry Residual Edge.
+        import itertools, json
+        grid = config["optimizer"]["execution_eval"]["grid"]
+        combos = [
+            dict(zip(grid.keys(), values))
+            for values in itertools.product(*grid.values())
+        ]
+        # Baseline first — see the comment above on theta's derivation.
+        combos.sort(key=lambda c: c.get("late_entry_enabled", False))
+        combos = combos[: config["optimizer"]["execution_eval"]["max_combinations"]]
+
+        for i, variant in enumerate(combos):
+            variant_override = utils.apply_overrides(config_override, variant)
+            variant_backtester = Backtester(
+                variant_override, db_conn, optimizer_run_id=optimizer_run_id
+            )
+            variant_backtester.run(
+                outer_test_df,
+                run_id=f"{outer_run_id}_x{i}",
+                fold_idx=-1,
+                outer_fold_idx=outer_fold_idx,
+                fold_test_start=outer_fold_meta["fold_test_start"],
+                fold_test_end=outer_fold_meta["fold_test_end"],
+                eval_type="outer_validation",
+                execution_variant=json.dumps(variant),
+            )
+
     outer_best_configs.append(best_config)
     outer_scores.append(outer_summary["winning_rate"])
 
@@ -636,6 +676,31 @@ class PipelineOptimizer:
         """
         Query experiment_log for the config with highest winning_rate
         belonging to this optimizer_run_id.
+
+        UNCHANGED by execution_eval: this ranks MODEL configs and reads only
+        rows with execution_variant IS NULL (the baseline pass of each outer
+        fold).
+        """
+        ...
+
+    def best_execution_variant(self) -> dict | None:
+        """
+        Rank execution variants for this optimizer_run_id on
+        optimizer.execution_eval.rank_metric, aggregated across outer folds.
+        Returns None when execution_eval is disabled or produced no rows.
+
+        Ranks on avg_pnl_pct, NOT winning_rate, and this is the point rather
+        than a detail. Every variant here is judged by the trades it ADDS or
+        REMOVES at the margin; a variant that admits marginal-but-positive-EV
+        trades lowers the win rate while raising the return, so ranking these
+        on winning_rate would systematically reject exactly the variants
+        worth having. best_config() is not switched to the same metric,
+        because that would propagate into model selection, which this change
+        has no business touching.
+
+        Separate from best_config() for the same reason it runs at outer
+        folds: the model config and the execution variant are independent,
+        so one is chosen without reference to the other.
         """
         ...
 ```
@@ -676,6 +741,37 @@ optimizer:
 
   parallelism:
     n_parallel_trials: 4    # ProcessPoolExecutor max_workers
+
+  execution_eval:
+    enabled: false          # paired execution-variant evaluation at outer folds
+    rank_metric: "avg_pnl_pct"
+    max_combinations: 8     # grid is evaluated exhaustively — a backtest per
+                            # combination per outer fold, so this is the cost
+                            # ceiling, not a sampling budget
+    late_entry_theta_quantile: 0.10
+                            # DEFAULT q for theta's derivation, needed even
+                            # when this whole block is disabled because the
+                            # offline derivation still has to pick a
+                            # quantile. The grid axis below overrides it per
+                            # combination — the same relationship
+                            # hyperparameter_search's entry_detector
+                            # .session_mode has with its own declaration
+    grid:
+      late_entry_enabled:          [false, true]
+      late_entry_theta_quantile:   [0.05, 0.10, 0.25]
+    # WHY THIS EXISTS AT ALL: execution-layer parameters do not change the
+    # training set or the model, so AUC is identical across their settings —
+    # they are unsearchable in hyperparameter_search above, where Successive
+    # Halving prunes on AUC and would drop them at random. Affected today:
+    # late_entry_enabled, late_entry_theta_quantile, execution.use_all_cash,
+    # execution.entry_order_type, and the three circuit-breaker limits that
+    # run_backtest.md already computes distributions for so Pilot can
+    # calibrate them — the distributions are measured, with no procedure for
+    # turning them into values. This is that procedure.
+    # late_entry_theta_quantile is DERIVATION-ONLY and is read here and by
+    # the offline utility alone; the resolved scalar lives in
+    # execution.late_entry_min_expected_return_pct, which is what both
+    # engines read (execution_common.md).
 
   regime_holdout:
     enabled: true

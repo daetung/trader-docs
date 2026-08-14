@@ -39,7 +39,8 @@ verification would have to be rediscovered from scratch.
 - **Continuously, for the self-measuring rows.** Some rows fill themselves in
   from ordinary operation — the retention boundary is probed every session
   start, the broker's rejection vocabulary accumulates through
-  `health_report.md`'s findings. Those need reading, not measuring.
+  `health_report.md`'s findings, and the detection-gap figures accumulate in
+  `live_scan_daily`. Those need reading, not measuring.
 - **On any broker or vendor change.** Treat every row as unmeasured again.
 
 ---
@@ -75,6 +76,10 @@ outranks a shaky one that degrades gracefully.
 | T-11 | Whether a server-clock endpoint exists | `clock_check.source: "vendor_api"` | **C** | Endpoint documentation | `live_mode.clock_check.source` | |
 | T-12 | Whether a resting order survives a trading halt on its ticker, is auto-canceled by the halt, or executes at the halt-resumption cross/auction | `live_mode_runner.md` Position Manager Loop — halt-clear handling for an in-flight exit order | **C** | Self-measuring — `health_report.md` finding 25 records every case where an in-flight exit order was found gone at halt-clear | — (no key; the design branches at halt-clear regardless of the answer — see below) | |
 | T-13 | How long after a minute closes the trading API's bar endpoint typically has that minute's bar ready | `live_mode_runner.md` Bar-Close Authority (Feed Outage trigger condition 2) | **B** | Self-measuring — `health_report.md` finding 26 accumulates the observed bar-arrival latency as a cumulative curve (whole-second buckets), so the value is read from ordinary operation rather than measured in a separate exercise | `live_mode.bar_close_grace_seconds` | |
+| T-14 | ~~Bar endpoint resolution and page ceiling~~ | ~~Prefix-scan sizing~~ | **RETIRED** | Nothing to verify — measured, then transcribed | — | **Retired** — the values now live in `trading_api.md`'s Call-Point Inventory |
+| T-15 | ~~Demo/production data equivalence and budget independence~~ | ~~Combined two-account budget~~ | **RETIRED** | Nothing to verify — measured, then transcribed | — | **Retired** — equivalence recorded in `trading_api.md`'s Call-Point Inventory; per-APP governance in `sdk_dependency.md` |
+| T-16 | ~~REST round-trip latency range~~ | ~~Prefix-scan slot allocation~~ | **RETIRED** | Nothing to verify — measured, then transcribed | — | **Retired** — 400-600ms recorded in `live_mode_runner.md`'s `scan:` keys; ongoing drift is `health_report.md`'s finding 32, not a checklist question |
+| T-17 | The watchdog list fires for every ticker that crosses conditions A-G, so a ticker becoming eligible always rises to the head | `live_mode_runner.md` prefix scan — the soundness of stopping where bar delta stops | **B** | Self-measuring — the `evening_detection_gap` stage runs `detect()` over the day's ingested bars and compares against `inference_log` | — (no key; the rotation cursor and the promotion path bound the gap rather than a value sizing it) | |
 
 **T-3 is RETIRED, not verified.** Its premise was that a real-world
 throughput ceiling had to be measured because none was published. `api_doc/`
@@ -117,6 +122,32 @@ normal operation. Set longer than necessary, it only slows genuine-outage
 detection. The seed value is chosen accordingly: conservative (higher)
 until measured, the same one-sided-error posture as `margin_ratio_fallback`.
 
+**T-14, T-15 and T-16 were opened and closed inside one session, which is
+why they RETIRE rather than sit here as measured rows.** This file is a
+check-ops queue: a row earns its place by naming work still to be done, and
+once the check has run and its result is transcribed into the spec that
+depends on it, that spec is the record and the row's job is over. T-6 is not
+an inconsistency with this — it was carried in from an earlier session where
+the measurement and the transcription did not coincide, and it stays
+Measured as recorded there.
+
+Each retirement note names WHERE the value went, which is what keeps the
+retirement reversible: on a broker change, re-open the row and re-check
+against that location rather than rediscovering it.
+
+**T-17 is an accepted risk, recorded rather than resolved.** If the watchdog's
+own firing condition is not a superset of A-G, a ticker can cross our
+conditions without rising to the head, and the prefix scan's early stop will
+not reach it. This was accepted deliberately: the loss is bounded by the
+rotation cursor, which walks the whole list about once per bar, and by the
+promotion path, which recovers a crossing found on an already-completed bar.
+What makes acceptance defensible is that the residual is MEASURED rather than
+assumed small — the evening stage compares an independent ground truth against
+what live actually evaluated. Note the row's own limit: the rotation cursor
+walks the LIST, so it can only find a ticker the watchdog listed at some point.
+A ticker that never appears at all is invisible in-session and shows up only in
+the evening comparison.
+
 **T-6 was re-anchored, not merely measured.** Its original phrasing
 described a "WS sequence lease" that no longer exists: subscription types
 turn out to be mutually exclusive per connection, so the two connections
@@ -150,7 +181,9 @@ rather than one call per outstanding order.
 
 **T-1 and T-7 are the grade A rows.** Both back a stated correctness
 guarantee rather than a tunable value — a wrong answer means the design
-itself is wrong, not just a config default.
+itself is wrong, not just a config default. They are also the only two:
+T-14 and T-15 were graded A while open, but both retired within the session
+that raised them, so no other row currently carries the grade.
 
 **T-1**: Exit Architecture states that WS and REST share one parser and one
 2-print guard, and therefore that the two exit paths have no filter
@@ -228,11 +261,13 @@ best-effort, not a guarantee, so the residual gap remains worth tracking.
 - Where a row names a config key, the measured value belongs in
   `pipeline_config.yaml` under that key — recording it only in this table
   leaves the code running on its default
-- The self-measuring rows (T-2, T-10, T-12, T-13, I-2) are filled in by
-  `health_report.md` findings during ordinary operation, and do not need a
-  separate measurement exercise. T-13 is the only one of these that still
-  names a config key and is graded above C — self-measuring describes how
-  the value is obtained, not what its being wrong costs, so it does not
-  lower a grade
+- The self-measuring rows (T-2, T-10, T-12, T-13, T-17, I-2) are filled in
+  during ordinary operation and do not need a separate measurement
+  exercise. Most accumulate through `health_report.md` findings; T-17
+  accumulates in `live_scan_daily` instead, by way of the evening
+  detection-gap stage, which `health_report.md` then reads. T-13 remains
+  the only one of these that names a config key while graded above C —
+  self-measuring describes how the value is obtained, not what its being
+  wrong costs, so it does not lower a grade
 - A grade-A row that cannot be verified before Pilot is a reason not to enter
   Pilot, not a reason to assume in its favour

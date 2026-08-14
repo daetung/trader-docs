@@ -109,14 +109,16 @@ unverified (api_contract_checklist.md), so the option exists to be selected
 later, not to be implemented now.
 
 1.0s is not arbitrary. Bar-Close Authority judges in whole seconds, scoped to
-each cycle's own `candidates` (see Feed Outage Recovery's trigger condition
-2, not the full watchlist) — past ~1s of skew, EVERY candidate in a cycle
-misses simultaneously, so 1s is the boundary at which a clock fault starts
-impersonating a feed outage, in any cycle large enough
+the tickers actually fetched inside a minute's accumulation window (see Feed
+Outage Recovery's trigger condition 2, not the full watchlist) — past ~1s of
+skew, EVERY ticker classified in that window misses simultaneously, because
+the deadline is wall-clock derived and shifts identically for all of them. So
+1s is the boundary at which a clock fault starts impersonating a feed outage,
+in any window whose working set is large enough
 (`len(candidates) >= min_watchlist_size`) for condition 2 to evaluate at
-all. Below that floor this particular impersonation risk is moot for the
-cycle — condition 2 does not fire regardless of clock health, leaving
-condition 1 (explicit connection failure) as the only detector.
+all. Below that floor this particular impersonation risk is moot — condition
+2 does not fire regardless of clock health, leaving condition 1 (explicit
+connection failure) as the only detector.
 
 `abort` is the default because a skewed clock disguises itself as other
 faults: it looks like a dead feed, it freezes exits along with entries, and it
@@ -751,27 +753,170 @@ session that trades nothing. The regular-session scope is what removes the
 need for a grace window — the list carries over already full from
 premarket, so 09:30 is the boundary.
 
-⚠️ **NOT EXECUTABLE AS SPECIFIED.** The working-set model needs a bar for
-up to 50 tickers every cycle. Per-ticker fetching cannot deliver that
-inside `poll_interval_seconds` at the chart endpoint's published rate —
-the SDK paces at a minimum interval rather than allowing a burst, so 50
-tickers serialise into an order of magnitude more time than the loop has.
-A bulk quote call accepting up to 50 symbols exists, but returns a price
-snapshot rather than OHLCV, so it does not directly serve
-`on_bar_close()`. This is not a tuning gap; Step 2a as written cannot be
-built until the call-budget item resolves it (`open_items.md`). An
-implementation session must not read STEP 2a'S FETCH as buildable. The rest
-of the loop — the working-set read, Step 3's multi-bar replay, the gate
-sequence and the submission path — is specified and is an implementation
-target.
+**The loop does NOT fetch a bar for every working-set ticker every cycle.**
+That reading is what once made this section unbuildable: 50 per-ticker
+fetches serialise well past `poll_interval_seconds`, because the SDK paces
+at a minimum interval rather than allowing a burst. The working set is what
+is ELIGIBLE to be looked at, not what is looked at each second.
 
-**Two different exclusions meet in this section and are not the same thing.**
-Step 2a's fetch is BLOCKED: a design answer is owed (`open_items.md`'s
-call-budget item) and the code cannot be written until it arrives. The
-watchdog module itself is OUT OF SCOPE: it is the access surface to a
+**PREFIX SCAN.** The list is ordered most-recently-fired-first, so a ticker
+that re-fires rises to the head. Scan from the head and stop at the first
+ticker whose own BAR DATA has not advanced since this ticker was last
+fetched: everything below it is, by the ordering, even staler in firing
+terms. Per-cycle cost is therefore D+1 calls, where D is the number of
+firings since the previous cycle — not the working-set size.
+
+This is NOT in tension with "caller-side delta computation is impossible"
+above. That finding concerns deltas of the LIST — which tickers are in it
+and in what order — and it stands unchanged. What the scan tests is a delta
+of each TICKER'S OWN BAR DATA, fetched per ticker, which the list cannot
+express and never could.
+
+**Slot allocation, and why the bound is latency rather than TPS.** Rate
+governance paces at a MINIMUM INTERVAL, not a per-second bucket that can be
+drained at once: each account allows a chart/min call every 250ms, so a
+cycle offers each account slots at t=0, 250, 500 and 750ms. Two accounts
+run in alternation (measured; that check is retired as
+`api_contract_checklist.md` T-15 — the demo account returns identical
+`chart/min` data on an independent budget), so:
+
+```
+t=0, t=250   both legs   →  SCAN — RESERVED  (N head + M rotation)
+t=500, t=750 both legs   →  shared, up to 4 calls
+```
+
+The non-reserved half is a CAP shared by several consumers, not an
+allocation belonging to one. `chart/min` has three consumers in this
+system, and the third is easy to miss because it lives in the other loop:
+Position Manager Loop Step 1 fetches bars per open position
+(`trading_api.md`'s Call-Point Inventory lists both call sites against this
+endpoint), alongside carryover and promotion. Their relative priority, and
+Position Manager's fetch cadence, are NOT settled here.
+
+Last scan call completes at `250ms + RTT`, i.e. 850ms worst case at the
+measured 400-600ms round trip (that check is retired as
+`api_contract_checklist.md` T-16; the `scan:` keys below are its record) —
+inside a 1s cycle. Giving the whole
+auxiliary leg to the recovery lane instead would force the scan onto one
+leg, firing its last call at 750ms and completing at 1150-1350ms, so the
+allocation is BY PACING SLOT, not by leg. N and M are config keys: if RTT
+drifts up past ~600ms, N must come down.
+
+**The three slot kinds and what each fetches.**
+
+- **Head (N=3).** The top of the list. Forming bar only, so the smallest
+  window that reaches this ticker's current bar open. Seen every second,
+  so no crossing inside the bar can be missed.
+- **Rotation (M=1).** One position per cycle through the remainder, so the
+  whole list is walked in about 50 cycles. Fetches a 120-SECOND window and
+  runs TWO evaluations on the one payload: the forming bar (as the head
+  slots do) and the PRECEDING COMPLETED BAR at full strength. 120s is the
+  exact minimum with margin — 60s of forming bar plus the 60s completed bar
+  behind it — and it holds regardless of the cursor's phase. Because the
+  rotation period (~50s) is shorter than a bar, some bars get two visits; a
+  per-ticker last-evaluated-bar record suppresses the duplicate.
+  `entry_points` is idempotent under INSERT OR IGNORE but `inference_log`
+  is not, and a duplicated `signal_fired` row is a duplicated entry.
+- **Shared, up to 4.** Carryover and promotion — see Recovery Lane
+  below — sharing the cap with Position Manager Step 1's per-position bars.
+
+**A response that came back is EVALUATED, never discarded.** The head slots
+fire SPECULATIVELY — all N go out before any of them lands, because waiting
+on each to decide whether to send the next would cost D x RTT instead of one
+RTT — so a cycle whose delta stops at position 1 still holds responses for
+positions 2 and 3. Those are evaluated. Absence of a watchdog re-fire is NOT
+absence of bar growth: B-G are cumulative and can cross with the watchdog
+never firing at all, which is exactly the accepted gap below, and the data is
+already paid for.
+
+**V60 reorders the queue and decides nothing.** The realtime trade stream is
+already subscribed for open positions (Exit Architecture); where it also
+covers working-set tickers, its print RATE is used to reorder which ticker a
+head slot reaches first. No threshold is ever evaluated against V60-derived
+data, and no bar is ever built from it. Three things bar the measurement
+role, and all three dissolve for a ranking one. A reactive subscription
+yields a bar missing its PREFIX — V60 delivers prints only from subscription
+onward, while a cumulative-volume condition needs them from bar open. The
+free entitlement carries roughly half the prints, which is worst-case for a
+volume threshold and is not a stable constant that could be scaled out.
+And backtest cannot reproduce WHICH half is delivered, so any decision taken
+from V60 data would be unreproducible. Ordering needs only monotonicity in
+activity, not calibration, and an ordering error shifts detection by a cycle
+without changing what is decided — which is also why PARTIAL coverage is
+fine, and why V60 subscription slots go to positions first and the second
+account's session is an optimisation rather than a prerequisite.
+
+**Window size is one rule, not three constants.** `dataCnt` covers
+(this ticker's last completed bar) minus (the last bar already held for
+it). The head slot's minimal window, the rotation slot's 120s and a cold
+ticker's backfill are the same call under that rule; a ticker absent from
+10:30 and returning at 11:47 needs 77 bars, not a session. The calculator
+pool persists per ticker across the session, so only the gap is refetched.
+
+**Resolution is chosen by TARGET, not by slot.** Minute mode does not
+return an incomplete bar at all, which is the entire reason
+`InputDivXtick=1` is used here (measured; that check is retired as
+`api_contract_checklist.md` T-14, recorded in `trading_api.md`'s Call-Point
+Inventory); inverted, a completed bar never
+needs second resolution. Head and rotation slots therefore run at second
+resolution; backfill runs at MINUTE resolution, where one call covers a
+whole session — 330-720 rows against the 2000-row `dataCnt` ceiling —
+against roughly twelve paged calls at second resolution.
+
+**Backfill has two forms.** AT REGULAR-SESSION OPEN it is a bulk burst:
+every working-set ticker needs bars from `volume_base_hour` (default
+04:00) onward, because conditions D, E and F are cumulative from it and
+G's 20-bar and C's 5-bar windows both reach back into premarket — and
+today's premarket bars are NOT in DuckDB, since ingestion is the evening
+batch and `load_ohlcv_with_history()` returns prior days only. This is not
+a spike to be smoothed: the scan is IDLE at open, because a ticker without
+today's bars cannot be evaluated at all, so the full combined chart/min
+budget is available and 50 tickers take about 6.25s against the 60s before
+the first bar close. AFTER OPEN, a newly-appearing ticker's backfill is
+issued AS its head slot rather than as an extra call, for the same reason:
+that slot would otherwise produce nothing. Its response is not awaited
+within the cycle — the ticker is unevaluable until it lands either way —
+and it rejoins the ordinary scan from the cycle after arrival. This attaches
+to WATCHLIST APPEND, which already fires on exactly this event — first
+appearance this session, or return after eviction — so no new lifecycle
+event appears, and a ticker with no DB history at all resolves through the
+existing `preload_fail` path. NOTE the mode distinction: Watchlist Append
+itself runs in BOTH `indicator_cache_mode` settings, while the calculator
+restore and `session_stats` Phase 2 load nested inside it are `"db"`-mode
+only. Backfill hangs off the hook, NOT off that nested branch — the eager
+pool loads prior-day history from DuckDB in either mode and today's bars are
+in neither, so a memory-mode session needs backfill exactly as much as a
+db-mode one.
+
+**ONE ASSUMPTION IS ACCEPTED, NOT PROVEN** (`api_contract_checklist.md`
+T-17). Early stop is sound only if the watchdog fires for every ticker that
+crosses conditions A-G. The watchdog applies its OWN matching, and a ticker
+that crosses ours without firing its own does not rise to the head, so the
+scan can stop above it.
+
+**The rotation cursor ALONE does not reduce that to a delay, and reading it
+that way is a mistake worth naming.** The cursor visits a ticker at an
+arbitrary phase within the bar, so a crossing occurring AFTER that visit is
+not seen until the next pass — which lands after the bar has closed. D and E
+are cumulative across the day and survive to the next bar, but B, C, F and G
+are bar-local and need not, so the bar can be lost outright rather than
+merely detected late. What actually converts loss into delay is the rotation
+slot's 120-second COMPLETED-BAR re-evaluation together with promotion, not
+the cursor's existence. Tickers the watchdog does fire on are unaffected
+either way — the head slots reach them within a cycle or two.
+
+What makes acceptance defensible is that the residual is MEASURED rather
+than assumed small: `metadata_crawler.md`'s `evening_detection_gap` stage
+runs `detect()` over the day's ingested bars and compares against
+`inference_log`. Note the limit of every in-session mitigation here: they all
+walk the LIST, so a ticker the watchdog never lists at all is invisible until
+that evening comparison.
+
+**The watchdog module itself is OUT OF SCOPE**, and this is a different
+kind of exclusion from the one above. It is the access surface to a
 separate external system, specified here by its one call and nothing else,
-and is not an implementation target of this spec set. Everything else in this
-loop is neither, and is buildable now.
+and is not an implementation target of this spec set. Everything in this
+loop is now buildable.
 
 **Loop termination (R-9).** This loop runs only while entries are
 structurally possible. At the top of every cycle, before Step 1:
@@ -812,12 +957,22 @@ loop every poll_interval_seconds:
      If empty AND inside the regular session: record finding 29
         (once per episode, re-armed when the list refills)
 
-  2. For each ticker in candidates:
-     a. Fetch current bars from trading API (1min chart up to now —
+  2. Allocate this cycle's slots (see PREFIX SCAN above), then for each
+     ticker a slot resolves to:
+     a. Fetch current bars from trading API (chart endpoint up to now —
         the API always returns the full range since the caller's last
-        query, not just the latest bar)
-     b. Fetch current ticks from trading API (10-tick up to now)
+        query, not just the latest bar). InputDivXtick=1 and a dataCnt
+        sized by the deficit rule for head/rotation slots; minute
+        resolution for a backfill
+     b. Fetch current ticks from trading API (10-tick up to now).
+        Indicator input only — NOT a detection input; the tick channel is
+        unchanged by the scan design
      c. Update intraday state in memory / DuckDB
+
+     Slots: N head (prefix scan, stop where this ticker's own bar data has
+     not advanced), M rotation (120s window, evaluated twice — see below),
+     and the shared slots. A cold ticker's head slot carries its backfill
+     instead, and its response is not awaited this cycle.
 
   3. If one or more new 1min bars completed for ticker since last check:
          for each newly-arrived bar, in chronological order:
@@ -840,11 +995,29 @@ loop every poll_interval_seconds:
      setup when indicator_cache_mode="db")
 
   5. For each ticker with completed bar and active calc:
-     a. Re-verify entry point candidate (detect())
-     b. If confirmed: Inferencer.infer(
-            bars, ticks, meta_bulk[ticker], entry,
+     a. Mid-bar screen only (rotation slot, forming bar): evaluate B-G
+        normally and RELAX A to PASS. A (0 < price <= 20) is the one
+        non-monotone condition — it reverts in BOTH directions as price
+        moves — so relaxing it is what makes the mid-bar result a PROVABLE
+        SUPERSET of the bar-close candidate set rather than an arbitrary
+        subset (see 01_entry_detection.md's monotonicity classification).
+        The superset is a FETCH LIST, never an entry list.
+     b. At bar close, call Inferencer.infer( bars, ticks,
+            meta_bulk[ticker], entry,
             session_stats=calculators[ticker]._session_stats
-        )
+        ) for EVERY member of the superset, with no detect() pre-filter
+        here. Inferencer's own step-3 detect() does the rejecting and
+        returns before feature extraction or model.predict(), so this is
+        free — and it is what keeps the instrumentation intact:
+        inference_log's no_detection event is the only record anywhere
+        that a candidate was EVALUATED AND REJECTED, and pre-filtering
+        would erase the distinction between "we looked and it failed" and
+        "we never looked", which the evening gap measurement rests on.
+        Bar-close re-evaluation applies the FULL expression to the
+        COMPLETED bar, so the final entry decision is identical to what
+        pure bar-close evaluation would have produced: the t-1
+        reference-bar convention, the label anchor and train-serve parity
+        are all untouched by the scan.
      c. If signal (up5 / up3):
         Fire an async, fire-and-forget REST bid/ask query for this ticker
         (5-level book) → `bid_ask_snapshots` (`source='signal_time_rest'`).
@@ -853,7 +1026,9 @@ loop every poll_interval_seconds:
         kind of observation the execution-gate path of the bid/ask open
         item needs. Not on the entry-submission critical path: this call
         is not awaited before gate evaluation or order submission below
-        proceed.
+        proceed. It shares the orderbook endpoint's budget with the exit
+        ladder's re-quote round-robin and PREEMPTS it at bar close — see
+        Position Manager Loop's ladder block.
         0.  Entry gates (R-5) — evaluated in this order, before every step
             below. Enforced identically in shadow mode; unlike R-4's
             breaker (evaluate-but-don't-enforce in shadow), a shadow run
@@ -1018,15 +1193,122 @@ loop every poll_interval_seconds:
 
 ---
 
+## Recovery Lane and Promotion
+
+The recovery lane is carryover and promotion's share of the non-reserved
+pacing slots at t=500 and t=750 on both legs — a share, not the whole cap;
+see the slot allocation above. It exists because two things need a bar
+outside the prefix scan's reach, and neither may be served by injecting the
+ticker at the scan head.
+
+**Head injection would corrupt the scan itself.** The prefix scan's early
+stop is sound ONLY because the list is ordered most-recently-fired-first.
+Placing a ticker into positions 0-2 for a reason unrelated to firing makes
+the head no longer the most recent firing, and the early-stop test becomes
+meaningless. The lane also bounds what head injection could not: rotation
+visits one ticker per cycle and a promotion lasts one bar, so up to 60
+promotions can accumulate against 3 head slots — at the limit the scan is
+starved of its own purpose.
+
+**Priority within the lane is CARRYOVER FIRST, then promotion.** Carryover
+is a live watchdog firing not yet serviced — the tail of a cycle where D
+exceeded N. Promotion is recovery of a bar already lost. Promotions that do
+not fit are DROPPED, not queued: dropping returns the ticker to exactly the
+no-promotion baseline, so the failure mode costs nothing, whereas a
+promotion queued past the bar it was issued for outlives its own reason.
+
+**AT BAR CLOSE the lane yields** to the superset-K fetch, the same
+precedence by which the exit ladder yields to `signal_time_rest`.
+
+**The 5-second figure is a DESIGN TARGET, not a measurement.** It is the
+budget for bar close -> fetch the superset -> infer -> submit, and the
+middle term has never been measured: model inference time is unknown. The
+figure IS `execution.entry_fill_delay_seconds` — one quantity, not two
+mirrored ones: BacktestEngine models the entry fill at it while this loop
+treats it as the reference its own submission is measured against. It is a
+config key for exactly this reason. Treat every "5-second deadline" in this file as
+naming that key's current value rather than a fixed property of the system;
+`live_scan_daily`'s stage timings below are what will settle it. Lane
+calls completing after the cycle boundary are harmless in any case:
+carryover is late against a 1s cycle, promotion against a 60s bar.
+
+**Promotion is a schedule change, never an eligibility change.** When the
+rotation slot's second evaluation finds a detection on the PRECEDING
+COMPLETED bar, that detection's t bar is the bar currently forming, already
+tau seconds old at the moment of the finding. Entering against it is
+unrepresentable in the t-bar-open-plus-5s fill model and would force a
+change to `09_backtest_engine.md`. So the ticker is PROMOTED — given
+recovery-lane priority for one bar — and the forming bar's own close is
+then evaluated on the ordinary fast path, with `p_entry`, the fill model
+and backtest parity all intact. One bar is lost; the next is guaranteed to
+be seen.
+
+Nothing about the condition is waived. D and E are cumulative across the
+day and survive to the next bar unconditionally; B, C, F and G are
+bar-local and need not, but volume clusters, so persistence into the
+adjacent bar is the common case rather than the exception. If A-G are not
+true on the next bar, promotion produces nothing, which is the correct
+outcome.
+
+Promotion adjudication runs `detect()` ONLY — not `infer()`. Running
+inference here would reach the model and leave `entry_points` and
+`inference_log` rows for a signal that was never entered. The count goes to
+`live_scan_daily.promotions_total` instead, which is also the in-session
+measure of how often the rotation cursor arrived too late in a bar.
+
+**Under `execution.late_entry_enabled` the finding takes a second path
+alongside promotion, not instead of it.** The candidate is put through
+`infer()` and then `execution_common.md`'s residual-edge gate, which prices
+the drift since the t bar's open against the edge the model still expects;
+if it passes, the entry is taken at `p_now`. Inference therefore RUNS FIRST
+on this path, which live can afford because these candidates are the small
+rotation-detected subset adjudicated mid-bar, outside the 5-second
+bar-close deadline. Promotion still happens either way — it is the fallback
+for a candidate the gate rejects, and it costs nothing when the gate
+accepts. With the flag false (the default) only promotion runs and this
+paragraph is inert.
+
+Both gate outcomes are counted into `live_scan_daily.late_entry_gate_pass`
+and `_reject`. The reject count is the one that matters: it measures what
+the gate costs in signals the model wanted, which is not observable any
+other way once the flag is on, and it is the input for deciding whether
+theta's quantile is set too high.
+
+This is the one place the scan produces an entry, and it does NOT weaken
+the eligibility rule in Constraints: what qualifies is still the full A-G
+expression over a COMPLETED bar. What the late path changes is WHEN that
+qualifying bar is observed and at WHAT PRICE it is taken.
+
+---
+
 ## Bar-Close Authority
 
-Judges, once per Watchdog Polling Loop cycle, whether each ticker in the
-current working set (not the full tradable universe — see the loop's own
-note on what the watchdog returns) has a bar for the most recently
-fully-elapsed minute, at whole-second precision. Scoped to the working set
-deliberately: a bar is fetched (Step 2a) for exactly those tickers, so
-nothing outside it has anything to judge, and checking the full active
-watchlist would report a missed deadline for tickers nobody is fetching.
+Judges, ONCE PER ELAPSED MINUTE rather than once per Watchdog Polling Loop
+cycle, whether each ticker in the current working set (not the full tradable
+universe — see the loop's own note on what the watchdog returns) has a bar
+for the most recently fully-elapsed minute, at whole-second precision.
+Scoped to the working set deliberately: nothing outside it is fetched at
+all, so nothing outside it has anything to judge, and checking the full
+active watchlist would report a missed deadline for tickers nobody is
+fetching.
+
+**A ticker is judged only once it has actually been ASKED.** Under the
+prefix scan a cycle fetches N head slots plus one rotation position, not
+the whole working set, so `last_bar_hour[ticker]` for a ticker not reached
+this cycle is merely STALE — it carries no information about whether the
+vendor has that minute's bar. Counting stale as `missed` would place most
+of the working set in the missed set on almost every cycle and trip Feed
+Outage's ratio test under entirely normal operation. The gate is
+`last_fetch_time[ticker]`, which the latency measurement below already
+maintains for its own purposes.
+
+**The denominator is guaranteed by the rotation cursor, not by luck.** M=1
+advances one position per cycle against a working set capped at 50, so
+every ticker is fetched at least once per ~50 cycles — inside one bar
+period. The rotation slot is DEDICATED and never competes with the head
+slots, so this holds however deep D runs in a given cycle. That is what
+makes a per-minute judgement well-populated where a per-cycle one would
+not be, and it is why the accumulation window below is exactly one minute.
 
 The working set is CUMULATIVE, so it carries tickers that fired hours ago
 and are legitimately quiet now. `missed` therefore mixes two causes — a
@@ -1037,26 +1319,45 @@ broad; it is Feed Outage's ratio test that is scoped to the recent end of
 the list, for exactly this reason (see that section).
 
 ```
-On every poll_interval_seconds cycle, after Step 2a's bar fetch:
+expected_minute = floor(now to the minute) - 1 minute   # the most
+    # recently fully-elapsed minute; NOT the current, still-forming one
+deadline = (end of expected_minute) + bar_close_grace_seconds
 
-  expected_minute = floor(now to the minute) - 1 minute   # the most
-      # recently fully-elapsed minute; NOT the current, still-forming one
-  deadline = (end of expected_minute) + bar_close_grace_seconds
+ACCUMULATION WINDOW for expected_minute = [deadline, deadline + 60s)
 
-  if now < deadline:
-      skip this check this cycle — expected_minute's own grace window has
-      not elapsed yet; checking earlier would just re-detect the same
-      ordinary poll-to-poll lag every single cycle
+  At each Step 2a fetch falling inside that window, classify THIS ticker
+  for expected_minute — first classification wins, so one ticker
+  contributes at most one verdict per minute:
 
-  else:
-      missed = [ticker for ticker in candidates
-                if last_bar_hour[ticker] < expected_minute]
-      # last_bar_hour[ticker]: this ticker's own most recent bar hour as
-      # actually returned by Step 2a, tracked per ticker across cycles —
-      # read directly off the fetch response, not derived from
-      # calculators[ticker], since that already absorbs Step 3's replay
-      # and would hide exactly the lag being measured here
+      'ok'      the response carries a bar for expected_minute
+                (last_bar_hour[ticker] >= expected_minute)
+      'missed'  it does not, and the fetch was issued after the deadline,
+                so the vendor had its full grace window before we looked
+
+  A ticker the scan never reaches inside the window is classified NEITHER.
+  It is absent from the denominator, not counted as missed — the
+  difference between "we asked and it was not there" and "we did not ask".
+
+  At the window's close: evaluate Feed Outage trigger condition 2 over the
+  classified set, emit finding 26's samples for the minute, then discard
+  the classification and open the next minute's window.
+
+  # last_bar_hour[ticker]: this ticker's own most recent bar hour as
+  # actually returned by Step 2a, tracked per ticker across cycles —
+  # read directly off the fetch response, not derived from
+  # calculators[ticker], since that already absorbs Step 3's replay
+  # and would hide exactly the lag being measured here
 ```
+
+**The cost of the window is detection latency on condition 2 only.** A
+systemic bar-feed failure now surfaces up to a minute after it starts,
+where the per-cycle test could in principle have caught it within a cycle.
+Condition 1 — an explicit connection or API-level failure — is unaffected
+and still fires on the cycle it occurs, and that is the fast path for a
+real outage. Condition 2 was always the slower "systemic signal even
+without a hard connection error" detector, and under the prefix scan a
+per-cycle version of it is not merely noisier but structurally wrong: it
+would be reading tickers nobody asked about.
 
 `bar_close_grace_seconds` (config, seed value — see
 api_contract_checklist.md's T-13: how promptly the vendor typically has a
@@ -1088,6 +1389,24 @@ would hide the very lag being measured. Two further properties fall out of
 that placement: the loop's hottest path (Step 3's `on_bar_close()` replay)
 is untouched, and at most one sample per ticker per cycle is structurally
 guaranteed, so a single slow bar cannot be counted repeatedly.
+
+**The prefix scan shifts this curve's POPULATION, and the shift is not
+neutral.** `e = min(delta, d)` admits a sample only when the ticker was
+fetched recently enough to bound the overstatement, so head-slot tickers —
+fetched every second, `delta` about 1s — supply nearly all admitted
+samples, while a ticker reached only by the rotation cursor carries
+`delta` up to ~50s and is admitted only on the rare pass that happens to
+land within `bar_latency_max_error_seconds` of its bar close. The curve
+therefore describes the vendor's latency ON ACTIVELY FIRING TICKERS. That
+is the opposite of the bias this measurement already guards against by
+admitting timestamp-discontinuous samples: thin names are the ones a
+vendor is slowest on, and they are now the ones least represented, so
+`bar_close_grace_seconds` calibrated from this curve runs OPTIMISTIC for
+exactly the tickers most likely to breach it. The one-sided-error posture
+already stated for this key — seed it conservative (higher) — is what
+absorbs the gap until `excluded_no_prior_fetch` / `excluded_both_wide`
+counts show how large it is; those two counters are now the measure of the
+shift, not merely of rejected samples.
 
 ```
 At Step 2a, for each candidate whose fetch returned a newer bar than
@@ -1220,8 +1539,16 @@ handled by finding 29 without a freeze.
 - An explicit connection/API-level failure (exception, timeout, non-200
   response) from the trading API, or
 - More than 50% of the working set's MOST-RECENTLY-FIRED
-  `live_mode.min_watchlist_size` tickers are in Bar-Close Authority's
-  `missed` set — a systemic signal even without a hard connection error.
+  `live_mode.min_watchlist_size` tickers are classified `missed` in
+  Bar-Close Authority's per-minute accumulation window, evaluated once at
+  that window's close — a systemic signal even without a hard connection
+  error. The ratio's denominator is the CLASSIFIED tickers among that MRU
+  slice, never the slice itself: under the prefix scan a ticker the scan
+  did not reach inside the window has not been asked, and counting it
+  against the feed would manufacture the very freeze this condition is
+  supposed to detect. The rotation cursor is what keeps the denominator
+  from thinning — it reaches every working-set ticker within a bar period
+  regardless of scan depth.
   Scoped to the recent end of the list because the working set is
   cumulative: an unscoped ratio counts tickers that fired hours ago and
   are legitimately quiet, which in this low-liquidity universe would
@@ -1263,8 +1590,17 @@ handled by finding 29 without a freeze.
    endpoint — the trading API's existing "always returns full range since
    last successful query" behavior (already relied on elsewhere — see
    Watchdog Polling Loop Step 2a, Position Manager Loop Step 1) means the
-   very next ordinary bar-fetch call for each active-watchlist ticker
-   naturally returns everything missed during the outage. The EXISTING
+   very next ordinary bar-fetch call for each ticker naturally returns
+   everything missed during the outage. Under the prefix scan that call
+   arrives per ticker as the scan reaches it, not for the whole watchlist
+   at once — head slots within a cycle or two for anything the watchdog is
+   firing on, and the rotation cursor within one bar period for the rest —
+   so catch-up is PROGRESSIVE, bounded by the rotation period rather than
+   simultaneous. This costs nothing: a ticker not yet caught up is simply
+   one that has not been re-evaluated yet, which is the ordinary steady
+   state of the scan in any case. Step 5's exit re-evaluation is unaffected
+   because Position Manager fetches each position's bars directly rather
+   than through the scan. The EXISTING
    Step 3 multi-bar replay loop (calculators[ticker].on_bar_close() called
    once per missed bar, in order) handles the catch-up with no new
    mechanism — the outage is, from the calculator's point of view, just an
@@ -1508,6 +1844,17 @@ so a re-crash during recovery re-enters warm restart on the same signature.
    corruption possible, and needs no transactional handling beyond that.
 
 5. On cache reload complete: clear 'restart_warmup'; entries resume.
+
+5a. Scan state is deliberately NOT restored, and the omission is safe
+   rather than overlooked. `last_bar_hour`, `last_fetch_time` and the
+   rotation cursor all start empty: Bar-Close Authority's per-minute window
+   simply leaves an unfetched ticker unclassified rather than counting it
+   missed, the cursor restarts at position 0 and covers the list within a
+   bar period, and the first pass's latency samples fall into the existing
+   `excluded_no_prior_fetch` class. The deficit window rule then sees no
+   bars held for any ticker and issues each one a backfill as its own head
+   slot — the same path a cold ticker takes after open, at a moment when
+   the scan has nothing else to do for those tickers anyway.
 
 6. Cooldown restore: per ticker, last entry-attempt time = max over
    today's live_positions rows in {pending, open, canceled, closed} (read
@@ -1970,6 +2317,12 @@ loop every position_check_interval_seconds (config, default: 5s):
   # (b) cannot replace (a): a fully filled order also disappears from
   # (b), so absence there alone does not separate cancellation from
   # completion.
+  # Record (a)'s RETURNED ROW COUNT each cycle into live_scan_daily's
+  # fill_page_rows_p50/_p95. The page size is a server-side parameter with
+  # no request field and it varies per call, so this is the only way the
+  # distribution is ever seen — and it is what closed the fill-inquiry
+  # page-size open item, which was closed as instrumented rather than as
+  # answered. Free: the rows are already in hand.
 
   For each order_id in in_flight_orders where side == 'exit':
     # WS account fill events are primary; the two calls above are the
@@ -2048,19 +2401,39 @@ loop every position_check_interval_seconds (config, default: 5s):
             # past exit_order_stuck_minutes. This replaces the former
             # "amend to bid every cycle" rule.
             bid, ask = REST orderbook query, this ticker's current level-1
-                (one call, folded into this loop's existing
-                position_check_interval_seconds cadence — no separate
-                polling schedule; both sides come back from the one call)
+                (one call; both sides come back from it)
             target = ask - k * (ask - bid)     # execution_common.md
             if target != this order_id's current resting limit_price:
                 amend this order_id's price to target — a single order
                     amendment, not cancel-and-resubmit, so the order_id
                     (and therefore fill tracking against it) is undisturbed
-            # Re-quoted every cycle unconditionally, whether or not the
-            # market moved much since the last check — the simplest
-            # correct behavior. A move-triggered variant (skip the amend
-            # call inside some tolerance band) is a possible later
-            # refinement, not designed here.
+            # ROUND-ROBIN, not one query per outstanding exit per cycle.
+            # The orderbook endpoint's combined budget is 4 calls/second,
+            # so at P outstanding limit exits each is re-quoted every P/4
+            # seconds rather than every cycle. This is what removes the
+            # ceiling: querying all P every cycle saturates the bucket at
+            # small P, while under round-robin no value of P can exceed it.
+            # The baseline to compare against is the ORIGINAL design, which
+            # already folded this query into the position_check_interval_seconds
+            # cadence — 5s by default. Round-robin at P=10 re-quotes each exit
+            # every 2.5s, BETTER than that baseline, and matches it at P=20.
+            # NOT justified by exit_order_stuck_minutes: that key paces the
+            # ladder's k escalation, while a re-quote tracks the BOOK — target
+            # moves as soon as bid/ask move, at k unchanged. The relevant time
+            # constant is how fast the book moves, which on these tickers is
+            # seconds. Staleness is also asymmetric: a resting sell limit left
+            # behind a rising book sits BELOW the new ask and fills cheap, which
+            # is adverse selection, while a falling book only delays the fill.
+            #
+            # AT BAR CLOSE, signal_time_rest PREEMPTS the round-robin.
+            # Same bucket, but the entry path sits inside the 5-second
+            # decision deadline and the ladder does not.
+            #
+            # A move-triggered variant (skip the amend inside some
+            # tolerance band) does NOT relieve the bucket and is not the
+            # refinement to reach for: it saves the AMEND, while the
+            # orderbook QUERY is what the bucket charges, and the book has
+            # to be read to know whether the market moved at all.
             # An order originally submitted as MARKET is assumed NOT
             # amendable into a limit (the vendor does not document whether
             # its amend path permits an order-type change). It is expected
@@ -2357,6 +2730,30 @@ loop every position_check_interval_seconds (config, default: 5s):
 live_mode:
   poll_interval_seconds:          1
   position_check_interval_seconds: 5    # shared timing grid — see Position Manager Loop
+  scan:
+    head_slots:                   3      # N — prefix-scan calls per cycle from
+                                         # the head of the watchdog list
+    rotation_slots:               1      # M — cursor positions advanced per
+                                         # cycle through the remainder. At the
+                                         # 50-ticker cap the whole list is
+                                         # walked in ~50 cycles, about one bar
+    shared_lane_slots:            4      # CAP on the non-reserved pacing
+                                         # slots, not an allocation to one
+                                         # consumer. Sized as (chart/min
+                                         # combined budget) - (head_slots +
+                                         # rotation_slots)
+    rotation_window_seconds:      120    # forming bar (60s) + the completed
+                                         # bar behind it (60s); phase-independent
+    # N and M are BOUNDED BY LATENCY, NOT TPS. Pacing is a minimum interval
+    # (250ms per account) and the two accounts alternate, so the last scan
+    # call completes at 250ms + RTT = 850ms worst case at the measured
+    # 400-600ms round trip (that check is retired as
+    # api_contract_checklist.md T-16 — these keys are its record). A sustained
+    # rise past ~600ms breaks the 1s cycle and head_slots must come down.
+    # The shared slots deliberately sit at t=500/t=750 on
+    # BOTH legs rather than a whole leg of its own — see the slot
+    # allocation under Watchdog Polling Loop for why a whole-leg split
+    # would push the scan's completion to 1150-1350ms.
   # max_positions removed — replaced by execution.max_tickers /
   # execution.max_positions_per_ticker (two independent axes; a single
   # global count could not express "5 positions, all on one ticker").
@@ -2482,7 +2879,13 @@ live_mode:
                                              # before tuning — the sample's
                                              # composition and its size pull
                                              # sensitivity in opposite
-                                             # directions
+                                             # directions. N bounds the
+                                             # denominator; it does not set
+                                             # it. Only tickers the scan
+                                             # actually reached inside the
+                                             # minute's window are counted,
+                                             # so the effective denominator
+                                             # is at most N
   bar_close_grace_seconds:        5          # seed value — Bar-Close
                                              # Authority's per-ticker
                                              # miss deadline; how long past
@@ -2509,7 +2912,18 @@ live_mode:
                                              # poll_interval_seconds changes,
                                              # or when finding 26 reports
                                              # heavy sample loss or a gap
-                                             # between its two error classes
+                                             # between its two error classes.
+                                             # NOTE: under the prefix scan a
+                                             # BASELINE level of sample loss
+                                             # is structural, not a fault —
+                                             # rotation-only tickers carry a
+                                             # delta up to ~50s and are
+                                             # rejected by design. Judge this
+                                             # key on CHANGE against that
+                                             # baseline, not on absolute
+                                             # loss; see the population-shift
+                                             # note under Bar-Arrival Latency
+                                             # Measurement
   bar_integrity_freeze_ticker_count: 5       # seed value — distinct tickers
                                              # with a negative bar-latency
                                              # sample (finding 27) before the
@@ -2580,6 +2994,34 @@ live_mode:
 - Inferencer is instantiated once per session with the DI FeatureExtractor
 - on_bar_close() called by LiveModeRunner for each ticker per bar — not by IndicatorCalculator
 - Position manager loop runs independently of watchdog polling loop
+- The watchdog scan governs WHAT IS FETCHED and WHICH TICKER IS
+  PRIORITISED — it never changes an entry's ELIGIBILITY. Eligibility
+  remains the full A-G expression over a COMPLETED bar in every path:
+  mid-bar screening relaxes A only to build a fetch superset, and
+  promotion only reschedules. (Under `execution.late_entry_enabled` a
+  rotation-slot finding can produce an entry, which is why this is phrased
+  as eligibility rather than as "scanning never produces an entry" — what
+  changes there is WHEN a qualifying bar is observed and at WHAT PRICE it
+  is taken, not what qualifies.)
+- The bar-close sequence is instrumented END TO END, because the 5-second
+  target is unverified and each stage moves independently:
+  `barclose_fetch_ms` (bar close -> superset fetched), `infer_ms` (-> all
+  candidates through `infer()`), `submit_dispatch_ms` (-> last entry order
+  handed to `trading_api.md`'s dispatch queue), `broker_ack_ms`
+  (dispatch -> broker's own order stamp) and `order_to_fill_ms` (order stamp
+  -> execution stamp). The last two are NOT locally timed: everything past
+  dispatch is on the far side of the async boundary, so both come from IS2's
+  own fields — `Sastklclorddttm`/`Sastkorddttm` for the crossing and
+  `Sastkorddttm` -> `Sastkexecdttm` for the fill, all broker-stamped and
+  therefore free of local clock skew. `entry_submit_late` counts entries
+  dispatched past their deadline; those are STILL SUBMITTED, since backtest
+  models late detection but not late submission and dropping them would
+  diverge from it in an unmodelled direction too
+- `live_scan_daily` is written by this loop once per session — scan depth
+  histogram, carryover, rotation visits/hits/misses, superset size,
+  bar-close fetch latency and promotions. These are the only in-session
+  evidence that N, M and the 5-second deadline hold, and health_report.md
+  reads them
 - Trade execution (buy/sell API calls) is LiveModeRunner's responsibility —
   Inferencer only returns InferenceResult
 - All inference_log writes include the active run_id

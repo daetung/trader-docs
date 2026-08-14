@@ -207,7 +207,8 @@ halts_td = db_conn.execute("""
 """, [ticker, date]).df()
 
 # halts_td passed explicitly to all internal methods
-fill_second  = utils.hour_add_seconds(entry_hour, 5)
+fill_second  = utils.hour_add_seconds(
+    entry_hour, config["execution"]["entry_fill_delay_seconds"])
 search_limit = utils.hour_add_seconds(entry_hour, 100)
 ticks_entry  = ticks_td[(ticks_td["hour"] >= entry_hour) &
                          (ticks_td["hour"] < search_limit)]
@@ -272,7 +273,8 @@ single instant fill.
 
 ```
 tick_10.hour = last tick timestamp of each 10-tick bundle (second precision)
-fill_second  = utils.hour_add_seconds(entry_hour, 5)
+fill_second  = utils.hour_add_seconds(
+    entry_hour, config["execution"]["entry_fill_delay_seconds"])
 search_limit = utils.hour_add_seconds(entry_hour, 100)
 
 Rationale for 100s window:
@@ -396,7 +398,8 @@ for each date, in ascending order:
     exit event    -> remove from active_positions
                      remaining_cash += realized proceeds
     revive credit -> remaining_cash += the scheduled amount
-    entry cand.   -> gates, in LiveModeRunner's step-5c.0 order:
+    entry cand.   -> LATE-DETECTION MODEL first (see below), then gates,
+                     in LiveModeRunner's step-5c.0 order:
                        1. distinct tickers in active_positions <
                           execution.max_tickers (skipped when this ticker
                           is already held)
@@ -436,6 +439,63 @@ for each date, in ascending order:
   exactly the data a run exists to score — see live_mode_runner.md's
   Circuit Breaker for the fuller argument, which applies here unchanged.
 ```
+
+**Late-detection model.** Backtest takes every detected entry point; live
+takes only what its watchdog scan OBSERVED. The two differ, and the
+difference is correlated with bursts — the moments where opportunity
+clusters — so leaving it unmodelled makes backtest most optimistic exactly
+where it matters most. This applies REGARDLESS of whether late entry is
+adopted; the flag below only decides what happens to the affected
+candidates, not whether they are affected.
+
+```
+h = deterministic_hash(ticker, date, hour) -> [0, 1)
+
+h >= backtest.late_detection_rate:
+    head-detected. Unchanged.
+
+h <  backtest.late_detection_rate:
+    rotation-detected.
+    if this ticker's IMMEDIATELY PRECEDING bar was dropped by this rule:
+        EXEMPT — take the candidate normally. This is promotion:
+        live promotes a ticker after a rotation-slot finding, so its next
+        bar close is guaranteed to be seen.
+    elif not execution.late_entry_enabled:
+        DROP the candidate. No trade_log row and no gate counter — nothing
+        was attempted; live never saw it.
+    else:
+        enter at t_open + delay, delay = h2 * backtest
+        .late_detection_delay_max_s, h2 a second hash of the same key.
+        Uniform delay follows from the rotation cursor's arbitrary phase;
+        live_scan_daily can falsify it.
+```
+
+A HASH, not an RNG. No seed to manage, invariant to iteration order in this
+loop, and — because it never reads the live database — a run today and the
+same run next month produce identical results. Reading
+`late_detection_rate` from accumulated live data AT RUN TIME would silently
+break that, which is why it is a config value seeded from measurement
+rather than a query.
+
+The exemption makes this loop state-dependent (one bit per ticker), which is
+the cost of representing promotion at all. It is also what makes promotion's
+real value — how often a detection persists into the adjacent bar — directly
+MEASURABLE in a backtest rather than assumed.
+
+Defaults `late_detection_rate: 0.0` and `late_detection_delay_max_s: 0.0`
+make the whole model a no-op, so current backtest output is preserved
+byte-for-byte until a measured rate exists to seed it with.
+
+**The parity gap runs the OTHER WAY most of the time, and the direction is
+worth stating.** `entry_fill_delay_seconds` is sized against live's WORST
+case — a bar close where the candidate superset is full, K orders queue
+behind each other at the order endpoint's rate, and the sequence only just
+fits. Ordinary bar closes carry far fewer candidates, so live fetches, infers
+and submits well inside that budget and fills EARLIER than this model does.
+Backtest is therefore CONSERVATIVE in the common case and converges to live
+only at burst. It is not a bound in either direction: if measured inference
+time turns out longer than assumed, the key moves up and the relationship
+inverts — which is why it is a key rather than a constant.
 
 A revive credit whose date is never processed (no candidates that day)
 applies at the start of the next processed date — no capital is lost, and
@@ -675,6 +735,24 @@ backtest:
   dead_position_penalty_pct: 0.05    # exit-side unfilled-quantity penalty only —
                                       # entry-side unfilled remainder is sized
                                       # down, not penalized (see Entry Slippage Model)
+  # entry_fill_delay_seconds is NOT declared here — it lives under execution:,
+  # because live reads the same quantity (execution_common.md). It was a
+  # hardcoded 5 at two sites in this file, the standard path and the
+  # tick-bundle block, so changing one and not the other would have split
+  # them silently.
+  late_detection_rate:        0.0    # share of entry points live's watchdog
+                                      # scan reaches only via the rotation
+                                      # cursor. 0.0 = model disabled, current
+                                      # output preserved exactly. Seeded from
+                                      # live_scan_daily's measured rotation
+                                      # figures, never read from the DB at run
+                                      # time — see Chronological Simulation
+  late_detection_delay_max_s: 0.0    # upper bound of the uniform delay applied
+                                      # to a rotation-detected candidate when
+                                      # execution.late_entry_enabled is true.
+                                      # Ignored when it is false, since those
+                                      # candidates are dropped rather than
+                                      # delayed
 # position_size_cash_pct, position_size_vol_pct, take_profit_up3/up5,
 # stop_loss_pct, exit_interpolation, sell_rate_tp/sl, use_all_cash moved to
 # the shared `execution:` section (see docs/utils/execution_common.md) —

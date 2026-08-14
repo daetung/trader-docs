@@ -415,6 +415,7 @@ CREATE TABLE IF NOT EXISTS batch_runs (
                                       -- 'evening_investing_forward_check' |
                                       -- 'evening_retention_purge' |
                                       -- 'evening_feed_coverage' |
+                                      -- 'evening_detection_gap' |
                                       -- 'overnight_token_refresh' |
                                       -- 'live_session_start' | 'live_session_end'
     date         VARCHAR   NOT NULL,  -- 'YYYYMMDD' — the trading day this batch targets
@@ -1469,6 +1470,88 @@ CREATE TABLE IF NOT EXISTS feed_coverage_daily (
 -- Growth is known in advance at roughly 50 rows/day — the first registry
 -- entry that arrives already resolvable, which is what the DB Health
 -- Observation exists to make the others.
+
+-- Live scan diagnostics — one row per (date, metric), session-level scalars.
+-- EAV in the same manner as tick_bar_aggregates above, and for the same
+-- reason: the metric set grows as the scan design is tuned, and a wide table
+-- would need a schema change per question. Unlike that table there is no
+-- per-ticker or per-bar axis — every value here summarises a whole session.
+-- The metric keys, and what each one answers:
+--   depth_hist_0 | _1 | _2 | _3 | _over
+--                            prefix-scan depth D per cycle, bucketed. Is
+--                            live_mode.scan.head_slots (N) large enough?
+--   carryover_cycles         cycles where D exceeded N
+--   carryover_tickers        tickers deferred to a later cycle by that
+--   rotation_visits          rotation-cursor visits
+--   rotation_hits            of those, ones where the relaxed expression was
+--                            true for a ticker the watchdog had not raised —
+--                            the measured watchdog gap (api_contract_checklist
+--                            T-17), not an assumed one
+--   rotation_misses          visits finding nothing
+--   superset_k_p50 | _p95    size of the mid-bar candidate superset fetched at
+--                            bar close. The design assumes roughly 10
+--   barclose_fetch_ms_p50 | _p95
+--                            wall time to fetch that superset after a bar
+--                            closes. LOAD-BEARING: the whole scan design
+--                            targets a 5-second decision deadline and nothing
+--                            measured it before this table existed
+--   infer_ms_p50 | _p95      superset fetched -> all candidates through
+--                            infer(). The unmeasured term the 5-second
+--                            target was assumed against
+--   submit_dispatch_ms_p50 | _p95
+--                            inference done -> last entry order handed to
+--                            the dispatch queue. These three plus the two
+--                            below decompose the bar-close budget, which is
+--                            why execution.entry_fill_delay_seconds is a key
+--   broker_ack_ms_p50 | _p95 dispatch -> the broker's own order stamp. NOT
+--                            locally timed: past dispatch is the far side of
+--                            the async boundary, so this is IS2's
+--                            Sastklclorddttm/Sastkorddttm pair
+--   order_to_fill_ms_p50 | _p95
+--                            broker order stamp -> execution stamp, both
+--                            from IS2 (Sastkorddttm -> Sastkexecdttm), so
+--                            free of local clock skew
+--   entry_submit_late        entries dispatched past their deadline. They
+--                            are still submitted — backtest models late
+--                            DETECTION but not late SUBMISSION, so dropping
+--                            them would diverge in an unmodelled direction
+--                            too
+--   fill_page_rows_p50 | _p95
+--                            rows returned by the exit-side fill inquiry, the
+--                            distribution its page-size question needed
+--   gap_total | _disagreed | _unevaluated
+--                            evening detection-gap stage (metadata_crawler.md)
+--   promotions_total         completed-bar detections found by the rotation
+--                            slot and promoted
+--   late_entry_gate_pass | _reject
+--                            residual-edge gate outcomes, populated only when
+--                            execution.late_entry_enabled is true
+-- OVERLAP, deliberately not resolved by subtracting: a promoted ticker that
+-- produced no late entry leaves no inference_log row for that bar, so it
+-- appears in gap_unevaluated AND in promotions_total. gap_unevaluated is the
+-- outer set and promotions_total names a known, already-handled part of it.
+-- These two must never be added together.
+-- Re-run rule: UPSERT PER (date, metric) — NOT feed_coverage_daily's
+-- DELETE-the-date-then-INSERT. Two writers touch one date at different times:
+-- LiveModeRunner writes the in-session keys at session end, and
+-- metadata_crawler.md's evening_detection_gap stage writes the gap_* keys
+-- hours later. A blanket delete by date on the second write would erase the
+-- first writer's rows. The tables on either side of this one warn about the
+-- opposite errors — bar_latency_daily against a blanket `+=`,
+-- feed_coverage_daily against an additive merge — and this is the third form
+-- of the same trap: the right granularity for the re-run rule is whatever the
+-- writer actually owns, which here is a key, not a date.
+-- Retention: purge-registry member — date_column `date`, retention_days: inf.
+-- Growth is a few dozen rows per day, bounded by the metric list above rather
+-- than by ticker count.
+CREATE TABLE IF NOT EXISTS live_scan_daily (
+    date        VARCHAR NOT NULL,   -- 'YYYYMMDD'
+    metric      VARCHAR NOT NULL,   -- one of the keys enumerated above
+    value       DOUBLE,             -- NULL if the metric was not produced that
+                                    -- session (e.g. late_entry_* while the
+                                    -- gate is disabled)
+    PRIMARY KEY (date, metric)
+);
 
 -- Health-event log — one row per discrete diagnostic event (health_report.md).
 -- Different in kind from bar_latency_daily above: that aggregates NORMAL

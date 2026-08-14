@@ -502,6 +502,59 @@ def gather_findings(db_conn, today_date, log_dir,
         reason, that a watchdog recovering and failing again is itself the
         signal.
 
+    30. Scan carryover rate (`scan_carryover_rate`) — the share of cycles in
+        which prefix-scan depth D exceeded `live_mode.scan.head_slots`,
+        from `live_scan_daily.carryover_cycles` against the session's cycle
+        count, with the `depth_hist_*` buckets carried in the detail. It
+        answers one question only: is N large enough. A rising rate means
+        firings are arriving faster than the head slots absorb them, and the
+        response is N, not a threshold edit — but N is bounded by RTT, not
+        by budget (live_mode_runner.md's slot allocation), so a rate that
+        cannot be fixed by raising N is the signal that the working set or
+        the watchdog's firing behaviour has changed shape.
+        Level: warn. Carryover costs detection latency, not correctness.
+        Threshold TBD — no baseline distribution exists yet, the same
+        deferral status as findings 6/7.
+    31. Rotation miss rate (`scan_rotation_miss_rate`) —
+        `rotation_misses / rotation_visits` from `live_scan_daily`. This is
+        the accepted watchdog-gap risk (`api_contract_checklist.md` T-17)
+        actually realising: the rotation cursor found a ticker crossing the
+        relaxed expression that the watchdog had not raised. A nonzero rate
+        is EXPECTED, which is why this is a rate finding rather than an
+        event one — what matters is movement, not presence.
+        Level: warn. Threshold TBD, same deferral.
+        Read alongside finding 33: this one sees only tickers the watchdog
+        listed at some point, while 33 sees the ones it never listed at all.
+    32. Bar-close fetch deadline (`barclose_fetch_deadline`) —
+        `live_scan_daily.barclose_fetch_ms_p95` against the 5-second
+        decision deadline the scan design targets. LOAD-BEARING: the entire
+        mid-bar screen exists to shrink the bar-close burst from the working
+        set to the candidate superset, and until this table existed nothing
+        measured whether it succeeded. The detail carries
+        `superset_k_p50`/`_p95` beside it, because a breached deadline
+        caused by an oversized superset and one caused by vendor latency
+        need opposite responses.
+        Level: warn, escalating to abort is deliberately NOT provided — a
+        missed deadline degrades entry timing, and freezing a session over
+        it would cost more than the late entries it prevents.
+    33. Detection gap (`detection_gap`) — `gap_total`, `gap_disagreed` and
+        `gap_unevaluated` from the evening `evening_detection_gap` stage
+        (metadata_crawler.md), reported as rates against the day's detected
+        set. The two components are NOT summed and NOT compared to each
+        other: `gap_disagreed` means the ticker was evaluated live and the
+        bars later disagreed, which is a feed-quality signal in the same
+        family as `feed_coverage_daily`, while `gap_unevaluated` means the
+        scan never reached it at all. One calls for looking at the feed, the
+        other at the scan.
+        Also note the overlap the detail must state rather than resolve: a
+        promoted ticker that produced no late entry appears in BOTH
+        `gap_unevaluated` and `promotions_total` (see db_schema.md), so the
+        two are never added.
+        Level: warn. Threshold TBD, same deferral. Available only on the
+        evening path, one day in arrears — the only finding here whose
+        input is produced by a batch stage rather than by the session it
+        describes.
+
     Returns: dict of {finding_name: {severity: 'ok'|'warn'|'abort', detail: ...}}
     """
     ...
@@ -515,7 +568,7 @@ A read-only summary emitted once at each FIRST-DB-ACCESS point: live session
 start, evening batch start, and premarket batch start. It reports:
 
 - the `data/market.duckdb` file size
-- row counts for the eleven purge-registry tables (see db_schema.md) and for
+- row counts for the twelve purge-registry tables (see db_schema.md) and for
   the structurally-excluded corpus tables
 - the latest `date` value present in each
 
@@ -818,7 +871,10 @@ present.
 - **`log_dir` files**: findings 4, 10, and the missing-`SUMMARY` finding.
   Readable without the DB, which is why path (7) can produce anything at all.
 - **DB**: findings 1, 2, 3, 5, 8, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
-  22, 23, 24, 25, 26, 27, 29.
+  22, 23, 24, 25, 26, 27, 29, 30, 31, 32, 33. The last four read
+  `live_scan_daily`; 33 alone reads a row written by the evening batch
+  rather than by the session being reported, so on a session-end call it
+  describes the PREVIOUS day.
 - **Neither**: findings 6, 7 (placeholders) and 28.
 - Finding 11 is produced BY the evening liveness probe rather than gathered
   during it — it is that path's own conclusion, not a query result.

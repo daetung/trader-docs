@@ -168,7 +168,13 @@ has no counterpart spec.
   here. What remains out of scope is multi-account TRADING: position
   accounting, per-account sizing, and reconcile across accounts, none of
   which the spec set addresses. A non-trading client such as
-  `auxiliary_stream.md`'s is not that
+  `auxiliary_stream.md`'s is not that, and neither is the READ-ONLY quote leg
+  the watchdog scan runs on the second account: it fetches bars against that
+  account's own allowance and never places an order, so no position
+  accounting, per-account sizing or cross-account reconcile arises. What the
+  scan's leg does raise, and this file does not settle, is PROCESS TOPOLOGY —
+  whether a second SDK client lives inside the trading process or behind a
+  subprocess boundary belongs to the async-boundary open item, not here
 - Vendor account and session limits, recorded because they now bound design
   rather than merely describing the vendor. An app registration is
   effectively an account — `prd_app_key` and `vtl_app_key` are separate
@@ -180,8 +186,17 @@ has no counterpart spec.
   10011, not from `api_doc/`. A hint string is not a contract and upstream
   may reword it, so it is a re-sync surface in the same manner as
   `DBSecWebSocket._MAX_SUBSCRIPTIONS`
-- Rate governance is per-APP (two-tier, app level plus endpoint level), so an
-  additional account carries its own app-level allowance. Adding accounts
-  widens the global budget rather than dividing it. This does not resolve
-  `open_items.md`'s budget item — the endpoint-level ceilings are unchanged —
-  but it removes the assumption that the app-level allowance is fixed
+- Rate governance is per-APP at BOTH tiers, app level and endpoint level, so
+  an additional account carries its own allowance at each. The app-level
+  tier is 20 TPS, and the SDK's `rate_limit_safety` defaults to `0.9`. Both
+  figures come from the SDK rather than from `api_doc/`, so they are a
+  re-sync surface in the same manner as the two-session figure above. Adding accounts
+  widens the global budget rather than dividing it. An earlier version of this
+  bullet added that "the endpoint-level ceilings are unchanged" — that
+  contradicted the per-APP premise stated in its own first clause and was
+  wrong. The consequence was measured under `api_contract_checklist.md` T-15,
+  since retired: the demo
+  account returns identical `chart/min` and `inquiry/orderbook` data on an
+  independent budget at both tiers. The combined two-account budget this
+  yields is a large part of what closed the call-budget open item, and
+  `trading_api.md`'s Call-Point Inventory carries the resulting figures

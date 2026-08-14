@@ -142,25 +142,27 @@ question would be reopened.
 Derived from the caller specs' stated needs, not from the vendor's catalogue —
 which is why the list is shorter than what the vendor publishes (11 quote
 endpoints plus 9 trading endpoints for overseas equities). TPS is the vendor's
-published per-endpoint rate, carried here because `open_items.md`'s budget item
-allocates against exactly these numbers.
+published per-endpoint rate FOR ONE APP — see the sixth note below for what
+two apps make of it. Every consumer is now bounded against these numbers and
+the call-budget open item is closed, so the column is a standing reference for
+future call sites rather than an input to an unresolved allocation.
 
 | Need | Call site | Endpoint | TPS |
 |---|---|---|---|
 | Tradable ticker list | Session Lifecycle Step 1; `build_trading_api_symbol_map()` (three per-exchange calls) | `quote/…/inquiry/stock-ticker` | 2 |
 | Balance and deposit | Step 1b; the funds gate; Broker Reconcile | `trading/…/inquiry/balance-margin` | 3 |
 | Per-ticker margin ratio | position sizing — undesigned, see `open_items.md` | `trading/…/inquiry/able-orderqty` | 2 |
-| 1-minute bars | Watchdog Step 2a; Position Manager Step 1 | `quote/…/chart/min` | 4 |
-| Ticks | Watchdog Step 2b; Position Manager Step 2 | `quote/…/chart/tick` | 4 |
+| Bars, minute OR second resolution | Watchdog Step 2a (prefix scan, rotation window, backfill); Position Manager Step 1 | `quote/…/chart/min` | 4 |
+| Ticks | Watchdog Step 2b; Exit Architecture's REST tick backstop (WS-dead only) | `quote/…/chart/tick` | 4 |
 | Bulk price snapshot | `bulk_fetch_today_first_price()` | `quote/…/inquiry/multiprice` | 2 |
 | Level-1 orderbook | the exit ladder; `signal_time_rest` | `quote/…/inquiry/orderbook` | 2 |
 | Order submit, amend, cancel | Step 5c; Position Manager; Shutdown; Broker Reconcile | `trading/…/order` | 10 |
 | Filled and outstanding orders | the exit-side backstop | `trading/…/inquiry/transaction-history` | 2 |
 | WebSocket session reset | the reconnect path | `ws_common/ws_session_disconnect` | 1 |
-| Realtime trade stream | Exit Architecture's tick handler | WebSocket `V60` | — |
+| Realtime trade stream | Exit Architecture's tick handler; the watchdog scan's ranking signal | WebSocket `V60` | — |
 | Realtime order/fill stream | in-flight order tracking | WebSocket `IS2` | — |
 
-Five things the table settles that prose had left ambiguous:
+Six things the table settles that prose had left ambiguous:
 
 - **Cancellation is not its own endpoint.** It is `trading/…/order` with
   `OrdTrdTpCode=2` and `OrgOrdNo`, so cancels draw on the SAME TPS-10 bucket
@@ -168,12 +170,17 @@ Five things the table settles that prose had left ambiguous:
 - **Filled and outstanding are one endpoint.** `inquiry/transaction-history`
   covers both, so the exit-side backstop's paired inquiries cost less than a
   count of calls suggests.
-- **`chart/min` is what blocks the watchdog loop.** At TPS 4, a per-ticker
-  fetch across a full 50-ticker working set takes 12.5s against a 1s loop —
-  the "order of magnitude" the polling loop's own warning states, now
-  quantified. `inquiry/multiprice` is the obvious substitute and returns a
-  price snapshot rather than OHLCV bars, so it does not serve
-  `on_bar_close()`.
+- **`chart/min` carries SECOND resolution as well as minute.**
+  `InputDivXtick=1` returns second-granularity rows from the same endpoint —
+  therefore the same TPS bucket — and `dataCnt` reaches 2000 rows in one
+  response, costing receive time rather than TPS (measured; that check is
+  retired as `api_contract_checklist.md` T-14 — this entry is its record).
+  Second resolution is what lets the watchdog loop observe a FORMING
+  bar, which minute mode does not return at all; inverted, a completed bar
+  never needs it, which is why backfill runs in minute mode where one call
+  covers a session. The loop's cost against this bucket is D+1 calls per
+  cycle, not the working set (`live_mode_runner.md`'s prefix scan), and the
+  mid-bar scan and the bar-close fetch share the bucket.
 - **The two WebSocket streams are separate rows because they are separate
   connections.** `api_contract_checklist.md` T-6 measured that subscription
   types are mutually exclusive per connection; V60 registers per ticker
@@ -183,6 +190,91 @@ Five things the table settles that prose had left ambiguous:
   `client.apis.ws_common.ws_session_disconnect()`, so this project does not
   build the call. Its scope is every session for the token's account, so
   recovering one connection resets the other.
+- **The TPS column is per APP, and TWO apps are in use.** `chart/min` and
+  `inquiry/orderbook` return identical data on the demo and production
+  accounts, and each account carries its own allowance at both the app and the
+  endpoint tier (measured; that check is retired as
+  `api_contract_checklist.md` T-15 — this entry and `sdk_dependency.md`'s
+  rate governance note are its record). ONLY THE `quote/` ENDPOINTS DOUBLE.
+  The endpoint prefix in the table is what sorts them: a `quote/` call
+  returns the same data whichever account asks, so either account can serve
+  it, while a `trading/` call is scoped to the account that owns the
+  positions and the cash. Placing an order on the demo account does not add
+  order capacity — it places an order in a paper account.
+
+```
+  quote/  (doubles)     chart/min 8   chart/tick 8   orderbook 4
+                        multiprice 4  stock-ticker 4
+  trading/ (does not)   order 10      transaction-history 2
+                        balance-margin 3   able-orderqty 2
+```
+
+  The watchdog scan's slot allocation is written against the doubled
+  `chart/min` figure. Note the one bucket with two contending consumers: the
+  exit ladder re-quotes round-robin inside `orderbook`'s 4, and
+  `signal_time_rest` preempts it at bar close.
+
+**Leg assignment, and the one rule that decides it.** A `trading/` call is
+scoped to the account that owns the positions and the cash, so it has no
+choice of leg. A `quote/` call has a free choice, since either account
+returns the same data. That asymmetry loads the two apps very differently
+against the app-level tier, because only production carries order traffic:
+
+```
+production leg    all trading/ calls  +  the scan's reserved half
+demo leg          everything else quote/
+```
+
+Two `quote/` consumers are exceptions and stay on BOTH legs:
+
+- **The watchdog scan.** Its 850ms bound comes from taking t=0 and t=250 on
+  each leg; confining it to one doubles its pacing interval and the bound
+  breaks. Half stays on production by necessity.
+- **The exit ladder's orderbook round-robin.** Pinning it to demo alone
+  would cap it at that leg's endpoint ceiling of 2/s, and at
+  `max_tickers`'s default that returns re-quote latency to exactly what the
+  original per-cycle design had — giving back the improvement for nothing.
+  It runs on both legs and YIELDS under the dispatch priority below when
+  production is busy, which is strictly better than a static assignment: it
+  degrades only while contended instead of always.
+
+**Dispatch priority is EARLIEST DEADLINE FIRST, and no class list is
+needed.** Every request carries the deadline it must meet, and ordering
+falls out of that:
+
+| Request | Deadline |
+|---|---|
+| Exit submission (tp/sl) | immediate |
+| Entry submission | t bar open + `execution.entry_fill_delay_seconds` |
+| Ghost / stuck-order cancel | 60s |
+| Ladder amend | next re-quote |
+
+Slack is `deadline - now - expected RTT`; a request with slack yields to one
+without. This is what lets an entry burst and the scan share the order and
+`chart/min` endpoints without either being statically starved. A ladder
+amend dropped under pressure is not a loss — the next rotation visit
+re-quotes from a fresher book, so discarding it is the correct handling
+rather than a degradation to be avoided.
+
+The queue belongs HERE and not in the SDK: its pacer is instance-internal
+and cannot be reordered from above, and `sdk_dependency.md`'s standing rule
+is that anything solvable in this module is not solved by a fork.
+
+**This module owns dispatch ORDER, not the structure that consumes it.** The
+mechanics past dispatch are already described above under Async Boundary —
+each REST call goes through `asyncio.to_thread`, and rate waits and retry
+backoff block a pool thread — so they are not out of scope here. What is
+undesigned is how that meets the caller's loop structure, and that is the
+async boundary open item's question rather than this one. The queue answers
+only WHICH call is handed over next.
+
+Entry submission is ordered by `execution.entry_fill_delay_seconds` but is
+NOT hard-gated on it: an entry past its reference time is still submitted
+and counted (`live_scan_daily.entry_submit_late`). The value is the
+reference both engines share — BacktestEngine models the fill at it — not a
+cancellation threshold.
+
+---
 
 **Two needs are NOT reachable here, and their absence is the finding.**
 Trading-halt status has no endpoint in the vendor's catalogue at all, so
@@ -223,8 +315,10 @@ completed set. Bounds accept both fill-ID and timestamp, and both upper and
 lower, so one method serves the exit backstop's "newer than last seen",
 Broker Reconcile's "today's fills", and any bounded window; time bounds map
 onto the vendor's own `InputDate1`/`InputDate2`. This is robust to the
-varying page size that `open_items.md`'s fill-inquiry item names as its
-central worry. Note that an ID bound inherits `api_contract_checklist.md`
+varying page size that was the fill-inquiry open item's central worry — an
+item now closed, its distribution accumulating in `live_scan_daily`'s
+`fill_page_rows_p50`/`_p95` during ordinary operation rather than through a
+separate measurement exercise. Note that an ID bound inherits `api_contract_checklist.md`
 T-7's risk — fill-ID ordering is exactly what that grade A row questions —
 while a time bound does not.
 
@@ -256,7 +350,13 @@ already exist — the vanished-order rule and Broker Reconcile.
 **Session-phase order types stay in `execution_common.md`.** Concealment was
 never available: `check_funds_available()` and `simulate_entry_fill()` both
 size against the market-BUY-to-limit conversion, and the latter is
-BacktestEngine's, which never reaches this layer. The boundary test forbids
+BacktestEngine's, which never reaches this layer. The two do not size
+IDENTICALLY — `simulate_entry_fill()` cannot read
+`live_mode.market_buy_price_margin` and approximates the conversion from bar
+data, an asymmetry `execution_common.md` states outright and `open_items.md`
+carries — but that sharpens this point rather than weakening it: the backtest
+side needs these semantics and has no way to obtain them from this layer. The
+boundary test forbids
 leaking vendor REPRESENTATIONS; it does not license hiding vendor SEMANTICS
 with an economic consequence. What this module owns is validation — refusing
 an order type the current session phase does not permit, before it reaches

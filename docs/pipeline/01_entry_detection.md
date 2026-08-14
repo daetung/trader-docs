@@ -215,6 +215,56 @@ See config section below for how to modify the expression.
 
 ---
 
+## Monotonicity of the Conditions
+
+A property of the conditions as written, recorded because a caller may
+evaluate them against a bar that is still FORMING and needs to know which
+verdicts can reverse. `detect()` itself is unchanged and always receives
+bars strictly up to t-1.
+
+The question is whether a condition, once TRUE while the bar is growing, can
+become FALSE by the time that bar closes.
+
+**MONOTONE — cannot revert.** In each, the left side only grows as volume
+accumulates while the right side is fixed for the duration of the bar:
+
+| | Left side | Right side while the bar forms |
+|---|---|---|
+| B | forming bar's volume | constant 50000 |
+| C | mean of the last 5 bars, four of them closed | constant 1000 |
+| D | cumulative volume from `volume_base_hour` | constant 100000 |
+| E | that same cumulative / shares_outstanding | constant 5.0 |
+| F | forming bar's volume | `0.70 * max(volume)` over PRIOR bars |
+| G | forming bar's volume | ratio against a 20-bar mean |
+
+F is monotone **because of a detail in its own definition**: `prior_bars =
+today_bars.iloc[:-1]` excludes the reference bar from the maximum, so the
+threshold is computed entirely from CLOSED bars and cannot move while the
+reference bar grows. Had the max included the reference bar, F would be
+neither monotone nor useful.
+
+G is monotone despite the reference bar being INSIDE its own denominator.
+Writing `v` for the forming bar's volume and `S` for the other 19 bars'
+total, `v >= ((S + v) / 20) * 2.5` reduces to `v >= S / 7`, with `S` fixed —
+so the condition is increasing in `v` like the rest.
+
+**NON-MONOTONE — A, alone.** `price = bars.iloc[-1]["close"]` is the forming
+bar's current close, and price moves in BOTH directions: a ticker can pass A
+at 19.80 and close at 20.10, or fail it at 20.10 and close at 19.80. So a
+mid-bar evaluation of the full expression is neither a subset nor a superset
+of what bar close would produce, unless A is handled explicitly.
+
+**What the property is for.** `live_mode_runner.md`'s watchdog scan
+evaluates B-G normally on a forming bar and RELAXES A to PASS. Because
+every other condition is monotone, that result is a provable SUPERSET of the
+bar-close candidate set — it can contain a ticker that closes out of the
+price range, but it cannot MISS one that qualifies. The scan uses it to
+decide which tickers to fetch completed bars for; the entry decision is
+always the full expression over the completed bar, so the reference-bar
+convention and train-serve parity hold unchanged.
+
+---
+
 ## Interface
 
 ```python
@@ -421,6 +471,11 @@ entry_detector:
 - Late-day entry points (hour > max_entry_hour) excluded in `scan()` when max_entry_hour is not null
 - `max_entry_hour` exclusion applied before session_mode filter — both are independent constraints
 - `volume_base_hour` applied to conditions D, E, F only — condition G uses rolling window, no base hour filter
+- Condition A is the only NON-MONOTONE condition (see Monotonicity of the
+  Conditions). A change that makes any of B-G able to revert as its bar
+  grows — most easily by letting F's maximum include the reference bar —
+  silently invalidates the superset guarantee `live_mode_runner.md`'s
+  mid-bar screen depends on, without any test in this module failing
 
 ---
 

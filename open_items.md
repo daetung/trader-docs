@@ -26,23 +26,87 @@ confirmation that it still reads correctly.
 
 ## Suggested order
 
-1. **API call budget allocation** comes first and is now UNBLOCKED: the
-   call-point inventory it waited on exists (`trading_api.md`), with each
-   endpoint's published TPS beside it. It is also load-bearing rather than
-   optimising — the watchdog working-set model leaves the polling loop
-   unbuildable until it resolves.
-2. **Margin-ratio computation** is blocked on nothing and touches sizing,
-   the schema and the budget at once, so its answer changes what 1 has to
-   plan for.
+1. **Exit-path bar consumers** comes first. It is blocked on nothing, its
+   four sub-questions are entangled and open together, and one API budget
+   figure is currently unresolved behind it. Raised at the end of the
+   session that designed the watchdog scan, deliberately NOT designed there
+   — see its own note on why.
+2. **Margin-ratio computation**: blocked on nothing, and it touches sizing,
+   the schema and the API budget at once.
 3. **Halt-status source** is independent and blocks nothing else, but the
    halt path has no primary signal until it lands.
-4. **Async boundary**, **early-close days**, **fill-inquiry page size** and
-   the **manual-intervention CLI** are independent of each other and of the
-   above.
+4. **Async boundary**, **early-close days** and the
+   **manual-intervention CLI** are independent of each other and of the
+   above. The async boundary is now the more constrained of the three: the
+   watchdog scan fires N speculative REST calls per cycle and alternates
+   across two accounts, so how many clients exist and where the boundary
+   falls has consequences it did not have before.
 5. **`api_contract_checklist.md` re-evaluation** goes last by construction —
    it collects what the items above establish.
 6. **Real-time bid/ask spread** is blocked on calendar time, not design time,
    so it is not sequenced against anything here.
+
+---
+
+## Exit-path bar consumers and the live/backtest split
+
+**Problem.** Position Manager Loop Step 1 fetches bars per open position on
+every `position_check_interval_seconds` cycle. That is a `chart/min` call,
+so it shares the endpoint budget with the watchdog scan — and it is the one
+consumer the scan's slot allocation does NOT account for, because it lives
+in the other loop. At P open positions the draw is
+`P / position_check_interval_seconds` per second against the four
+non-reserved pacing slots; at the default cycle that is 2/s at P=10 and the
+whole non-reserved budget at P=20, starving carryover and promotion.
+`live_mode_runner.md` records the three consumers and states explicitly that
+their priority and this cadence are NOT settled there.
+
+The obvious fix — fetch at bar cadence rather than cycle cadence, since a
+bar count only changes once a minute — cannot be taken until it is known
+what those bars actually feed. Four findings, entangled, and none of them
+originates in the scan design:
+
+- **`ohlcv_exit` and `ohlcv_entry` appear in the fill simulators' signatures
+  but nothing in the documented bodies reads them.** Every reference in
+  `simulate_exit_fill()`'s per-bundle logic is to `ticks_exit` bundles —
+  `bundle.volume`, `bundle.high/low/close`, `interpolate_bundle_price()` —
+  and halts come from `halts_df`. `simulate_entry_fill()` is the same shape.
+  BacktestEngine nonetheless passes a real slice for both. If they are
+  genuinely unused, shadow mode's exit needs no fresh bars at all and the
+  cadence question mostly dissolves; if there is an undocumented use, it
+  does not.
+- **Live shadow mode calls `simulate_exit_fill()` for all four exit reasons;
+  BacktestEngine calls it for tp/sl only.** In backtest, `session_end` takes
+  the bar close and `time_limit` takes the close of the last valid bar, both
+  without the simulator. Live's Step 3 runs unconditionally after Step 2, so
+  `time_limit` and `session_end` reach it with `sell_rate_sl` and with
+  `breach_price` and `breach_bundle_idx` that `execution_common.md` itself
+  says are not applicable for those reasons. Either the live path is wrong,
+  or it is right and backtest is the one diverging — and if backtest's
+  "close of the last valid bar" is the intended semantics, live DOES need a
+  bar current to the exit instant, which decides the cadence question.
+- **Feed Outage Recovery step 5 calls `track_price_breach()` in live**,
+  while Position Manager Step 2 states that function is now backtest-only
+  after R-2. One of the two is stale; whichever survives determines whether
+  recovery needs bars fetched on demand.
+- **Consequently the shared-lane priority is undecided too** — whether
+  Position Manager's bars come before or after carryover and promotion
+  depends on how tight its own need turns out to be.
+
+**Not yet designed.** Blocked on nothing external; the entanglement is
+internal to these four. The material is all in three files and the specific
+sites are named above, so this does not need rediscovery:
+`execution_common.md`'s two simulator signatures and their documented
+bodies, `09_backtest_engine.md`'s exit logic where the per-reason call
+branch lives, and `live_mode_runner.md`'s Position Manager Step 1/Step 3 and
+Feed Outage Recovery step 5.
+
+**Why it was not designed in the session that found it.** It was raised
+while patching the watchdog scan, and taking it there would have meant
+building on four unconfirmed premises at once — the failure mode that
+session had already had to reverse twice. The scan's own specs record the
+open question rather than assuming an answer, so nothing downstream depends
+on guessing it.
 
 ---
 
@@ -61,7 +125,11 @@ actually one number per ticker.
 The affected surface is wider than the probe: `live_session_state` stores a
 single `margin_ratio` column, `compute_position_size()` takes a scalar, and a
 per-ticker query at every entry signal is a NEW consumer on the API budget
-(`inquiry/able-orderqty`, TPS 2) that the budget item has to plan for.
+(`inquiry/able-orderqty`, TPS 2). The budget item that would once have
+absorbed that is gone — every consumer it enumerated is now bounded — so
+this item carries its own accounting: at TPS 2 per account and 4 combined a
+per-signal draw is small, but it is signal-proportional rather than
+fixed-cadence and nothing else currently competes for that endpoint.
 `api_contract_checklist.md`'s T-5 is re-anchored to this shape, and T-4
 (whether the balance figure is cash or buying power) is entangled with it —
 both feed the same sizing decision.
@@ -120,53 +188,6 @@ interface is drawn.
 
 ---
 
-## API call budget allocation
-
-**Problem.** Supersedes the former "rate-limit reconciliation" item, whose
-blocking condition is gone: per-endpoint limits are published (the SDK
-carries them as a table and paces against them automatically, two-tier, app
-level plus endpoint level), so nothing is waiting on their extraction any
-more. What remains is not reconciliation but ALLOCATION — the endpoint
-limits and the global app limit are both real, and several consumers draw
-on the same budget on the same cadence.
-
-The consumers, all of them: the watchdog loop's bar fetch across the
-candidate set; the exit-side backstop's paired filled/outstanding inquiries;
-the exit ladder's per-cycle orderbook query for each outstanding limit exit;
-`signal_time_rest`'s bid/ask query at every entry signal
-(frequency-proportional, not fixed-cadence); the halt-check bulk call; and
-entry/exit order submission itself.
-
-Two findings from this session bear on it directly. The exit-side fill
-backstop is ACCOUNT-WIDE rather than per-order, so its cost does not scale
-with the number of outstanding orders — a load source that was previously
-assumed to scale does not. Against that, the watchdog loop's bar fetch does
-scale with the candidate set, and the per-endpoint pacing is a minimum
-INTERVAL rather than a burst allowance, so a naive per-ticker fetch
-serialises: at the chart endpoint's published rate, fetching a full
-candidate set exceeds the loop's own interval by an order of magnitude. A
-bulk quote call accepting up to 50 symbols exists and is the obvious
-substitute, but it returns a price snapshot rather than OHLCV bars, so it
-does not directly serve `on_bar_close()`.
-
-**Also absorbed here:** whether the exit-side REST tick backstop should
-become an unconditional every-cycle poll rather than firing only when the WS
-stream is down. It would give defense-in-depth against a silently-failed
-subscription and remove the need to judge "is WS dead", but it is another
-draw on the same budget and cannot be decided separately from the rest.
-
-**Not yet designed.** No longer blocked: `trading_api.md`'s call-point
-inventory now enumerates the consumers, with each endpoint's published TPS
-beside it. Two figures from it bear directly on the allocation. `chart/min`
-is TPS 4, so a per-ticker bar fetch across a full 50-ticker working set takes
-12.5s against a 1s loop — the order-of-magnitude gap, quantified. And
-cancellation is not a separate endpoint but `trading/…/order` with a
-discriminator, so cancels draw on the SAME TPS-10 bucket as submissions.
-Against that, filled and outstanding inquiries are ONE endpoint rather than
-two, and the margin-ratio item above may add a per-entry-signal consumer.
-
----
-
 ## Async boundary
 
 **Problem.** The SDK's client is an async facade over a synchronous core:
@@ -200,28 +221,6 @@ interface exposes a per-date close time, so the fix needs no new vendor —
 but the affected surface is wider than any one of those keys.
 
 **Not yet designed.**
-
----
-
-## Fill-inquiry page size
-
-**Problem.** The exit-side backstop reads the filled-orders inquiry
-newest-first and takes only the first page. The page size is a server-side
-internal parameter with no field in the request, and the returned row count
-varies per call, so there is no guarantee a single page covers a full
-position-check interval.
-
-Correctness is not at stake — `seen_fills` is fill-ID idempotent, so a fill
-missed by one page folds in unchanged when it appears on the next, and the
-vanished-order rule is deliberately asymmetric for exactly this reason. What
-is at stake is the latency bound on detecting a vanished order, and whether
-continuation paging is needed at all.
-
-**Not yet designed.** Self-measuring in the manner of the bar-latency
-finding: recording the returned row count each cycle would accumulate the
-distribution during ordinary operation rather than requiring a separate
-measurement exercise. Whether to add it as a checklist row has not been
-decided.
 
 ---
 
@@ -263,15 +262,15 @@ has enough history; revisit then, not before.
 ## `api_contract_checklist.md` — verify before Pilot
 
 Not a new design problem — a pointer, so it isn't lost among the items
-above. `docs/ops/api_contract_checklist.md` holds **16 rows, of which 14 are
-still unverified** assumptions, two graded **A** (T-1: REST/WS tick
-granularity; T-7: fill-event stream ID stability). The three numbers
-reconcile as 16 = 14 unverified + T-6 measured + T-3 retired, and the row
-count does not fall as questions are settled because that file's Role and
-Constraints forbid deleting rows — a broker change would make a settled
-question live again, and a deleted row would have to be rediscovered. Both
-A-graded rows must
-be verified, or their fallback paths confirmed sufficient, before Stage 2
+above. `docs/ops/api_contract_checklist.md` holds **20 rows, of which 15 are
+still unverified** assumptions, two of those graded **A** (T-1: REST/WS tick
+granularity; T-7: fill-event stream ID stability). The numbers reconcile as
+20 = 15 unverified + 1 measured (T-6) + 4 retired (T-3, T-14, T-15, T-16),
+and the row count does not fall as questions are settled because that
+file's Role and Constraints forbid deleting rows — a broker change would
+make a settled question live again, and a deleted row would have to be
+rediscovered. T-1 and T-7 are the only A-graded rows, and both must be
+verified, or their fallback paths confirmed sufficient, before Stage 2
 (Pilot) — see that file's own "When to use it" section. Not duplicated here;
 consult that file directly rather than letting a second copy of its contents
 drift out of sync.
@@ -281,6 +280,19 @@ around what was actually found: subscription types are mutually exclusive per
 connection, which removed the "WS sequence lease" the row had been anchored
 to. T-9 kept its row but lost its config key, the key having been deleted
 with that lease.
+
+Four rows were ADDED this session and three RETIRED in the same session:
+T-14 (second-resolution bars at `InputDivXtick=1`, `dataCnt` to 2000,
+costing receive time rather than TPS), T-15 (demo and production return
+identical `chart/min` and `orderbook` data on independent budgets) and T-16
+(REST round-trip 400-600ms). Each was measured and its value transcribed
+into the spec that depends on it, which is where a checked row's result
+belongs — the checklist is a queue of work still to do, not a second copy
+of the specs. T-17 is the exception and the one to look at: it records that
+the watchdog list fires for every ticker crossing conditions A-G — an
+assumption the prefix scan's early stop rests on, ACCEPTED rather than
+proven, and measured only after the fact, by the evening detection-gap
+stage.
 
 **A re-evaluation pass is itself unresolved**, though it shrank. Three rows
 moved: T-3 retired outright, its premise gone once per-endpoint TPS turned

@@ -86,8 +86,13 @@ Live inference endpoint: LiveModeRunner (execution orchestrator)
                          │       model.predict() → resolve_signal()
                          │       inference_log writes (DuckDB)
                          │
-                         ├── Watchdog polling loop  (1s interval)
+                         ├── Watchdog Polling Loop  (1s interval)
                          │       watchdog.get_candidates() → cumulative working set
+                         │       PREFIX SCAN — list is most-recently-fired-first,
+                         │         so cost is D+1 per cycle, not working-set size
+                         │         N=3 speculative head slots + M=1 rotation cursor
+                         │       Recovery lane (4/cycle, spare chart/min budget):
+                         │         carryover first, then promotion
                          │       TradingAPI fetch (bars + ticks) → on_bar_close()
                          │       detect → infer → buy order
                          │
@@ -113,7 +118,7 @@ Standalone scripts:
 |---|---|
 | `data/data_boundary.md` | **Read before any module implementation.** Shared boundary rules, P_entry definition, REFERENCE_SESSION boundary, leakage prevention, Corporate Event Adjustment Boundary (raw/adjusted/scalar-corrected layering) |
 | `data/db_schema.md` | DuckDB schema, JSON ingestion logic, inference_log, precomputed_session_stats |
-| `pipeline/01_entry_detection.md` | EntryPointDetector logic, session_mode, volume_base_hour |
+| `pipeline/01_entry_detection.md` | EntryPointDetector logic, session_mode, volume_base_hour, A-G monotonicity classification (which conditions may be evaluated mid-bar) |
 | `pipeline/02_indicator_calculator.md` | All indicator methods, REFERENCE_SESSION indicators, VWAP reset_mode, missing bar classification, precalculate_bars config |
 | `pipeline/03_vectorizer.md` | Time-series → vector transformation methods, REFERENCE_SESSION mapping |
 | `pipeline/04_feature_extractor.md` | Integration entrypoint, DI constructor, extract_batch strategy (A~E), REFERENCE_SESSION handling, parquet column structure |
@@ -121,25 +126,25 @@ Standalone scripts:
 | `pipeline/06_class_balancer.md` | Downsampling strategy, split() and generate_folds() |
 | `pipeline/07_lgbm_pipeline.md` | LightGBM 5-classifier structure and evaluation |
 | `pipeline/08_dimensionality_reducer.md` | ImportanceProvider pattern, model-agnostic reduction |
-| `pipeline/09_backtest_engine.md` | DB-direct backtest, tick_10 slippage, dead position handling (has_data=TRUE) |
+| `pipeline/09_backtest_engine.md` | DB-direct backtest, tick_10 slippage, dead position handling (has_data=TRUE), late-detection modelling (deterministic-hash drop/delay mirroring what live actually observes) |
 | `models/base_model.md` | Abstract base class for model trainers |
-| `optimization/pipeline_optimizer.md` | Training endpoint, nested validation, successive halving, regime holdout |
-| `ops/api_contract_checklist.md` | Unverified vendor-contract assumptions inventory (trading API, yfinance, investing.com), graded by blast radius, tracked to verification before Pilot |
+| `optimization/pipeline_optimizer.md` | Training endpoint, nested validation, successive halving, regime holdout, execution_eval (paired execution-variant evaluation at outer folds) |
+| `ops/api_contract_checklist.md` | Vendor-contract assumption inventory (trading API, yfinance, investing.com), graded by blast radius, tracked to verification before Pilot. Accumulates: a verified row keeps its measured value rather than being deleted |
 | `ops/shadow_retraining.md` | Shadow mode design, execution-parameter fitting (fit_execution_params()), retraining cadence |
 | `scripts/run_preprocess.md` | Preprocessor class, return_data, training pipeline only |
 | `scripts/run_train.md` | Trainer class, session_mode filter, train_log |
 | `scripts/run_backtest.md` | Backtester class, sole experiment_log writer |
 | `api/trading_api.md` | TradingAPI — the single caller-facing layer over the vendored trading-API SDK. Result contract (a rejected order returns HTTP 200), symbol/exchange encoding, async boundary. No other module imports the SDK |
 | `api/sdk_dependency.md` | The vendored SDK as an external artifact — adoption form, the three fork modifications and why none could be avoided, and the costs accepted with it |
-| `utils/execution_common.md` | Execution-time decisions shared between BacktestEngine and LiveModeRunner — signal resolution, cooldown guard, entry/exit fill simulation, position sizing |
+| `utils/execution_common.md` | Execution-time decisions shared between BacktestEngine and LiveModeRunner — signal resolution, cooldown guard, entry/exit fill simulation, position sizing, late-entry residual-edge gate |
 | `utils/utils.md` | Shared utilities: bar sequence, signal resolution, slippage/fill simulation, label breach detection, encoding maps, trading calendar, REFERENCE_SESSION stats (populate + load), corporate-event adjustment (cum_split_ratio, adjust_bars_for_corporate_events, adjust_tick_derived_series_for_corporate_events, estimate_historical_meta, ticker rename stitching) |
 | `inferencer/inferencer.md` | Live inference service object — _prepare_bars, infer/infer_batch, inference_log |
-| `inferencer/live_mode_runner.md` | Live mode execution orchestrator — watchdog loop, position manager loop, session lifecycle |
+| `inferencer/live_mode_runner.md` | Live mode execution orchestrator — prefix-scan watchdog loop, recovery lane, position manager loop, session lifecycle |
 | `inferencer/caching_calculator.md` | CachingIndicatorCalculator — Layer 1/2 cache, fibonacci deque, sr_levels per-entry-point |
 | `tools/init_db.md` | Schema bootstrap CLI — creates every table from db_schema.md's canonical DDL; `--verify` reports schema drift read-only. Sole DDL-issuing component; prerequisite for migration_tool |
 | `tools/migration_tool.md` | JSON → DuckDB migration, trading_calendar/coverage init, precomputed_session_stats population |
-| `tools/detection_benchmark.md` | Entry detection threshold tuning + timing benchmark |
-| `tools/metadata_crawler.md` | Daily metadata fetch, new data ingestion, session stats daily update |
+| `tools/detection_benchmark.md` | Entry detection threshold tuning + timing benchmark, plus the diagnostic delayed-entry decay sweep |
+| `tools/metadata_crawler.md` | Daily metadata fetch, new data ingestion, session stats daily update, evening detection-gap stage |
 | `tools/auxiliary_stream.md` | Host for non-trading WebSocket subscriptions on a separate account — delayed-quote capture for feed-coverage measurement is its first consumer |
 | `tools/health_report.md` | Findings gathering, log/Discord/email alert delivery, alert-level config |
 | `visualization/viz_connector.md` | Abstract base class for visualization backends |

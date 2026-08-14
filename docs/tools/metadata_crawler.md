@@ -573,9 +573,9 @@ pair. The live side is written by LiveModeRunner and the delayed side by
 `auxiliary_stream.md`; each file has exactly one writer, so neither engages
 P-5's single-writer constraint — they are not database files.
 
-**Placed fifth, immediately before Retention Purge.** `feed_coverage_daily`
-is a purge-registry member, so running after the purge would leave the
-registry counting a table whose row for that date does not yet exist. It
+**Placed fifth, before Retention Purge.** `feed_coverage_daily` is a
+purge-registry member, so running after the purge would leave the registry
+counting a table whose row for that date does not yet exist. It
 reads no DB table and depends on no other stage, so a failure here blocks
 nothing downstream.
 
@@ -640,6 +640,69 @@ is recorded.
 
 ---
 
+## Detection-Gap Analysis (`stage='evening_detection_gap'`)
+
+Runs `EntryPointDetector.detect()` in memory over the day's ingested
+`ohlcv_1min` for every non-quarantined ticker holding bars, and compares the
+result against what the live session actually evaluated, recorded in
+`inference_log`. Writes three `live_scan_daily` metrics for the date and
+disposes of nothing.
+
+**Why it exists.** The watchdog scan's early stop is sound only if the
+watchdog fires for every ticker that crosses conditions A-G
+(`api_contract_checklist.md` T-17), and that is an ACCEPTED, not proven,
+assumption. The in-session mitigations — the rotation cursor and promotion —
+all walk the watchdog LIST, so a ticker the watchdog never lists at all is
+invisible from inside the session by construction. This stage is the only
+independent ground truth in the system, which is what makes accepting the
+assumption defensible rather than merely convenient.
+
+**Placed sixth, immediately before Retention Purge.** It needs the day's
+bars, so it must run after ingestion; it writes a purge-registry member, so
+it must run before the purge, for the same reason Feed Coverage Analysis
+does. It is non-destructive and nothing downstream depends on it.
+
+**It must NOT write `entry_points`.** That table has no writer discriminator
+and is written by both Preprocessor and Inferencer (see `db_schema.md`'s
+Ingestion Rules), so writing there would both pollute the training corpus
+with rows that were never live decisions and make the comparison
+self-referential — this stage would be measuring itself. `detect()` runs in
+memory and only counts are persisted.
+
+**Both sides must carry the same filters.** `session_mode`,
+`max_entry_hour` and the after-market exclusion are applied by Inferencer
+BEFORE `detect()`, and it logs nothing when they reject. Comparing an
+unfiltered evening pass against that would turn every deliberate exclusion
+into a false gap — the filters go on both sides or the number means nothing.
+
+The three categories, and the distinction that carries the diagnosis:
+
+| Category | Metric | Meaning |
+|---|---|---|
+| `detect()` true, an `inference_log` row exists with `no_detection` | `gap_disagreed` | The ticker WAS evaluated live and rejected. Not a scan gap — a data disagreement, i.e. the bars differ between live and post-ingestion. An independent second read on feed quality alongside `feed_coverage_daily` |
+| `detect()` true, no `inference_log` row at all | `gap_unevaluated` | Never evaluated. The scan never reached it |
+| Either, summed | `gap_total` | |
+
+`gap_disagreed` versus `gap_unevaluated` is the whole point of routing
+bar-close evaluation through `infer()` rather than pre-filtering
+(`live_mode_runner.md`): the `no_detection` event is the only record
+anywhere that a candidate was evaluated AND rejected, and without it "we
+looked and it failed" collapses into "we never looked".
+
+**Carryover's share of `gap_unevaluated` is already measured in-session** as
+`live_scan_daily.carryover_tickers`, so the watchdog's own share is
+recoverable by subtraction. No per-ticker roster table is added for it: the
+first days of data size the residual before any storage is built for it.
+
+**Universe scoping has a known residual.** The population is tickers holding
+today's `ohlcv_1min`, minus quarantine. The session's actual tradable list is
+persisted nowhere, so tickers the session could not have traded are still
+counted. Conditions A (price <= 20), B (50000) and D (100000) make the
+passing set small enough that this is observable rather than dominant —
+stated rather than silently absorbed.
+
+---
+
 ## Retention Purge (R-9) — final evening stage
 
 The last stage of the evening run, after every other stage has completed.
@@ -658,6 +721,7 @@ PURGE_REGISTRY = {
     "bid_ask_snapshots":  ("date",   float("inf")),
     "bar_latency_daily":  ("date",   float("inf")),
     "feed_coverage_daily": ("date",  float("inf")),
+    "live_scan_daily":    ("date",   float("inf")),
     "health_events":      ("date",   float("inf")),
     "alert_log":          ("date",   float("inf")),
     "train_log":          ("run_at", float("inf")),
@@ -1433,12 +1497,13 @@ quarantine:
   single evening run must not change; the premarket refresh is intentionally
   a separate, later, supplementary crawl that session_stats does NOT re-read
 - `populate_trading_calendar()`, `populate_ticker_coverage()`, and `populate_precomputed_session_stats()` sourced from `utils.py`
-- The evening run writes six `batch_runs` rows as it progresses —
+- The evening run writes seven `batch_runs` rows as it progresses —
   `stage='evening_ingestion'` (around Steps 3-4 above), `stage='evening_tick_bar_aggregates'`
   (Tick Bar Aggregates Update), `stage='evening_session_stats'` (Session Stats
   Update), `stage='evening_investing_forward_check'` (Evening
   Forward-Looking Corporate-Events Check, item N),
-  `stage='evening_feed_coverage'` (Feed Coverage Analysis), and finally
+  `stage='evening_feed_coverage'` (Feed Coverage Analysis),
+  `stage='evening_detection_gap'` (Detection-Gap Analysis), and finally
   `stage='evening_retention_purge'` (Retention Purge, R-9 — last, after
   every other stage, being the only destructive one) — each
   `status='running'` at its own start, `'success'`/`'failed'`

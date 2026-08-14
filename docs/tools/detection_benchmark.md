@@ -186,6 +186,68 @@ Detection Benchmark (full run)
 
 ---
 
+## Delayed-Entry Decay Sweep
+
+**DIAGNOSTIC ONLY.** It sizes no threshold: `execution_common.md`'s
+residual-edge gate divides by `(1 + d)` and so self-adjusts to whatever
+drift distribution exists. What this sweep answers is how much traffic the
+late-entry path would carry and whether the gate's inputs behave sanely
+before it is switched on — not whether to switch it on, which is
+`pipeline_optimizer.md`'s `execution_eval` question.
+
+```bash
+python tools/detection_benchmark.py \
+    --db-path data/market.duckdb \
+    --config configs/pipeline_config.yaml \
+    --decay-sweep 0,5,10,20,30,40,50,60 \
+    --decay-sample 5000
+```
+
+For each delta, re-label a stratified sample of detected entry points as if
+entry had happened delta seconds after the t bar's open instead of at it.
+
+**`Labeler` is NOT modified.** Its own `ticks_df` input is sliced to
+`hour >= (t_open + delta)` using `tick_10`'s absolute `HHMMSS`, and the
+anchor price is substituted; adjudication logic is reused untouched, which
+is what this tool's "reuse, do not reimplement" constraint requires. TWO
+things move together and moving only one is the trap: shifting the anchor
+without shifting the scan start counts the movement DURING the wait as
+movement AFTER entry, which reads as free profit.
+
+**The anchor is bundle-resolution-bounded, and the bound is reported rather
+than hidden.** `tick_10.hour` is the LAST tick of a bundle, so the target
+instant usually falls inside one and is not recoverable:
+
+```
+p_lo(delta) = close of the last bundle at or before the target — under-reacts,
+              OPTIMISTIC about how far price has already moved
+p_hi(delta) = close of the first bundle at or after the target — PESSIMISTIC
+```
+
+Both are reported as an interval; the pessimistic `p_hi` is what any figure
+downstream should be read against, and the interval WIDTH is itself the
+diagnostic — a wide one means this measurement cannot carry weight at that
+delta. Entry points are structurally in dense-bundle territory (condition B
+requires 50,000 shares in the reference bar), so the interval should be
+narrow where it matters, and is worth checking rather than assuming.
+
+**Stratified sample, not the full set.** The per-entry-point slice boundary
+differs for every point, so a shared `ticks_df` cannot express it and
+batching is defeated — the full 284k-point set is not viable at this cost.
+Sampling is stratified BY LABEL CLASS, because survival is a statistic and
+stratification is what gets usable counts into `up5` and `dn5`.
+
+Reported per delta: `survival_up5` / `survival_up3` (label still holds after
+the wait), `already_moved` (the threshold was already crossed at
+`t_open + delta`, so the move the detection was aiming at is spent),
+`adverse` (price moved against the position during the wait), and
+`pnl_delta_p50` / `_p95`.
+
+Written to the same `tools/benchmark_results/` JSON as any other run, under
+a `decay_sweep` key. Not to `experiment_log` — that table is for model runs.
+
+---
+
 ## Result Persistence
 
 Each run saves a result JSON to `tools/benchmark_results/`:
@@ -211,7 +273,9 @@ Benchmark results are NOT written to `experiment_log` (that table is for model r
 - Must not modify any DuckDB table — read-only access to:
   `ohlcv_1min`, `stock_meta`, `tick_10`, `trading_halts`,
   `trading_calendar`, `ticker_data_coverage`, `corporate_events`
-- Labeling logic must call `Labeler` directly (reuse, do not reimplement)
+- Labeling logic must call `Labeler` directly (reuse, do not reimplement) —
+  including the decay sweep, which shifts `Labeler`'s INPUTS (sliced
+  `ticks_df`, substituted anchor) and never its logic or its signature
 - `Labeler.label()` requires `ticks_df`, `halts_df`, `trading_calendar`,
   `ticker_data_coverage`, and `corporate_events` — all must be loaded from
   DuckDB before calling (see 05_labeler.md — corporate_events added for
