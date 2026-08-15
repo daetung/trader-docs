@@ -3017,11 +3017,21 @@ live_mode:
   dispatched past their deadline; those are STILL SUBMITTED, since backtest
   models late detection but not late submission and dropping them would
   diverge from it in an unmodelled direction too
-- `live_scan_daily` is written by this loop once per session — scan depth
-  histogram, carryover, rotation visits/hits/misses, superset size,
-  bar-close fetch latency and promotions. These are the only in-session
-  evidence that N, M and the 5-second deadline hold, and health_report.md
-  reads them
+- The WATCHDOG LOOP's share of `live_scan_daily` is written once per session
+  at shutdown, at the same layer as `bar_latency_daily`'s final flush
+  (health_report.md's Shutdown Order and Drain) — scan depth histogram,
+  carryover, rotation visits/hits/misses, superset size, bar-close fetch
+  latency, the bar-close stage timings and promotions. These are the only
+  in-session evidence that N, M and the 5-second target hold, and
+  health_report.md's findings 30-32 read them
+- That list is this LOOP's share, NOT the table. `live_scan_daily` has three
+  other writers and none of them is here: `fill_page_rows_*` comes from the
+  Position Manager Loop's fill inquiry, `late_entry_gate_pass`/`_reject`
+  from the late-entry path, and `gap_*` from `metadata_crawler.md`'s evening
+  detection-gap stage hours after this process has exited — which is why
+  finding 33 reports the previous day when called at session end. The
+  canonical key list is the schema comment in `db_schema.md`, not this
+  bullet
 - Trade execution (buy/sell API calls) is LiveModeRunner's responsibility —
   Inferencer only returns InferenceResult
 - All inference_log writes include the active run_id

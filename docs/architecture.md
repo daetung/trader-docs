@@ -91,8 +91,10 @@ Live inference endpoint: LiveModeRunner (execution orchestrator)
                          │       PREFIX SCAN — list is most-recently-fired-first,
                          │         so cost is D+1 per cycle, not working-set size
                          │         N=3 speculative head slots + M=1 rotation cursor
-                         │       Recovery lane (4/cycle, spare chart/min budget):
-                         │         carryover first, then promotion
+                         │       Shared lane (CAP 4/cycle, non-reserved chart/min
+                         │         slots — carryover and promotion share this
+                         │         with Position Manager Step 1's bars; the
+                         │         priority order between them is an open item)
                          │       TradingAPI fetch (bars + ticks) → on_bar_close()
                          │       detect → infer → buy order
                          │

@@ -413,9 +413,9 @@ CREATE TABLE IF NOT EXISTS batch_runs (
                                       -- 'evening_ingestion' | 'evening_tick_bar_aggregates' |
                                       -- 'evening_session_stats' |
                                       -- 'evening_investing_forward_check' |
-                                      -- 'evening_retention_purge' |
                                       -- 'evening_feed_coverage' |
                                       -- 'evening_detection_gap' |
+                                      -- 'evening_retention_purge' |
                                       -- 'overnight_token_refresh' |
                                       -- 'live_session_start' | 'live_session_end'
     date         VARCHAR   NOT NULL,  -- 'YYYYMMDD' — the trading day this batch targets

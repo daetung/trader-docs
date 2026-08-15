@@ -742,12 +742,21 @@ entries are recorded (`outcome='dropped_queue'`), not merely counted.
 
 ### Shutdown Order and Drain
 
-At session end, three requirements fix the order: finding 26 reads
-`bar_latency_daily`, `gather_findings()` needs the DB, and the evening batch
-needs the write lock released.
+At session end, four requirements fix the order: finding 26 reads
+`bar_latency_daily`, findings 30-32 read `live_scan_daily`,
+`gather_findings()` needs the DB, and the evening batch needs the write lock
+released.
 ```
 1. final flush of bar_latency_daily      (else finding 26 loses the last
                                           un-flushed minute)
+1a. LiveModeRunner writes live_scan_daily (else findings 30-32 read a table
+                                          this session never wrote — same
+                                          layer as step 1, and for the same
+                                          reason. gap_* are NOT written here:
+                                          the evening detection-gap stage
+                                          writes those hours later, which is
+                                          why finding 33 reports the previous
+                                          day on a session-end call)
 2. gather_findings + write_to_log
 3. dispatch delivery                     (background)
 4. drain, up to alerting.drain_timeout_seconds
