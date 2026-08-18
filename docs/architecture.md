@@ -93,8 +93,8 @@ Live inference endpoint: LiveModeRunner (execution orchestrator)
                          │         N=3 speculative head slots + M=1 rotation cursor
                          │       Shared lane (CAP 4/cycle, non-reserved chart/min
                          │         slots — carryover and promotion share this
-                         │         with Position Manager Step 1's bars; the
-                         │         priority order between them is an open item)
+                         │         with the bar-close superset-K fetch, which
+                         │         preempts both; carryover before promotion)
                          │       TradingAPI fetch (bars + ticks) → on_bar_close()
                          │       detect → infer → buy order
                          │
@@ -119,7 +119,7 @@ Standalone scripts:
 | Document | Description |
 |---|---|
 | `data/data_boundary.md` | **Read before any module implementation.** Shared boundary rules, P_entry definition, REFERENCE_SESSION boundary, leakage prevention, Corporate Event Adjustment Boundary (raw/adjusted/scalar-corrected layering) |
-| `data/db_schema.md` | DuckDB schema, JSON ingestion logic, inference_log, precomputed_session_stats |
+| `data/db_schema.md` | DuckDB schema, JSON ingestion logic, inference_log, precomputed_session_stats. Live-session diagnostics: live_halt_episodes (observed halt intervals, ticker-scoped) and exit_trigger_agreement_daily (live-vs-backtest exit triggering, decomposed into tape and algorithm terms) |
 | `pipeline/01_entry_detection.md` | EntryPointDetector logic, session_mode, volume_base_hour, A-G monotonicity classification (which conditions may be evaluated mid-bar) |
 | `pipeline/02_indicator_calculator.md` | All indicator methods, REFERENCE_SESSION indicators, VWAP reset_mode, missing bar classification, precalculate_bars config |
 | `pipeline/03_vectorizer.md` | Time-series → vector transformation methods, REFERENCE_SESSION mapping |
@@ -128,7 +128,7 @@ Standalone scripts:
 | `pipeline/06_class_balancer.md` | Downsampling strategy, split() and generate_folds() |
 | `pipeline/07_lgbm_pipeline.md` | LightGBM 5-classifier structure and evaluation |
 | `pipeline/08_dimensionality_reducer.md` | ImportanceProvider pattern, model-agnostic reduction |
-| `pipeline/09_backtest_engine.md` | DB-direct backtest, tick_10 slippage, dead position handling (has_data=TRUE), late-detection modelling (deterministic-hash drop/delay mirroring what live actually observes) |
+| `pipeline/09_backtest_engine.md` | DB-direct backtest, tick_10 slippage, dead position handling (has_data=TRUE), late-detection modelling (deterministic-hash drop/delay mirroring what live actually observes), gated fill simulation for the direction-free exits, counterfactual participation-rate switches |
 | `models/base_model.md` | Abstract base class for model trainers |
 | `optimization/pipeline_optimizer.md` | Training endpoint, nested validation, successive halving, regime holdout, execution_eval (paired execution-variant evaluation at outer folds) |
 | `ops/api_contract_checklist.md` | Vendor-contract assumption inventory (trading API, yfinance, investing.com), graded by blast radius, tracked to verification before Pilot. Accumulates: a verified row keeps its measured value rather than being deleted |
@@ -138,10 +138,10 @@ Standalone scripts:
 | `scripts/run_backtest.md` | Backtester class, sole experiment_log writer |
 | `api/trading_api.md` | TradingAPI — the single caller-facing layer over the vendored trading-API SDK. Result contract (a rejected order returns HTTP 200), symbol/exchange encoding, async boundary. No other module imports the SDK |
 | `api/sdk_dependency.md` | The vendored SDK as an external artifact — adoption form, the three fork modifications and why none could be avoided, and the costs accepted with it |
-| `utils/execution_common.md` | Execution-time decisions shared between BacktestEngine and LiveModeRunner — signal resolution, cooldown guard, entry/exit fill simulation, position sizing, late-entry residual-edge gate |
+| `utils/execution_common.md` | Execution-time decisions shared between BacktestEngine and LiveModeRunner — signal resolution, cooldown guard, entry/exit fill simulation over a time-valued anchor, position sizing, late-entry residual-edge gate |
 | `utils/utils.md` | Shared utilities: bar sequence, signal resolution, slippage/fill simulation, label breach detection, encoding maps, trading calendar, REFERENCE_SESSION stats (populate + load), corporate-event adjustment (cum_split_ratio, adjust_bars_for_corporate_events, adjust_tick_derived_series_for_corporate_events, estimate_historical_meta, ticker rename stitching) |
 | `inferencer/inferencer.md` | Live inference service object — _prepare_bars, infer/infer_batch, inference_log |
-| `inferencer/live_mode_runner.md` | Live mode execution orchestrator — prefix-scan watchdog loop, recovery lane, position manager loop, session lifecycle |
+| `inferencer/live_mode_runner.md` | Live mode execution orchestrator — prefix-scan watchdog loop, recovery lane, position manager loop, session lifecycle, ticker-scoped 1-tick acquisition, real-path-parallel shadow fills |
 | `inferencer/caching_calculator.md` | CachingIndicatorCalculator — Layer 1/2 cache, fibonacci deque, sr_levels per-entry-point |
 | `tools/init_db.md` | Schema bootstrap CLI — creates every table from db_schema.md's canonical DDL; `--verify` reports schema drift read-only. Sole DDL-issuing component; prerequisite for migration_tool |
 | `tools/migration_tool.md` | JSON → DuckDB migration, trading_calendar/coverage init, precomputed_session_stats population |

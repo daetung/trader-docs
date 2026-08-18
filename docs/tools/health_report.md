@@ -125,7 +125,7 @@ def gather_findings(db_conn, today_date, log_dir,
        one signal. Threshold TBD, same deferral as finding 6.
     8. Halt-check signal-source rate (N-4: data path matches finding 5's
        pattern) — fraction of today's Position Manager Loop halt checks
-       (see live_mode_runner.md's Step 1a) tagged
+       (see live_mode_runner.md's Position Manager Loop Step 1) tagged
        signal_source='tick_rate_fallback' vs. 'api'. Not recomputed here —
        LiveModeRunner tallies signal_source per check as the session runs
        and persists the counts (R-9) to
@@ -210,7 +210,7 @@ def gather_findings(db_conn, today_date, log_dir,
         positions that skipped `session_end` while `status='halted'` and
         were carried to the next session's Broker Reconcile. Surfaces what
         was previously a silent skip (see live_mode_runner.md's Position
-        Manager Loop Step 1a).
+        Manager Loop Step 1).
         Source (R-9): aggregated from health_events where
         finding_name='overnight_halt_carry'; detail carries ticker and the
         position identifier. Recorded once per position at the carry, not per
@@ -410,7 +410,7 @@ def gather_findings(db_conn, today_date, log_dir,
         and go stale again, and that recurrence is the signal.
     25. In-flight exit order gone at halt-clear (R-2-style resumption
         handling) — count of times a ticker's halted→tradable transition
-        (Position Manager Loop Step 1a) found an in-flight exit order for
+        (Position Manager Loop Step 1) found an in-flight exit order for
         that ticker had disappeared on immediate re-query, meaning the
         broker canceled it during the halt. Distinct from finding 18: that
         one is duration-based (still open past an age threshold); this one
@@ -757,6 +757,18 @@ released.
                                           writes those hours later, which is
                                           why finding 33 reports the previous
                                           day on a session-end call)
+1b. LiveModeRunner closes any OPEN live_halt_episodes interval, same layer
+                                         (a clean shutdown observed the
+                                          session's end, so leaving an
+                                          interval open would assert an
+                                          unresolved halt that nothing will
+                                          resolve. After a CRASH the row
+                                          legitimately stays open — no party
+                                          observed a resumption — and a warm
+                                          restart resolves it by replay
+                                          instead. exit_trigger_agreement_daily
+                                          needs no step here: it is written per
+                                          settled exit, not at shutdown)
 2. gather_findings + write_to_log
 3. dispatch delivery                     (background)
 4. drain, up to alerting.drain_timeout_seconds

@@ -152,7 +152,7 @@ future call sites rather than an input to an unresolved allocation.
 | Tradable ticker list | Session Lifecycle Step 1; `build_trading_api_symbol_map()` (three per-exchange calls) | `quote/…/inquiry/stock-ticker` | 2 |
 | Balance and deposit | Step 1b; the funds gate; Broker Reconcile | `trading/…/inquiry/balance-margin` | 3 |
 | Per-ticker margin ratio | position sizing — undesigned, see `open_items.md` | `trading/…/inquiry/able-orderqty` | 2 |
-| Bars, minute OR second resolution | Watchdog Step 2a (prefix scan, rotation window, backfill); Position Manager Step 1 | `quote/…/chart/min` | 4 |
+| Bars, minute OR second resolution | Watchdog Step 2a (prefix scan, rotation window, backfill) | `quote/…/chart/min` | 4 |
 | Ticks | Watchdog Step 2b; Exit Architecture's REST tick backstop (WS-dead only) | `quote/…/chart/tick` | 4 |
 | Bulk price snapshot | `bulk_fetch_today_first_price()` | `quote/…/inquiry/multiprice` | 2 |
 | Level-1 orderbook | the exit ladder; `signal_time_rest` | `quote/…/inquiry/orderbook` | 2 |
@@ -210,9 +210,15 @@ Six things the table settles that prose had left ambiguous:
 ```
 
   The watchdog scan's slot allocation is written against the doubled
-  `chart/min` figure. Note the one bucket with two contending consumers: the
-  exit ladder re-quotes round-robin inside `orderbook`'s 4, and
-  `signal_time_rest` preempts it at bar close.
+  `chart/min` figure. Note the buckets with contending consumers: the exit
+  ladder re-quotes round-robin inside `orderbook`'s 4, and `signal_time_rest`
+  preempts it at bar close; inside `chart/min`'s non-reserved half, carryover
+  and promotion share the cap with the bar-close superset-K fetch, which
+  preempts both. Position Manager Loop is no longer among the `chart/min`
+  consumers — its per-position bar fetch went with `bars_since_entry`
+  (live_mode_runner.md). It does draw `chart/tick`: the WS-dead exit backstop,
+  and, at stage `shadow`, the ticker-scoped 1-tick buffer the fill
+  simulations run over.
 
 **Leg assignment, and the one rule that decides it.** A `trading/` call is
 scoped to the account that owns the positions and the cash, so it has no

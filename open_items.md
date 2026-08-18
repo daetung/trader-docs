@@ -26,21 +26,24 @@ confirmation that it still reads correctly.
 
 ## Suggested order
 
-1. **Exit-path bar consumers** comes first. It is blocked on nothing, its
-   four sub-questions are entangled and open together, and one API budget
-   figure is currently unresolved behind it. Raised at the end of the
-   session that designed the watchdog scan, deliberately NOT designed there
-   — see its own note on why.
-2. **Margin-ratio computation**: blocked on nothing, and it touches sizing,
+1. **Margin-ratio computation**: blocked on nothing, and it touches sizing,
    the schema and the API budget at once.
-3. **Halt-status source** is independent and blocks nothing else, but the
-   halt path has no primary signal until it lands.
-4. **Async boundary**, **early-close days** and the
+2. **Halt-status source** is independent and blocks nothing else, but the
+   halt path has no primary signal until it lands. `live_halt_episodes`'
+   `source` column now gives it an audit axis: once a real source exists its
+   intervals can be compared against the heuristic's directly, which nothing
+   in the system could do before.
+3. **Async boundary**, **early-close days** and the
    **manual-intervention CLI** are independent of each other and of the
    above. The async boundary is now the more constrained of the three: the
    watchdog scan fires N speculative REST calls per cycle and alternates
    across two accounts, so how many clients exist and where the boundary
    falls has consequences it did not have before.
+4. **WS/REST tape asymmetry and exit-trigger path transitions** is blocked on
+   SHADOW-PERIOD DATA rather than on design time, so it is not sequenced
+   against the items above. Its two undesigned sub-questions (guard state at
+   each handover direction) could be taken at any point; its deferred part
+   cannot.
 5. **`api_contract_checklist.md` re-evaluation** goes last by construction —
    it collects what the items above establish.
 6. **Real-time bid/ask spread** is blocked on calendar time, not design time,
@@ -48,68 +51,49 @@ confirmation that it still reads correctly.
 
 ---
 
-## Exit-path bar consumers and the live/backtest split
+## WS/REST tape asymmetry and exit-trigger path transitions
 
-**Problem.** Position Manager Loop Step 1 fetches bars per open position on
-every `position_check_interval_seconds` cycle. That is a `chart/min` call,
-so it shares the endpoint budget with the watchdog scan — and it is the one
-consumer the scan's slot allocation does NOT account for, because it lives
-in the other loop. At P open positions the draw is
-`P / position_check_interval_seconds` per second against the four
-non-reserved pacing slots; at the default cycle that is 2/s at P=10 and the
-whole non-reserved budget at P=20, starving carryover and promotion.
-`live_mode_runner.md` records the three consumers and states explicitly that
-their priority and this cadence are NOT settled there.
+**Problem.** WS-primary and REST-backstop do NOT consume the same tick data.
+The vendor's free real-time entitlement carries roughly half the trade
+prints; the REST tick endpoint is vendor-guaranteed complete. Live's exit
+trigger therefore runs on a different tape depending on which path is
+active, and on a different tape again from backtest's.
 
-The obvious fix — fetch at bar cadence rather than cycle cadence, since a
-bar count only changes once a minute — cannot be taken until it is known
-what those bars actually feed. Four findings, entangled, and none of them
-originates in the scan design:
+`live_mode_runner.md`'s Exit Architecture asserts the opposite — "both paths
+consume identical tick data with an identical filter, there is NO
+accuracy/filter asymmetry between them, only latency differs". That sentence
+is deliberately LEFT IN PLACE for now, and this item is what marks it false.
+It is not a description but a JUSTIFICATION: it is what licenses swapping the
+two paths with no rule governing the swap, so removing it exposes an
+undesigned region rather than fixing anything.
 
-- **`ohlcv_exit` and `ohlcv_entry` appear in the fill simulators' signatures
-  but nothing in the documented bodies reads them.** Every reference in
-  `simulate_exit_fill()`'s per-bundle logic is to `ticks_exit` bundles —
-  `bundle.volume`, `bundle.high/low/close`, `interpolate_bundle_price()` —
-  and halts come from `halts_df`. `simulate_entry_fill()` is the same shape.
-  BacktestEngine nonetheless passes a real slice for both. If they are
-  genuinely unused, shadow mode's exit needs no fresh bars at all and the
-  cadence question mostly dissolves; if there is an undocumented use, it
-  does not.
-- **Live shadow mode calls `simulate_exit_fill()` for all four exit reasons;
-  BacktestEngine calls it for tp/sl only.** In backtest, `session_end` takes
-  the bar close and `time_limit` takes the close of the last valid bar, both
-  without the simulator. Live's Step 3 runs unconditionally after Step 2, so
-  `time_limit` and `session_end` reach it with `sell_rate_sl` and with
-  `breach_price` and `breach_bundle_idx` that `execution_common.md` itself
-  says are not applicable for those reasons. Either the live path is wrong,
-  or it is right and backtest is the one diverging — and if backtest's
-  "close of the last valid bar" is the intended semantics, live DOES need a
-  bar current to the exit instant, which decides the cadence question.
-- **Feed Outage Recovery step 5 calls `track_price_breach()` in live**,
-  while Position Manager Step 2 states that function is now backtest-only
-  after R-2. One of the two is stale; whichever survives determines whether
-  recovery needs bars fetched on demand.
-- **Consequently the shared-lane priority is undecided too** — whether
-  Position Manager's bars come before or after carryover and promotion
-  depends on how tight its own need turns out to be.
+The 2-print guard breaks in BOTH directions on a half tape, so the error has
+no fixed sign. A false positive when an intervening sub-threshold print was
+not seen — the guard exists to reject one-off spikes, and an unseen middle
+print manufactures persistence. A false negative when one of a genuine
+consecutive pair is among the missing half. Which dominates depends on print
+density, the axis `feed_coverage_daily` already buckets
+(`delayed_prints_d1`..`d4`); that table's stated purpose, making the guard's
+constants resolvable against data, presumes the guard unsettled, which the
+sentence above contradicted from the neighbouring section.
 
-**Not yet designed.** Blocked on nothing external; the entanglement is
-internal to these four. The material is all in three files and the specific
-sites are named above, so this does not need rediscovery:
-`execution_common.md`'s two simulator signatures and their documented
-bodies, `09_backtest_engine.md`'s exit logic where the per-reason call
-branch lives, and `live_mode_runner.md`'s Position Manager Step 1/Step 3 and
-Feed Outage Recovery step 5.
+**Two sub-questions, both undesigned and both takeable now:**
 
-**Why it was not designed in the session that found it.** It was raised
-while patching the watchdog scan, and taking it there would have meant
-building on four unconfirmed premises at once — the failure mode that
-session had already had to reverse twice. The scan's own specs record the
-open question rather than assuming an answer, so nothing downstream depends
-on guessing it.
+(a) Guard-state semantics at WS-death handover, where a "consecutive pair"
+    may straddle the transition from a half tape to a full one.
+(b) The same at WS recovery — subtler, because it moves TOWARD lower
+    density, so an in-progress confirmation weakens silently.
 
----
-
+**Deferred, and explicitly not to be decided yet.** Whether the full-tape
+REST buffer should serve as a COMPARATOR rather than only a fallback. That
+buffer is now maintained per held ticker every cycle regardless of stage,
+since the indicator path needs its derived bundles in real mode too, so a
+fast half tape and a slow full one are both in hand and discarding the latter
+for detection is not self-evident. But the size and direction of the
+divergence are unmeasured, and `exit_trigger_agreement_daily` is the
+instrument built to measure them — its L-vs-M term is exactly the tape
+effect. Deciding before that data exists would repeat this project's
+most-reversed failure. Blocked on shadow-period data, not on design time.
 ## Margin-ratio computation
 
 **Problem.** The spec set holds the margin ratio as a SESSION CONSTANT,
@@ -244,7 +228,7 @@ there for the same reason. If backtest is ever extended to replay
 
 - **As entry sizing.** The market-BUY funds gate prices against
   `ask1 * market_buy_price_margin` in live mode, while `simulate_entry_fill()`
-  receives `ticks_entry`, `ohlcv_entry` and `p_entry` — never a book — and so
+  receives `ticks_entry` and `p_entry` — never a book — and so
   approximates the vendor's undisclosed conversion from bar data instead. The
   two do not size identically and the gap is unquantified. This is NOT a
   defect to fix by making one call the other: the live side uses the better

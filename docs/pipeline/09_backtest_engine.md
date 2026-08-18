@@ -323,8 +323,14 @@ Procedure:
 
     if fill_bundle is not None:
         fill_price, total_filled, unfilled_qty, status = execution_common.simulate_entry_fill(
-            ticks_entry=ticks_t, ohlcv_entry=bars_from_t, quantity=quantity,
-            fill_bundle_idx=fill_idx, p_entry=p_entry,
+            ticks_entry=ticks_t, quantity=quantity,
+            entry_anchor_second=entry_hour + config["execution"]["entry_fill_delay_seconds"],
+            p_entry=p_entry,
+            # ohlcv_entry dropped and the index argument replaced by a TIME:
+            # backtest COMPUTES this instant while live OBSERVES it as
+            # live_positions.submitted_at, and the two must never be composed
+            # (execution_common.md). fill_idx is still computed above for the
+            # `fill_bundle is not None` guard; the simulator derives its own.
             buy_rate=config["execution"]["buy_rate"],
             halts_df=halts_td, cancel_after_seconds=config["execution"]["cancel_after_seconds"],
             limit_price=limit_price,
@@ -559,20 +565,40 @@ if direction is not None:
 
     weighted_avg_exit_price, total_filled, unfilled_qty, _ = execution_common.simulate_exit_fill(
         ticks_exit=ticks_td[ticks_td["hour"] >= effective_second],
-        ohlcv_exit=ohlcv_ticker[ohlcv_ticker["hour"] >= effective_second],
         position_size=quantity,
-        breach_bundle_idx=bundle_idx_at(effective_second),
-        breach_price=effective_price,
+        exit_anchor_second=effective_second,
+        reference_price=effective_price,
         sell_rate=sell_rate,
         halts_df=halts_td,
     )
+    # ohlcv_exit is gone — it had no reader, and the slice passed here was
+    # filtered on `hour` alone across a MULTI-DATE frame while ticks_exit was
+    # correctly date-scoped, which is itself evidence nothing read it.
+    # bundle_idx_at() is no longer called here: index derivation moved inside
+    # the simulator so both engines pass a TIME (execution_common.md).
 
-    if unfilled_qty > 0:
-        # Not a dead position — all available ticks (including after-market) were used.
-        # Unfilled portion penalized at flat dead_position_penalty_pct.
+    if total_filled > 0 and unfilled_qty > 0:
+        # PARTIAL fill. Not a dead position — all available ticks (including
+        # after-market) were used. Unfilled portion penalized at flat
+        # dead_position_penalty_pct.
+        # total_filled > 0 is part of the test, not decoration: on its own
+        # `unfilled_qty > 0` calls a TOTAL non-fill a partial fill, which
+        # would put a row at unfilled_quantity/quantity == 1.0 in the same
+        # category as one at 0.5.
         pnl_filled   = (weighted_avg_exit_price - fill_price) / fill_price
         pnl_unfilled = -config["backtest"]["dead_position_penalty_pct"]
         pnl = (pnl_filled * total_filled + pnl_unfilled * unfilled_qty) / quantity
+    elif total_filled == 0:
+        # ZERO fill, named separately. Still NOT a dead position: the
+        # dead-position condition is absence of DATA, and this path was
+        # entered with ticks available, so liquidity was absent rather than
+        # the price being unresolvable. exit_price falls back to the
+        # reference price and the flat penalty applies to the whole
+        # quantity — deliberately not the same as dead-position Cases B/D's
+        # pnl = -1.0, because a reference price was actually OBSERVED here
+        # and the position can be expected to leave near it, whereas B/D
+        # have no resolvable price at all.
+        pnl = -config["backtest"]["dead_position_penalty_pct"]
     else:
         pnl = (weighted_avg_exit_price - fill_price) / fill_price
 
@@ -590,9 +616,12 @@ itself). New small utility; belongs in `utils.py` alongside the other hour
 utilities (not execution_common.md — it's a pure time-arithmetic function
 with no execution-decision content, same category as `hour_add_seconds()`).
 
-**`trade_log.exit_bar`**: should be populated from `effective_second`
-above, not the raw `exit_hour` — the poll-delayed value is the realistic
-one. This file's exact trade_log-row-assembly code is outside this
+**`trade_log.exit_bar`**: the EXIT ANCHOR INSTANT, for all four exit
+reasons. On the tp/sl path that is `effective_second` above rather than the
+raw `exit_hour`. On the `time_limit` / `session_end` paths it is the instant
+the trigger fired — previously undefined here, those two reasons having had
+no `effective_second` to populate it from, which the generalised anchor
+closes (execution_common.md). This file's exact trade_log-row-assembly code is outside this
 section's scope to fresh-quote here; flagging so it isn't missed as a
 separate small follow-up when this section is actually applied.
 
@@ -604,24 +633,46 @@ separate small follow-up when this section is actually applied.
 
 ```python
 if current bar hour == config["execution"]["session_close_exit_time"]:
-    exit immediately at 15:59 bar close
     exit_reason = "session_end"
+    # DEAD-POSITION RESOLUTION FIRST, ahead of any fill modelling:
     if 15:59 bar is halt/no_data:
         fallback: first tick_10 row with hour > "155900"
-        if none: → dead position
+        if none: → dead position          # no ticks at all → no simulator call
+    if not config["execution"]["simulate_nondirectional_exit_fill"]:
+        exit_price = the reference price (15:59 bar close, or the
+                     after-market tick fallback above)
+    else:
+        anchor    = "155900"
+        reference = last print strictly before the anchor
+        → simulate_exit_fill(..., exit_anchor_second=anchor,
+                              reference_price=reference,
+                              sell_rate=execution.sell_rate_neutral, ...)
 ```
 
-`simulate_exit_fill()` is NOT called for session_end exits —
-exit_price is the bar close (or after-market tick fallback).
+The dead-position test stays AHEAD of the simulator because it is a
+DATA-ABSENCE condition, not a failure to fill. Keeping it there preserves
+both it and the exhaustion-is-not-a-dead-position rule below: the simulator
+is only entered once at least one tick exists at or after the anchor, so a
+zero fill there means liquidity was absent, which is a different fact.
 
 ### Time-limit exit
 
 ```python
 if config["execution"]["max_hold_bars"] valid bars elapsed since entry
    (via build_effective_bar_sequence):
-    exit_price = close of last valid bar
     exit_reason = "time_limit"
+    if not config["execution"]["simulate_nondirectional_exit_fill"]:
+        exit_price = close of last valid bar
+    else:
+        anchor    = the instant that count was reached
+        reference = last print strictly before the anchor
+        → simulate_exit_fill(..., sell_rate=execution.sell_rate_neutral, ...)
 ```
+
+Note that once an exit reason is assigned, filling may continue past 15:59
+into the after-market — the simulator's own contract. "Session close takes
+priority over time-limit" governs which reason is ASSIGNED, not whether an
+in-progress fill is re-triggered.
 
 ---
 
@@ -718,8 +769,11 @@ Dead position trades are included in the winning_rate denominator.
 
 Note: `simulate_exit_fill()` exhausting all available ticks with remaining unfilled
 quantity is **not** a dead position — the position is partially closed and does not
-require an overnight hold. This case is handled in the tp/sl exit path using a blended
-PnL with flat penalty for the unfilled portion. Diagnostic via `trade_log.unfilled_quantity / quantity`.
+require an overnight hold. Handled with a blended PnL and a flat penalty on the
+unfilled portion, for EVERY exit reason that reaches the simulator rather than the
+tp/sl path alone, since `time_limit` and `session_end` now reach it too when
+`execution.simulate_nondirectional_exit_fill` is on. Diagnostic via
+`trade_log.unfilled_quantity / quantity`.
 
 ---
 
@@ -735,6 +789,46 @@ backtest:
   dead_position_penalty_pct: 0.05    # exit-side unfilled-quantity penalty only —
                                       # entry-side unfilled remainder is sized
                                       # down, not penalized (see Entry Slippage Model)
+  entry_fill_rate_disabled:  false   # counterfactual analysis switches. When on,
+  exit_fill_rate_disabled:   false   # the participation-rate factor is removed
+                                      # from that side and the fill takes the FULL
+                                      # OBSERVED volume — everything else intact:
+                                      # bundles are still walked forward from the
+                                      # anchor, halt intervals still exclude
+                                      # bundles, tick exhaustion still leaves an
+                                      # unfilled remainder, and the price is still
+                                      # the volume-weighted path. Keeping the time
+                                      # axis and price path is the point; a variant
+                                      # that filled instantly at the reference price
+                                      # would discard exactly what makes the result
+                                      # readable (how long a liquidation took still
+                                      # shows).
+                                      # Under backtest:, NOT execution:, because
+                                      # unlike simulate_nondirectional_exit_fill this
+                                      # has no real-market counterpart — a venue
+                                      # cannot be told to fill everything. Live must
+                                      # not read it, and shadow must not either,
+                                      # shadow existing to reproduce live.
+                                      # SWITCHES, not `rate: 1.0`:
+                                      # get_execution_param() (N-7) is the sole read
+                                      # point and carries a resolution chain (fitted
+                                      # execution_params, then config, then a hard
+                                      # bound), so a configured 1.0 can be overridden
+                                      # by a fitted value or clamped by that bound.
+                                      # The two also differ in kind — 1.0 asserts
+                                      # full participation is realistic; the switch
+                                      # asserts no participation model is in use,
+                                      # which is neither a fitting target nor a
+                                      # bound's subject.
+                                      # Independently switchable, and the asymmetry
+                                      # that allows is the use: disabling only the
+                                      # exit side asks whether an edge survives
+                                      # without exit-side liquidity while entry
+                                      # sizing stays realistic.
+                                      # Recorded per run in experiment_log's
+                                      # entry_fill_rate_disabled /
+                                      # exit_fill_rate_disabled columns
+                                      # (db_schema.md), never as resolved rates.
   # entry_fill_delay_seconds is NOT declared here — it lives under execution:,
   # because live reads the same quantity (execution_common.md). It was a
   # hardcoded 5 at two sites in this file, the standard path and the
@@ -797,7 +891,22 @@ requested_quantity       INTEGER,   -- quantity actually SUBMITTED, i.e. after
 - Tick data loaded once per ticker/date (full day); filtered in memory by range
 - `halts_td` passed explicitly to all internal methods — no internal DB queries after initial load
 - Session close (15:59 bar) triggers immediate exit — takes priority over time-limit
-- `simulate_exit_fill()` not called for session_end exits (bar close used directly)
+- `simulate_exit_fill()` is not called for `session_end` or `time_limit` exits
+  while `execution.simulate_nondirectional_exit_fill` is false, its default —
+  the bar close and the last valid bar's close are used directly, so current
+  output is preserved BYTE-FOR-BYTE, the same guarantee `late_detection_rate:
+  0.0` carries. Turning it on routes both through the simulator with the
+  generalised anchor and `sell_rate_neutral`, which changes the exit price on
+  the MAJORITY path from an instant, complete, frictionless fill at a bar
+  close to a tick-level partial fill, and can produce unfilled remainders and
+  their flat penalty where none existed — recorded here so a later session
+  does not read that movement as a defect
+- The key lives under `execution:`, not `backtest:`, because live shadow reads
+  the same value: it is a SEMANTICS SELECTOR both engines share, and a
+  backtest-only switch would make them diverge exactly when it is off, which
+  is the divergence it exists to remove. With it off, live writes the
+  reference price straight to `exit_price` rather than calling the simulator,
+  so on and off branch over the SAME anchor
 - After-market data used only as fallback when 15:59 bar is halt/no_data
 - Dead position: session_end fallback fails only (15:59 halt + no after-market data)
 - Dead position lookup uses `has_data = TRUE` filter (not `is_trading_day`) — consistent with Labeler
@@ -806,8 +915,14 @@ requested_quantity       INTEGER,   -- quantity actually SUBMITTED, i.e. after
   `trading_calendar`/`ticker_data_coverage` for this lookup; same query pattern as Labeler
 - Dead position Case D (`exit_reason = "dead_position_extended_halt"`) triggers only when
   Case A's exit_price cannot be resolved after fallback — pnl = -1.0, consistent with Case B
-- `simulate_exit_fill()` ticks exhaustion (unfilled_qty > 0) is partial fill — not dead position;
-  `is_dead_position` remains False; diagnostic via `trade_log.unfilled_quantity`
+- `simulate_exit_fill()` ticks exhaustion is a partial fill — not a dead
+  position — when `total_filled > 0 AND unfilled_qty > 0`. The `filled` half
+  of that test is load-bearing: `unfilled_qty > 0` alone classifies a TOTAL
+  non-fill as a partial fill and clears `is_dead_position` for it, leaving
+  capital locked with nothing recording it. A zero fill is named separately
+  and is still not a dead position, that condition being absence of data
+  rather than failure to fill. `is_dead_position` remains False in both;
+  diagnostic via `trade_log.unfilled_quantity`
 - sell_rate_tp > sell_rate_sl: rising-market exits have more available buy-side depth
 - Entry slippage search window: entry_hour to entry_hour + 100s (not limited to 1-minute t bar)
 - Cooldown applied continuously across full time axis; no reset at session
@@ -818,7 +933,8 @@ requested_quantity       INTEGER,   -- quantity actually SUBMITTED, i.e. after
   as int via `utils.hour_to_int(effective_second)`, which is now simply
   `exit_hour` itself (P-10 revised, R-2 — the poll-delay alignment was
   removed since live detects tp/sl at tick granularity; see Exit Logic).
-  `trade_log.exit_bar` therefore reflects `track_price_breach()`'s raw,
+  `trade_log.exit_bar` therefore reflects, on the tp/sl path,
+  `track_price_breach()`'s raw,
   bundle-interpolated exit moment directly. `exit_reason='entry_canceled'`
   rows (see Entry Slippage Model) set `exit_bar = entry_bar` — there is no
   distinct exit moment for a trade that never opened.

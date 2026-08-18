@@ -717,6 +717,19 @@ CREATE TABLE IF NOT EXISTS experiment_log (
                                  -- by, and 0 would misread as "no loss"
     breaker_max_consecutive_losses  INTEGER,
     breaker_peak_entries_per_hour   INTEGER,
+    entry_fill_rate_disabled BOOLEAN NOT NULL DEFAULT FALSE,
+    exit_fill_rate_disabled  BOOLEAN NOT NULL DEFAULT FALSE,
+    -- The two backtest: participation-rate switches, recorded per RUN
+    -- (09_backtest_engine.md). Recorded as switch state rather than as the
+    -- resolved rate values, for three reasons: a rate would place the
+    -- switch back inside get_execution_param()'s resolution chain, which
+    -- the switch exists to bypass; it would scatter one fact across
+    -- buy_rate plus three sell_rate_* slots now that a neutral rate
+    -- exists; and it would be indistinguishable from all four having
+    -- genuinely fitted to 1.0. A run with either set is not comparable to
+    -- one without, so these columns are what keeps a ranking from being
+    -- read outside the state it was produced in
+    -- (pipeline_optimizer.md's execution_eval fixes them per run).
     trades_by_signal     VARCHAR,                -- JSON
     trades_by_exit       VARCHAR,                -- JSON
     -- Column vs JSON: trades_by_exit is JSON because exit_reason is an OPEN,
@@ -732,9 +745,11 @@ CREATE TABLE IF NOT EXISTS experiment_log (
 );
 
 -- Trade log (output of BacktestEngine — one row per executed trade;
--- also written by LiveModeRunner in shadow mode — see is_shadow below and
--- live_mode_runner.md's Position Manager / Watchdog Loop shadow_mode
--- branches)
+-- also written by LiveModeRunner at stage 'shadow' — see is_shadow below and
+-- live_mode_runner.md's Position Manager / Watchdog Loop
+-- `stage == "shadow"` branches. Written COMPLETE in a single INSERT: the
+-- predicted_* columns are populated at exit completion alongside the real
+-- values, not appended by a session-end update pass)
 -- Retention: NEVER purged — structurally excluded from the purge registry
 --   (the P&L record).
 CREATE TABLE IF NOT EXISTS trade_log (
@@ -891,10 +906,21 @@ CREATE TABLE IF NOT EXISTS trade_log (
                                         -- which shadow session (not a real backtest run_id)
     predicted_fill_price              DOUBLE,  -- pilot-stage only: simulate_entry_fill()
                                         -- run counterfactually against the same tick
-                                        -- data as the real fill above, at session end
+                                        -- data as the real fill above, AT EXIT
+                                        -- COMPLETION rather than at session end
                                         -- (see shadow_retraining.md Stage 2). NULL for
                                         -- backtest/shadow rows (no "real" counterpart
                                         -- to predict against) and for scale-stage rows.
+                                        -- The former session-end timing existed because
+                                        -- the simulator needed tick data that did not
+                                        -- exist yet mid-session; the real-path-parallel
+                                        -- incremental form resolves exactly that, so
+                                        -- settlement IS the moment no further data is
+                                        -- owed. Consequence for writers: a trade_log row
+                                        -- is written COMPLETE in a single INSERT, not
+                                        -- inserted and then updated at session end, and
+                                        -- a crash mid-session no longer loses the whole
+                                        -- day's predicted_* values.
     predicted_weighted_avg_exit_price DOUBLE,  -- same, exit side
     predicted_partial_fills_count     INTEGER, -- same, exit side — diagnostic
                                         -- counterpart to partial_fills_count above
@@ -1169,9 +1195,28 @@ CREATE TABLE IF NOT EXISTS live_positions (
                                      --   live_mode_runner.md's In-flight order
                                      --   tracking), and it is what trade_log's own
                                      --   requested_quantity is written from.
+    is_shadow    BOOLEAN NOT NULL DEFAULT FALSE,
+                                     -- fixed at row creation from
+                                     --   live_mode.stage == 'shadow'. Same
+                                     --   meaning and same name as
+                                     --   trade_log.is_shadow.
     updated_at   VARCHAR NOT NULL,
     PRIMARY KEY (run_id, ticker, date, entry_bar)
 );
+-- WHY is_shadow lives on the ROW and is not derived from the session: these
+--   rows OUTLIVE their session, which is the whole premise of the Unified
+--   Overnight Policy. Without the column, a shadow position left open at
+--   close is found next day by a REAL session's Broker Reconcile, has no
+--   broker counterpart, is dated to a prior day, and is routed to a real
+--   market liquidation for a position that never existed. Joining rows to
+--   sessions by time cannot cover it either: an abnormal exit leaves
+--   live_session_start open with no live_session_end, so the interval is
+--   unclosed exactly for the rows that need classifying, and reading it as
+--   open-to-now swallows the next day's real rows.
+-- Boolean, not three-valued: its three consumers — reconcile_ghost
+--   suppression, overnight-liquidation blocking, and fit_execution_params —
+--   ask only whether a REAL order was placed, which does not separate pilot
+--   from scale. Rollout attribution lives in live_session_state.stage.
 -- status lifecycle:
 --   'pending' -> 'open' -> 'exiting' -> 'closed'
 --   'pending' -> 'partial_open' -> 'open' -> ... (R-7: fills arrive on a
@@ -1203,6 +1248,27 @@ CREATE TABLE IF NOT EXISTS live_session_state (
     run_id             VARCHAR NOT NULL,
     session_start_cash DOUBLE  NOT NULL,
     started_at         VARCHAR NOT NULL,
+    stage              VARCHAR NOT NULL,  -- 'shadow' | 'pilot' | 'scale'
+                                          -- (shadow_retraining.md's own
+                                          -- names). Records what
+                                          -- live_mode.stage declared at
+                                          -- session start; Warm Restart
+                                          -- compares the two and aborts on
+                                          -- a mismatch, so a stage edited
+                                          -- between a crash and a restart
+                                          -- cannot silently switch the
+                                          -- session's mode. Pilot and scale
+                                          -- had no record anywhere before
+                                          -- this column: they were
+                                          -- distinguished only by config
+                                          -- values and were
+                                          -- indistinguishable in the data.
+                                          -- Session start/end TIMES are not
+                                          -- duplicated here — batch_runs'
+                                          -- live_session_start /
+                                          -- live_session_end rows hold them
+                                          -- and Warm Restart detection
+                                          -- reads them there.
     breaker_tripped_at VARCHAR,           -- R-4/Warm Restart: NULL until the
                                           -- circuit breaker trips this
                                           -- session, then the trip
@@ -1552,6 +1618,117 @@ CREATE TABLE IF NOT EXISTS live_scan_daily (
                                     -- gate is disabled)
     PRIMARY KEY (date, metric)
 );
+
+-- Live halt intervals, as OBSERVED by the Position Manager Loop's halt check
+-- (live_mode_runner.md). TICKER-scoped, not position-scoped: last_halt_state
+-- is keyed by ticker and max_positions_per_ticker allows several positions on
+-- one, so a per-position column would store one interval N times. A
+-- position's halted minutes are derived by intersecting [fill_second, now]
+-- with this ticker's rows, which is what execution.max_hold_bars' live
+-- reading needs (elapsed minus halted == build_effective_bar_sequence()'s
+-- valid-bar count).
+-- MUST NEVER be merged into or written to trading_halts. That table is the
+-- NYSE-crawled authority, structurally excluded from purging as a historical
+-- fact, carries no writer discriminator, and is read by Labeler,
+-- BacktestEngine, build_effective_bar_sequence() and missing-bar
+-- classification; writing heuristic estimates there would contaminate the
+-- training corpus — the same argument by which metadata_crawler.md's
+-- evening detection-gap stage must not write entry_points.
+-- SCOPE: NOT a market-wide halt record. Only tickers holding an open position
+-- ever appear here.
+-- halt_end NULL means OPEN — either still halted, or left unresolved by a
+-- crash. An open interval is passed to the fill simulators as
+-- [halt_start, unbounded); closing it at `now` instead would make stateless
+-- recomputation return different answers for the same inputs. A restart
+-- resolves it by replaying the tick-rate heuristic over the gap-fill ticks
+-- (live_mode_runner.md's Warm Restart step b2) rather than by assuming
+-- either outcome, because the STATE self-corrects either way but the
+-- DURATION does not, and the duration is why this table exists.
+-- source distinguishes provenance so metadata_crawler.md's evening
+-- comparison against trading_halts can be read correctly: for
+-- 'tick_rate_fallback' rows it measures a heuristic against an authority,
+-- for 'api' rows it compares two independent sources, and the two questions
+-- must not be pooled.
+-- Retention: purge-registry member — date_column `date`, retention_days: inf.
+-- It does NOT qualify for trading_halts' structural exclusion: this is a
+-- heuristic ESTIMATE, so losing it costs visibility into how the signal
+-- behaved, not correctness. Growth is bounded by execution.max_tickers
+-- because the halt check is position-scoped — a few dozen rows a day, the
+-- same order as live_scan_daily.
+CREATE TABLE IF NOT EXISTS live_halt_episodes (
+    ticker      VARCHAR NOT NULL,
+    date        VARCHAR NOT NULL,   -- 'YYYYMMDD', session date
+    halt_start  VARCHAR NOT NULL,   -- 'HHMMSS'
+    halt_end    VARCHAR,            -- NULL = open / unresolved
+    source      VARCHAR NOT NULL,   -- 'api' | 'tick_rate_fallback'
+    PRIMARY KEY (ticker, date, halt_start)
+);
+-- No run_id: a market observation rather than a run artifact, and a warm
+--   restart must be able to write the same row idempotently.
+-- No reason_code: the heuristic cannot produce one.
+
+-- Exit-trigger agreement — how far live's exit triggering diverges from
+-- backtest's, DECOMPOSED into its two causes. Both change at the
+-- backtest->shadow boundary and never again: the tape (complete tick_10
+-- versus the WS entitlement's roughly half of prints) and the algorithm
+-- (utils.track_price_breach() versus the 2-print guard). Nothing measured
+-- either before this table, and the consequence is not benign — Pilot's
+-- fit_execution_params() anchors its counterfactual on whatever the LIVE
+-- path detected while backtest anchors on the full tape, so a detection
+-- difference is absorbed as a fill-rate difference and mislabelled silently.
+-- Three computations over the ONE 1-tick buffer already held at exit
+-- completion, so no extra fetch, no extra retention and no new stage:
+--   L = what live's exit trigger path actually consumed, 2-print guard.
+--       An OBSERVATION, never recomputed. Not WS-scoped: the REST backstop
+--       takes over while WS is dead and runs the same guard over the full
+--       tape, and those stretches belong to L.
+--   M = complete 1-tick, 2-print guard   -> tape swapped
+--   R = complete 1-tick, track_price_breach() -> backtest equivalent
+-- L vs M isolates the TAPE term, M vs R the ALGORITHM term, L vs R the
+-- total. M is the only term that makes the split possible.
+-- Cannot be deferred to the evening batch, unlike its entry-side counterpart
+-- evening_detection_gap: L is an observation, and which prints live happened
+-- to receive is not reconstructable from tick_10.
+-- Written by LiveModeRunner per settled exit, ALWAYS — deliberately NOT
+-- merged into feed_coverage_daily despite the identical grain and the shared
+-- purpose. That table is evening-batch-written and single-writer, skips
+-- entirely when auxiliary_stream.enabled is false, excludes tickers missing
+-- from the delayed side, and writes NOTHING for a date on partial failure;
+-- all three rules protect a RATIO, which an agreement observation is not, so
+-- it would inherit the constraints without the protection. Paired reading is
+-- intended: coverage says what arrived, agreement says how much that moved
+-- the verdict.
+-- Per-ticker grain is deliberate, for the reason feed_coverage_daily gives
+-- for its own — if the omission is liquidity-dependent, ticker IS the axis
+-- the bias lives on, and folding it would erase what this measures.
+-- Retention: purge-registry member — date_column `date`, retention_days: inf.
+CREATE TABLE IF NOT EXISTS exit_trigger_agreement_daily (
+    date        VARCHAR NOT NULL,   -- 'YYYYMMDD'
+    ticker      VARCHAR NOT NULL,
+    live_and_backtest              INTEGER,  -- both paths fired
+    live_only                      INTEGER,  -- live fired where backtest would not
+    backtest_only                  INTEGER,  -- live missed it
+    live_vs_fulltape_disagreed     INTEGER,  -- TAPE term: same guard, tape differs
+    fulltape_vs_backtest_disagreed INTEGER,  -- ALGORITHM term, tape controlled
+    backstop_excluded_exits        INTEGER,  -- excluded from the TAPE term only;
+                                             --   a large value is itself a
+                                             --   WS-health signal
+    live_delay_seconds_p50         DOUBLE,   -- live firing minus backtest firing;
+    live_delay_seconds_p95         DOUBLE,   --   sign convention is in the name,
+                                             --   so positive means late
+    live_price_diff_p50            DOUBLE,   -- price at firing
+    PRIMARY KEY (date, ticker)
+);
+-- The TAPE term is stored, not derived. feed_coverage_daily omits its total
+--   dropout because subtraction recovers it, but that does not hold here:
+--   the three paths fire on different SETS, so a difference of counts is not
+--   the size of a set difference.
+-- An exit whose window overlaps a backstop stretch is excluded from
+--   live_vs_fulltape_disagreed ONLY and stays in every other column, so no
+--   observation is lost. For those exits the tape term is meaningless rather
+--   than wrong — the same judgement feed_coverage_daily makes in excluding
+--   tickers absent from the delayed side instead of recording them as total
+--   dropout.
 
 -- Health-event log — one row per discrete diagnostic event (health_report.md).
 -- Different in kind from bar_latency_daily above: that aggregates NORMAL

@@ -16,9 +16,13 @@ orders" gap in the original design review.
 ## Stage 1: Shadow Mode
 
 Full live pipeline runs end-to-end (detection, inference, sizing,
-execution_common.md's shared decision logic) with `live_mode.shadow_mode:
-true` — see live_mode_runner.md's Watchdog Polling Loop / Position Manager
-Loop shadow_mode branches. Orders are never sent to the broker; hypothetical
+execution_common.md's shared decision logic) with `live_mode.stage: shadow`
+— see live_mode_runner.md's Watchdog Polling Loop / Position Manager Loop
+`stage == "shadow"` branches. That key REPLACES the former `shadow_mode`
+boolean and also names Stages 2 and 3 (`pilot`, `scale`), which previously
+had no record anywhere: they were distinguished only by config values and
+were indistinguishable in the data. It is recorded to
+`live_session_state.stage` at session start. Orders are never sent to the broker; hypothetical
 fills are estimated via `execution_common.simulate_entry_fill()` /
 `simulate_exit_fill()` (the same functions BacktestEngine uses) and logged
 to `trade_log` with `is_shadow=TRUE`.
@@ -49,8 +53,12 @@ Real orders, deliberately small size. No new sizing mechanism — set
 `execution.exposure_cap_pct` and/or `execution.per_ticker_share_cap_pct`
 (see execution_common.md's `compute_position_size()`, default `0` =
 disabled) to a small nonzero fraction for the pilot period, then relax back
-toward `0` (or a larger deliberate ceiling) at Stage 3. `shadow_mode: false`
-from this stage onward.
+toward `0` (or a larger deliberate ceiling) at Stage 3. `stage: pilot`
+from this stage onward, `stage: scale` at Stage 3.
+Entering either while the circuit-breaker thresholds are still at their `0`
+default is REFUSED AT STARTUP (live_mode_runner.md). R-4 already required
+them to be set on entering this stage and had no mechanism to enforce it;
+one declarative key gives it one.
 
 **Circuit-breaker thresholds must be set on entering this stage (R-4).**
 `execution.intraday_loss_limit_pct`, `consecutive_loss_limit` and
@@ -75,16 +83,30 @@ aggregate winning_rate/avg_pnl_pct only — a different, independent check;
 see the divergence-check note under Retraining Cadence below for how the
 two relate).
 
-*Data collection*: at session end (same timing as `health_report.py`'s
-second daily invocation), for every pilot-stage trade executed that day,
+*Data collection*: AT EXIT COMPLETION, for every pilot-stage trade,
 `simulate_entry_fill()`/`simulate_exit_fill()` are run counterfactually
 against the same tick data the real order saw, writing
 `trade_log.predicted_fill_price` / `predicted_weighted_avg_exit_price` /
 `predicted_partial_fills_count` alongside the real `fill_price` /
-`weighted_avg_exit_price` / `partial_fills_count` already on that row.
-Must run after session end, not immediately post-fill — `simulate_exit_fill()`
-needs that day's remaining tick data through session close, which does not
-exist yet mid-session.
+`weighted_avg_exit_price` / `partial_fills_count` on the same row — which
+is what lets that row be written COMPLETE in a single INSERT rather than
+inserted and updated later.
+This used to run at session end, and the reason given was that
+`simulate_exit_fill()` needs that day's remaining tick data through session
+close, which does not exist yet mid-session. That is exactly what the
+real-path-parallel incremental form resolves (live_mode_runner.md): the
+simulation walks forward from its anchor and recomputes until it settles,
+and settlement IS the moment no further data is owed. Moving it also lets
+the raw 1-tick retention bound advance as positions close instead of every
+closed position pinning it to session end, collapses Shadow and Pilot onto
+one mechanism — same function, same anchor, same instant, differing only in
+whether a real fill sits beside the simulated one — and is crash-tolerant
+per trade, where a session-end batch loses the whole day if the process dies
+first. The single exception is an exit still unfilled at session end, which
+is treated as settled at that moment, the same instant its slot is released.
+`fit_execution_params()` itself is UNCHANGED and still runs at or after
+session end: what moved is when `predicted_*` is populated, not when the fit
+runs — a fit needs a population, not one trade.
 
 *`fit_execution_params()`*: runs weekly (calendar-week, same Monday-start /
 >=3-trading-day convention as the divergence check), but the **data it
@@ -98,6 +120,8 @@ to it:
 buy_rate, cancel_after_seconds:  gated on cumulative pilot ENTRY count >= 30
 sell_rate_tp:                    gated on cumulative exit_reason='take_profit' count >= 15
 sell_rate_sl:                    gated on cumulative exit_reason='stop_loss' count >= 15
+sell_rate_neutral:               gated on cumulative exit_reason IN
+                                 ('time_limit','session_end') count >= 15
 ```
 
 A parameter whose gate isn't met yet is left unchanged this cycle — the

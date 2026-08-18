@@ -689,6 +689,30 @@ class PipelineOptimizer:
         optimizer.execution_eval.rank_metric, aggregated across outer folds.
         Returns None when execution_eval is disabled or produced no rows.
 
+        The backtest fill-rate switches (backtest.entry_fill_rate_disabled /
+        exit_fill_rate_disabled) are a property of a RUN, not a variant axis:
+        execution_eval fixes them for the whole run and cannot vary them
+        across variants. Mixing states within one run would rank on the
+        SWITCH rather than on the parameters, the frictionless side scoring
+        higher on avg_pnl_pct almost regardless of what else changed.
+        This contract is UNCHANGED and stays state-agnostic — the caller
+        runs it once per switch state and compares within a state, never
+        across. Running with a switch on is NOT refused: this axis ranks
+        execution PARAMETER SETS (entry_gap_type / entry_gap_value,
+        exit_ladder_seed, cancel_after_seconds, entry_order_type), and those
+        still separate with the participation model disabled — a different
+        limit_price still gates different bundles, a different
+        cancel_after_seconds still bounds a different consumption window, and
+        the time axis and volume-weighted price path are preserved. The
+        separation NARROWS rather than vanishes, and that narrowing is the
+        use: with liquidity friction removed, the pure effect of the price
+        and timing parameters is isolated, where today the two are entangled
+        and it is not visible which drives the ranking. The two states
+        selecting different variants is itself the finding — it says the best
+        parameters depend on liquidity friction. Both switches are recorded
+        per run in experiment_log (db_schema.md), so a ranking is never read
+        outside the state it was produced in.
+
         Ranks on avg_pnl_pct, NOT winning_rate, and this is the point rather
         than a detail. Every variant here is judged by the trades it ADDS or
         REMOVES at the margin; a variant that admits marginal-but-positive-EV

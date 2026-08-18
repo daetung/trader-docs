@@ -57,6 +57,11 @@ Statements are already written `CREATE TABLE IF NOT EXISTS` in `db_schema.md`,
 so idempotency is not something this tool decides or adds.
 
 **When `db_schema.md` changes, `SCHEMA_STATEMENTS` is re-transcribed from it.**
+Re-transcription has now been required FOUR times. The most recent occasion
+added `live_halt_episodes` and `exit_trigger_agreement_daily`, moving the
+table count 31 -> 33; `live_positions` and `live_session_state` each also
+gained a column in the same change, which is class 2 below and needs a hand
+`ALTER` that init alone will not perform.
 The design documents are maintained as a separate project from this codebase
 and are read-only from here, so there is no build step, no generator, and no
 runtime dependency on the documents being present on disk. The list in this
@@ -166,10 +171,10 @@ Plain stdout; no log file and no `batch_runs` row (this tool is outside the
 batch-marker scheme entirely — see the concurrency assumption above).
 
 ```
-init:   created 31 tables, 0 already present    # fresh database
-init:   created 1 table, 30 already present     # after a new table was added
-verify: 31 tables checked, 0 differences
-verify: 31 tables checked, 1 difference
+init:   created 33 tables, 0 already present    # fresh database
+init:   created 1 table, 32 already present     # after a new table was added
+verify: 33 tables checked, 0 differences
+verify: 33 tables checked, 1 difference
         live_session_state: column 'session_diagnostics' missing — ALTER needed
 ```
 

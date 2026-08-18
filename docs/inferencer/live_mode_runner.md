@@ -786,12 +786,13 @@ t=500, t=750 both legs   →  shared, up to 4 calls
 ```
 
 The non-reserved half is a CAP shared by several consumers, not an
-allocation belonging to one. `chart/min` has three consumers in this
-system, and the third is easy to miss because it lives in the other loop:
-Position Manager Loop Step 1 fetches bars per open position
-(`trading_api.md`'s Call-Point Inventory lists both call sites against this
-endpoint), alongside carryover and promotion. Their relative priority, and
-Position Manager's fetch cadence, are NOT settled here.
+allocation belonging to one. `chart/min` has TWO consumers here — carryover
+and promotion — plus the bar-close superset-K fetch, which preempts both at
+bar close. Position Manager Loop Step 1 was a third until `bars_since_entry`
+was removed; it fetches no bars now, so `trading_api.md`'s Call-Point
+Inventory lists this endpoint against the scan alone. Every pairwise
+precedence is stated — the lane yields to superset-K, carryover before
+promotion — and re-derivable from EDF slack, so nothing here is left open.
 
 Last scan call completes at `250ms + RTT`, i.e. 850ms worst case at the
 measured 400-600ms round trip (that check is retired as
@@ -818,7 +819,8 @@ drifts up past ~600ms, N must come down.
   `entry_points` is idempotent under INSERT OR IGNORE but `inference_log`
   is not, and a duplicated `signal_fired` row is a duplicated entry.
 - **Shared, up to 4.** Carryover and promotion — see Recovery Lane
-  below — sharing the cap with Position Manager Step 1's per-position bars.
+  below — sharing the cap with the bar-close superset-K fetch, which
+  preempts them at bar close.
 
 **A response that came back is EVALUATED, never discarded.** The head slots
 fire SPECULATIVELY — all N go out before any of them lands, because waiting
@@ -1115,30 +1117,59 @@ loop every poll_interval_seconds:
                  else (entry["p_entry"] * (1 + config["execution"]["entry_gap_value"])
                        if config["execution"]["entry_gap_type"] == "percentage"
                        else entry["p_entry"] + config["execution"]["entry_gap_value"])
-             if config["live_mode"]["shadow_mode"]:
+             if config["live_mode"]["stage"] == "shadow":
+                 # REAL-PATH-PARALLEL INCREMENTAL, as on the exit side
+                 # (Position Manager Loop Step 3). simulate_entry_fill()
+                 # consumes ticks forward from its anchor through
+                 # cancel_after_seconds and those do not exist yet at this
+                 # instant, so this branch OPENS a pending window instead
+                 # of resolving one.
+                 db_write: INSERT live_positions (run_id, ticker, date,
+                     entry_bar, order_id=NULL, limit_price,
+                     submitted_at=now, signal, status='pending',
+                     fill_price=NULL, fill_second=NULL, quantity=NULL,
+                     is_shadow=TRUE)
+                 # Same SSoT-first write as the real branch below. The row
+                 # carries is_shadow because live_positions rows OUTLIVE
+                 # their session: without it a shadow row left open at
+                 # close is adopted next day by a real session's Broker
+                 # Reconcile and really liquidated (db_schema.md).
+                 subscribe to this ticker's realtime trade stream NOW —
+                     submission, not fill, is the trigger, the SAME rule
+                     and the SAME zero-fill unsubscribe path as the real
+                     branch. The former shadow-only simplification rested
+                     on simulate_entry_fill() resolving synchronously,
+                     which it cannot; a branch disappears here rather than
+                     a simplification being lost.
+                 anchor = submitted_at
+                     # Live OBSERVES this instant; backtest COMPUTES its
+                     # equivalent as entry_hour +
+                     # execution.entry_fill_delay_seconds. Two expressions
+                     # of ONE moment, never composed — adding the delay to
+                     # submitted_at double-counts a wait live has already
+                     # lived through (execution_common.md).
+                 Once the 1-tick buffer covers anchor + cancel_after_seconds,
+                 recompute STATELESSLY from the anchor:
                  weighted_avg_fill_price, filled, unfilled, status =
                      execution_common.simulate_entry_fill(
-                         ticks_entry=..., ohlcv_entry=..., quantity=quantity,
-                         fill_bundle_idx=..., p_entry=entry["p_entry"],
+                         ticks_entry=<1-tick buffer, anchor forward>,
+                         quantity=quantity,
+                         entry_anchor_second=anchor, p_entry=entry["p_entry"],
                          buy_rate=config["execution"]["buy_rate"],
-                         halts_df=...,
+                         halts_df=<live_halt_episodes rows for this ticker>,
                          cancel_after_seconds=config["execution"]["cancel_after_seconds"],
                          limit_price=limit_price,
                      )
-                 log hypothetical entry to trade_log (is_shadow=TRUE, quantity=filled)
+                 # ohlcv_entry is GONE — it had no reader. p_entry stays:
+                 # its zero-fill fallback role is inert (a zero-fill entry
+                 # is 'canceled', quantity=0, pnl NULL, reaching no summary
+                 # statistic) but it is still the sizing input above.
                  # entry_order_type is simulated the same way in shadow as
                  # in backtest — see execution_common.md's price-gate logic
-                 if filled > 0:
-                     subscribe to this ticker's realtime trade stream NOW
-                         (see Exit Architecture's "Primary — WebSocket tick
-                         stream") — same "submission, not fill, is the
-                         trigger" principle as the real branch below, but
-                         simplified: simulate_entry_fill() already resolved
-                         filled/unfilled synchronously, so there is no
-                         async pending window to subscribe ahead of, and no
-                         separate zero-fill unsubscribe path is needed —
-                         a hypothetical position simply is not opened, and
-                         no subscription is ever made, when filled == 0.
+                 then transition the row exactly as the real branch does:
+                 filled == 0 → 'canceled' and unsubscribe; filled > 0 →
+                 'open' with quantity = filled, trade_log written COMPLETE
+                 in a single INSERT (is_shadow=TRUE).
              else:
                  order_id = submit order via trading API: quantity=`quantity`,
                      order_type=config["execution"]["entry_order_type"],
@@ -1152,7 +1183,7 @@ loop every poll_interval_seconds:
                  db_write: INSERT live_positions (run_id, ticker, date,
                      entry_bar, order_id, limit_price, submitted_at=now,
                      signal, status='pending', fill_price=NULL,
-                     fill_second=NULL, quantity=NULL)
+                     fill_second=NULL, quantity=NULL, is_shadow=FALSE)
                  # R-7: the order API's response confirms ACCEPTANCE of the
                  # submission, not a fill — fills arrive on the separate
                  # fill channel (WS account stream / REST order query). The
@@ -1589,7 +1620,7 @@ handled by finding 29 without a freeze.
 3. Catch up: once reconnected, this does NOT require a separate vendor
    endpoint — the trading API's existing "always returns full range since
    last successful query" behavior (already relied on elsewhere — see
-   Watchdog Polling Loop Step 2a, Position Manager Loop Step 1) means the
+   Watchdog Polling Loop Step 2a) means the
    very next ordinary bar-fetch call for each ticker naturally returns
    everything missed during the outage. Under the prefix scan that call
    arrives per ticker as the scan reaches it, not for the whole watchlist
@@ -1599,8 +1630,9 @@ handled by finding 29 without a freeze.
    simultaneous. This costs nothing: a ticker not yet caught up is simply
    one that has not been re-evaluated yet, which is the ordinary steady
    state of the scan in any case. Step 5's exit re-evaluation is unaffected
-   because Position Manager fetches each position's bars directly rather
-   than through the scan. The EXISTING
+   for a different reason than it once was: it runs on TICKS, so the scan's
+   bar catch-up is not its input at all, and Position Manager fetches no
+   bars now. The EXISTING
    Step 3 multi-bar replay loop (calculators[ticker].on_bar_close() called
    once per missed bar, in order) handles the catch-up with no new
    mechanism — the outage is, from the calculator's point of view, just an
@@ -1618,8 +1650,11 @@ handled by finding 29 without a freeze.
    applies only to positions that remained open through the outage.
 
 5. Re-evaluate exits: for each position that remained open through the
-   outage, run exit evaluation (track_price_breach() over the now-caught-up
-   bars/ticks) once before unfreezing. Any position whose exit condition
+   outage, apply the 2-PRINT GUARD over the now-caught-up TICKS once before
+   unfreezing — the same form Warm Restart step 3c already uses for the
+   identical question. NOT track_price_breach(), which is backtest-only as
+   of R-2: the call named here was the stale side of that change, against
+   two declarations in this file saying so. Any position whose exit condition
    would have triggered *during* the gap: exit at market immediately (not
    at the historical breach point — that price is stale by now), logged
    with `exit_reason='feed_gap_exit'` (see db_schema.md's trade_log) so
@@ -1722,6 +1757,19 @@ view (open orders + open positions) against `live_positions` rows.
     `exit_reason='reconcile_ghost'`, `quantity=0`, PnL-excluded — there was
     no real position, so logging it as `stop_loss` etc. would fabricate a
     trade that never happened.
+    **SUPPRESSED for `is_shadow=TRUE` rows.** A shadow row never had a
+    broker counterpart, so an open row with no broker position is its
+    EXPECTED state rather than a ghost. Without the exclusion this
+    procedure destroys open shadow positions at two of its three call
+    sites — Feed Outage step 4 MID-SESSION and Warm Restart step 1 — and
+    does so silently, the resulting rows being PnL-excluded. The
+    BROKER-side branches above are NOT suppressed in shadow: a broker
+    order or position found while `stage == "shadow"` is a genuine anomaly
+    (a config error, or residue from a prior real session) and
+    'unknown_broker_order_or_position' stays its correct outcome. Shadow
+    rows also carry no `order_id`, so the pending-order branch could never
+    match them — stated here as intended rather than reached by a match
+    failure.
 
 **Cold-start note:** at cold start nothing has opened today, so ANY broker
 position found is by definition an overnight orphan — it always routes to
@@ -1750,6 +1798,15 @@ date of that liquidation, NOT the row's `date` (the entry date) — these are
 by definition different for this label, and may differ by more than one day
 across a weekend, holiday, or multi-day halt. See db_schema.md's
 `trade_log.exit_date`.
+
+**`is_shadow=TRUE` rows are EXCLUDED from this policy's real
+liquidation.** A shadow row carried across a day describes a position that
+never existed at the broker, so submitting a market exit for it would place
+a live order on the strength of a simulation. It is closed with the same
+`overnight_exit` label and PnL exclusion, but by row transition alone with
+no order submitted. This is the failure `live_positions.is_shadow` exists
+to prevent, and it is reachable precisely because the incremental fill form
+allows a shadow exit to still be unsettled at the close.
 
 **Mechanism** — no special executor needed: the adopted position enters
 the ordinary Position Manager Loop, where `execution.max_hold_bars` was
@@ -1812,12 +1869,31 @@ so a re-crash during recovery re-enters warm restart on the same signature.
      b. REST gap-fill for the crash gap, deduped against the WS buffer by
         the global tick-dedup rule (see utils.md's stitch_ticks()). Doing
         (a) before (b) guarantees no realtime tick is lost in the seam.
+     b2. Resolve any live_halt_episodes row left OPEN by the crash
+        (halt_end IS NULL) by REPLAYING the tick-rate heuristic over (b)'s
+        gap-fill ticks: no ticks, or tick_rate_per_min below
+        halt_heuristic_tpm, across the gap leaves the interval open, and
+        the first point crossing the threshold closes it at the ACTUAL
+        resumption time. Neither assumption was acceptable — treating the
+        interval as continuing lets the first post-restart cycle close it
+        at `now`, inflating the duration by (now − actual resumption),
+        while closing it at the last pre-crash observation deflates it by
+        the same amount. The STATE self-corrects either way; the DURATION
+        does not, and duration is why the table exists. Not new machinery:
+        it applies the computation the loop would have performed to data
+        that arrived late, the same idiom as Watchdog Step 3's multi-bar
+        replay. The half-tape WS entitlement is harmless here because
+        replay and live path apply the identical test, so both are biased
+        the same way rather than acquiring an independent error term.
+        Ordered between (b) and (c) because (c) reads its result.
      c. status IN ('open','halted'): apply the 2-print guard over gap-fill
         + live ticks; if a tp/sl breach is found within the gap, liquidate
         at current price, exit_reason='restart_gap_exit' (see
-        db_schema.md). If the position's elapsed hold already exceeds
-        config["execution"]["max_hold_bars"], skip retro-detection and
-        liquidate immediately (still 'restart_gap_exit').
+        db_schema.md). If the position's ELAPSED MINUS HALTED hold already
+        exceeds config["execution"]["max_hold_bars"], skip retro-detection
+        and liquidate immediately (still 'restart_gap_exit') — the same
+        rule Position Manager Loop Step 2 applies in steady state, rather
+        than the raw elapsed hold this step used to read.
         status IN ('pending','partial_open'): no `fill_price` yet, so no
         breach evaluation — same as the ordinary (non-restart) guard in
         Exit Architecture. Gap-filled ticks are retained by the dedup
@@ -2040,7 +2116,8 @@ accuracy matches WS — only detection TIME lags. `utils.track_price_breach()`
 is NOT used on this path; it is backtest-only as of this patch.
 
 **Time-based triggers are not on the WS path.** `time_limit` and
-`session_end` are wall-clock/bar-count conditions, evaluated by the
+`session_end` are wall-clock conditions — `time_limit` on elapsed minus
+halted minutes, `session_end` on the clock alone — evaluated by the
 periodic loop (Position Manager Loop Step 2) regardless of tick arrival —
 a tick may never arrive for a low-liquidity or halted name near close, and
 a time trigger must still fire. WS is fixed to price-breach only.
@@ -2097,8 +2174,12 @@ debuggability), with no compensating benefit found for per-position timing.
 
 At position open (buy fill, real or shadow), the caller initializes:
 ```
-position.bars_since_entry  = []   # grown each iteration; used for
-                                  # time_limit / session_end bar counting
+# No bars_since_entry. Its only consumer was Step 2's time_limit, which is
+# now elapsed-minus-halted minutes (below); session_end is pure wall clock
+# and never read it, so the comment naming both was already wrong. Elapsed
+# comes from live_positions.fill_second and halted minutes from this
+# ticker's live_halt_episodes intervals — both durable, so this loop
+# accumulates nothing and a warm restart restores nothing.
 # No entry_ticks (R-2): tp/sl detection is WS-primary / REST-backstop over
 # the real tick stream (see Exit Architecture below), not
 # track_price_breach() — the former Phase-1 t-bar-ticks input is gone.
@@ -2515,14 +2596,17 @@ loop every position_check_interval_seconds (config, default: 5s):
         remove from in_flight_orders
 
   For each open position:
-    1. Fetch current bars from trading API (entry → now; the API always
-       returns the full range, so this naturally becomes
-       position.bars_since_entry each call — no incremental bookkeeping
-       needed)
-
-    1a. Halt check — position-scoped only, not applied to new-entry
+    1.  Halt check — position-scoped only, not applied to new-entry
         candidates. API-primary, tick-rate fallback (see P-1's halt-status
         endpoint integration — utils.query_halt_status()):
+        # Was Step 1a. The former Step 1 (fetch bars entry → now) is GONE
+        # with bars_since_entry, its only product. Steps 2-4 keep their
+        # numbers, so nothing referring to them shifts; health_report.md's
+        # findings 8 and 25 now name this step as Step 1. The label keeps
+        # its old width so the block below is not re-indented.
+        # This step issues NO REST call — query_halt_status() is not a
+        # dbsec call and the fallback reads the WS tick buffer — so the
+        # Position Manager Loop is no longer a chart/min consumer at all.
 
         Once per Position Manager Loop iteration (not once per position —
         same single-shared-loop batching principle as the global polling
@@ -2660,6 +2744,14 @@ loop every position_check_interval_seconds (config, default: 5s):
                 # filled/partially filled through the resumption cross) —
                 # no action; the ordinary fill-tracking pass on this same
                 # loop's next cycle picks up whatever state it is in
+            # live_halt_episodes (db_schema.md) is written from this same
+            # transition: False → True INSERTs (ticker, date,
+            # halt_start=now, source), True → False sets halt_end=now on
+            # the open row. TICKER-scoped, so several positions on one
+            # ticker share one interval instead of each storing it, and
+            # source carries signal_source ('api' | 'tick_rate_fallback')
+            # so the evening comparison against trading_halts can tell the
+            # two apart. NEVER written into trading_halts itself.
             last_halt_state[ticker] = is_halted
         ```
 
@@ -2669,8 +2761,17 @@ loop every position_check_interval_seconds (config, default: 5s):
        # utils.track_price_breach(), which is now backtest-only.
        if a confirmed tp/sl breach is pending for this position:
            exit_reason = "take_profit" if breach_direction == "up" else "stop_loss"
-       elif bars elapsed >= config["execution"]["max_hold_bars"]:
-           exit_reason = "time_limit"        # wall-clock/bar-count — this loop, not WS
+       elif elapsed_minutes(position.fill_second, now)
+              - halted_minutes(position.ticker, position.fill_second, now)
+              >= config["execution"]["max_hold_bars"]:
+           exit_reason = "time_limit"        # wall-clock — this loop, not WS
+           # Elapsed minus halted minutes IS backtest's valid-bar count:
+           # build_effective_bar_sequence() excludes halt bars and counts
+           # no_trade bars, so live reading max_hold_bars as minutes and
+           # backtest counting valid bars are ONE quantity, not two
+           # conventions (execution_common.md). Halted minutes intersect
+           # [fill_second, now] with this ticker's live_halt_episodes; an
+           # open interval counts to now.
        elif now >= config["execution"]["session_close_exit_time"]:
            exit_reason = "session_end"       # wall-clock — this loop, not WS
        else:
@@ -2683,17 +2784,54 @@ loop every position_check_interval_seconds (config, default: 5s):
        # Exit Architecture, so the same "first time only" write applies at
        # this transition too (db_schema.md).
 
-    3. if config["live_mode"]["shadow_mode"]:
-           sell_rate = config["execution"]["sell_rate_tp"] if exit_reason == "take_profit" \
-                       else config["execution"]["sell_rate_sl"]
+    3. if config["live_mode"]["stage"] == "shadow":
+           # REAL-PATH-PARALLEL INCREMENTAL. simulate_exit_fill() consumes
+           # ticks FORWARD from its anchor and those do not exist at this
+           # instant, so it cannot resolve inline; deferring it to the
+           # evening batch is equally rejected, because caps, cash,
+           # cooldown, the circuit breaker and slot recycling all need
+           # terminal outcomes in-session. Shadow therefore walks the real
+           # path's beats with a tick poll where the broker poll sits, and
+           # THIS step only opens the window — Step 2 has already set
+           # status='exiting' and exiting_since. Settlement happens on a
+           # later cycle of this same loop.
+           sell_rate = execution.sell_rate_tp   if exit_reason == "take_profit"
+                  else execution.sell_rate_sl   if exit_reason == "stop_loss"
+                  else execution.sell_rate_neutral
+           # A clock-triggered exit has no direction, so time_limit and
+           # session_end must NOT fall through to _sl — doing so was
+           # contaminating the population _sl is fitted on
+           # (execution_common.md).
+           anchor    = position.exiting_since      # a TIME, never an index
+           reference = last print strictly before anchor, from the 1-tick
+                       buffer for this ticker
+           Each cycle, recompute STATELESSLY from the anchor (no cursor, no
+           residual counter — the window only grows, so an intermediate
+           answer is under-determined rather than wrong, and a warm restart
+           restores no state because the anchor is a durable column):
            weighted_avg_exit_price, filled, unfilled, _ = execution_common.simulate_exit_fill(
-               ticks_exit=..., ohlcv_exit=..., position_size=position.quantity,
-               breach_bundle_idx=..., breach_price=breach_price,
-               sell_rate=sell_rate, halts_df=...,
+               ticks_exit=<1-tick buffer, anchor forward>,
+               position_size=position.quantity,
+               exit_anchor_second=anchor, reference_price=reference,
+               sell_rate=sell_rate,
+               halts_df=<live_halt_episodes rows for this ticker>,
            )
-           log hypothetical exit to trade_log (is_shadow=TRUE), breach_price
-           also recorded alongside the simulated fill for future
-           realized-vs-simulated comparison
+           # ohlcv_exit is GONE — it had no reader (execution_common.md).
+           Settled when filled == position.quantity, or at SESSION END,
+           which is live's only available meaning for "ticks exhausted":
+           it cannot distinguish "not yet arrived" from "no more". An
+           unsettled shadow exit holds its slot to session end, exactly as
+           an unfilled real sell order does.
+           On settlement, in one pass over that same buffer:
+             - trade_log row written COMPLETE in a single INSERT
+               (is_shadow=TRUE), reference price recorded alongside the
+               simulated fill for realized-vs-simulated comparison
+             - exit_trigger_agreement_daily updated for this ticker: rerun
+               the 2-print guard and utils.track_price_breach() over the
+               full-tape buffer to obtain M and R against this exit's
+               observed L (db_schema.md)
+             - raw 1-tick rows ahead of the oldest remaining unresolved
+               anchor are released
        else:
            if config["execution"]["exit_order_type"] == "market":
                order_id = submit order via trading API: quantity=`position.quantity`
@@ -2712,12 +2850,15 @@ loop every position_check_interval_seconds (config, default: 5s):
            # escalation is a market order INSIDE regular hours and a k
            # ladder outside them, since the venue refuses a market order
            # outside the regular session (execution_common.md).
-           breach_price still logged for the same comparison purpose
-           # R-2: breach_price here is now the OBSERVED price of the
-           # confirming (2nd) breach tick from the WS/REST stream — a real
+           reference price still logged for the same comparison purpose
+           # R-2: for tp/sl this is the OBSERVED price of the confirming
+           # (2nd) breach tick from the WS/REST stream — a real
            # observation, not a bundle interpolation — improving the
-           # realized-vs-simulated comparison's quality. For time_limit/
-           # session_end exits (no breach), this field is not applicable.
+           # realized-vs-simulated comparison's quality. It GENERALISES to
+           # the last print before the trigger instant, which is defined
+           # for all four exit reasons, so the former "not applicable for
+           # time_limit/session_end" case no longer arises
+           # (execution_common.md).
 
     4. Log exit to inference_log
 ```
@@ -2949,11 +3090,32 @@ live_mode:
   halt_check_window_seconds:      60
   halt_heuristic_tpm:             10      # ticks/min below this → position.status='halted'
 
-  # Shadow mode (see Position Manager / Watchdog Loop shadow_mode branches
-  # and new health_report.md / ops doc for the comparison methodology)
-  shadow_mode:                    false
+  # Rollout stage (see Position Manager / Watchdog Loop stage branches and
+  # shadow_retraining.md for the comparison methodology). REPLACES the
+  # former `shadow_mode` boolean rather than sitting beside it: one fact
+  # behind two independently editable keys is what the shared `execution:`
+  # section exists to prevent, so this is the single declaration and every
+  # branch reads `stage == "shadow"`.
+  stage:                          shadow  # 'shadow' | 'pilot' | 'scale'
+                                          # Recorded to live_session_state
+                                          # at session start; Warm Restart
+                                          # compares the two and ABORTS on
+                                          # a mismatch, so a stage edited
+                                          # between a crash and a restart
+                                          # cannot silently switch the
+                                          # session's mode.
+                                          # Starting at 'pilot' or 'scale'
+                                          # while intraday_loss_limit_pct,
+                                          # consecutive_loss_limit and
+                                          # entries_per_hour_limit all sit
+                                          # at their 0 default is REFUSED
+                                          # at startup — R-4 required this
+                                          # in prose and had no mechanism
+                                          # to enforce it until one
+                                          # declarative key existed.
   shadow_duration_weeks:          0       # 0 = sync to class_balancer.outer_fold.test_weeks
                                           # (currently 6); >0 = explicit override
+                                          # A duration, not a mode — unaffected by the above
 
 # session_start_cash is not a config key — queried once from the trading
 # API at Session Lifecycle Step 1 and held fixed for the session (the
@@ -3032,6 +3194,18 @@ live_mode:
   finding 33 reports the previous day when called at session end. The
   canonical key list is the schema comment in `db_schema.md`, not this
   bullet
+- `live_halt_episodes` is written by the Position Manager Loop's halt check
+  as intervals open and close, and any interval still OPEN at a clean
+  shutdown is closed there, at the same layer as the `live_scan_daily`
+  write above. After a crash with no restart the row stays open, which
+  reads correctly as unresolved — no party observed a resumption. A crash
+  followed by a restart resolves it instead by replay (Warm Restart step b2)
+- `exit_trigger_agreement_daily` is written PER SETTLED EXIT rather than at
+  shutdown. Its L term is what the live trigger path actually consumed, an
+  observation that cannot be reconstructed afterwards from `tick_10`, so it
+  has to be captured while this session's own 1-tick buffer still holds the
+  window — which is also why the entry-side counterpart can live in the
+  evening batch and this cannot
 - Trade execution (buy/sell API calls) is LiveModeRunner's responsibility —
   Inferencer only returns InferenceResult
 - All inference_log writes include the active run_id

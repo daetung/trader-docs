@@ -722,6 +722,8 @@ PURGE_REGISTRY = {
     "bar_latency_daily":  ("date",   float("inf")),
     "feed_coverage_daily": ("date",  float("inf")),
     "live_scan_daily":    ("date",   float("inf")),
+    "live_halt_episodes": ("date",   float("inf")),
+    "exit_trigger_agreement_daily": ("date", float("inf")),
     "health_events":      ("date",   float("inf")),
     "alert_log":          ("date",   float("inf")),
     "train_log":          ("run_at", float("inf")),

@@ -158,7 +158,12 @@ def track_price_breach(
     Used directly by BacktestEngine (single threshold pair, immediate exit).
 
     Phase 1 — tick-level scan within t bar:
-        Iterate tick bundles from fill_bundle_idx+1 onward within the t bar.
+        Iterate tick bundles from the entry fill bundle onward, exclusive,
+        within the t bar. (Named by position rather than by
+        `fill_bundle_idx`: that argument no longer exists on
+        simulate_entry_fill(), which now takes a time-valued
+        entry_anchor_second and derives the index internally —
+        execution_common.md.)
         For each bundle: check if high >= tp_target or low <= sl_target.
         Ambiguity: if both thresholds satisfied within the same bundle,
             use ambiguity_priority to break the tie.
@@ -1217,8 +1222,9 @@ def query_halt_status(
     immediately.
 
     Called by:
-        - live_mode_runner.md's Position Manager Loop, Step 1a (halt check,
-          source-primary + tick-rate fallback)
+        - live_mode_runner.md's Position Manager Loop, Step 1 (halt check,
+          source-primary + tick-rate fallback; was Step 1a before the former
+          bar-fetch Step 1 was removed)
         - metadata_crawler.md's check_corporate_event_anomaly() (premarket
           quarantine check, P-8)
     """
@@ -1268,7 +1274,7 @@ def record_health_event(
           sample (health_report.md finding 27)
         - live_mode_runner.md's Broker Reconcile, on an unmatched broker order
           or position (finding 12)
-        - live_mode_runner.md's Position Manager Loop Step 1a, when a halted
+        - live_mode_runner.md's Position Manager Loop Step 1, when a halted
           position is carried past session_end (finding 14), and when a
           halted→tradable transition finds the in-flight exit order gone
           (finding 25)
@@ -1311,6 +1317,22 @@ def stitch_ticks(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame
     same-second, same-price-band activity within one bundle); recorded, not
     engineered around.
 
+    THAT JUSTIFICATION DOES NOT CARRY TO 1-TICK DATA, where a row is one
+    print: same-second, same-price, same-size prints are ordinary rather
+    than implausible, so the limitation would stop being negligible. It
+    does not become a problem, because 1-tick responses carry an
+    INTRA-SECOND ORDINAL — the `nnnn` tail of the vendor's cont_key,
+    `YYYYMMDDHHMMSSnnnn` — which is the same concept `tick_10.seq_id`
+    encodes as groupby(ticker, date, hour).cumcount(). The `if present`
+    branch below is therefore PRESENT on the live 1-tick path, and the
+    ordinal is a true key there rather than a sort aid.
+    Live buffers hold SEALED bundles and 1-tick rows only. A vendor 10-tick
+    response's terminal bundle is unsealed and its `hour` and OHLCV update
+    with every arriving print, so the same bundle fetched twice does not
+    compare equal under the rule above and both copies survive as a
+    phantom; it is discarded at the source rather than handled here
+    (live_mode_runner.md).
+
     Returns: existing with incoming appended, deduped per the rule above,
     re-sorted by (hour, seq_id) if present.
     """
@@ -1341,6 +1363,11 @@ def stitch_ticks(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame
   LiveModeRunner's Position Manager Loop.)
 - `stitch_ticks()`'s tick-identity rule (hour + full OHLCV, not hour alone)
   applies wherever REST ticks are concatenated — see that function above.
+  At 1-tick granularity the rule is completed by the intra-second ordinal
+  rather than weakened: the tuple alone cannot separate two identical
+  same-second prints, which the ordinal does. Only SEALED bundles are ever
+  stitched — an unsealed terminal bundle mutates between fetches and would
+  dedup as two distinct rows
 - `track_label_breach()` is the high-level wrapper for two-stage label detection (Labeler only)
 - `generate_run_id()` not called inside parallel workers or sequential fold loops —
   coordinator pre-generates structured run_ids in all optimizer contexts
