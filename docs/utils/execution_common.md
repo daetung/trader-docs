@@ -739,7 +739,8 @@ def simulate_exit_fill(
     material is unknown at design time and should be estimated from
     realized-vs-simulated fill data during shadow/pilot calibration (see
     shadow_retraining.md's fit_execution_params() — sell_rate_tp/sell_rate_sl
-    are refit there alongside buy_rate/cancel_after_seconds).
+    and sell_rate_neutral are refit there alongside
+    buy_rate/cancel_after_seconds).
     """
     ...
 ```

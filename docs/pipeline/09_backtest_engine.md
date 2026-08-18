@@ -977,15 +977,36 @@ requested_quantity       INTEGER,   -- quantity actually SUBMITTED, i.e. after
   never queries this table for real-time decisions; its live-mode halt signal
   is a separate tick-rate heuristic scoped to open positions (see
   live_mode_runner.md's Position Manager Loop)
-- Backtest-vs-live exit asymmetry (R-2) — two DISTINCT kinds, do not
-  conflate: (1) DATA-GRANULARITY, irreducible — backtest has only 10-tick
-  OHLC bundles (`tick_10`) and cannot see intra-bundle spikes that live's
-  true WS/REST tick stream detects; shadow mode quantifies this residual.
-  (2) The FORMER backstop-vs-WS filter asymmetry (a bundle-based backstop
-  would have been less sensitive than WS's per-tick 2-print guard) does
-  NOT apply here — it never shipped; the live REST backstop polls
-  individual ticks at WS granularity with the same 2-print guard from the
-  start (see live_mode_runner.md's Exit Architecture), so only latency
-  differs between WS and its own backstop, not accuracy. Only asymmetry
-  (1) is a live open residual; it is inherent to the historical dataset's
-  granularity, not a design gap.
+- Backtest-vs-live exit asymmetry (R-2) — THREE distinct kinds, do not
+  conflate. (1) ORDERING WITHIN A BUNDLE, irreducible — backtest reads
+  10-tick `tick_10` bundles, and `track_price_breach()`'s Phase 1 tests
+  `bundle.high >= tp_target or bundle.low <= sl_target`, so an intra-bundle
+  extreme IS seen; what is lost is the ORDER of two extremes inside one
+  bundle, which is exactly what `is_ambiguous` records and
+  `ambiguity_priority` resolves. (Previously stated as backtest being unable
+  to SEE intra-bundle spikes, and as live's stream being the "true" one —
+  both wrong: the bundle carries the extreme, and the direction can invert,
+  since a print in the half the WS entitlement drops is absent from live's
+  WS path while still reflected in that bundle's high/low.)
+  (2) TAPE COMPLETENESS, open — the free real-time entitlement carries
+  roughly half the trade prints while the REST tick endpoint is
+  vendor-guaranteed complete, so live's WS path, live's REST backstop and
+  backtest's `tick_10` do not run on the same tape. Registered in
+  open_items.md as "WS/REST tape asymmetry and exit-trigger path
+  transitions"; `exit_trigger_agreement_daily`'s L-vs-M term is what
+  measures it.
+  (3) The FORMER backstop-vs-WS FILTER asymmetry (a bundle-based backstop
+  would have been less sensitive than WS's per-tick 2-print guard) does NOT
+  apply — it never shipped; the live REST backstop polls individual ticks at
+  WS granularity with the same 2-print guard from the start (see
+  live_mode_runner.md's Exit Architecture). That premise stands; what does
+  NOT follow from it, and used to be asserted here, is that only latency
+  therefore differs between WS and its backstop — identical GRANULARITY and
+  identical FILTER do not imply identical TAPE, which is (2). The
+  corresponding sentence in live_mode_runner.md's Exit Architecture is
+  deliberately left in place and marked false by the open item instead; it
+  is corrected HERE because this file has no WS/REST branch for it to
+  license, so removing it exposes nothing.
+  (1) and (2) are both live open residuals. (1) is inherent to the
+  historical dataset's granularity, not a design gap; (2) is a design gap
+  and is blocked on shadow-period data.

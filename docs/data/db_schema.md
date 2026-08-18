@@ -438,7 +438,8 @@ CREATE TABLE IF NOT EXISTS batch_runs (
 -- keys on — see live_mode_runner.md.
 
 -- Fitted execution-simulation parameters (buy_rate, sell_rate_tp, sell_rate_sl,
--- cancel_after_seconds), refit periodically from pilot-stage predicted-vs-actual
+-- sell_rate_neutral, cancel_after_seconds), refit periodically from
+-- pilot-stage predicted-vs-actual
 -- fill comparisons (see trade_log.predicted_* columns and
 -- shadow_retraining.md's fit_execution_params()). The `execution:` config
 -- block values (execution_common.md) are seed defaults only, used until the
@@ -449,7 +450,7 @@ CREATE TABLE IF NOT EXISTS batch_runs (
 --   (fitted-parameter history).
 CREATE TABLE IF NOT EXISTS execution_params (
     param_name   VARCHAR   NOT NULL,  -- 'buy_rate' | 'sell_rate_tp' | 'sell_rate_sl' |
-                                      -- 'cancel_after_seconds'
+                                      -- 'sell_rate_neutral' | 'cancel_after_seconds'
     value        DOUBLE    NOT NULL,
     fitted_at    TIMESTAMP NOT NULL,
     sample_size  INTEGER   NOT NULL,  -- cumulative pilot-stage trade count used —

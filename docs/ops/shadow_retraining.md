@@ -74,8 +74,8 @@ regardless of whether the thresholds are armed. Same class of stage
 precondition as Stage 3's "at least one successful fit_execution_params()".
 
 **Execution-parameter calibration** (`buy_rate`, `sell_rate_tp`,
-`sell_rate_sl`, `cancel_after_seconds` — see execution_common.md's
-`execution:` config). Real fills only exist from this stage onward, which
+`sell_rate_sl`, `sell_rate_neutral`, `cancel_after_seconds` — see
+execution_common.md's `execution:` config). Real fills only exist from this stage onward, which
 is what makes this calibration possible at all — Shadow (Stage 1) has no
 real fill to compare a prediction against, so this is Pilot-only, not
 something Shadow's comparison already covers (Shadow's comparison is
@@ -112,7 +112,7 @@ runs — a fit needs a population, not one trade.
 >=3-trading-day convention as the divergence check), but the **data it
 fits on accumulates across the whole pilot period rather than resetting
 each week** — pilot trade counts are small enough that a strict per-week
-window would rarely clear the sample-size gates below. Each of the four
+window would rarely clear the sample-size gates below. Each of the five
 parameters is gated independently, using only the trade_log rows relevant
 to it:
 
@@ -125,7 +125,7 @@ sell_rate_neutral:               gated on cumulative exit_reason IN
 ```
 
 A parameter whose gate isn't met yet is left unchanged this cycle — the
-other three (if their own gates are met) still refit independently.
+other four (if their own gates are met) still refit independently.
 `exit_reason='entry_canceled'` rows (see db_schema.md) are included in the
 entry-count denominator for `buy_rate`/`cancel_after_seconds` — a fully-
 unfilled entry is itself a direct, relevant observation for those two
@@ -208,7 +208,7 @@ retraining cadence (below) begins governing the deployed model from this
 point.
 
 **Gate on entering Stage 3**: at least one successful `fit_execution_params()`
-refit (any of the four parameters clearing its sample-size gate at least
+refit (any of the five parameters clearing its sample-size gate at least
 once) must have occurred during Pilot. Moving to Scale before any
 calibration has happened defeats Pilot's purpose — exposure would increase
 on execution assumptions that were never actually checked against real
@@ -273,7 +273,7 @@ the current market regime.
   is no pilot-specific config key
 - Calendar and divergence retraining triggers are independent — either
   firing is sufficient; they are not required to agree
-- `fit_execution_params()`'s four parameters are gated and refit
+- `fit_execution_params()`'s five parameters are gated and refit
   independently — one parameter clearing its sample-size threshold does
   not imply or require the others have too
 - `fit_execution_params()`'s sample accumulates across the entire pilot

@@ -59,6 +59,9 @@ prints; the REST tick endpoint is vendor-guaranteed complete. Live's exit
 trigger therefore runs on a different tape depending on which path is
 active, and on a different tape again from backtest's.
 
+The proposition exists in TWO copies, treated differently, and both
+locations are named here so neither reads as authoritative by omission.
+
 `live_mode_runner.md`'s Exit Architecture asserts the opposite — "both paths
 consume identical tick data with an identical filter, there is NO
 accuracy/filter asymmetry between them, only latency differs". That sentence
@@ -66,6 +69,14 @@ is deliberately LEFT IN PLACE for now, and this item is what marks it false.
 It is not a description but a JUSTIFICATION: it is what licenses swapping the
 two paths with no rule governing the swap, so removing it exposes an
 undesigned region rather than fixing anything.
+
+`09_backtest_engine.md`'s R-2 Constraint carried the same claim and HAS been
+corrected, because the reasoning above does not transfer: that file has no
+WS/REST branch, so the sentence licensed nothing there and deleting it left
+no hole. Leaving both would have been worse than leaving neither — a reader
+grepping the proposition would meet two copies, one marked false and one
+not, and the unmarked one reads as authoritative. Its R-2 Constraint now
+carries three kinds rather than two, this tape asymmetry being the second.
 
 The 2-print guard breaks in BOTH directions on a half tape, so the error has
 no fixed sign. A false positive when an intervening sub-threshold print was
