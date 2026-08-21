@@ -225,9 +225,10 @@ def is_tradable(ticker: str, db_conn) -> bool:
 def compute_position_size(
     balance: float,
     fill_price: float,
+    mgnrt: float,
     t_bar_volume: int,
-    ticker_notional: float,
-    total_notional: float,
+    ticker_margin_used: float,
+    total_margin_used: float,
     position_size_cash_pct: float,
     position_size_vol_pct: float,
     per_ticker_share_cap_pct: float,
@@ -237,57 +238,100 @@ def compute_position_size(
     Compute per-trade buy quantity. Shared by BacktestEngine and
     LiveModeRunner — same formula, different `balance` source:
         backtest: initial_cash (config, fixed for the whole run)
-        live:     session_start_cash (queried once from the trading API at
-                  session start, fixed for the session)
+        live:     session_start_cash — the UNCORRECTED DEPOSIT
+                  (balance-margin's AstkOrdAbleAmt), queried once at session
+                  start and fixed for the session
     `balance` is deliberately NOT a running/decrementing value — see
     Constraints below for why, and see the separate funds-availability gate.
 
-    cash_based = floor((balance * position_size_cash_pct) / fill_price)
-    vol_based  = floor(t_bar_volume * position_size_vol_pct)
+    EVERY BALANCE-DERIVED TERM IS IN MARGIN UNITS. One definition governs:
+
+        margin_of(price, qty, rate) = price * qty * (rate / 100)
+
+    so the three of them read as ONE statement: the margin this entry locks
+    stays within a fraction of the deposit. `balance` stays the uncorrected
+    deposit in all three; the leverage correction lives in the denominator
+    and in the deductions, never in `balance` itself.
+
+        m_now = fill_price * (mgnrt / 100)
+
+    cash_based = floor((position_size_cash_pct * balance) / m_now)
+    vol_based  = floor(t_bar_volume * position_size_vol_pct)   # UNCHANGED
 
     per_ticker_share_cap_pct == 0 → ticker_cap_qty = inf (uncapped)
     else:
         ticker_cap_qty = floor(
-            max(0, per_ticker_share_cap_pct * balance - ticker_notional)
-            / fill_price
+            max(0, per_ticker_share_cap_pct * balance - ticker_margin_used)
+            / m_now
         )
 
     exposure_cap_pct == 0 → exposure_cap_qty = inf (uncapped)
     else:
         exposure_cap_qty = floor(
-            max(0, exposure_cap_pct * balance - total_notional)
-            / fill_price
+            max(0, exposure_cap_pct * balance - total_margin_used)
+            / m_now
         )
 
     quantity = min(cash_based, vol_based, ticker_cap_qty, exposure_cap_qty)
 
+    position_size_cash_pct reaching mgnrt / 100 is therefore EXACTLY full
+    deposit deployment, and is where the liquidation-defence ceiling sits:
+    above it an entry draws on credit rather than on its own capital.
+
+    Pre-correcting `balance` instead (effective_balance = balance *
+    100 / mgnrt) was REJECTED although algebraically equivalent for
+    cash_based and ticker_cap: it makes `balance` per-ticker, breaking its
+    "fixed reference for the run/session" constraint, and it gives
+    exposure_cap — an ACCOUNT-WIDE limit — a per-ticker baseline.
+
+    At mgnrt == 100 every term reduces to the previous notional formula
+    EXACTLY (m_now == fill_price, margin_of == notional), so BacktestEngine
+    passes the constant 100 and needs no branch. That is why the former
+    live-only `sizing_basis` key has no successor rather than a backtest
+    counterpart — there is nothing left to select between.
+
     Args:
         balance:            fixed reference capital (see above) — not a
-                             running/decrementing value
+                             running/decrementing value, and NOT
+                             margin-corrected
         fill_price:          slippage-adjusted entry price
+        mgnrt:               this ticker's margin rate as a PERCENT. Live
+                             passes live_ticker_terms.mgnrt (the vendor's
+                             Mgnrt0 — see live_mode_runner.md's Per-Ticker
+                             Trading Terms); BacktestEngine passes the
+                             constant 100. NOT a config key: it is a
+                             per-ticker vendor fact, and no account-level
+                             rate exists to hold instead.
         t_bar_volume:        ohlcv_1min volume of the t bar
-        ticker_notional:     sum(entry_price_i * quantity_i) across this
-                             ticker's currently-open positions, PLUS its
-                             submitted-but-unfilled ones (R-5: live
-                             live_positions status 'pending'/'partial_open'
-                             — priced at limit_price, or p_entry for a
-                             market order). Pending notional is reserved
+        ticker_margin_used:  sum(margin_of(entry_price_i, quantity_i,
+                             rate_i)) across this ticker's currently-open
+                             positions, PLUS its submitted-but-unfilled ones
+                             (R-5: live live_positions status
+                             'pending'/'partial_open' — priced at
+                             limit_price, or p_entry for a market order).
+                             Each row contributes at its OWN PINNED RATE
+                             (live_positions.entry_mgnrt), never the current
+                             one, so an open position's margin cannot move
+                             retroactively. Pending margin is reserved
                              capacity: excluding it lets a burst of
                              simultaneous submissions breach the cap on
                              aggregate fill, which is inert only while
                              per_ticker_share_cap_pct is 0 and becomes real
                              the moment Pilot sets it. BacktestEngine has no
                              pending state, so there the two sums coincide.
-        total_notional:      the same sum across all positions, any ticker,
+        total_margin_used:   the same sum across all positions, any ticker,
                              on the same open-plus-pending basis
-        position_size_cash_pct:   fraction of balance per trade (cash leg)
+        position_size_cash_pct:   fraction of balance per trade, MEASURED IN
+                             MARGIN (cash leg)
         position_size_vol_pct:    fraction of t bar volume per trade
-                             (liquidity leg)
-        per_ticker_share_cap_pct: 0 = disabled; >0 = cap on this ticker's
-                             cumulative notional as a fraction of balance
-        exposure_cap_pct:    0 = disabled; >0 = cap on total notional
-                             across all open positions as a fraction of
+                             (liquidity leg) — the one term the margin unit
+                             does not touch, being a liquidity bound rather
+                             than a capital one
+        per_ticker_share_cap_pct: 0 = disabled; >0 = cap on the margin this
+                             ticker's positions lock, as a fraction of
                              balance
+        exposure_cap_pct:    0 = disabled; >0 = cap on margin locked across
+                             all open positions, as a fraction of balance
 
     Returns:
         int quantity (>= 0)
@@ -318,8 +362,32 @@ def check_funds_available(
               models a single deployment rather than a book that turns
               over, and silently stops trading partway through any run
               with initial_cash > 0.
-    live:     available_cash is queried fresh from the trading API
-              immediately before this check.
+    live:     available_cash is COMPUTED, not observed:
+
+                  available_cash = AstkOrdAbleAmt * (100 / mgnrt) - @cost
+
+              `AstkOrdAbleAmt` from inquiry/balance-margin (3 TPS,
+              account-scoped), queried fresh immediately before this check;
+              `mgnrt` and `@cost` from this ticker's persisted
+              live_ticker_terms row (live_mode_runner.md's Per-Ticker
+              Trading Terms). Reading AstkOrdAbleAmt1 directly would be
+              exact and need no arithmetic, but that field exists ONLY on
+              able-orderqty, so a direct read puts a 2 TPS per-ticker call
+              back on the entry path — the burst the acquisition point was
+              moved to avoid. The computed figure runs ALWAYS-HIGH, `@cost`
+              being subtractive and derived once from possibly-stale
+              conditions, so the bias is one-sided toward over-permitting;
+              the order-time observation is what surfaces drift.
+
+    THE COMPARISON STAYS NOTIONAL AGAINST NOTIONAL. compute_position_size()'s
+    margin-unit form does NOT extend here. Its three balance-derived terms
+    are one question in three forms, so a split unit there risks one being
+    fixed alone; this gate asks a different question — what can actually be
+    paid now — and `available_cash` above is already leverage-inclusive.
+    Multiplying the left side by mgnrt / 100 would apply the same factor
+    twice: returning the right side to deposit terms leaves `@cost`
+    dimensionally wrong, and leaving it as-is loosens the gate by exactly
+    that factor.
 
     use_all_cash:
         quantity * fill_price <= available_cash → always (True, quantity),
@@ -410,23 +478,12 @@ execution:
                                    # which names this key as where its
                                    # measurement is recorded. max_tickers: 0
                                    # (unlimited) clamps to this in live.
-  sizing_basis:          "equity"  # R-8: "equity" | "buying_power". LIVE ONLY
-                                   # — backtest has no margin and no
-                                   # margin_ratio to query, so BacktestEngine
-                                   # ignores this key and always sizes on
-                                   # initial_cash directly.
-                                   # "equity": divide the broker's reported
-                                   # balance by the session's margin_ratio
-                                   # before passing it as compute_position_size
-                                   # ()'s `balance`, so "fully deployed" means
-                                   # 100% of OWN capital.
-                                   # Default is equity because the failure is
-                                   # one-sided: what the balance endpoint
-                                   # returns is still unverified
-                                   # (api_contract_checklist.md), and reading
-                                   # buying power as if it were cash silently
-                                   # multiplies intended exposure by the
-                                   # leverage factor.
+  # sizing_basis removed. It existed to select an INTERPRETATION of a
+  # balance figure whose meaning was unverified. Both fields are now named
+  # outright — AstkOrdAbleAmt is the deposit, AstkOrdAbleAmt1 the buying
+  # power — so there is nothing to select between, and the leverage term
+  # enters compute_position_size() as a per-ticker argument rather than as a
+  # session-wide interpretation of `balance`.
   # R-4 circuit-breaker thresholds. All THREE default to 0 = NO LIMIT, matching
   # exposure_cap_pct / per_ticker_share_cap_pct's "off until Pilot" pattern.
   # 0 is unambiguous for each: "trip after 0 consecutive losses" or "after a 0%
@@ -574,9 +631,9 @@ execution:
                                     # entry_order_type. NOT hard-fixed to
                                     # "market": an unprotected market order
                                     # carries slippage risk of unmeasured
-                                    # size (same one-sided-error posture as
-                                    # margin_ratio_fallback choosing 4.0 over
-                                    # 1.0 — see Session Start Probes). No
+                                    # size (the same one-sided-error posture
+                                    # this spec set takes wherever a bound
+                                    # stands in for an unknown). No
                                     # gap_type/gap_value counterpart: when
                                     # "limit", the resting price is a SPREAD
                                     # POSITION tracked against live bid/ask
@@ -864,9 +921,10 @@ documentation rather than assumed:
   entered alongside the other bid/ask asymmetries. Stage 2, authority: the vendor's own insufficient-funds refusal is
   the gate's real outcome, which the entry-side rejection path already
   anticipates (`live_mode_runner.md`). The margin is set GENEROUS
-  deliberately — the same one-sided-error posture as `margin_ratio_fallback`
-  choosing 4.0 over 1.0. Too large costs an occasionally under-sized entry;
-  too small costs a vendor rejection that is already handled.
+  deliberately — the same one-sided-error posture this spec set takes
+  wherever a bound stands in for an unknown. Too large costs an occasionally
+  under-sized entry; too small costs a vendor rejection that is already
+  handled.
 - **A market SELL is not converted.** The vendor states the conversion for
   buys only and its reason is buy-specific, so the exit-side escalation's
   final-backstop guarantee holds wherever a market order is permitted at
@@ -916,6 +974,12 @@ bid/ask model to mirror them. If backtest is later extended to replay
   and LiveModeRunner both import from here
 - `is_tradable()` is checked before sizing, not after — an untradable ticker
   should never reach `compute_position_size()` at all
+- The per-ticker terms gate (live_mode_runner.md's Per-Ticker Trading Terms)
+  is evaluated at the SAME POINT but BESIDE `is_tradable()`, never folded
+  into it: that function is a pure `ticker_cik_map` read, and mixing session
+  state into it changes what it is. The gate is structural rather than a
+  policy layered on top — a ticker with no `live_ticker_terms` row for today
+  has no `mgnrt` to pass, so it cannot be sized at all
 - `compute_position_size()` and `check_funds_available()` are intentionally
   separate — `balance` in sizing is fixed for the run/session; only the
   funds-availability gate uses a running/decrementing or freshly-queried value
@@ -924,6 +988,13 @@ bid/ask model to mirror them. If backtest is later extended to replay
 - `check_funds_available()`'s `use_all_cash` defaults to `True` — the default
   behavior sizes a trade down to fit remaining cash rather than skipping it
   outright; set `False` to restore the older all-or-nothing behavior
+- A quantity reduced by `use_all_cash` does NOT re-enter
+  `compute_position_size()`'s caps. All four sizing terms are monotone in
+  quantity and combined by `min()`, and `margin_of()` is linear in quantity
+  so the margin-unit form preserves that — any value at or below the
+  returned `quantity` satisfies all four by construction. Sizing sets the
+  ceiling; the gate only lowers it. Stated because nothing said so before
+  and a reader had to derive it
 - `p_entry`'s three roles SPLIT when `late_entry_enabled` is true, having
   coincided until now. As the `entry_points` primary-key component and
   detection record: t-bar open, UNCHANGED. As the label anchor in
@@ -934,8 +1005,8 @@ bid/ask model to mirror them. If backtest is later extended to replay
   value passed there changes even though the signature does not.
   `trade_log` already records the real fill and needs nothing
 - Entry-side call order, LiveModeRunner ONLY (N-5 — deliberately not
-  BacktestEngine; see below): `is_tradable()` →
-  `compute_position_size(fill_price=p_entry, ...)` →
+  BacktestEngine; see below): `is_tradable()` + the terms gate →
+  `compute_position_size(fill_price=p_entry, mgnrt=<this ticker's>, ...)` →
   `check_funds_available(quantity, p_entry, ...)` →
   `simulate_entry_fill(quantity=adjusted_quantity, p_entry=p_entry, ...)`.
   Sizing and the funds gate both use `p_entry` (always known immediately,

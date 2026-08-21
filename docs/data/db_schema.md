@@ -667,11 +667,13 @@ CREATE TABLE IF NOT EXISTS experiment_log (
     -- Column naming: gate_blocked_* / breaker_* prefixes group these at a
     -- glance as the table grows, and gate_blocked_* matches
     -- inference_log.gate_result's own values name-for-name.
-    -- Five counters, not ten: `gate_result` has ten non-'submitted'
-    -- values, but five have no counter here — 'freeze', 'not_tradable' and
-    -- 'bar_integrity' have no backtest concept at all (N-5, see
-    -- execution_common.md; 'bar_integrity' is a live bar-arrival-latency
-    -- verdict, and backtest has no bar arrival to be late);
+    -- Five counters, not eleven: `gate_result` has eleven non-'submitted'
+    -- values, but six have no counter here — 'freeze', 'not_tradable',
+    -- 'bar_integrity' and 'no_terms' have no backtest concept at all (N-5,
+    -- see execution_common.md; 'bar_integrity' is a live
+    -- bar-arrival-latency verdict, and backtest has no bar arrival to be
+    -- late; 'no_terms' is the outcome of a vendor call backtest never
+    -- makes);
     -- 'breaker' is evaluated in backtest but never enforced (see
     -- breaker_* below, which reports the underlying metrics instead of a
     -- blocked-count that would imply enforcement); 'error' has no
@@ -1009,6 +1011,35 @@ CREATE TABLE IF NOT EXISTS inference_log (
                                        --                      tp/sl runs off the WS
                                        --                      tick stream, not the
                                        --                      bar channel.
+                                       --   'no_terms'       : no live_ticker_terms
+                                       --                      row for this ticker
+                                       --                      today — its margin
+                                       --                      rate was never
+                                       --                      acquired, or
+                                       --                      acquisition failed
+                                       --                      and the ticker was
+                                       --                      given up for the
+                                       --                      session
+                                       --                      (live_mode_runner.md's
+                                       --                      Per-Ticker Trading
+                                       --                      Terms). Named for the
+                                       --                      OBSERVED condition,
+                                       --                      not an inferred
+                                       --                      cause: the absence
+                                       --                      also covers a ticker
+                                       --                      first-listed in the
+                                       --                      same cycle whose row
+                                       --                      is not yet written,
+                                       --                      for which
+                                       --                      'acquisition_failed'
+                                       --                      would be false. NOT
+                                       --                      split by cause —
+                                       --                      live_session_state
+                                       --                      .session_diagnostics
+                                       --                      already carries
+                                       --                      attempts, failures
+                                       --                      and the blocked
+                                       --                      tickers by name.
                                        --   'sizing_zero'    : quantity resolved to 0
                                        --   'funds'          : check_funds_available()
                                        -- A COLUMN rather than new event values,
@@ -1196,6 +1227,28 @@ CREATE TABLE IF NOT EXISTS live_positions (
                                      --   live_mode_runner.md's In-flight order
                                      --   tracking), and it is what trade_log's own
                                      --   requested_quantity is written from.
+    entry_mgnrt  DOUBLE NOT NULL,    -- the margin rate (vendor Mgnrt0, PERCENT)
+                                     --   in force when this entry was sized;
+                                     --   pinned at entry, or at submission for
+                                     --   a 'pending' row, and NEVER revised.
+                                     --   NOT NULL because sizing cannot run
+                                     --   without it (execution_common.md's
+                                     --   compute_position_size() takes it as
+                                     --   `mgnrt`), so a row existing with no
+                                     --   value is unreachable. Written for
+                                     --   SHADOW rows too: shadow omits the real
+                                     --   order, not the sizing path.
+                                     --   DISTINCT from live_ticker_terms.mgnrt
+                                     --   below, and neither may be dropped for
+                                     --   the other — this is what THAT ENTRY
+                                     --   ACTUALLY USED, fixed against any later
+                                     --   observation; that one is what was
+                                     --   OBSERVED for the ticker that session,
+                                     --   and is the baseline the order-time
+                                     --   check compares against. They hold
+                                     --   equal values whenever Mgnrt0 is 100,
+                                     --   which is exactly when the duplication
+                                     --   looks removable and is not.
     is_shadow    BOOLEAN NOT NULL DEFAULT FALSE,
                                      -- fixed at row creation from
                                      --   live_mode.stage == 'shadow'. Same
@@ -1314,18 +1367,38 @@ CREATE TABLE IF NOT EXISTS live_session_state (
                                           -- there would dissolve the
                                           -- distinction it is built on.
                                           -- Keys: clock_offset_start,
-                                          -- clock_offset_end, margin_ratio,
+                                          -- clock_offset_end,
                                           -- retention_boundary (each probe also
                                           -- flagged 'disabled' | 'succeeded' |
                                           -- 'fell_back', so "never ran" and
                                           -- "ran and fell back" stay distinct —
                                           -- the fallbacks are safe but they
-                                          -- silently change sizing and gap-fill
+                                          -- silently change gap-fill
                                           -- behaviour); the finding-5
                                           -- tier-fallback summary; finding 8's
                                           -- halt-check source counts; finding
-                                          -- 22's dropped-row count; and
-                                          -- restart_count.
+                                          -- 22's dropped-row count; the
+                                          -- per-ticker terms-acquisition tally
+                                          -- — first-listing attempts, failures,
+                                          -- and THE BLOCKED TICKERS BY NAME
+                                          -- (live_mode_runner.md's Per-Ticker
+                                          -- Trading Terms); and restart_count.
+                                          -- margin_ratio is GONE from this list:
+                                          -- the margin rate is per-ticker with
+                                          -- no account-level counterpart, so
+                                          -- there is no session scalar to hold.
+                                          -- It lives in live_ticker_terms, and
+                                          -- per position in
+                                          -- live_positions.entry_mgnrt.
+                                          -- The blocked-ticker list sits here
+                                          -- rather than in live_scan_daily
+                                          -- because that table's grain is (date)
+                                          -- with scalar metric columns and
+                                          -- cannot hold names, and splitting the
+                                          -- count there from the names here
+                                          -- would put one fact in two places
+                                          -- under a length-agreement
+                                          -- constraint.
                                           -- clock_offset_end is written NULL at
                                           -- session start rather than left
                                           -- absent, so its absence at report
@@ -1667,6 +1740,56 @@ CREATE TABLE IF NOT EXISTS live_halt_episodes (
 -- No run_id: a market observation rather than a run artifact, and a warm
 --   restart must be able to write the same row idempotently.
 -- No reason_code: the heuristic cannot produce one.
+
+-- Per-ticker trading terms, as published by the vendor and observed ONCE PER
+-- TICKER PER SESSION at watchdog first listing (live_mode_runner.md's
+-- Per-Ticker Trading Terms). Valid for that session; the row's existence for
+-- (ticker, date) is what the entry-side terms gate tests, and its ABSENCE is
+-- how a failed or given-up acquisition is represented — there is no
+-- provenance column and no nullable rate, so the state space is two states:
+-- terms held, or not.
+-- Written by LiveModeRunner, both columns from ONE able-orderqty response in
+-- one transaction. order_cost is DERIVED rather than modelled: the same
+-- response carries AstkOrdAbleAmt1 beside Mgnrt0, so solving
+--   AstkOrdAbleAmt * (100 / Mgnrt0) - @cost = AstkOrdAbleAmt1
+-- against it yields the cost term on a call already being made.
+-- NOT merged into live_halt_episodes above despite the shared (ticker, date)
+-- axis: that table's key is INTERVAL-shaped (halt_start a key component,
+-- halt_end NULL meaning unresolved) and one ticker can carry several halts a
+-- session, so a session-scalar would need a dummy start and a permanently
+-- NULL end.
+-- NOT named *_daily: feed_coverage_daily, bar_latency_daily and
+-- exit_trigger_agreement_daily are daily AGGREGATES; this is a session
+-- constant observed once.
+-- WIDE COLUMNS rather than (metric, value): both values arrive together in
+-- one response, so EAV's independent-arrival advantage never applies, there
+-- are only two of them, and both are numeric.
+-- The account-level 100% override is NOT stored — Mgnrt0 already
+-- incorporates it and reads 100 when it is off, so a separate flag would
+-- duplicate the rate.
+-- Retention: purge-registry member — date_column `date`, retention_days: inf
+--   (see metadata_crawler.md's evening purge stage). Same treatment as
+--   live_halt_episodes: an observation history whose loss costs visibility
+--   rather than correctness. NOT session-scoped — api_contract_checklist.md's
+--   Mgnrt0-invariance row uses these rows as its comparison baseline, which a
+--   session-scoped purge would delete.
+CREATE TABLE IF NOT EXISTS live_ticker_terms (
+    ticker      VARCHAR   NOT NULL,
+    date        VARCHAR   NOT NULL,   -- 'YYYYMMDD', session date
+    mgnrt       DOUBLE    NOT NULL,   -- vendor Mgnrt0 (적용증거금률), PERCENT.
+                                      --   100 = no leverage. Taken AS-IS: there
+                                      --   is no account-level rate to combine
+                                      --   it with (OtptItemNm1 is a label
+                                      --   string, not a number).
+    order_cost  DOUBLE    NOT NULL,   -- the @cost term above. NOT NULL because
+                                      --   a row exists only when the response
+                                      --   was whole, and a whole response
+                                      --   carries both values.
+    observed_at TIMESTAMP NOT NULL,
+    PRIMARY KEY (ticker, date)
+);
+-- No run_id, for live_halt_episodes' reason: a market observation rather than
+--   a run artifact, and a warm restart must rewrite the same row idempotently.
 
 -- Exit-trigger agreement — how far live's exit triggering diverges from
 -- backtest's, DECOMPOSED into its two causes. Both change at the

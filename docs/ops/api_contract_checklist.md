@@ -66,8 +66,8 @@ outranks a shaky one that degrades gracefully.
 | T-1 | The REST tick endpoint returns the same granularity and schema as the WS trade stream | `live_mode_runner.md` Exit Architecture | **A** | Pull the same window from both, compare tick counts and fields | — (no key; a mismatch needs a normalisation layer, not a value) | |
 | T-2 | Full-range-since-last-query retention: how far back, and what a first-ever query returns | Warm Restart gap-fill, Feed Outage Recovery | **B** | Self-measuring — the session-start retention probe records the oldest timestamp actually returned | `live_mode.retention_probe.assumed_days` (fallback only) | |
 | T-3 | ~~Throughput ceiling, assumed ~100 tickers/sec~~ | ~~Chunked fetches; Eager Pool~~ | **RETIRED** | Nothing to verify — see below | — (key deleted) | **Retired** — premise gone |
-| T-4 | What the balance query returns: cash, buying power, or settled funds | `session_start_cash` → `compute_position_size()` | **B** | Compare the returned figure against the broker's own statement | `execution.sizing_basis` selects the interpretation | |
-| T-5 | Margin ratio is obtained PER TICKER from `inquiry/able-orderqty`, and combines with the account-level figure to yield the effective requirement | Position sizing — see `open_items.md`'s margin-ratio item | **B** | Call it for a ticker with and without an open position; confirm the returned figure moves, and reconcile against the account-level value | — (key deleted with `margin_ratio_url`) | |
+| T-4 | Whether `AstkOrdAbleAmt` includes UNSETTLED SELL PROCEEDS — the settled-funds axis, the part of the original cash/buying-power/settled question still open | `session_start_cash` → `compute_position_size()` | **B** | `inquiry/deposit-detail` (CAZCQ01400, TPS 2, no input) returns a D+0..D+4 ladder — `DpsBaseDt0..4` against `AstkDps*`, `AstkUnsttSellAmt*`, `AstkUnsttBuyAmt*`. `AstkUnsttSellAmt0` is the discriminator: when it is nonzero, whether `AstkOrdAbleAmt` tracks `AstkDps0` or `AstkDps0` minus it settles the question from two vendor responses | — (no key; what remains is a FIELD CHOICE, not a value) | |
+| T-5 | `Mgnrt0` from `inquiry/able-orderqty` IS the effective requirement, needing no combination — `Mgnrt` is the instrument rate and `OtptItemNm1` a label string, so there is no second RATE to reconcile against | Position sizing — `live_mode_runner.md`'s Per-Ticker Trading Terms | **B** | Call it for a ticker with and without an open position and confirm `Mgnrt0` is what the broker actually applies; the account-level override shows as `Mgnrt0 == 100` rather than as a separate figure | — (key deleted with `margin_ratio_url`) | |
 | T-6 | WS connection limits: tickers per connection, connections per account, subscription types per connection, connections per IP per port | Exit Architecture; WS connections | **B** | Subscribe and connect past each limit and observe the failure | `execution.ws_ticker_limit` | **Measured** — 50 tickers per connection; 2 connections per account; ONE subscription type per connection (an account registration sent on a quote connection converts it and silently stops quote delivery); 30 connections per IP per port. Confirmed against production AND demo accounts |
 | T-7 | Account-wide fill event stream: whether individual fills carry a stable, unique ID; schema; heartbeat; reconnect; whether events missed while disconnected are replayed | In-flight order tracking (fill accounting invariant) | **A** | See the fill-accounting sub-items below the table | — | |
 | T-8 | A REST order-status endpoint suitable as the exit-fill backstop, and whether it returns a given order's COMPLETE fill history or a paginated/windowed slice (shared checkpoint with T-7 — see below) | In-flight order tracking (exits are REST-only) | **C** | Endpoint documentation; poll a known order; check for pagination on an order with many fills | — | |
@@ -80,6 +80,7 @@ outranks a shaky one that degrades gracefully.
 | T-15 | ~~Demo/production data equivalence and budget independence~~ | ~~Combined two-account budget~~ | **RETIRED** | Nothing to verify — measured, then transcribed | — | **Retired** — equivalence recorded in `trading_api.md`'s Call-Point Inventory; per-APP governance in `sdk_dependency.md` |
 | T-16 | ~~REST round-trip latency range~~ | ~~Prefix-scan slot allocation~~ | **RETIRED** | Nothing to verify — measured, then transcribed | — | **Retired** — 400-600ms recorded in `live_mode_runner.md`'s `scan:` keys; ongoing drift is `health_report.md`'s finding 32, not a checklist question |
 | T-17 | The watchdog list fires for every ticker that crosses conditions A-G, so a ticker becoming eligible always rises to the head | `live_mode_runner.md` prefix scan — the soundness of stopping where bar delta stops | **B** | Self-measuring — the `evening_detection_gap` stage runs `detect()` over the day's ingested bars and compares against `inference_log` | — (no key; the rotation cursor and the promotion path bound the gap rather than a value sizing it) | |
+| T-18 | `Mgnrt0` is INTRADAY-INVARIANT, so a rate acquired at watchdog first listing stands for the session | `live_mode_runner.md`'s Per-Ticker Trading Terms — acquisition once per ticker, and the rate pinned onto each `live_positions` row | **B** | Self-measuring at zero cost — the post-dispatch entry observation already calls `able-orderqty` and its response carries `Mgnrt0` beside `AstkOrdAbleQty`, so comparing it against the PERSISTED `live_ticker_terms` row needs no extra call. A mismatch raises the same warning. Comparing against the persisted row rather than an in-memory cache is what lets the measurement survive a crash and a warm restart, which is exactly when a rate change would be least visible | — (no key; a rate that moves needs a re-acquisition rule, not a value) | |
 
 **T-3 is RETIRED, not verified.** Its premise was that a real-world
 throughput ceiling had to be measured because none was published. `api_doc/`
@@ -90,14 +91,36 @@ config key was deleted rather than superseded. The row stays because this file
 does not delete rows — a broker change would make the question live again, and
 a deleted row would have to be rediscovered.
 
-**T-5 was re-anchored, not merely graded.** The original row assumed an
-account-level margin-ratio endpoint. The vendor catalogue publishes none: the
-balance-margin call returns `AstkMgn`, an AMOUNT rather than a ratio, and the
-per-ticker figure comes from `inquiry/able-orderqty` instead. That makes the
-ratio a per-ticker value rather than the session constant the spec set assumed,
-which is why the redesign is an open item rather than a config change. The
-row's own question survives in re-anchored form: whether the two figures
-combine as expected.
+**T-5 was re-anchored TWICE, and the second time removed its premise.** The
+original row assumed an account-level margin-ratio endpoint; the vendor
+catalogue publishes none, so it was re-anchored to the per-ticker figure from
+`inquiry/able-orderqty`, still asking how that figure COMBINES with an
+account-level one. Measurement then showed there is no account-level RATE to
+combine with: `OtptItemNm1` is a label string — "100% 계좌" | "컬러증거금" —
+reporting whether a per-ticker 100% override applies, not a number, and
+`Mgnrt0` already incorporates that override. The redesign that followed is
+DONE, not deferred, so the row no longer points at an open item. What
+survives is narrower and is what the row now asks: whether `Mgnrt0` is in
+fact the rate the broker applies.
+
+**T-4 lost two thirds of its question to the same measurement.** The
+identity `AstkOrdAbleAmt * (100 / Mgnrt0) - @cost = AstkOrdAbleAmt1` fixes
+`AstkOrdAbleAmt` as the PRE-LEVERAGE deposit and `AstkOrdAbleAmt1` as buying
+power, which dissolves the cash-versus-buying-power dichotomy — both are
+separate fields the design now names outright, so `execution.sizing_basis`
+had nothing left to select between and was deleted. The settled-funds axis is
+untouched, and it matters in practice rather than in principle: this strategy
+turns over intraday, so unsettled sell proceeds are present continuously. The
+row is re-anchored to that axis rather than retired, this file deleting no
+rows.
+
+**T-18 is not a value question.** If `Mgnrt0` proves to move intraday, no
+number needs setting — the acquisition rule does, since a rate cached at
+first listing and pinned at entry would then be stale by construction. It is
+graded B rather than A because the design already survives a stale rate
+one-sidedly: `live_positions.entry_mgnrt` records what each entry actually
+used, so a moved rate makes past sizing suboptimal rather than
+unreconstructable.
 
 **T-1 acquired a method, and is not thereby closer to closed.** The delayed
 quote stream (V10/V11) carries the COMPLETE tape without a separate
@@ -120,7 +143,8 @@ Authority over-count ordinary lag as a "missed deadline" — which, combined
 with `min_watchlist_size`, risks a spurious Feed Outage freeze under
 normal operation. Set longer than necessary, it only slows genuine-outage
 detection. The seed value is chosen accordingly: conservative (higher)
-until measured, the same one-sided-error posture as `margin_ratio_fallback`.
+until measured, the same one-sided-error posture this spec set takes
+wherever a bound stands in for an unknown.
 
 **T-14, T-15 and T-16 were opened and closed inside one session, which is
 why they RETIRE rather than sit here as measured rows.** This file is a
@@ -218,11 +242,17 @@ over-count). This is why T-7 is graded on the same tier as T-1 rather than
 on the strength of its own fallback: the fallback exists so a No to item 1
 degrades to a still-correct mechanism, not so item 1 can go unverified.
 
-**T-4 and T-5 are one question in two parts.** Full deployment is the intended
-operating point, so if the balance figure is buying power and it is read as
-cash, intended exposure is multiplied by the leverage factor. `sizing_basis`
-exists to absorb either answer, but it can only be set correctly once the
-answer is known.
+**T-4 and T-5 WERE one question in two parts, and are no longer.** They were
+one only while the balance figure's meaning was unknown: full deployment being
+the intended operating point, reading buying power as cash would have
+multiplied intended exposure by the leverage factor, and `sizing_basis`
+existed to absorb whichever answer came back. Measurement named both fields
+outright — `AstkOrdAbleAmt` the deposit, `AstkOrdAbleAmt1` the buying power —
+so nothing is left to absorb and the key is deleted. The two rows now ask
+about DIFFERENT axes: T-4 whether the deposit figure carries unsettled sell
+proceeds, T-5 whether `Mgnrt0` is the rate the broker actually applies.
+Neither answer constrains the other, and neither is a precondition for
+reading the other's result.
 
 ---
 
@@ -261,8 +291,8 @@ best-effort, not a guarantee, so the residual gap remains worth tracking.
 - Where a row names a config key, the measured value belongs in
   `pipeline_config.yaml` under that key — recording it only in this table
   leaves the code running on its default
-- The self-measuring rows (T-2, T-10, T-12, T-13, T-17, I-2) are filled in
-  during ordinary operation and do not need a separate measurement
+- The self-measuring rows (T-2, T-10, T-12, T-13, T-17, T-18, I-2) are
+  filled in during ordinary operation and do not need a separate measurement
   exercise. Most accumulate through `health_report.md` findings; T-17
   accumulates in `live_scan_daily` instead, by way of the evening
   detection-gap stage, which `health_report.md` then reads. T-13 remains

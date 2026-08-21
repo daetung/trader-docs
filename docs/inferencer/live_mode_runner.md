@@ -95,8 +95,12 @@ elif wait_deadline reached first: proceed anyway (this IS the "degraded
 
 ## Session Start Probes (R-7 / R-8)
 
-Three cheap, one-shot checks run after Session Start Gating and before the
+Two cheap, one-shot checks run after Session Start Gating and before the
 Watchdog loop opens. Each is a single call; none is on a hot path.
+
+The margin ratio was a third until it became PER TICKER. It is acquired at
+watchdog first listing instead — see "Per-Ticker Trading Terms" below — which
+is neither session start nor one-shot, so it is not a probe.
 
 **Clock offset (R-8).** Config `clock_check`: `source` (`"ntp_daemon"` default
 | `"vendor_api"` | `"disabled"`), `max_offset_seconds` (default 1.0),
@@ -134,46 +138,6 @@ look identical from outside. On abort, send health_report immediately (at
 `abort` severity) before terminating — the same mid-session trigger
 mechanism Circuit Breaker uses below, reused rather than duplicated.
 
-**Margin ratio (R-8). UNDER REVIEW — see `open_items.md`.** The vendor
-publishes no account-level margin-ratio endpoint; the ratio is obtained PER
-TICKER from `inquiry/able-orderqty` and has to be combined with the
-account-level figure, so "held as a session constant" is structurally wrong
-and the surface that assumes it is wider than this probe — `live_session_state`
-stores one value per session, `compute_position_size()` takes a scalar, and a
-per-entry-signal query is a new draw on the API budget. The text below
-describes the CURRENT design, not a settled one, and is left in place rather
-than half-rewritten so the replacement is designed from the problem.
-
-Queried once at session start and held as a session constant, consumed by
-`execution.sizing_basis` (execution_common.md). On failure: fall back to
-`live_mode.margin_ratio_fallback` (default 4.0, a typical day-trading
-buying-power multiple) plus a health_report finding. Never aborts: this
-refines sizing, it does not authorise trading.
-
-The fallback is deliberately NOT 1.0. `sizing_basis: "equity"` divides the
-queried balance by margin_ratio; the safe direction for that division is the
-LARGER divisor, because whether the balance figure itself is cash or buying
-power is still unverified (api_contract_checklist.md T-4). If it is buying
-power and the fallback were 1.0, "fully deployed" would silently mean the
-full buying-power figure — the exact multiplication `sizing_basis` exists to
-prevent, arriving at the one moment its own input is missing. A fallback
-that turns out too conservative once T-4 is verified only under-sizes, which
-costs opportunity, not solvency — the same one-sided-error reasoning
-`sizing_basis`'s own default already applies.
-
-Background: the PDT designation and its $25,000 floor were removed from FINRA
-Rule 4210 effective 2026-06-04, replaced by a risk-based INTRADAY margin
-standard tied to live exposure. That is why this is queried rather than
-encoded — the requirement now moves with position state, brokers phase the new
-framework in on their own schedules through 2027-10-20, and house rules may be
-stricter than the regulatory floor. Modelling the rule in code would be wrong
-for some broker at some date; asking is not.
-
-One query at session start does not track intraday movement, and it is not
-meant to. The binding constraint is enforced by the broker, and it becomes
-visible to us as rejected submissions (`entry_rejected` with `reject_reason`).
-Sizing's job is only to avoid submitting what will obviously be refused.
-
 **Retention boundary (R-7).** Config `retention_probe`: `enabled`,
 `lookback_days` (ask from further back than retention is expected to reach),
 `assumed_days` (fallback).
@@ -196,7 +160,7 @@ from a one-off measurement.
 
 ### session_diagnostics write protocol (R-9)
 
-The three probe results above, plus Health Gate 2's tier-fallback summary
+The two probe results above, plus Health Gate 2's tier-fallback summary
 and two running counters, are persisted to
 `live_session_state.session_diagnostics` (JSON — see db_schema.md) instead
 of being held as in-memory tallies handed to `health_report.py` at session
@@ -211,14 +175,20 @@ atomicity question arises.
 Write points:
 ```
 (a) immediately after the probes above, BEFORE Health Gate 2
-      clock_offset_start, clock_offset_end=null, margin_ratio,
-      retention_boundary; each probe flagged 'disabled' | 'succeeded' |
-      'fell_back' so "never ran" and "ran and fell back" stay distinct
+      clock_offset_start, clock_offset_end=null, retention_boundary; each
+      probe flagged 'disabled' | 'succeeded' | 'fell_back' so "never ran"
+      and "ran and fell back" stay distinct
 (b) immediately after Health Gate 2
       adds the tier-fallback summary (finding 5)
 (c) on the existing bar_latency_daily flush cadence
       refreshes the running counters — halt-check signal_source counts
-      (finding 8) and inference_log dropped-row count (finding 22)
+      (finding 8), inference_log dropped-row count (finding 22), and the
+      per-ticker terms-acquisition tally: first-listing attempts, failures,
+      and the BLOCKED TICKERS BY NAME (see "Per-Ticker Trading Terms").
+      The blocked list lives here and NOT in live_scan_daily: that table's
+      grain is (date) with scalar metric columns and cannot hold names, and
+      splitting the count there from the names here would put one fact in
+      two places under a length-agreement constraint
 (d) at Session Shutdown
       fills clock_offset_end (finding 21)
 ```
@@ -337,8 +307,17 @@ LiveModeRunner.start_session(today_date):
       connection to disturb, but here an uncoordinated revoke would drop
       both WS connections mid-session.
 
-  1b. Query account balance from trading API:
+  1b. Query account balance from trading API — `inquiry/balance-margin`'s
+      `AstkOrdAbleAmt`, the UNCORRECTED DEPOSIT:
          session_start_cash: float
+      Deliberately the pre-leverage figure rather than buying power. The
+      measured identity `AstkOrdAbleAmt * (100 / Mgnrt0) - @cost =
+      AstkOrdAbleAmt1` fixes the first as deposit and the last as buying
+      power; sizing takes the deposit because `position_size_cash_pct` and
+      both caps express exposure as fractions of OWN capital. The leverage
+      correction is applied PER CALL from the ticker's own `Mgnrt0` (see
+      "Per-Ticker Trading Terms"), never folded in here — `Mgnrt0` is
+      per-ticker while this is one scalar.
       Fixed for the entire session — this is the `balance` argument to
       every `execution_common.compute_position_size()` call this session
       makes (see Watchdog Polling Loop step 5c.ii), mirroring backtest's
@@ -1065,9 +1044,9 @@ loop every poll_interval_seconds:
             Whichever gate stops the candidate, write its reason to
             inference_log.gate_result on THIS candidate's own
             event='signal_fired' row — 'freeze' | 'cap_tickers' |
-            'cap_per_ticker' | 'cooldown', and likewise 'not_tradable' and
-            'bar_integrity' (step i), 'sizing_zero' / 'funds' (step ii)
-            below. A candidate
+            'cap_per_ticker' | 'cooldown', and likewise 'not_tradable',
+            'bar_integrity' and 'no_terms' (step i), 'sizing_zero' /
+            'funds' (step ii) below. A candidate
             reaching submission in step iii records 'submitted'. If step
             ii's check_funds_available() call raises (the one network call
             in this sequence — timeout, connection error) rather than
@@ -1095,9 +1074,25 @@ loop every poll_interval_seconds:
             A runtime set membership test, so it costs nothing to place
             here rather than earlier; unlike the freeze_reasons check in
             step 0, it is per-ticker rather than session-wide.
+            Then, third and last in this step: skip if this ticker has no
+            `live_ticker_terms` row for today — its margin rate was never
+            acquired, or acquisition failed and the ticker was given up for
+            the session (see "Per-Ticker Trading Terms")
+            → gate_result='no_terms'. A SEPARATE gate evaluated at the same
+            point rather than folded into `is_tradable()`: that function is
+            a pure `ticker_cik_map` read, and mixing session state into it
+            changes what it is.
         ii. quantity = execution_common.compute_position_size(
                 balance=session_start_cash, fill_price=entry["p_entry"],
-                t_bar_volume=..., ticker_notional=..., total_notional=...,
+                mgnrt=<this ticker's live_ticker_terms.mgnrt>,
+                # the persisted per-ticker rate, never re-queried here (see
+                # "Per-Ticker Trading Terms"). The step-i terms gate is what
+                # guarantees a value exists to pass.
+                t_bar_volume=...,
+                ticker_margin_used=..., total_margin_used=...,
+                # margin, not notional: each open or pending row contributes
+                # at its OWN pinned live_positions.entry_mgnrt, so an open
+                # position's margin never moves retroactively
                 position_size_cash_pct=config["execution"]["position_size_cash_pct"],
                 position_size_vol_pct=config["execution"]["position_size_vol_pct"],
                 per_ticker_share_cap_pct=config["execution"]["per_ticker_share_cap_pct"],
@@ -1110,9 +1105,32 @@ loop every poll_interval_seconds:
                 quantity, entry["p_entry"], available_cash,
                 use_all_cash=config["execution"]["use_all_cash"],
             )
-            available_cash queried fresh from trading API immediately
-            before this call (see execution_common.md's Constraints)
+            available_cash is COMPUTED, not observed:
+                available_cash = AstkOrdAbleAmt * (100 / Mgnrt0) - @cost
+            `AstkOrdAbleAmt` from `inquiry/balance-margin` (3 TPS,
+            account-scoped, one call) queried fresh immediately before this
+            call; `Mgnrt0` and `@cost` from this ticker's persisted terms
+            (see "Per-Ticker Trading Terms"). Reading `AstkOrdAbleAmt1`
+            directly would be exact and need no arithmetic, but that field
+            exists ONLY on `able-orderqty`, so a direct read puts a 2 TPS
+            per-ticker call back on the entry path — the burst the
+            acquisition point was moved to avoid. Computation is preferred
+            wherever an observation would sit inside the bar-close deadline.
+            The computed figure runs ALWAYS-HIGH — `@cost` is subtractive and
+            derived once, from possibly-stale conditions — so the bias is
+            one-sided toward over-permitting; step iii's own comparison is
+            what surfaces drift.
+            The comparison itself stays NOTIONAL against NOTIONAL. The
+            margin-unit form sizing uses (execution_common.md) does not
+            extend here: `available_cash` is already leverage-inclusive, so
+            multiplying the left side by `Mgnrt0 / 100` would apply the same
+            factor twice.
             if not proceed: skip, no order
+            # A reduced quantity from use_all_cash does NOT re-enter the
+            # sizing caps above. All four sizing terms are monotone in
+            # quantity and combined by min(), so any value at or below
+            # `quantity` satisfies all four by construction: sizing sets the
+            # ceiling, this gate only lowers it.
         iii. limit_price = None if config["execution"]["entry_order_type"] == "market" \
                  else (entry["p_entry"] * (1 + config["execution"]["entry_gap_value"])
                        if config["execution"]["entry_gap_type"] == "percentage"
@@ -1220,6 +1238,23 @@ loop every poll_interval_seconds:
                      # runtime cache over the live_positions row above —
                      # BOTH order types, tracked to fill/reject/cancel by
                      # Position Manager Loop's "In-flight order tracking"
+                     # OBSERVATION ONLY, and only for entry_order_type
+                     # "limit", which has a quotable price to send. Call
+                     # able-orderqty at limit_price and compare its
+                     # AstkOrdAbleQty against the quantity just submitted,
+                     # and its Mgnrt0 against this ticker's persisted rate.
+                     # A mismatch on either raises a warning; NEITHER blocks
+                     # — check_funds_available() above is the gate, and this
+                     # runs AFTER dispatch precisely so it cannot sit ahead
+                     # of the submission deadline live_scan_daily's
+                     # entry_submit_late measures. Best-effort: dropped
+                     # rather than awaited if the call is slow or fails.
+                     # The Mgnrt0 half is what measures intraday invariance
+                     # (api_contract_checklist.md) at zero extra cost, the
+                     # response carrying both values.
+                     # MARKET entries skip this entirely and keep the
+                     # existing balance-query path unchanged, having no
+                     # quotable price to submit"
 ```
 
 ---
@@ -1856,7 +1891,14 @@ so a re-crash during recovery re-enters warm restart on the same signature.
        policy (R-3).
 
 2. Restore session_start_cash from live_session_state (NOT re-queried —
-   see Session Lifecycle Step 1c).
+   see Session Lifecycle Step 1c). Per-ticker trading terms are NOT
+   re-acquired either: today's `live_ticker_terms` rows are read back as
+   they stand, and each open position's own rate comes from its
+   `live_positions` row rather than from either that table or the vendor
+   (see "Per-Ticker Trading Terms"). A restart is the WORST burst case —
+   many tickers wanted at once against a 2 TPS endpoint — so persistence is
+   load-bearing here rather than incidental. The in-memory give-up set does
+   NOT survive, by design.
 
 3. Start Position Manager exit-only immediately — exits are
    indicator-independent (WS/REST tick driven; no Eager-Pool state needed
@@ -1997,7 +2039,116 @@ after any gap):
   # missed bars uniformly, so first-appearance (potentially many bars since
   # session start) and re-appearance (typically few bars) are the same code
   # path with no special-casing.
+
+  # Per-ticker trading terms are acquired HERE, on genuinely-first
+  # appearance — see "Per-Ticker Trading Terms" below. The
+  # live_ticker_terms row's existence for (ticker, today) is the guard, so
+  # a re-appearance after eviction is a no-op with no new tracking state.
 ```
+
+---
+
+## Per-Ticker Trading Terms
+
+The margin rate is PER TICKER and has NO account-level counterpart.
+`inquiry/able-orderqty` returns `Mgnrt0` (적용증거금률), the effective
+requirement, and it is taken AS-IS. Its neighbours are not a second rate to
+combine with it: `Mgnrt` is the instrument rate, and `OtptItemNm1` is a LABEL
+STRING — measured as "100% 계좌" | "컬러증거금" — reporting whether a
+per-ticker 100% override is set at account level, not a number. `Mgnrt0`
+already incorporates that override and reads 100 when it is off, so the
+correction `100 / Mgnrt0` is the identity for a leverage-free account and no
+branch is needed anywhere downstream.
+
+`AstkOrdPrc` is a required request field but a DUMMY here: the rates do not
+depend on it.
+
+Background: the PDT designation and its $25,000 floor were removed from FINRA
+Rule 4210 effective 2026-06-04, replaced by a risk-based INTRADAY margin
+standard tied to live exposure. That is why this is asked rather than
+encoded — the requirement moves with position state, brokers phase the new
+framework in on their own schedules through 2027-10-20, and house rules may be
+stricter than the regulatory floor. Modelling the rule in code would be wrong
+for some broker at some date; asking is not. Asking PER TICKER does more of
+that, not less.
+
+**Acquired ONCE PER TICKER at watchdog first listing** (Watchlist Append
+above) and persisted to `live_ticker_terms` (db_schema.md): the rate plus the
+cost term, both from ONE response in one transaction. The cost term is
+DERIVED rather than modelled — the same response carries `AstkOrdAbleAmt1`
+beside `Mgnrt0`, so solving
+
+```
+AstkOrdAbleAmt * (100 / Mgnrt0) - @cost = AstkOrdAbleAmt1
+```
+
+against it yields `@cost` at zero extra cost, on a call already being made.
+Every margin-related acquisition in this design shares that one call site.
+
+**Never fetched on the entry path.** Per-entry acquisition was rejected on
+BURST, not on steady-state budget: `able-orderqty` is 2 TPS and does not
+double, being a `trading/` endpoint (trading_api.md), and
+`execution.max_tickers` bounds the steady state — but simultaneous first
+listings serialise at 2 TPS and would land inside the bar-close decision
+deadline. First listing sits outside that deadline.
+
+The rate in force at entry, or at submission for a pending row, is PINNED
+ONTO THE `live_positions` ROW (db_schema.md). That row and `live_ticker_terms`
+are NOT redundant and neither may be dropped for the other: the position row
+is WHAT THAT ENTRY ACTUALLY USED, fixed against any later observation, while
+`live_ticker_terms` is WHAT WAS OBSERVED FOR THAT TICKER THAT SESSION and is
+the comparison baseline for the order-time check. They coincide whenever
+`Mgnrt0` is 100 — which is exactly when the duplication looks removable and
+is not.
+
+**ACQUISITION FAILURE BLOCKS THE TICKER. There is no fallback rate.** A
+substitute of 100 is correct when the real rate is 100 and silently
+substitutes a DIFFERENT STRATEGY when it is not — a real 30 sizes 3.3x
+smaller — and nothing downstream distinguishes the two cases. The
+one-sided-error argument used elsewhere in this spec set ("under-sizing costs
+opportunity, not solvency") does not carry: the exposure here is MEASUREMENT,
+not solvency. A trade sized on a substituted rate still reaches `trade_log`,
+where Pilot's `fit_execution_params()` pools it with the rest.
+
+This PARTIALLY RETIRES R-8's "Never aborts: this refines sizing, it does not
+authorise trading." That was decided when the rate was an ACCOUNT SCALAR,
+where failure was global and the only alternative to a fallback was standing
+down the session. A per-ticker rate creates a per-ticker option that did not
+exist then, and skipping one ticker is not the same cost as standing down a
+session.
+
+Failure is the ABSENCE OF A ROW. There is no provenance column and no
+nullable rate, so the state space is two states: terms held, or not.
+
+**Retry is `trading_api.md`'s existing policy and nothing more.** The
+re-attempt budget stays at its DEFAULT 0, so the SDK's own per-call
+classification and backoff is the whole retry story and no new policy is
+introduced. Recorded explicitly because that budget's stated rule reads the
+other way at first glance: first listing sits inside a cyclic loop, and
+cyclic callers pass 0 on the ground that their next cycle IS their retry. The
+axis that rule draws is whether the next cycle's call fetches something NEW
+or re-fetches THE SAME THING. Bars and ticks are the former; `Mgnrt0` is the
+latter, so this is a one-shot caller embedded in a cycle, and treating the
+next cycle as its retry would mean unbounded re-attempts — the burst the
+acquisition point was moved to avoid.
+
+Past that, the ticker is GIVEN UP for the session, held in a runner-side
+IN-MEMORY SET. Not a row in `live_ticker_terms`: a failed attempt produced no
+observation, and that table holds what the vendor said, so a failure row
+would need a provenance column and a nullable rate back. Without the set,
+"not yet listed" and "failed, given up" are both "no row" and the loop
+re-calls every cycle. The set does not survive a warm restart, which gives
+each failed ticker exactly one more attempt after one — bounded, and
+desirable, since a transient vendor fault may have cleared by then.
+
+Blocked tickers are counted AND NAMED in `session_diagnostics` (write point
+(c) above) and surface as a health_report finding of the same class as
+finding 8 — an infrastructure-health signal, distinct in kind from strategy
+underperformance. That finding is what makes the no-fallback choice
+survivable: silent trading stoppage is its principal risk, and this is the
+instrument that shows it. It is also what measures the assumption the choice
+rests on, that vendor-response failure is rare; a high observed rate is the
+ground for revisiting it in favour of a fallback.
 
 ---
 
@@ -2148,7 +2299,7 @@ read from config at every use in this section and elsewhere — this spec
 deliberately does not commit specific values beyond the defaults already in
 Config Keys and `execution:`. Any future change to R-4's circuit-breaker
 thresholds, R-5's entry-gate cap checks (Watchdog Polling Loop step 5c.0),
-or `compute_position_size()`'s notional/exposure sums must read the same
+or `compute_position_size()`'s margin/exposure sums must read the same
 config keys rather than hardcode a value independently. This is a standing
 rule for future edits, not a pointer to unfinished work: R-4's thresholds,
 freeze scope, and no-auto-clear behaviour are fully specified in Circuit
@@ -2956,10 +3107,11 @@ live_mode:
                                              # model, so simulate_entry_fill()
                                              # cannot read this and
                                              # approximates from bar data.
-                                             # Set GENEROUS deliberately, the
-                                             # one-sided-error posture of
-                                             # margin_ratio_fallback: too high
-                                             # costs an occasionally
+                                             # Set GENEROUS deliberately, on
+                                             # the one-sided-error posture
+                                             # this spec set takes wherever a
+                                             # bound stands in for an unknown:
+                                             # too high costs an occasionally
                                              # under-sized entry, too low a
                                              # vendor rejection the entry-side
                                              # path already handles
@@ -2987,15 +3139,15 @@ live_mode:
     lookback_days:                14           # ask from further back than
                                                # retention is expected to reach
     assumed_days:                 5            # fallback when the probe fails
-  # margin_ratio_url removed. The vendor publishes no account-level
-  # margin-ratio endpoint; the ratio is obtained PER TICKER from
-  # inquiry/able-orderqty and combined with the account-level figure, so the
-  # key named a path that does not exist. How the combined ratio is computed
-  # — and what that does to holding it as a session constant — is an open
-  # item (open_items.md); the probe below is flagged accordingly.
-  margin_ratio_fallback:          4.0        # used only if the query fails —
-                                             # see Session Start Probes for
-                                             # why this is not 1.0
+  # margin_ratio_url removed, and margin_ratio_fallback with it. The vendor
+  # publishes no account-level margin-ratio endpoint and no account-level
+  # RATE at all: OtptItemNm1 is a label string reporting whether a
+  # per-ticker 100% override applies, not a number. The effective
+  # requirement is inquiry/able-orderqty's Mgnrt0, taken as-is and already
+  # incorporating that override, so there is nothing to combine and no
+  # session scalar to hold. A fallback RATE is deliberately absent too:
+  # acquisition failure BLOCKS the ticker rather than substituting a value
+  # — see "Per-Ticker Trading Terms".
   exit_order_stuck_minutes:       10         # health_report finding 18's age
                                              # threshold
   session_hard_exit_time:         "20:00"    # R-9: process hard cap — see

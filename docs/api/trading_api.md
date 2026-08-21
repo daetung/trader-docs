@@ -151,7 +151,7 @@ future call sites rather than an input to an unresolved allocation.
 |---|---|---|---|
 | Tradable ticker list | Session Lifecycle Step 1; `build_trading_api_symbol_map()` (three per-exchange calls) | `quote/…/inquiry/stock-ticker` | 2 |
 | Balance and deposit | Step 1b; the funds gate; Broker Reconcile | `trading/…/inquiry/balance-margin` | 3 |
-| Per-ticker margin ratio | position sizing — undesigned, see `open_items.md` | `trading/…/inquiry/able-orderqty` | 2 |
+| Per-ticker margin rate and order cost | watchdog first listing, once per ticker per session; and the post-dispatch entry observation | `trading/…/inquiry/able-orderqty` | 2 |
 | Bars, minute OR second resolution | Watchdog Step 2a (prefix scan, rotation window, backfill) | `quote/…/chart/min` | 4 |
 | Ticks | Watchdog Step 2b; Exit Architecture's REST tick backstop (WS-dead only) | `quote/…/chart/tick` | 4 |
 | Bulk price snapshot | `bulk_fetch_today_first_price()` | `quote/…/inquiry/multiprice` | 2 |
@@ -339,7 +339,16 @@ because a cyclic caller's next cycle IS its retry — the watchdog loop at
 `position_check_interval_seconds` both pass 0, since re-attempting inside the
 call only spends the same rate budget earlier. One-shot callers with no next
 cycle — Session Start Probes, the crawler's universe-scale paths — are the
-only ones with a reason to pass non-zero. A re-attempt re-enters through the
+only ones with a reason to pass non-zero.
+The axis is whether the next cycle's call fetches something NEW or
+re-fetches THE SAME THING, and a caller can sit inside a loop and still be
+one-shot by it. Per-ticker terms acquisition is the case: it runs from the
+watchdog's Watchlist Append, but its next-cycle call would re-fetch the same
+rate for the same ticker, so treating the cycle as its retry would mean
+unbounded re-attempts against a 2 TPS endpoint. It passes 0 and gives up
+past the SDK's own retries (live_mode_runner.md's Per-Ticker Trading Terms),
+which is a CALLER decision under test 4, not a change to the budget's
+default. A re-attempt re-enters through the
 SDK and is therefore paced by the rate governor the SDK already owns; no
 second pacer appears. The result carries the attempt count, so how many
 attempts happened stays observable rather than hidden by a second layer.

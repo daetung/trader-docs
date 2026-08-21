@@ -723,6 +723,7 @@ PURGE_REGISTRY = {
     "feed_coverage_daily": ("date",  float("inf")),
     "live_scan_daily":    ("date",   float("inf")),
     "live_halt_episodes": ("date",   float("inf")),
+    "live_ticker_terms":  ("date",   float("inf")),
     "exit_trigger_agreement_daily": ("date", float("inf")),
     "health_events":      ("date",   float("inf")),
     "alert_log":          ("date",   float("inf")),

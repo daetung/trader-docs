@@ -293,8 +293,14 @@ Procedure:
     # Constraints for why this ordering is required (simulate_entry_fill()
     # takes quantity as input, so quantity cannot wait for its own output).
     quantity = execution_common.compute_position_size(
-        balance=initial_cash, fill_price=p_entry, t_bar_volume=t_bar_volume,
-        ticker_notional=..., total_notional=...,
+        balance=initial_cash, fill_price=p_entry, mgnrt=100,
+        # mgnrt=100 is the CONSTANT, not a config key: backtest has no
+        # broker to publish a rate and no margin to model. At 100 the
+        # margin-unit form reduces to the previous notional formula exactly
+        # (execution_common.md), which is why no backtest-side branch or
+        # successor to the deleted sizing_basis is needed.
+        t_bar_volume=t_bar_volume,
+        ticker_margin_used=..., total_margin_used=...,
         position_size_cash_pct=config["execution"]["position_size_cash_pct"],
         position_size_vol_pct=config["execution"]["position_size_vol_pct"],
         per_ticker_share_cap_pct=config["execution"]["per_ticker_share_cap_pct"],
@@ -412,7 +418,7 @@ for each date, in ascending order:
                        2. this ticker's own count <
                           execution.max_positions_per_ticker
                        3. can_enter(...)   [cooldown]
-                       4. compute_position_size(...)  [current notionals]
+                       4. compute_position_size(...)  [current margin used]
                        5. check_funds_available(...)  [current cash]
                      admitted -> resolve the trade (Entry Slippage Model +
                      Exit Logic), deduct the committed cash, add to
@@ -553,9 +559,14 @@ if direction is not None:
     # left to model: backtest uses track_price_breach()'s raw
     # exit_hour/exit_price (already interpolate_bundle_price-precision)
     # directly for the fill simulation and for trade_log.exit_bar. The
-    # relationship this corrects: live is now ground truth at tick
-    # granularity, and backtest approximates it — not the reverse, as the
-    # removed poll-delay alignment implied.
+    # relationship this corrects, STATED AGAINST LIVE'S REST 1-TICK BUFFER
+    # and not against live generally: that buffer is vendor-guaranteed
+    # complete AND print-ordered, so it is ground truth at tick granularity
+    # and backtest approximates it — not the reverse, as the removed
+    # poll-delay alignment implied. Live's exit TRIGGER path is WS-primary,
+    # and the WS entitlement carries roughly half the prints, so the trigger
+    # path is NOT the thing being ranked here; against it and tick_10
+    # neither dominates (see Constraints' R-2 kinds (1) and (2)).
     effective_second = exit_hour        # raw, no ceil_to_interval
     effective_price  = exit_price       # raw interpolate_bundle_price output,
                                         # no re-interpolation at a delayed second
@@ -984,10 +995,14 @@ requested_quantity       INTEGER,   -- quantity actually SUBMITTED, i.e. after
   extreme IS seen; what is lost is the ORDER of two extremes inside one
   bundle, which is exactly what `is_ambiguous` records and
   `ambiguity_priority` resolves. (Previously stated as backtest being unable
-  to SEE intra-bundle spikes, and as live's stream being the "true" one —
+  to SEE intra-bundle spikes, and as live's WS STREAM being the "true" one —
   both wrong: the bundle carries the extreme, and the direction can invert,
   since a print in the half the WS entitlement drops is absent from live's
-  WS path while still reflected in that bundle's high/low.)
+  WS path while still reflected in that bundle's high/low. The negation is
+  scoped to the WS axis deliberately. Live's REST 1-tick tape IS complete,
+  and against IT backtest does not invert — nothing is absent from a full
+  tape — so calling live's stream untrue without qualification would deny
+  the one live source that outranks `tick_10` on both axes.)
   (2) TAPE COMPLETENESS, open — the free real-time entitlement carries
   roughly half the trade prints while the REST tick endpoint is
   vendor-guaranteed complete, so live's WS path, live's REST backstop and

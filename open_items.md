@@ -26,27 +26,28 @@ confirmation that it still reads correctly.
 
 ## Suggested order
 
-1. **Margin-ratio computation**: blocked on nothing, and it touches sizing,
-   the schema and the API budget at once.
-2. **Halt-status source** is independent and blocks nothing else, but the
+1. **Halt-status source** is independent and blocks nothing else, but the
    halt path has no primary signal until it lands. `live_halt_episodes`'
    `source` column now gives it an audit axis: once a real source exists its
    intervals can be compared against the heuristic's directly, which nothing
-   in the system could do before.
-3. **Async boundary**, **early-close days** and the
+   in the system could do before. It is open FOR AN INDEPENDENT SOURCE: the
+   NYSE page that already fills `trading_halts` is not a candidate, since a
+   live signal drawn from it would make the evening comparison a source
+   against itself.
+2. **Async boundary**, **early-close days** and the
    **manual-intervention CLI** are independent of each other and of the
    above. The async boundary is now the more constrained of the three: the
    watchdog scan fires N speculative REST calls per cycle and alternates
    across two accounts, so how many clients exist and where the boundary
    falls has consequences it did not have before.
-4. **WS/REST tape asymmetry and exit-trigger path transitions** is blocked on
+3. **WS/REST tape asymmetry and exit-trigger path transitions** is blocked on
    SHADOW-PERIOD DATA rather than on design time, so it is not sequenced
    against the items above. Its two undesigned sub-questions (guard state at
    each handover direction) could be taken at any point; its deferred part
    cannot.
-5. **`api_contract_checklist.md` re-evaluation** goes last by construction —
+4. **`api_contract_checklist.md` re-evaluation** goes last by construction —
    it collects what the items above establish.
-6. **Real-time bid/ask spread** is blocked on calendar time, not design time,
+5. **Real-time bid/ask spread** is blocked on calendar time, not design time,
    so it is not sequenced against anything here.
 
 ---
@@ -105,34 +106,6 @@ divergence are unmeasured, and `exit_trigger_agreement_daily` is the
 instrument built to measure them — its L-vs-M term is exactly the tape
 effect. Deciding before that data exists would repeat this project's
 most-reversed failure. Blocked on shadow-period data, not on design time.
-## Margin-ratio computation
-
-**Problem.** The spec set holds the margin ratio as a SESSION CONSTANT,
-probed once at session start (`live_mode_runner.md`'s R-8) and consumed as a
-scalar by `compute_position_size()` through `execution.sizing_basis`. The
-vendor publishes no account-level margin-ratio endpoint at all: the
-balance-margin call returns `AstkMgn`, an amount rather than a ratio, and the
-per-ticker figure comes from `inquiry/able-orderqty`. The effective
-requirement is the account-level figure and the per-ticker one taken
-together, so the quantity the design treats as one number per session is
-actually one number per ticker.
-
-The affected surface is wider than the probe: `live_session_state` stores a
-single `margin_ratio` column, `compute_position_size()` takes a scalar, and a
-per-ticker query at every entry signal is a NEW consumer on the API budget
-(`inquiry/able-orderqty`, TPS 2). The budget item that would once have
-absorbed that is gone — every consumer it enumerated is now bounded — so
-this item carries its own accounting: at TPS 2 per account and 4 combined a
-per-signal draw is small, but it is signal-proportional rather than
-fixed-cadence and nothing else currently competes for that endpoint.
-`api_contract_checklist.md`'s T-5 is re-anchored to this shape, and T-4
-(whether the balance figure is cash or buying power) is entangled with it —
-both feed the same sizing decision.
-
-**Not yet designed.** Blocked on nothing.
-
----
-
 ## Halt-status source
 
 **Problem.** `utils.query_halt_status()` is specified as the single access
@@ -257,10 +230,10 @@ has enough history; revisit then, not before.
 ## `api_contract_checklist.md` — verify before Pilot
 
 Not a new design problem — a pointer, so it isn't lost among the items
-above. `docs/ops/api_contract_checklist.md` holds **20 rows, of which 15 are
+above. `docs/ops/api_contract_checklist.md` holds **21 rows, of which 16 are
 still unverified** assumptions, two of those graded **A** (T-1: REST/WS tick
 granularity; T-7: fill-event stream ID stability). The numbers reconcile as
-20 = 15 unverified + 1 measured (T-6) + 4 retired (T-3, T-14, T-15, T-16),
+21 = 16 unverified + 1 measured (T-6) + 4 retired (T-3, T-14, T-15, T-16),
 and the row count does not fall as questions are settled because that
 file's Role and Constraints forbid deleting rows — a broker change would
 make a settled question live again, and a deleted row would have to be

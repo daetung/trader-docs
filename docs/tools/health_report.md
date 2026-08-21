@@ -341,15 +341,20 @@ def gather_findings(db_conn, today_date, log_dir,
         distinct from a fresh trip this session — the underlying cause and
         its timing are what the earlier trip already established, not a new
         event to investigate.
-    21. Session-start probe results (R-7/R-8) — the measured clock offset,
-        margin_ratio, and retention_boundary, one line each. Recording the
+    21. Session-start probe results (R-7) — the measured clock offset and
+        retention_boundary, one line each. TWO probes, not three: the margin
+        ratio was a third until it became per-ticker, and it is now acquired
+        at watchdog first listing rather than at session start (see finding
+        34 and live_mode_runner.md's Per-Ticker Trading Terms). Recording the
         clock offset at session END as well catches an NTP daemon that died
         after the start gate passed, and gives a drift trend; periodic
         re-checking is unnecessary if the daemon is alive. A probe that fell
-        back (margin_ratio to live_mode.margin_ratio_fallback, retention to
-        assumed_days) is flagged distinctly from one that succeeded — the
-        fallbacks are safe but they silently change sizing and gap-fill
-        behaviour. Each measurement also fills in its row in
+        back (retention to assumed_days) is flagged distinctly from one that
+        succeeded — the fallback is safe but it silently changes gap-fill
+        behaviour. There is no margin counterpart to that any more: a failed
+        terms acquisition BLOCKS the ticker rather than substituting a rate,
+        which is why it surfaces as its own finding rather than as a
+        fell-back flag here. Each measurement also fills in its row in
         api_contract_checklist.md from ordinary operation.
         Read (R-9) from live_session_state.session_diagnostics. The probe
         values are written there immediately after the probes and BEFORE
@@ -555,6 +560,30 @@ def gather_findings(db_conn, today_date, log_dir,
         input is produced by a batch stage rather than by the session it
         describes.
 
+    34. Per-ticker terms-acquisition failure
+        (`ticker_terms_acquisition_failure`) — tickers blocked from entry
+        for want of a `live_ticker_terms` row, against watchdog
+        first-listing attempts. Read (R-9) from
+        `live_session_state.session_diagnostics`, where LiveModeRunner
+        tallies it as the session runs and flushes on the
+        `bar_latency_daily` cadence; NOT recomputed here. Same class and
+        same mechanics as finding 8 — an INFRASTRUCTURE-HEALTH signal,
+        distinct in kind from strategy underperformance, so it is never
+        read alongside the winning-rate findings.
+        Detail view: the BLOCKED TICKERS BY NAME, on finding 2's pattern.
+        A count alone does not let an operator act, and the block persists
+        for the session once a ticker is given up (live_mode_runner.md's
+        Per-Ticker Trading Terms), so identity is the actionable part.
+        This finding is what makes the no-fallback design survivable:
+        acquisition failure blocks the ticker rather than substituting a
+        rate, so silent trading stoppage is that choice's principal risk
+        and this is the instrument that shows it. It is also what measures
+        the assumption the choice rests on — that vendor-response failure
+        is rare — and a high rate here is the ground for revisiting it.
+        Level: warn. Threshold TBD, same deferral as findings 3/6/7/8: the
+        rate is always computed and loggable, only the warn cutoff is
+        undecided.
+
     Returns: dict of {finding_name: {severity: 'ok'|'warn'|'abort', detail: ...}}
     """
     ...
@@ -568,7 +597,7 @@ A read-only summary emitted once at each FIRST-DB-ACCESS point: live session
 start, evening batch start, and premarket batch start. It reports:
 
 - the `data/market.duckdb` file size
-- row counts for the twelve purge-registry tables (see db_schema.md) and for
+- row counts for the fifteen purge-registry tables (see db_schema.md) and for
   the structurally-excluded corpus tables
 - the latest `date` value present in each
 
