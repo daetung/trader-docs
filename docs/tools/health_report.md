@@ -969,8 +969,8 @@ would assert a measurement that was never taken ("no halt checks fell back to
 the tick-rate heuristic" reads as healthy when in fact nothing was checked).
 Same boundary handling as the six `gate_result` values that get no backtest
 counter (see db_schema.md). That set is not the same as finding 19's
-live-only three: it also holds 'breaker', which backtest evaluates without
-enforcing, and 'error', which it cannot raise at all. This applies per finding, not per
+live-only four: it is those four plus 'breaker', which backtest evaluates
+without enforcing, and 'error', which it cannot raise at all. This applies per finding, not per
 call: a live session that crashed before its first flush has a row with the
 counters absent, and those specific keys report not-applicable while the
 probe values in the same row report normally.
