@@ -287,8 +287,11 @@ def gather_findings(db_conn, today_date, log_dir,
     19. Entries lost at the entry gates (R-5) — today's inference_log rows
         with event='signal_fired', grouped by gate_result: 'submitted' plus
         one bucket per gate ('freeze', 'cap_tickers', 'cap_per_ticker',
-        'cooldown', 'not_tradable', 'bar_integrity', 'sizing_zero',
-        'funds'). Read straight
+        'cooldown', 'not_tradable', 'bar_integrity', 'no_terms',
+        'sizing_zero', 'funds'). A COMPLETE enumeration of the gates, not a
+        sample: 'error' and 'breaker' are absent because neither is a gate
+        verdict — one is a raised exception, the other a session state.
+        Read straight
         from the table, NOT passed in from LiveModeRunner — unlike findings
         5 and 8, whose aggregates travel in memory only because tier_used
         and signal_source have nowhere to be stored, gate_result has a
@@ -304,8 +307,8 @@ def gather_findings(db_conn, today_date, log_dir,
         in practice. The same bucket names appear as BacktestEngine summary
         counters (09_backtest_engine.md), so a live session and a backtest
         over the same window are directly comparable; 'freeze',
-        'not_tradable' and 'bar_integrity' are live-only, by design rather
-        than omission.
+        'not_tradable', 'bar_integrity' and 'no_terms' are live-only, by
+        design rather than omission.
         A broker rejection is NOT one of these buckets: it occurs after
         submission, so it is counted under 'submitted' here and surfaces in
         finding 17 as exit_reason='entry_rejected'.
@@ -964,8 +967,10 @@ never an error, and never 0. Both alternatives are wrong in the same
 direction: raising would make an ordinary backtest invocation fail, and 0
 would assert a measurement that was never taken ("no halt checks fell back to
 the tick-rate heuristic" reads as healthy when in fact nothing was checked).
-Same boundary handling as `gate_result`'s five live-only values being
-excluded in backtest (see db_schema.md). This applies per finding, not per
+Same boundary handling as the six `gate_result` values that get no backtest
+counter (see db_schema.md). That set is not the same as finding 19's
+live-only three: it also holds 'breaker', which backtest evaluates without
+enforcing, and 'error', which it cannot raise at all. This applies per finding, not per
 call: a live session that crashed before its first flush has a row with the
 counters absent, and those specific keys report not-applicable while the
 probe values in the same row report normally.

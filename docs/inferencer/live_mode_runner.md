@@ -1066,7 +1066,10 @@ loop every poll_interval_seconds:
             finding 19 reads these rows directly, so no in-session tally has
             to be threaded through to it.
         i.  is_tradable(ticker, db_conn) — execution_common.md gate.
-            False (ticker_cik_map.status = 'suspended') → skip, no order.
+            False (ticker_cik_map.rename_pending = TRUE OR
+            quarantine_reason IS NOT NULL — N-2 replaced the old single
+            `status` column with these two, and the gate needs BOTH clear)
+            → skip, no order.
             Then, in the same step because it is the other per-ticker
             eligibility verdict: skip if this ticker is in the
             bar_integrity exclusion set (see Bar-Close Authority's
