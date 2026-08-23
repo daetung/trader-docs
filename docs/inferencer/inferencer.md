@@ -151,11 +151,12 @@ step 0: bars = self._prepare_bars(bars, entry)
            return None
        # "combined" passes both pre-market and regular
 
-2. max_entry_hour filter:
-       max_entry_hour = last - config["execution"]["max_hold_bars"] minutes
-                        # DERIVED (01_entry_detection.md), no longer a config key
-       if hour > max_entry_hour:
-           return None          # > operator, consistent with scan() exclusion
+2. Late-day filter:
+       off = config["entry_detector"]["max_entry_offset_minutes"]
+       if off is not None:                     # null = no cutoff
+           max_entry_hour = last - off minutes # PER DATE, follows the calendar
+           if hour > max_entry_hour:
+               return None      # > operator, consistent with scan() exclusion
 
 3. EntryPointDetector.detect(bars, date=entry["date"],
                               shares_outstanding=meta["shares_outstanding"])
@@ -276,7 +277,8 @@ def infer_batch(
 ## Late-Day Exclusion
 
 ```
-max_entry_hour: if set, signals with t bar open time > max_entry_hour are not fired,
+max_entry_offset_minutes: if not null, signals with t bar open time later than
+    last_bar(date) - max_entry_offset_minutes are not fired,
                 consistent with scan() exclusion logic (> operator, boundary inclusive)
 ```
 
@@ -371,10 +373,11 @@ class Inferencer:
 - Preprocessor is NOT used in live inference — FeatureExtractor.extract() called directly
 - After-market entry points suppressed regardless of session_mode
   (hour > last_bar(date))
-- Session mode and max_entry_hour filters applied by Inferencer before detect()
-- `max_entry_hour`: signals with t bar open time > max_entry_hour(date) are not
-  fired (> operator consistent with scan() exclusion logic; boundary is
-  inclusive). DERIVED per date, not read from config
+- Session mode and late-day filters applied by Inferencer before detect()
+- `max_entry_offset_minutes`: when not null, signals with t bar open time >
+  max_entry_hour(date) are not fired, where max_entry_hour(date) = last_bar(date)
+  - max_entry_offset_minutes (> operator consistent with scan() exclusion logic;
+  boundary is inclusive). null disables the cutoff entirely
 - `halts_df` queried from trading_halts table via db_conn at inference time;
   passed explicitly to FeatureExtractor.extract()
 - `infer_batch()` caches halts_df per (ticker, date) — not per candidate

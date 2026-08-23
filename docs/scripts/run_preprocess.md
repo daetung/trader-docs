@@ -85,7 +85,8 @@ pd.DataFrame  # full labeled feature matrix, unsplit
        # REFERENCE_SESSION indicators return NaN (not an error)
 
 2. EntryPointDetector.scan() for each ticker → entry_points (all sessions)
-   max_entry_hour exclusion applied inside scan()
+   late-day exclusion applied inside scan() when max_entry_offset_minutes
+   is not null (01_entry_detection.md)
    scan() retrieves p_entry from bars[i+1]["open"] (t bar open price)
 
    # scan() meta (V-1): date-keyed, {date: {"shares_outstanding": value}}
@@ -315,6 +316,7 @@ misc.lookback_bars
 - `p_entry` included in parquet as identifier column, not feature
 - `is_dead_position`, `dead_position_case`, `is_ambiguous` stored as metadata columns
 - entry_points and labeled_samples DB saves use INSERT OR IGNORE for idempotency
-- `max_entry_hour` exclusion applied inside EntryPointDetector.scan()
+- Late-day exclusion applied inside EntryPointDetector.scan(), and only when
+  `entry_detector.max_entry_offset_minutes` is not null
 - Standalone CLI always calls split() — split_method config enforced by PipelineOptimizer only
 - live_mode is NOT supported — Preprocessor is training-only

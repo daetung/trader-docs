@@ -80,27 +80,30 @@ the label is dominated by session-close exit logic rather than genuine
 price movement — creating a systematic bias.
 
 ```
-max_entry_hour: DERIVED, not configured —
-    max_entry_hour(date) = last_bar(date) - execution.max_hold_bars minutes
+max_entry_offset_minutes: minutes before the session's last bar (default: null)
 
-    entry points with t bar open time > max_entry_hour(date) are excluded
-    from scan() output.
+    null  → no cutoff applied
+    N     → max_entry_hour(date) = last_bar(date) - N minutes
+            entry points with t bar open time > max_entry_hour(date) are
+            excluded from scan() output.
 
 Applied after after-market exclusion, before session_mode filtering.
 ```
 
-Rationale: the cutoff exists so that at least `max_hold_bars` valid bars remain
-before the close, and that is exactly what the expression says. It was formerly
-a hand-tuned constant (`"150000"`, with the note "at 15:00, only ~60 valid bars
-remain before 15:59 close") — but 60 IS `execution.max_hold_bars` and 15:59 IS
-the last bar, so the constant was already a function of two other keys and
-merely written out. This is the same defect R-6 fixed for `max_hold_bars`
-itself, and deriving it resolves the early-close case as a by-product: on a
-13:00 close the cutoff becomes 12:00 rather than sitting three hours past the
-session's end, where it excluded nothing.
+Rationale: the cutoff exists so that enough valid bars remain before the close
+for the label horizon to complete. It was formerly an ABSOLUTE time
+(`max_entry_hour: "150000"`, with the note "at 15:00, only ~60 valid bars remain
+before 15:59 close"), which fixed it to an ordinary session and left it sitting
+past the end of an early-close day, excluding nothing. As an offset it follows
+the calendar, matching the form `execution.session_close_exit_offset_minutes`
+already uses.
 
-Ordinarily this yields 150000, matching the former recommended value exactly.
-For pre-market mode the cutoff still has no practical effect.
+Setting N = `execution.max_hold_bars` reproduces the former recommendation
+exactly — 150000 on an ordinary day, 120000 on a 13:00 close — and is the
+natural choice, since that is how many valid bars the horizon needs. It is NOT
+derived from `max_hold_bars`, because null must remain expressible: no cutoff is
+a legitimate operating mode and is the default. For pre-market mode the cutoff
+has no practical effect either way.
 
 ---
 
@@ -368,8 +371,8 @@ class EntryPointDetector:
 
         Exclusion order applied inside scan():
           1. After-market entry points (hour > last_bar(date)) always excluded
-          2. Late-day entry points (hour > max_entry_hour) excluded
-             when max_entry_hour is not null
+          2. Late-day entry points (hour > max_entry_hour(date)) excluded
+             when max_entry_offset_minutes is not null
           3. Session_mode filtering applied at ClassBalancer.split() stage,
              not here
 
@@ -441,11 +444,14 @@ entry_detector:
   volume_base_hour: "040000"     # base hour for D, E, F conditions
 
   # Late-day exclusion
-  # max_entry_hour REMOVED — derived as last_bar(date) - execution.max_hold_bars
-  # minutes (see Late-Day Entry Exclusion). Its own stated rationale was already
-  # a function of max_hold_bars and the session close; writing the result out as
-  # a constant is what R-6 removed elsewhere.
-  # Applied in scan() before session_mode filter
+  max_entry_offset_minutes: null # minutes before last_bar(date); null = no cutoff.
+                                 # REPLACES max_entry_hour: "150000", which was an
+                                 # ABSOLUTE time and so could not follow an
+                                 # early-close day. Same offset form as
+                                 # execution.session_close_exit_offset_minutes.
+                                 # Set to execution.max_hold_bars to reproduce the
+                                 # former recommendation.
+                                 # Applied in scan() before session_mode filter
 
   # Individual filter thresholds
   A_max_price: 20.0
@@ -482,8 +488,9 @@ entry_detector:
   consistent with this module never computing metadata values itself
 - Filter F returns `False` (not an error) when no prior bars exist for the day (first bar of session edge case)
 - After-market entry points (hour > last_bar(date)) must never be returned from `scan()`
-- Late-day entry points (hour > max_entry_hour) excluded in `scan()` when max_entry_hour is not null
-- `max_entry_hour` exclusion applied before session_mode filter — both are independent constraints
+- Late-day entry points (hour > max_entry_hour(date)) excluded in `scan()` when max_entry_offset_minutes is not null
+- `max_entry_hour(date)` resolves as last_bar(date) - max_entry_offset_minutes; the cutoff moves with the calendar
+- Late-day exclusion applied before session_mode filter — both are independent constraints
 - `volume_base_hour` applied to conditions D, E, F only — condition G uses rolling window, no base hour filter
 - Condition A is the only NON-MONOTONE condition (see Monotonicity of the
   Conditions). A change that makes any of B-G able to revert as its bar
@@ -507,7 +514,9 @@ entry_detector:
 | Expression changed in config to "A and B" | detect() respects new expression |
 | volume_base_hour = "093000", pre-market bars present | D/E/F exclude pre-market bars |
 | after-market bar as t-1 | scan() excludes from output |
-| max_entry_hour = "150000", t bar hour = "150100" | scan() excludes from output |
-| max_entry_hour = "150000", t bar hour = "150000" | scan() includes (boundary inclusive) |
-| max_entry_hour = null | no late-day exclusion applied |
+| max_entry_offset_minutes = 60, ordinary close, t bar hour = "150100" | scan() excludes from output |
+| max_entry_offset_minutes = 60, ordinary close, t bar hour = "150000" | scan() includes (boundary inclusive) |
+| max_entry_offset_minutes = 60, 13:00 close, t bar hour = "120100" | scan() excludes — cutoff follows the calendar |
+| max_entry_offset_minutes = 60, 13:00 close, t bar hour = "120000" | scan() includes (boundary inclusive) |
+| max_entry_offset_minutes = null | no late-day exclusion applied |
 | t bar missing (last bar in DataFrame) | scan() skips that entry point |

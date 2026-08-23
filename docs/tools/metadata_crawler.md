@@ -672,11 +672,16 @@ with rows that were never live decisions and make the comparison
 self-referential — this stage would be measuring itself. `detect()` runs in
 memory and only counts are persisted.
 
-**Both sides must carry the same filters.** `session_mode`,
-`max_entry_hour` and the after-market exclusion are applied by Inferencer
-BEFORE `detect()`, and it logs nothing when they reject. Comparing an
-unfiltered evening pass against that would turn every deliberate exclusion
-into a false gap — the filters go on both sides or the number means nothing.
+**Both sides must carry the same filters.** `session_mode`, the late-day
+cutoff (`entry_detector.max_entry_offset_minutes`, skipped entirely when null)
+and the after-market exclusion are applied by Inferencer BEFORE `detect()`, and
+it logs nothing when they reject. The late-day cutoff is now PER DATE — it
+resolves as `last_bar(date) - max_entry_offset_minutes` — so the evening pass
+must resolve it against the SESSION'S date, not the date the pass runs on.
+While it was an absolute time the two agreed trivially; they no longer do.
+Comparing an unfiltered evening pass against that would turn every deliberate
+exclusion into a false gap — the filters go on both sides or the number means
+nothing.
 
 The three categories, and the distinction that carries the diagnosis:
 

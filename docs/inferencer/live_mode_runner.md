@@ -957,11 +957,10 @@ if now >= exit_deadline(today):
 Breaking between cycles rather than mid-cycle means no partial fetch or
 half-applied `on_bar_close()` replay. Past that time no entry can be
 submitted anyway (after-market bars are excluded from entry detection in
-every mode, and `max_entry_hour` has long since cut off), so nothing is
-lost — but the loop is stopped explicitly rather than left polling an
-external service whose after-hours behaviour is not part of this system's
-contract and whose responses would be exercising the candidate path for no
-possible benefit. Close-out continues on the Position Manager Loop, which
+every mode), so nothing is lost — but the loop is stopped explicitly rather
+than left polling an external service whose after-hours behaviour is not
+part of this system's contract and whose responses would be exercising the
+candidate path for no possible benefit. Close-out continues on the Position Manager Loop, which
 is independent of this one and does its own bar/tick fetching.
 
 A warm restart that lands after `exit_deadline(today)` still starts this
