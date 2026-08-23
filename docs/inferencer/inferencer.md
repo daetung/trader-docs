@@ -50,7 +50,10 @@ REFERENCE_SESSION: RVOL, rel_dvol, gap_percentile, intraday_seasonality
 ```
 
 `calculate_required_history()` considers CONTINUOUS indicators only:
-- `min_bars = lookback_days * 390`
+- `min_bars = lookback_days * 390` — not per-date. The 390 names the regular
+  session while `bars` is loaded across the full 040000~200000 range, so the
+  real supply is nearer 960 min/day; the margin is understated rather than at
+  risk, on an early-close day as on any other.
 - REFERENCE_SESSION baseline is satisfied by precomputed_session_stats independently
 
 ---
@@ -139,17 +142,19 @@ step 0: bars = self._prepare_bars(bars, entry)
        session_mode = config["entry_detector"]["session_mode"]
        hour = entry["hour"]
 
-       if hour > "155900": return None          # after-market always excluded
+       last = last_bar(entry["date"])           # utils.md — PER DATE
+       if hour > last: return None              # after-market always excluded
 
-       if session_mode == "regular" and not ("093000" <= hour <= "155900"):
+       if session_mode == "regular" and not ("093000" <= hour <= last):
            return None
        if session_mode == "pre" and not ("040000" <= hour <= "092900"):
            return None
        # "combined" passes both pre-market and regular
 
 2. max_entry_hour filter:
-       max_entry_hour = config["entry_detector"].get("max_entry_hour")
-       if max_entry_hour is not None and hour > max_entry_hour:
+       max_entry_hour = last - config["execution"]["max_hold_bars"] minutes
+                        # DERIVED (01_entry_detection.md), no longer a config key
+       if hour > max_entry_hour:
            return None          # > operator, consistent with scan() exclusion
 
 3. EntryPointDetector.detect(bars, date=entry["date"],
@@ -364,10 +369,12 @@ class Inferencer:
 - `suppress_threshold` read from `config["backtest"]["suppress_threshold"]`
 - No data leakage: t bar OHLCV must not be used as feature input
 - Preprocessor is NOT used in live inference — FeatureExtractor.extract() called directly
-- After-market entry points suppressed regardless of session_mode (hour > "155900")
+- After-market entry points suppressed regardless of session_mode
+  (hour > last_bar(date))
 - Session mode and max_entry_hour filters applied by Inferencer before detect()
-- `max_entry_hour`: signals with t bar open time > max_entry_hour are not fired
-  (> operator consistent with scan() exclusion logic; boundary is inclusive)
+- `max_entry_hour`: signals with t bar open time > max_entry_hour(date) are not
+  fired (> operator consistent with scan() exclusion logic; boundary is
+  inclusive). DERIVED per date, not read from config
 - `halts_df` queried from trading_halts table via db_conn at inference time;
   passed explicitly to FeatureExtractor.extract()
 - `infer_batch()` caches halts_df per (ticker, date) — not per candidate

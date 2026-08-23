@@ -646,17 +646,17 @@ separate small follow-up when this section is actually applied.
 ### Session close exit (priority over time-limit)
 
 ```python
-if current bar hour == config["execution"]["session_close_exit_time"]:
+if current bar hour == exit_deadline(date):     # utils.md — PER DATE
     exit_reason = "session_end"
     # DEAD-POSITION RESOLUTION FIRST, ahead of any fill modelling:
-    if 15:59 bar is halt/no_data:
-        fallback: first tick_10 row with hour > "155900"
+    if exit_deadline(date) bar is halt/no_data:
+        fallback: first tick_10 row with hour > exit_deadline(date)
         if none: → dead position          # no ticks at all → no simulator call
     if not config["execution"]["simulate_nondirectional_exit_fill"]:
-        exit_price = the reference price (15:59 bar close, or the
+        exit_price = the reference price (that bar's close, or the
                      after-market tick fallback above)
     else:
-        anchor    = "155900"
+        anchor    = exit_deadline(date)
         reference = last print strictly before the anchor
         → simulate_exit_fill(..., exit_anchor_second=anchor,
                               reference_price=reference,
@@ -683,8 +683,8 @@ if config["execution"]["max_hold_bars"] valid bars elapsed since entry
         → simulate_exit_fill(..., sell_rate=execution.sell_rate_neutral, ...)
 ```
 
-Note that once an exit reason is assigned, filling may continue past 15:59
-into the after-market — the simulator's own contract. "Session close takes
+Note that once an exit reason is assigned, filling may continue past the
+session close into the after-market — the simulator's own contract. "Session close takes
 priority over time-limit" governs which reason is ASSIGNED, not whether an
 in-progress fill is re-triggered.
 
@@ -703,7 +703,8 @@ Recorded in `trade_log.is_ambiguous` for post-hoc analysis.
 ## Dead Position
 
 Occurs when:
-1. Session_end exit price cannot be determined (15:59 halt + no after-market data).
+1. Session_end exit price cannot be determined (exit_deadline(date) halt + no
+   after-market data).
 
 ```
 Case A — next trading day has_data=True AND ticker exists in ticker_data_coverage:
@@ -732,7 +733,7 @@ Case B — next trading day has_data=True AND ticker NOT in ticker_data_coverage
     exit_price = 0
     exit_reason = "dead_position_delisted"
     is_dead_position = True
-    exit_bar = 155900, exit_date = D
+    exit_bar = last_bar(D), exit_date = D
 
 Case C — next trading day not in dataset (dataset boundary):
     exit_price = p_entry * (1 - config["backtest"]["dead_position_boundary_pct"])
@@ -741,7 +742,7 @@ Case C — next trading day not in dataset (dataset boundary):
                  # value, two different treatments
     exit_reason = "dead_position_no_data"
     is_dead_position = True
-    exit_bar = 155900, exit_date = D — the synthetic exit_price needs no
+    exit_bar = last_bar(D), exit_date = D — the synthetic exit_price needs no
         D+1 data, so it is already known at D's close
 
 Case D — Case A path entered, but exit_price unresolvable after fallback
@@ -751,9 +752,28 @@ Case D — Case A path entered, but exit_price unresolvable after fallback
     exit_price = 0
     exit_reason = "dead_position_extended_halt"
     is_dead_position = True
-    exit_bar = 155900, exit_date = D
+    exit_bar = last_bar(D), exit_date = D
     (mirrors Labeler's Case D — see 05_labeler.md — same mechanism as Case B)
 ```
+
+**Early-close dates are ALWAYS replayed.** `live_mode.trade_early_close_days`
+gates live entry submission only and is not read here — a known one-sided
+divergence between the engines, in the same family as R-4's breaker being
+computed but never enforced and shadow mode's evaluate-but-don't-enforce. It is
+deliberate: those days are labelled correctly and kept in the corpus precisely so
+backtest can measure whether they are worth trading, and a gate that switched off
+both engines would make that measurement impossible. Nothing is recorded in
+`experiment_log` for this, because nothing varies per run — see db_schema.md.
+
+**Cases B/C/D's `exit_bar` is DERIVED, not the literal 155900 it once was.**
+These three write a SYNTHETIC anchor — no liquidation happened — but
+db_schema.md defines `exit_bar` as the exit anchor instant and `exit_date` as
+the date it belongs to, and all three carry `exit_date = D`. On an early-close D
+the literal named an instant that does not exist, so the pair (date, exit_bar)
+pointed nowhere. `last_bar(D)`, NOT `exit_deadline(D)`: the anchor marks the end
+of D's tape, which is a data fact, and it must not drift if someone later sets
+the exit offset to ten minutes. Case A is unaffected — it already carries a real
+D+1 resolution timestamp.
 
 **Capital treatment.** At D's close the position releases its slot (it no
 longer counts toward `execution.max_tickers` /
@@ -904,7 +924,7 @@ requested_quantity       INTEGER,   -- quantity actually SUBMITTED, i.e. after
 - OHLCV loaded once per ticker for all its entry dates
 - Tick data loaded once per ticker/date (full day); filtered in memory by range
 - `halts_td` passed explicitly to all internal methods — no internal DB queries after initial load
-- Session close (15:59 bar) triggers immediate exit — takes priority over time-limit
+- Session close (exit_deadline(date) bar) triggers immediate exit — takes priority over time-limit
 - `simulate_exit_fill()` is not called for `session_end` or `time_limit` exits
   while `execution.simulate_nondirectional_exit_fill` is false, its default —
   the bar close and the last valid bar's close are used directly, so current
@@ -921,8 +941,8 @@ requested_quantity       INTEGER,   -- quantity actually SUBMITTED, i.e. after
   is the divergence it exists to remove. With it off, live writes the
   reference price straight to `exit_price` rather than calling the simulator,
   so on and off branch over the SAME anchor
-- After-market data used only as fallback when 15:59 bar is halt/no_data
-- Dead position: session_end fallback fails only (15:59 halt + no after-market data)
+- After-market data used only as fallback when exit_deadline(date) bar is halt/no_data
+- Dead position: session_end fallback fails only (exit_deadline(date) halt + no after-market data)
 - Dead position lookup uses `has_data = TRUE` filter (not `is_trading_day`) — consistent with Labeler
 - Dead position Case A pnl uses dividend/split-adjusted p_entry (see Dead Position section) —
   `corporate_events` rows for (ticker, event_date IN (D, D+1]) are loaded alongside

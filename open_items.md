@@ -26,6 +26,13 @@ confirmation that it still reads correctly.
 
 ## Suggested order
 
+**Ordering caveat.** Halt-status leads this list on dependency grounds, but
+its actual blocker is SOURCE SELECTION, not design time: until a source
+exists there is nothing to design, since the shape of the fix (a market-wide
+feed versus a per-ticker query) is what decides whether chunking survives and
+whether the ticker list is a request or a filter. Sequence the unblocked
+items ahead of it.
+
 1. **Halt-status source** is independent and blocks nothing else, but the
    halt path has no primary signal until it lands. `live_halt_episodes`'
    `source` column now gives it an audit axis: once a real source exists its
@@ -34,12 +41,15 @@ confirmation that it still reads correctly.
    NYSE page that already fills `trading_halts` is not a candidate, since a
    live signal drawn from it would make the evening comparison a source
    against itself.
-2. **Async boundary**, **early-close days** and the
-   **manual-intervention CLI** are independent of each other and of the
-   above. The async boundary is now the more constrained of the three: the
-   watchdog scan fires N speculative REST calls per cycle and alternates
+2. **Async boundary** and the **manual-intervention CLI** are independent of
+   each other and of the above. The async boundary is the more constrained:
+   the watchdog scan fires N speculative REST calls per cycle and alternates
    across two accounts, so how many clients exist and where the boundary
-   falls has consequences it did not have before.
+   falls has consequences it did not have before. It shares a review surface
+   with (3)'s two undesigned sub-questions — the 2-print guard runs inside
+   the tick callback, so settling handover semantics before knowing what that
+   callback may do inline is work done in the wrong order — and the two are
+   best taken together.
 3. **WS/REST tape asymmetry and exit-trigger path transitions** is blocked on
    SHADOW-PERIOD DATA rather than on design time, so it is not sequenced
    against the items above. Its two undesigned sub-questions (guard state at
@@ -173,22 +183,6 @@ what the tick callback is allowed to do inline — is not designed.
 
 **Not yet designed.** Independent of the other items; can be taken at any
 point.
-
----
-
-## Early-close days
-
-**Problem.** The NYSE calendar library is already the holiday source, but
-only its holiday set is read, and a holiday set cannot express a half day.
-On an early-close day the regular session ends at 13:00 rather than 16:00.
-
-`session_close_exit_time`, `session_hard_exit_time`, the session-phase
-boundaries that now decide which order types are permitted, and the evening
-batch's own gating all assume a 16:00 close. The same library's schedule
-interface exposes a per-date close time, so the fix needs no new vendor —
-but the affected surface is wider than any one of those keys.
-
-**Not yet designed.**
 
 ---
 

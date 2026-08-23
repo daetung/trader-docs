@@ -359,6 +359,9 @@ def _update_fib(self, close: float) -> None:
 ```
 Config value  → Bars to use at session_start_compute()
 "lookback"    → historical_bars[-lookback_days * 390 :]
+                 (390 = an ordinary session's bar count, used as a WINDOW SIZE
+                  over the loaded frame; not a per-date session boundary. The
+                  frame spans 040000~200000, so the slice is conservative)
 "window"      → historical_bars[-indicator.window_bars :]
 0             → not precalculated (bar-by-bar in on_bar_close)
 ```

@@ -386,7 +386,7 @@ def check_corporate_event_anomaly(
     For each ticker with a non-null quote in `quotes`:
         yesterday_close = <today's D-1 close, via the same halt-aware
             search utils.md's gap_pct C. logic uses for a single prior
-            session: try D-1's 155900 bar close; if halt/missing,
+            session: try D-1's last_bar(D-1) close; if halt/missing,
             search backward within D-1's regular session for the last
             non-halt bar; if none found, skip this ticker (no baseline)>
         if yesterday_close is None: skip
@@ -495,6 +495,9 @@ migrate_date(data_root, db_conn, date=today)
 ```
 
 Time range filter: `hour >= '040000' AND hour <= '200000'` (no session filtering).
+NOT per-date and deliberately so: the filter exists to exclude OVERNIGHT, and an
+early-close day has no data past its own `after_hours_end` (17:00), so the fixed
+upper bound still admits everything real and still excludes overnight.
 
 ---
 
@@ -1311,6 +1314,8 @@ Daily Collection — 20250715
 
   [Session Stats — next trading day: 20250716]
     precomputed_session_stats: 11,847 tickers × 390 bars × 8 metrics computed
+                               (390 = an ordinary session; a capacity estimate,
+                                not a per-date assertion)
     Duration            : 1m 48s
 ```
 
@@ -1582,8 +1587,15 @@ quarantine:
   specified here, out of scope) check to decide whether to actually run a
   session that day, not the presence or absence of a `batch_runs` row.
 - Failed metadata tickers do not block ingestion — two steps are independent
-- No session time filter on ingested data — all periods (040000~200000) stored
+- No session time filter on ingested data — all periods (040000~200000) stored.
+  The bound stays fixed on an early-close day; see the Time range filter note
 - The evening cron must not start before that day's JSON dump has finished.
+  On an early-close day the dump completes at 17:00 rather than 20:00, so the
+  21:00 slot gains margin instead of losing it. THE CRON IS NOT MOVED EARLIER TO
+  MATCH: the truncation risk below is one-sided — waiting longer than necessary
+  costs nothing, while ingesting before the dump finishes is permanent. This is
+  why the exit path and the ingestion path do NOT share one boundary key even
+  though both concern the after-market end.
   The ingestion range's upper bound (`200000`) and the dump's completion are
   the same instant by construction, so the 21:00 ET slot is derived from that
   boundary rather than chosen independently — if the dump moves, this cron

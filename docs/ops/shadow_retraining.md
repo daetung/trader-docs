@@ -297,9 +297,9 @@ the current market regime.
 04:00 ET `--premarket-open`, 09:20 ET `--premarket-recheck` — R-1: the
 09:20 pass is now a LiveModeRunner in-process task, not a cron entry — see
 metadata_crawler.md's "Dual Schedule", N-1/N-3 — 09:30 regular session
-open, 15:59 session close, 16:00 regular session close — past which the
-venue refuses market orders, so order type branches on it, see
-execution_common.md's session-phase table — 20:00 ET
+open, `last_bar(date)` session close, `session_close(date)` regular session
+close — past which the venue refuses market orders, so order type branches on
+it, see execution_common.md's session-phase table — `after_hours_end(date)`
 `session_hard_exit_time`, 21:00 ET evening batch run, 23:30 ET
 `evening_wait_hard_deadline`) are wall-clock America/New_York times, which
 observe DST. The set above is every wall-clock time the system schedules or
@@ -321,6 +321,20 @@ shift correctly across the two annual transitions. Operator checklist: on
 the Monday following each DST transition (mid-March, early November),
 verify that day's `batch_runs` rows landed at the expected wall-clock
 times before trusting the session.
+
+**This list is where the system's two distinct close concepts became visible
+side by side**, and naming them is what the calendar column made possible: the
+LAST BAR (`last_bar()`, ordinarily 15:59) and the EXCHANGE CLOSE
+(`session_close()`, ordinarily 16:00) differ by a minute and were both written
+as bare times here. On an early-close day they are 12:59 and 13:00, and
+`after_hours_end` is 17:00 rather than 20:00. The 21:00 and 23:30 slots do NOT
+move — see metadata_crawler.md for why the evening cron is not pulled earlier.
+The session-boundary entries above are now DERIVED rather than fixed, which does
+not remove them from the enumeration: the criterion is that the system gates
+behaviour on the value, not that the value is a literal. Membership rule for the
+comparison described above — an entry whose authority is a config key is compared
+against that key; an entry whose authority is `trading_calendar` is compared
+against the column.
 
 **DuckDB Backup/Recovery.** `data/market.duckdb` is backed up via a
 nightly file-level copy, scheduled in the quiescent window after the

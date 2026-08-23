@@ -149,12 +149,12 @@ Use build_effective_bar_sequence() from utils.py.
 Collect bars from t onward for this (ticker, date).
 Collection stops at whichever comes first:
     - 60 valid (non-halt) bars collected, or
-    - 15:59 bar reached
-After-market bars (hour > "155900") are never included.
+    - last_bar(date) reached
+After-market bars (hour > last_bar(date)) are never included.
 
 Halt classification applies across all time periods (pre/regular/after-market).
 
-For each missing bar slot up to 15:59:
+For each missing bar slot up to last_bar(date):
     if slot overlaps halt interval in halts_df → "halt" (excluded from valid count)
     else                                        → "no_trade" (OHLC = prior close, volume=0)
 
@@ -184,17 +184,25 @@ else:
 Triggered when track_label_breach() returns None (no ±3pp breach).
 Exit path determined by which condition terminated Step 1:
 
-    Case A — time-limit exit (60 valid bars collected before 15:59 bar reached):
+    Case A — time-limit exit (60 valid bars collected before last_bar(date) reached):
         exit_price = close of last valid bar in effective_bars
         pnl = (exit_price - P_entry) / P_entry
         apply label by pnl threshold (same rules as Case B below)
         → no after-market fallback; no dead position
 
-    Case B — session close exit (15:59 bar reached within 60 valid bars):
-        exit_price = 15:59 bar close
+    Case B — session close exit (last_bar(date) reached within 60 valid bars):
+        exit_price = last_bar(date) close
+        # last_bar(), not exit_deadline(): Case B is not an exit POLICY but the
+        # terminal condition of Step 1's collection, so it must land where
+        # collection stopped. BacktestEngine's session-close exit IS a policy
+        # and uses exit_deadline(). At the default offset the two coincide; at
+        # an offset of 10 the label observes to 15:59 while backtest exits at
+        # 15:50. Not an error — the label is a training target and backtest
+        # computes pnl from its own fills — but the observation window and the
+        # exit instant then differ by nine minutes.
 
-        if 15:59 bar is halt or no_data:
-            fallback: first tick_10 row with hour > "155900" (after-market)
+        if last_bar(date) is halt or no_data:
+            fallback: first tick_10 row with hour > last_bar(date) (after-market)
             if no after-market tick: → Dead position (Step 4)
 
         pnl = (exit_price - P_entry) / P_entry
@@ -208,7 +216,7 @@ Exit path determined by which condition terminated Step 1:
 --- Step 4: Dead position ---
 
 Dead position occurs only when:
-    - Session close exit price cannot be determined (15:59 halt + no after-market data)
+    - Session close exit price cannot be determined (last_bar(date) halt + no after-market data)
     - Triggered from Step 3 Case B only — time-limit exit never leads to dead position
 
 In this case:
@@ -297,13 +305,13 @@ Note: `build_effective_bar_sequence()` is an internal delegation to
 
 - t bar high/low/close/volume must NOT be used — only t bar open (P_entry) is permitted as reference
 - Halt bars are excluded from the 60-bar valid count — search extends to compensate
-- Time-limit exit (Step 3 Case A): triggered when 60 valid bars collected before 15:59;
+- Time-limit exit (Step 3 Case A): triggered when 60 valid bars collected before last_bar(date);
   exit_price = last valid bar close; no after-market fallback; no dead position
-- Session close exit (Step 3 Case B): triggered when 15:59 bar reached within 60 valid bars;
-  after-market fallback applies when 15:59 bar is halt/no_data
+- Session close exit (Step 3 Case B): triggered when last_bar(date) reached within 60 valid bars;
+  after-market fallback applies when last_bar(date) is halt/no_data
 - Dead position triggered from Step 3 Case B only — time-limit exit never leads to dead position
-- After-market data usage limited to 15:59 halt/no_data fallback only (Step 3 Case B)
-- build_effective_bar_sequence() collects bars up to 15:59 only — after-market bars never included
+- After-market data usage limited to last_bar(date) halt/no_data fallback only (Step 3 Case B)
+- build_effective_bar_sequence() collects bars up to last_bar(date) only — after-market bars never included
 - Dead position is the only case where after-market and next-day data are used
 - Threshold values (threshold_3pp, threshold_5pp) must be read from config, not hardcoded
 - `build_effective_bar_sequence()` is sourced from `utils.py` — do not reimplement
@@ -340,9 +348,30 @@ Note: `build_effective_bar_sequence()` is an internal delegation to
 labeler:
   threshold_3pp: 0.03
   threshold_5pp: 0.05
-  session_close_hour: "155900"
-  after_market_close_hour: "200000"
-  max_holding_bars: 60                # valid (non-halt) bars, within session boundary
+  # session_close_hour REMOVED. It re-declared the session boundary under a
+  # key of its own; the calendar is the single source whichever derivation a
+  # site needs. It is NOT simply a duplicate of
+  # execution.session_close_exit_time: the two held the same value but not the
+  # same concept, this one being a COLLECTION bound. R-7's ground still
+  # applies — "a value both engines must agree on cannot be declared on one
+  # side only" — and the engines that must agree are backtest, live AND this
+  # one. The boundary now resolves through
+  # utils.md's last_bar(date), which is also what utils.md names as
+  # build_effective_bar_sequence()'s collection bound, so the shared function
+  # is no longer reached through this module's key on one side and
+  # execution:'s on the other.
+  # after_market_close_hour REMOVED. It duplicated the 200000 after-market
+  # boundary already carried by live_mode.session_hard_exit_time, the
+  # ingestion range, and metadata_crawler.md's evening-cron derivation. Where
+  # this module needs it, it reads trading_calendar.after_hours_end.
+  # max_holding_bars REMOVED — execution.max_hold_bars is the single source.
+  # R-6 established that and enumerated the consumers it knew of; this module
+  # was not among them, because the key here was max_holDING_bars and no grep
+  # on the established identifier could reach a near-miss name. That
+  # enumeration is why a COUNT should not stand in for a list: it read as
+  # complete while a member sat outside it.
+  # A NEAR-MISS IDENTIFIER IS ITS OWN SWEEP AXIS — neither the literal axis
+  # nor the prose axis reaches it.
   dead_position_penalty_pct: 0.05     # applied to next-day exit price (Case A)
   ambiguity_priority: "up"            # "up" | "dn" — breach direction on simultaneous bundle breach
   exit_interpolation: true            # passed to track_label_breach(); default true
@@ -358,8 +387,8 @@ labeler:
 | +3pp hit at bar 10, -3pp hit at bar 15 (before +5pp) | label_up3 |
 | -3pp hit first, -5pp reached | label_dn5 |
 | -3pp hit first, +3pp cuts off before -5pp | label_dn3 |
-| Neither ±3pp breached, 15:59 reached within 60 bars | label_sw (session close exit) |
-| Neither ±3pp breached, 60 valid bars collected before 15:59 | label_sw (time-limit exit, last valid bar close) |
+| Neither ±3pp breached, last_bar(date) reached within 60 bars | label_sw (session close exit) |
+| Neither ±3pp breached, 60 valid bars collected before last_bar(date) | label_sw (time-limit exit, last valid bar close) |
 | Ambiguous bundle (both ±3pp in same bundle), priority="up" | label_up3/up5, is_ambiguous=True |
 | Dead position Case A (ticker in coverage, has_data=True next day) | is_dead_position=True, case="A", label by pnl threshold (dividend/split adjusted) |
 | Dead position Case B (ticker missing, has_data=True next day) | is_dead_position=True, case="B", pnl=-1.0, label_dn5 |
@@ -367,4 +396,4 @@ labeler:
 | Dead position Case D (Case A entered, exit_price unresolvable — extended halt) | is_dead_position=True, case="D", pnl=-1.0, label_dn5 |
 | Dead position Case A with split effective D+1 | pnl computed against split-adjusted P_entry, not raw P_entry |
 | Halt bar skipped in 60-bar count | label assigned after halt |
-| Time-limit exit: 60 valid bars collected, 15:59 bar not yet reached | exit at last valid bar close, no dead position |
+| Time-limit exit: 60 valid bars collected, last_bar(date) not yet reached | exit at last valid bar close, no dead position |

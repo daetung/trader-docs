@@ -55,12 +55,14 @@ detect(): Training and live inference.
 Entry point detection scope is controlled by `session_mode` config:
 
 ```
-"regular"  : entry points from regular session only (093000~155900) [default]
+"regular"  : entry points from regular session only (093000~last_bar(date)) [default]
 "pre"      : entry points from pre-market only (040000~092900)
 "combined" : entry points from both pre-market and regular session
 ```
 
-After-market (hour > 155900) entry points are excluded in all modes.
+After-market (hour > last_bar(date)) entry points are excluded in all modes.
+The bound is PER DATE (utils.md last_bar()): on an early-close day it is 125900,
+so an entry at 13:30 is after-market there and 155900 would admit it.
 
 Session mode filtering is applied during the **training stage only**.
 The preprocessing stage runs EntryPointDetector for all entry points regardless
@@ -72,24 +74,33 @@ when loading preprocessed data.
 ## Late-Day Entry Exclusion
 
 Entry points detected too close to session close are excluded to avoid
-label horizon distortion. When fewer than 60 valid bars remain before 15:59,
+label horizon distortion. When fewer than 60 valid bars remain before
+last_bar(date),
 the label is dominated by session-close exit logic rather than genuine
 price movement — creating a systematic bias.
 
 ```
-max_entry_hour: configurable cutoff (default: null — no cutoff applied)
+max_entry_hour: DERIVED, not configured —
+    max_entry_hour(date) = last_bar(date) - execution.max_hold_bars minutes
 
-When max_entry_hour is set (e.g. "150000"):
-    entry points with t bar open time > max_entry_hour are excluded
+    entry points with t bar open time > max_entry_hour(date) are excluded
     from scan() output.
 
 Applied after after-market exclusion, before session_mode filtering.
 ```
 
-Rationale: at 15:00, only ~60 valid bars remain before 15:59 close.
-Entries at or after 15:00 are structurally label-distorted.
-Setting `max_entry_hour: "150000"` is recommended for regular session mode.
-For pre-market mode, this setting has no practical effect.
+Rationale: the cutoff exists so that at least `max_hold_bars` valid bars remain
+before the close, and that is exactly what the expression says. It was formerly
+a hand-tuned constant (`"150000"`, with the note "at 15:00, only ~60 valid bars
+remain before 15:59 close") — but 60 IS `execution.max_hold_bars` and 15:59 IS
+the last bar, so the constant was already a function of two other keys and
+merely written out. This is the same defect R-6 fixed for `max_hold_bars`
+itself, and deriving it resolves the early-close case as a by-product: on a
+13:00 close the cutoff becomes 12:00 rather than sitting three hours past the
+session's end, where it excluded nothing.
+
+Ordinarily this yields 150000, matching the former recommended value exactly.
+For pre-market mode the cutoff still has no practical effect.
 
 ---
 
@@ -356,7 +367,7 @@ class EntryPointDetector:
         needed there, since a live call handles exactly one date: today).
 
         Exclusion order applied inside scan():
-          1. After-market entry points (hour > 155900) always excluded
+          1. After-market entry points (hour > last_bar(date)) always excluded
           2. Late-day entry points (hour > max_entry_hour) excluded
              when max_entry_hour is not null
           3. Session_mode filtering applied at ClassBalancer.split() stage,
@@ -430,8 +441,11 @@ entry_detector:
   volume_base_hour: "040000"     # base hour for D, E, F conditions
 
   # Late-day exclusion
-  max_entry_hour: "150000"       # null = no cutoff; "150000" recommended for regular session
-                                 # Applied in scan() before session_mode filter
+  # max_entry_hour REMOVED — derived as last_bar(date) - execution.max_hold_bars
+  # minutes (see Late-Day Entry Exclusion). Its own stated rationale was already
+  # a function of max_hold_bars and the session close; writing the result out as
+  # a constant is what R-6 removed elsewhere.
+  # Applied in scan() before session_mode filter
 
   # Individual filter thresholds
   A_max_price: 20.0
@@ -467,7 +481,7 @@ entry_detector:
   `utils.estimate_historical_meta()` fallback) is the caller's responsibility,
   consistent with this module never computing metadata values itself
 - Filter F returns `False` (not an error) when no prior bars exist for the day (first bar of session edge case)
-- After-market entry points (hour > 155900) must never be returned from `scan()`
+- After-market entry points (hour > last_bar(date)) must never be returned from `scan()`
 - Late-day entry points (hour > max_entry_hour) excluded in `scan()` when max_entry_hour is not null
 - `max_entry_hour` exclusion applied before session_mode filter — both are independent constraints
 - `volume_base_hour` applied to conditions D, E, F only — condition G uses rolling window, no base hour filter

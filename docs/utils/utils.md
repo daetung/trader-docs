@@ -28,22 +28,34 @@ def build_effective_bar_sequence(
     Build sequence of valid (non-halt) bars starting from t_hour.
     Used by Labeler and BacktestEngine for consistent bar counting.
 
-    Collection boundary: bars up to and including 15:59 (session_close_hour) only.
-    After-market bars (hour > "155900") are NEVER included regardless of
-    target_valid_bars. If 15:59 is reached before target_valid_bars valid bars
-    are collected, collection stops at 15:59.
+    Collection boundary: bars up to and including last_bar(date) only.
+    After-market bars (hour > last_bar(date)) are NEVER included regardless of
+    target_valid_bars. If last_bar(date) is reached before target_valid_bars valid
+    bars are collected, collection stops there.
+
+    PER-DATE, not the fixed 155900 this once assumed. On an early-close day the
+    session ends at 13:00, so the boundary is 125900 and there are no bars after
+    it. Filling to 155900 there would manufacture ~180 no_trade slots — which
+    count as VALID by the rule below — and drive every label toward label_sw
+    while reading a normal session as heavily synthetic through
+    04_feature_extractor.md's synthetic_bar_ratio / missing_bar_count /
+    consecutive_synthetic_max. This boundary is what keeps those three correct;
+    the coupling is stated because neither side can be changed alone.
+    last_bar(), NOT exit_deadline(): this is a data fact (the final bar of the
+    session), not the exit policy. They coincide only while
+    execution.session_close_exit_offset_minutes is 1.
 
     Halt classification applies across ALL time periods (pre/regular/after-market).
     halts_df is the authoritative source regardless of hour.
 
-    For each missing bar slot in the sequence (up to 15:59):
+    For each missing bar slot in the sequence (up to last_bar(date)):
         if slot overlaps any halt interval in halts_df → classified as "halt"
             halt bars: excluded from valid bar count, OHLC = NaN, volume = 0
         else → classified as "no_trade"
             no_trade bars: included in valid count, OHLC = prior close (forward-fill), volume = 0
 
     Continues until target_valid_bars valid (non-halt) bars are collected
-    or 15:59 bar is reached (whichever comes first).
+    or last_bar(date) is reached (whichever comes first).
 
     Args:
         ohlcv_future:       bars from t_hour onward for (ticker, date)
@@ -54,7 +66,7 @@ def build_effective_bar_sequence(
 
     Returns:
         pd.DataFrame with columns [hour, open, high, low, close, volume, is_halt, is_valid]
-        Never contains bars with hour > "155900".
+        Never contains bars with hour > last_bar(date).
     """
     ...
 ```
@@ -402,6 +414,111 @@ def save_encoding_map(map_name: str, mapping: dict, configs_dir: str = "configs"
 
 ---
 
+### Session Boundary Derivations
+
+One column, several names. `trading_calendar.session_close` holds the exchange
+close; everything else in the system derives from it through exactly one of
+the derivations below.
+
+CALL-SITE NOTATION. Signatures below take the `{date: close}` map (and, for
+`exit_deadline()`, config) explicitly — nothing here queries DuckDB, matching
+`halts_df` and `session_stats`. Other specs write the single-argument forms
+`last_bar(date)` / `exit_deadline(today)` for readability; the map argument is
+ELIDED IN PROSE, never fetched internally. A call site that has no map in scope
+is a design error at that site, not a case for a lookup inside these functions. They are named so that no call site can confuse them — that legibility is
+the point, and it is why the arithmetic is NOT inlined at each use site.
+
+```python
+def session_close(date: str, closes: dict[str, str]) -> str:
+    """
+    That date's EXCHANGE close, 'HHMMSS' — the trading_calendar column verbatim.
+    '160000' ordinarily, '130000' on an early-close day.
+
+    `closes` is the canonical {date: close} map (see load_session_boundaries()).
+
+    RAISES on a date absent from the map. It must NOT fall back to '160000':
+    that fallback restores the silent 16:00 assumption this whole mechanism
+    exists to remove, and it would fail exactly on the days that differ. Same
+    posture as get_next_trading_day() raising on an unpopulated calendar.
+    """
+    ...
+
+
+def last_bar(date: str, closes: dict[str, str]) -> str:
+    """
+    session_close(date) - 1 minute. The final bar of the regular session:
+    '155900' ordinarily, '125900' on an early-close day.
+
+    A DATA FACT. It is where bar collection stops, where a prior session's close
+    price is read, and the upper bound of the "regular" session_mode range. It
+    does not move with policy.
+
+    Callers: build_effective_bar_sequence()'s collection boundary;
+    gap_pct's prev_close anchor (this file, 02_indicator_calculator.md,
+    migration_tool.md, metadata_crawler.md — every copy of one anchor);
+    load_session_stats() / build_session_stats_dict()'s session_mode ranges;
+    05_labeler.md's Steps 1/3/4; 01_entry_detection.md's session_mode and
+    max_entry_hour; inferencer.md's session-mode filter.
+
+    The "- 1 minute" is a bar-resolution assumption. It is deliberately HERE and
+    nowhere else: the column holds the exchange close precisely so that a change
+    of bar resolution touches one derivation instead of every site.
+    """
+    ...
+
+
+def exit_deadline(date: str, closes: dict[str, str], config: dict) -> str:
+    """
+    session_close(date) - execution.session_close_exit_offset_minutes.
+
+    A POLICY. Being flat by 15:50 must stay expressible, which is why the offset
+    survives as a config key rather than collapsing into the calendar.
+
+    Callers: every former reader of execution.session_close_exit_time — the
+    Position Manager Loop's session_end trigger, Session Shutdown condition (a),
+    the Watchdog Loop's self-termination guard, BacktestEngine's session-close
+    exit.
+
+    NOT INTERCHANGEABLE WITH last_bar(). They coincide only because the offset
+    defaults to 1. At an offset of 10, exit_deadline is 15:50 while last_bar is
+    still 15:59, and a gap_pct anchor following the exit deadline would be
+    silently wrong by nine minutes. One literal 155900 was serving both meanings
+    before this split; each former site was classified into exactly one of the
+    derivations above, and that classification is what surfaced the conflation.
+    """
+    ...
+
+
+def load_session_boundaries(
+    db_conn: duckdb.DuckDBPyConnection,
+    dates: list[str] | None = None,
+) -> dict[str, str]:
+    """
+    Load the canonical {date: session_close} map in ONE query, alongside
+    session_stats_bulk rather than inside it.
+
+    NOT folded into the session_stats dict. That dict's grain is
+    (date, ticker, metric, hour) while a close is one per DATE, so folding would
+    replicate one value across ~15,000 tickers per day — 15,000 declaration sites
+    of a single fact — and would make the close inherit session_stats' "absent is
+    fine, degrade to NaN" contract, which is the opposite of the raise rule above.
+    Labeler and BacktestEngine receive no session_stats at all yet need the close
+    most, so folding would also leave a second delivery path in place for the same
+    fact.
+
+    Rows number in the thousands even across the whole corpus. Vectorised
+    consumers attach it to their own frame — bars["session_close"] =
+    bars["date"].map(closes) — which is a derivation of this map, not a second
+    source. dates=None loads every row.
+
+    after_hours_end is loaded by the same mechanism where needed; it is a separate
+    column with the same NULL rule.
+    """
+    ...
+```
+
+---
+
 ### Trading Calendar Utilities
 
 ```python
@@ -411,9 +528,42 @@ def populate_trading_calendar(
 ) -> int:
     """
     Populate or refresh trading_calendar table.
-    Uses pandas_market_calendars (NYSE) for is_trading_day / is_holiday.
+    Uses pandas_market_calendars (NYSE) for is_trading_day / is_holiday, and its
+    SCHEDULE interface — not merely its holiday set — for session_close: the
+    per-date market_close, stored as 'HHMMSS' wall clock ('160000' ordinarily,
+    '130000' on an early-close day). A holiday set cannot express a half day,
+    which is why reading only holidays left the whole system assuming 16:00.
+    after_hours_end is NOT available from that library — schedule() returns
+    market_open/market_close only — so it is written from the confirmed venue
+    fact: '200000' ordinarily, '170000' on an early-close day. See db_schema.md's
+    column-class membership rule on trading_calendar.
     Sets has_data=True for dates present in ohlcv_1min.
     Safe to re-run (upsert).
+
+    FORWARD FILL — ONE YEAR AHEAD, ROLLING.
+    date_range=None populates from the earliest date already present through one
+    year past today, and the daily run extends that horizon by a day each time it
+    runs rather than refreshing it in an annual batch, so the horizon never
+    reaches an expiry cliff. us_holidays already carries the correct convention
+    ("3 years forward on first run; refresh annually" — metadata_crawler.md); this
+    table did not, and get_next_trading_day()'s "calendar should be populated far
+    enough ahead by populate_trading_calendar()" was an ASSUMPTION stated in a
+    parenthetical that no call site implemented — migration passes ingested_dates
+    (past) and the daily run passes [today].
+    What that closes: on reaching the last populated date the daily collection
+    raises at get_next_trading_day(), tomorrow's precomputed_session_stats is
+    never written, and Health Gate 1a aborts tomorrow's session — the ending
+    health_report.md finding 28 describes. The raise rule on a missing
+    session_close (below) makes the dependency heavier still.
+    A forward row carries is_trading_day, is_holiday, session_close and
+    after_hours_end, and has_data=FALSE. That FALSE is correct, not a gap.
+
+    THE DAILY RUN REWRITES A NEAR-TERM WINDOW, it does not only append. An
+    unscheduled early close — weather, national mourning — is announced days
+    ahead and must overwrite a session_close written a year earlier. Append-only
+    extension would leave the stale '160000' in place for exactly the case that
+    cannot be predicted a year out.
+
     Returns: number of rows upserted.
     """
     ...
@@ -918,6 +1068,36 @@ def populate_precomputed_session_stats(
         (halt naturally interrupts volume flow — this is correct behavior).
         Sessions with no ohlcv rows for that date (full-day no-data) are
         excluded from count entirely.
+        EARLY-CLOSE SESSIONS ARE EXCLUDED WHOLESALE, on the same footing — a
+        session that was not in progress across the whole slot range cannot
+        supply a cumulative curve over it.
+        WHY WHOLESALE AND NOT PER-SLOT, since B below is per-slot: a cumulative
+        curve inherits from its neighbours, so a sample set that CHANGES between
+        adjacent slots puts a step in the baseline itself. With 19 normal
+        sessions and one early close, baseline[125900] averages 20 samples and
+        baseline[130100] averages 19, and rvol = today_cum(T) / baseline(T)
+        therefore steps at 13:00 for every date whose lookback contains that day
+        — an artifact of sample composition, not of the market. It is worse than
+        a fixed artifact: the window rolls, so the step appears, moves and
+        vanishes as the early-close day enters and leaves the lookback, and a
+        non-stationary artifact is not something the model absorbs. Delta
+        smoothing does not localise it either — a [H-delta, H+delta] window
+        straddling 13:00 mixes 20-sample and 19-sample values, spreading the
+        discontinuity across the whole smoothing width.
+        NORMALISATION was rejected: scaling by session length assumes volume is
+        linear in it, and an early close is thin partly because fewer
+        participants show up, not only because it is shorter. Before 13:00 there
+        is nothing to normalise — those values are already correct — so the
+        adjustment would corrupt good samples to fix absent ones.
+        Cost: count = 19 rather than 20 at every slot, for roughly 20 as_of_dates
+        per early-close day. The count column already records this and consumers
+        already handle count < n_sessions, which occurs throughout the dataset's
+        opening window.
+        PARTIAL-SESSION BEHAVIOUR IS NOW STATED, having been undefined: whether
+        the cumsum was `sum(hour <= T)` (which would carry an early-close
+        session's total forward into every later slot, depressing the mean ~2.5%)
+        or required a bar at slot T (dropping count) was never specified.
+        Wholesale exclusion makes the question moot rather than answering it.
 
     B. Per-bar metrics (intra_vol_baseline, intra_return_baseline,
                         intra_tpm_baseline, buy_ratio_baseline):
@@ -930,10 +1110,17 @@ def populate_precomputed_session_stats(
         gap_pct = (today_regular_open - prev_close) / prev_close
 
         prev_close determination (for each prior session D-k):
-            1. Try D-k 155900 bar close
+            1. Try D-k last_bar(D-k) close
             2. If halt or missing: search backward for last non-halt bar
-               in D-k 093000~155900 (latest HHMMSS with non-NaN OHLC)
+               in D-k 093000~last_bar(D-k) (latest HHMMSS with non-NaN OHLC)
             3. If no non-halt bar found in D-k regular session: exclude session
+            PER-DATE, not 155900. When D-k was an early close, 155900 does not
+            exist and step 1 always misses; step 2's halt fallback then walks
+            back to the real final bar and happens to land correctly — the right
+            answer for the wrong reason, a halt device silently absorbing a
+            structural difference in session length. Anchoring on last_bar(D-k)
+            makes step 1 hit directly and leaves the fallback to do only the job
+            it was built for.
 
         today_regular_open determination (for each prior session D-k):
             1. Try D-k 093000 bar open
@@ -1032,9 +1219,19 @@ def load_session_stats(
     Steps:
         1. Query precomputed_session_stats WHERE ticker=?, as_of_date=?, n_sessions=?
         2. Apply session_mode filter:
-               "regular":  keep hours 093000~155900 only
+               "regular":  keep hours 093000~last_bar(as_of_date) only
                "pre":      keep hours 040000~092900 only
-               "combined": keep 040000~155900
+               "combined": keep 040000~last_bar(as_of_date)
+               Day-level metrics (hour='000000') always included regardless of session_mode.
+           The last sentence is COPIED VERBATIM from build_session_stats_dict()
+           below, where it was already stated and here was not. Read literally,
+           the "regular" range excluded hour='000000' and therefore dropped
+           gap_pct_mean/gap_pct_std — so a ticker loaded in the session-start bulk
+           kept its gap_pct baseline while the same ticker arriving mid-session
+           through Phase 2 lost it and gap_percentile returned NaN. One
+           proposition, two copies, only one of them stated. The wording matches
+           to the character on purpose: two copies that differ read as two
+           propositions to the next sweep.
         3. Apply delta_minutes rolling average per metric:
                For each hour H, smoothed_value[H] =
                    mean(avg_value for hours in [H-delta, H+delta])
@@ -1062,7 +1259,7 @@ def build_session_stats_dict(
 
     Processing:
         1. Filter rows by session_mode (apply hour range filter per metric):
-               "regular":  include hours in 093000~155900 (bar-level metrics only)
+               "regular":  include hours in 093000~last_bar(as_of_date) (bar-level metrics only)
                "pre":      include hours in 040000~092900
                "combined": include all hours
                Day-level metrics (hour='000000') always included regardless of session_mode.
@@ -1099,7 +1296,7 @@ def compute_vol_regime_holdout(
 ) -> set[str]:
     """
     Compute holdout dates based on rolling volatility percentile.
-    Uses regular session bars only (093000–155900) from ohlcv_1min.
+    Uses regular session bars only (093000~last_bar(date)) from ohlcv_1min.
 
     vol_metric = "avg_intraday_range":
         per date = mean of (high - low) / open across all tickers
@@ -1346,7 +1543,7 @@ def stitch_ticks(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame
 - All functions are stateless — no module-level state or caching
 - `build_effective_bar_sequence()` is the single source of truth for valid bar counting
   — Labeler and BacktestEngine both import from here; logic must not be duplicated
-- `build_effective_bar_sequence()` never returns bars with hour > "155900" —
+- `build_effective_bar_sequence()` never returns bars with hour > last_bar(date) —
   after-market bars are excluded regardless of target_valid_bars
 - `apply_overrides()` must deep-copy config — original must never be mutated
 - `load_encoding_map()` returns empty dict (not error) when file does not exist
@@ -1371,12 +1568,16 @@ def stitch_ticks(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame
 - `track_label_breach()` is the high-level wrapper for two-stage label detection (Labeler only)
 - `generate_run_id()` not called inside parallel workers or sequential fold loops —
   coordinator pre-generates structured run_ids in all optimizer contexts
-- `compute_vol_regime_holdout()` uses regular session bars only (093000–155900)
+- `compute_vol_regime_holdout()` uses regular session bars only
+  (093000~last_bar(date))
 - `compute_consensus_config()` grid-rounding uses nearest valid value from search_space
 - `temporal_split_simple()` applies no balancing — training-only utility for early stopping val
 - `populate_precomputed_session_stats()` uses INSERT OR IGNORE — safe to re-run
 - `populate_precomputed_session_stats()` halt handling must be applied per metric type:
-  cumulative metrics include halt bars as volume=0; per-bar metrics exclude halt slots per hour;
+  cumulative metrics include halt bars as volume=0 AND exclude early-close
+  sessions wholesale; per-bar metrics exclude halt slots per hour and need no
+  early-close handling of their own — an early-close session simply supplies no
+  sample past its close, which the existing per-slot count already expresses;
   gap_pct uses nearest non-halt bar fallback (see function docstring for details)
 - `load_session_stats()` → single (ticker, as_of_date) DB query; output `{metric: {hour: value}}`
   (flat, no ticker/date dimension); used for live mode Phase 2 (per-ticker on demand)

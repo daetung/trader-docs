@@ -372,13 +372,53 @@ CREATE TABLE IF NOT EXISTS us_holidays (
     holiday_name  VARCHAR
 );
 
--- Trading calendar — all dates with trading day status and data availability
+-- Trading calendar — all dates with trading day status, session boundaries and
+-- data availability
+-- COLUMN CLASSES — the distinction governs what a forward-filled
+-- row may carry (see utils.md populate_trading_calendar()'s rolling one-year
+-- horizon):
+-- Membership rule: a column belongs to (3) if its value cannot be known before
+-- the date's data arrives; otherwise to (1) if the calendar library supplies
+-- it, and to (2) if it does not.
+--   (1) LIBRARY-SOURCED, knowable in advance — is_trading_day, is_holiday,
+--       session_close. From pandas_market_calendars' schedule interface.
+--   (2) MEASURED, knowable in advance but NOT from that library —
+--       after_hours_end. schedule() returns market_open/market_close only and
+--       exposes no extended-hours boundary, so this column is filled from the
+--       confirmed venue fact, not derived by the library.
+--   (3) KNOWABLE ONLY AFTER INGESTION — has_data. A row written a year ahead
+--       carries FALSE here, which is CORRECT rather than a gap: consumers that
+--       need ingested data filter on has_data = TRUE (dead-position resolution)
+--       and therefore skip future rows, while get_next_trading_day() reads
+--       is_trading_day and is satisfied by them.
 -- Retention: NEVER purged — structurally excluded from the purge registry
 --   (reference data).
 CREATE TABLE IF NOT EXISTS trading_calendar (
     date            VARCHAR   PRIMARY KEY,  -- 'YYYYMMDD'
     is_trading_day  BOOLEAN   NOT NULL,
     is_holiday      BOOLEAN   NOT NULL,
+    session_close   VARCHAR,              -- 'HHMMSS' — the EXCHANGE close on this
+                                          -- date, wall clock: '160000' ordinarily,
+                                          -- '130000' on an early-close day.
+                                          -- NULL if and only if is_trading_day =
+                                          -- FALSE (a non-trading day has no close);
+                                          -- no sentinel value is used.
+                                          -- This is the exchange fact. Pipeline
+                                          -- conventions DERIVE from it rather than
+                                          -- being stored beside it — see utils.md's
+                                          -- last_bar() (close - 1 minute, a data
+                                          -- fact) and exit_deadline() (close -
+                                          -- execution.session_close_exit_offset_
+                                          -- minutes, a policy). Storing the
+                                          -- last-bar convention here instead would
+                                          -- move with any change of bar resolution;
+                                          -- the exchange close does not.
+    after_hours_end VARCHAR,              -- 'HHMMSS' — end of the after-hours
+                                          -- session: '200000' ordinarily, '170000'
+                                          -- on an early-close day. Same NULL rule as
+                                          -- session_close. Class (2) above: this
+                                          -- value does NOT come from the calendar
+                                          -- library.
     has_data        BOOLEAN   NOT NULL,
     updated_at      VARCHAR
 );
@@ -722,6 +762,20 @@ CREATE TABLE IF NOT EXISTS experiment_log (
     breaker_peak_entries_per_hour   INTEGER,
     entry_fill_rate_disabled BOOLEAN NOT NULL DEFAULT FALSE,
     exit_fill_rate_disabled  BOOLEAN NOT NULL DEFAULT FALSE,
+    -- NO early-close column here, and the absence is DELIBERATE — recorded so
+    -- it is not proposed again. The pair above exists because those switches
+    -- vary per RUN and cannot be reconstructed afterwards. Early-close handling
+    -- does not vary per run: live_mode.trade_early_close_days gates LIVE entry
+    -- submission only, and BacktestEngine always replays early-close dates, so
+    -- every run treats them identically and there is no variable to record.
+    -- Which dates in a run's window were early closes is recoverable at any
+    -- time by joining fold_test_start/fold_test_end against trading_calendar,
+    -- which is structurally excluded from the purge registry and therefore
+    -- always present. One caveat for that join: fold_test_start/end bound the
+    -- DATA window, not the set of dates actually traded, so a window containing
+    -- dateless days over-counts slightly.
+    -- The LIVE side is the opposite case and DOES record its setting — see
+    -- live_session_state.session_diagnostics.early_close_participation.
     -- The two backtest: participation-rate switches, recorded per RUN
     -- (09_backtest_engine.md). Recorded as switch state rather than as the
     -- resolved rate values, for three reasons: a rate would place the
@@ -1152,7 +1206,14 @@ CREATE TABLE IF NOT EXISTS precomputed_session_stats (
                                      --   (a) near dataset start (insufficient history)
                                      --   (b) halt bars reduce valid session count at
                                      --       specific hour slots (per-bar metrics only)
-                                     --   (c) halt at 155900/093000 reduces gap_pct count
+                                     --   (c) halt at that date's last bar (utils.md
+                                     --       last_bar()) or at 093000 reduces
+                                     --       gap_pct count
+                                     --   (d) an early-close session is excluded
+                                     --       WHOLESALE from the cumulative metrics
+                                     --       (rvol_baseline, rel_dvol_baseline) —
+                                     --       see utils.md
+                                     --       populate_precomputed_session_stats() A
                                      -- Granularity: per (ticker, as_of_date, hour, metric)
                                      -- count may differ by hour slot within same ticker/date.
     PRIMARY KEY (ticker, as_of_date, hour, metric, n_sessions)
@@ -1366,7 +1427,18 @@ CREATE TABLE IF NOT EXISTS live_session_state (
                                           -- mostly-normal checks — putting them
                                           -- there would dissolve the
                                           -- distinction it is built on.
-                                          -- Keys: clock_offset_start,
+                                          -- Keys: early_close_participation
+                                          -- (present only when the Early-Close
+                                          -- Participation Gate blocked the
+                                          -- session — carries that date's
+                                          -- session_close AND the value of
+                                          -- live_mode.trade_early_close_days at
+                                          -- that run. The DATE is recoverable
+                                          -- from trading_calendar; the SETTING
+                                          -- is not, once participation is
+                                          -- enabled, which is the same ground
+                                          -- entry_fill_rate_disabled is stored
+                                          -- on), clock_offset_start,
                                           -- clock_offset_end,
                                           -- retention_boundary (each probe also
                                           -- flagged 'disabled' | 'succeeded' |

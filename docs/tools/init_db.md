@@ -57,11 +57,16 @@ Statements are already written `CREATE TABLE IF NOT EXISTS` in `db_schema.md`,
 so idempotency is not something this tool decides or adds.
 
 **When `db_schema.md` changes, `SCHEMA_STATEMENTS` is re-transcribed from it.**
-Re-transcription has now been required FIVE times. The most recent occasion
-added `live_ticker_terms`, moving the table count 33 -> 34; `live_positions`
-gained `entry_mgnrt` in the same change, which is class 2 below and needs a
-hand `ALTER` that init alone will not perform.
-The occasion before it added `live_halt_episodes` and
+Re-transcription has now been required SIX times. The most recent occasion
+added NO table — the count stays at 34 — but gave `trading_calendar` two new
+columns, `session_close` and `after_hours_end`. Both are class 2 below and need
+a hand `ALTER` that init alone will not perform. They arrive in ONE
+re-transcription rather than two: they were decided together and neither is
+usable without the other being at least considered, so splitting them would fire
+this consequence twice for one change.
+The occasion before it added `live_ticker_terms`, moving the table count
+33 -> 34; `live_positions` gained `entry_mgnrt` in the same change, also class 2.
+The occasion before that added `live_halt_episodes` and
 `exit_trigger_agreement_daily` (31 -> 33), with a column each on
 `live_positions` and `live_session_state`.
 The design documents are maintained as a separate project from this codebase
@@ -178,6 +183,9 @@ init:   created 1 table, 33 already present     # after a new table was added
 verify: 34 tables checked, 0 differences
 verify: 34 tables checked, 1 difference
         live_positions: column 'entry_mgnrt' missing — ALTER needed
+verify: 34 tables checked, 2 differences         # two columns, one table
+        trading_calendar: column 'session_close' missing — ALTER needed
+        trading_calendar: column 'after_hours_end' missing — ALTER needed
 ```
 
 ---

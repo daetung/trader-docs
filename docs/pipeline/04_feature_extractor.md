@@ -356,6 +356,17 @@ class FeatureExtractor:
         Simplified: lookback_days * 390 is guaranteed >= max(window_bars)
         by init constraint. n_sessions is independent (baselines from
         precomputed_session_stats, not from bars window).
+
+        The 390 is NOT per-date and deliberately stays a literal, although
+        min_bars is a real threshold rather than a margin — it becomes
+        Inferencer.required_bars and decides inference_log event='preload_fail',
+        where a failing candidate returns None and is never inferred at all.
+        It survives an early close for two reasons. Bars are loaded across the
+        FULL 040000-200000 range, not the regular session, so the actual supply
+        is ~960 min/day against a 390 min/day nominal — the wording understates
+        the real margin, independently of early closes. And the init-time check
+        reads only lookback_days and window_bars, with no date in it at all, so
+        no calendar fact can reach it.
         """
         return {
             "min_bars": self.config["indicators"]["lookback_days"] * 390,
@@ -462,13 +473,34 @@ temporal_features = {
     "minute_of_session": int,          # minutes since session open (entry.hour reference)
     "day_of_week":       int,          # 0=Mon ... 4=Fri (encoded via day_of_week_map)
     "is_near_open":      int,          # 1 if within first 30 min of regular session
-    "is_near_close":     int,          # 1 if within last 30 min of regular session
+    "is_near_close":     int,          # 1 if entry.hour >= session_close(date)
+                                       #   - 30 min; open on the right
     "is_holiday_week":   int,          # 1 if trading week contains a US holiday
 }
 ```
 
 `entry.hour` is the clock time at which detection fired — not t bar OHLCV data,
 and its use as a temporal feature does not constitute data leakage.
+
+`is_near_close` anchors on the EXCHANGE close — `session_close(date)`, not
+`last_bar(date)`. 160000 - 30 = 153000 gives 153000..155900, exactly 30 bars;
+anchoring on the last bar would give 31. On an early-close day it yields
+123000..125900, likewise 30. Held at a fixed 15:30-16:00 the feature reads 0 for
+every row of an early-close day, even though that session did have a final
+30 minutes — and since live inference runs this same code, both training and
+serving are wrong in the same direction rather than skewed against each other.
+`is_near_open` is unaffected: the 09:30 open does not move.
+
+THIS SITE CARRIES NO CLOSE-TIME LITERAL. Its former definition was prose, so no
+grep on 155900 or 160000 could reach it; it was found on the MEANING axis. Making
+the value available and making this site read it are separate changes, and a
+literal sweep closes only the second kind.
+
+`session_close` reaches this module as its OWN argument, alongside `halts_df`
+and `session_stats` — "passed explicitly, not fetched internally" is this
+module's standing rule and it never queries DuckDB directly. It is not folded
+into `meta`: `meta` is date-keyed so the shape would fit, but it carries
+stock_meta-sourced per-ticker values and a session close is neither.
 
 Holiday calendar sourced from `us_holidays` table in DuckDB.
 `day_of_week` encoding map loaded via `utils.load_encoding_map("day_of_week_map")`.

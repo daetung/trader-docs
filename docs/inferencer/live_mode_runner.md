@@ -71,6 +71,52 @@ def db_read(sql, params):
     # if violated).
 ```
 
+## Early-Close Participation Gate
+
+Evaluated FIRST, before the premarket wait below — there is no reason to wait on
+markers for a session that will not open.
+
+```
+today_close = session_close(today)                  # utils.md, per date
+if today_close != the ordinary close
+       and not config["live_mode"]["trade_early_close_days"]:   # default false
+    write live_session_state.session_diagnostics: participation blocked,
+        today's session_close, and the KEY'S VALUE AT THIS RUN
+    exit — no connections opened, no watchlist, no scan
+```
+
+**A session-start gate, not an entry gate**, and the distinction is what leaves
+`gate_result`'s value list (db_schema.md) untouched. `freeze_reasons` is
+session-wide yet still records per candidate, so being global is not by itself
+disqualifying — the real difference is WHEN the answer is fixed. A freeze can
+lift mid-session, so each candidate must be asked again; an early close is
+settled before the first tick and never changes, so asking per candidate would
+write one identical value across every row of the day. The cost of the
+alternative is measured, not assumed: adding `'no_terms'` produced SEVEN
+declaration sites across FOUR files, and one cardinality comment was missed and
+needed a separate correction. A twelfth value would buy a repetition of "this
+day was not traded".
+
+**Why `live_mode:` and not `execution:`.** `execution:` is the shared block, and
+R-7 moved `session_close_exit_time` INTO it precisely because both engines had
+to agree on that value. This key is the opposite case — BacktestEngine must
+ignore it and always replay early-close dates, since measuring whether those
+days are worth trading is the whole reason they are labelled and kept in the
+corpus. Opposite rationale, opposite side.
+
+**Why the key's value is written to `session_diagnostics`** even though the date
+itself is recoverable by joining `trading_calendar`. The calendar says the day
+was an early close; it cannot say whether the gate was on when that session ran.
+Once participation is enabled, no past session's setting is reconstructible —
+the same reason `entry_fill_rate_disabled` is stored rather than derived. This
+does NOT extend to `experiment_log`: nothing varies per backtest run here (see
+09_backtest_engine.md).
+
+**Carried positions wait a day.** A position held into an unopened early-close
+session is not managed that day. Unified Overnight Policy liquidates it at the
+next session's first Position Manager evaluation regardless, and early closes sit
+adjacent to holidays, where the carry already spans multiple days.
+
 ## Session Start Gating (P-5 temporal ownership)
 
 Before opening either connection above, LiveModeRunner waits on the
@@ -217,11 +263,13 @@ zero; they are session totals.
 **Exit trigger (R-9).** The process exits at whichever of these comes
 first:
 ```
-(a) all positions are flat AND now >= config["execution"]["session_close_exit_time"]
+(a) all positions are flat AND now >= exit_deadline(today)
 (b) now >= config["live_mode"]["session_hard_exit_time"]   # hard cap
 ```
 (a) is the ordinary path — on a normal day the 15:59 `session_end` exits
-fill within minutes and the process leaves shortly after 16:00. (b) exists
+fill within minutes and the process leaves shortly after 16:00; on an
+early-close day both instants move with the calendar, to 12:59 and 13:00.
+(b) exists
 because submitting an exit is not the same as filling one: a limit exit is
 re-priced every `position_check_interval_seconds` and escalates to market
 at `exit_order_stuck_minutes`, and exit tracking has NO give-up timeout, so
@@ -902,7 +950,7 @@ loop is now buildable.
 **Loop termination (R-9).** This loop runs only while entries are
 structurally possible. At the top of every cycle, before Step 1:
 ```
-if now >= config["execution"]["session_close_exit_time"]:
+if now >= exit_deadline(today):
     break        # exit the loop; the process itself lives on until
                  # Session Shutdown's exit trigger fires
 ```
@@ -916,12 +964,12 @@ contract and whose responses would be exercising the candidate path for no
 possible benefit. Close-out continues on the Position Manager Loop, which
 is independent of this one and does its own bar/tick fetching.
 
-A warm restart that lands after `session_close_exit_time` still starts this
+A warm restart that lands after `exit_deadline(today)` still starts this
 loop (Session Lifecycle Step 8) and it self-terminates on its first cycle
 through the same guard — no separate branch is needed.
 
 Two accepted consequences: Bar-Close Authority and its Bar-Arrival Latency
-sampling (finding 26) stop collecting at `session_close_exit_time`, and
+sampling (finding 26) stop collecting at `exit_deadline(today)`, and
 watchdog-triggered Feed Outage Recovery stops evaluating there too. The
 first is fine because the day's curve is finalised by the final
 `bar_latency_daily` flush in Session Shutdown; the second because close-out
@@ -2277,7 +2325,7 @@ a tick may never arrive for a low-liquidity or halted name near close, and
 a time trigger must still fire. WS is fixed to price-breach only.
 
 **R-3: moving `session_end` to WS was considered and rejected.** Each WS
-tick does carry an `hour`, so a `now >= session_close_exit_time` check is
+tick does carry an `hour`, so a `now >= exit_deadline(today)` check is
 technically expressible on the WS path — but that check would only ever
 fire when a tick arrives, which is exactly the case that fails for a
 low-liquidity or halted name near close: `session_end` must fire on schedule
@@ -2285,7 +2333,7 @@ whether or not a tick ever does. This is structural, not a tuning gap —
 tying a schedule-based trigger to tick arrival trades away the one property
 (fires regardless of tick activity) that makes it useful. On a normal,
 liquid name where WS ticks arrive continuously, WS's price-breach path and
-the periodic loop's `session_close_exit_time` check can both become true in
+the periodic loop's `exit_deadline(today)` check can both become true in
 the same iteration; see the ordering rule in Position Manager Loop Step 2
 (tp/sl wins, `status='exiting'` guarantees a single submission).
 
@@ -2810,7 +2858,7 @@ loop every position_check_interval_seconds (config, default: 5s):
             alert (see health_report.md), tagged with signal_source for
             diagnosability (see health_report.md's new fallback-rate finding)
             → skip Steps 2-4 this iteration (no reliable price to act on)
-            # R-3: if now >= config["execution"]["session_close_exit_time"]
+            # R-3: if now >= exit_deadline(today)
             # (i.e. this position is skipping session_end specifically
             # because it cannot trade, not merely skipping an ordinary
             # mid-session iteration), log explicitly and
@@ -2926,7 +2974,7 @@ loop every position_check_interval_seconds (config, default: 5s):
            # conventions (execution_common.md). Halted minutes intersect
            # [fill_second, now] with this ticker's live_halt_episodes; an
            # open interval counts to now.
-       elif now >= config["execution"]["session_close_exit_time"]:
+       elif now >= exit_deadline(today):
            exit_reason = "session_end"       # wall-clock — this loop, not WS
        else:
            continue to next position (no exit yet)
@@ -3082,11 +3130,16 @@ live_mode:
 
   # R-3: periodic-loop session_end trigger (Position Manager Loop Step 2)
   # — deliberately NOT on the WS path, see Exit Architecture's
-  # "Time-based triggers" note. Matches backtest's 15:59 close-exit
-  # convention.
+  # "Time-based triggers" note. Matches backtest's close-exit
+  # convention, both engines resolving through utils.md exit_deadline().
   # session_close_exit_time removed — promoted to execution: (R-7), where
   # BacktestEngine reads it too; a value both engines must agree on cannot be
   # declared on one side only (same defect R-6 fixed for max_hold_bars).
+  # It no longer exists under that NAME either: execution: now carries
+  # session_close_exit_offset_minutes, and the instant is resolved per date by
+  # utils.md exit_deadline(). R-7's property is unchanged — one declaration,
+  # both engines reading it — only its form moved from an absolute time to an
+  # offset, so that being flat by 15:50 stays expressible.
   # fill_stream_mode / fill_stream_linger_seconds removed: a connection
   # carries one subscription type, so the fill stream needs a connection of
   # its own for the whole session. Nothing is leased, so there is no idle
@@ -3153,6 +3206,24 @@ live_mode:
   # — see "Per-Ticker Trading Terms".
   exit_order_stuck_minutes:       10         # health_report finding 18's age
                                              # threshold
+  trade_early_close_days:         false      # Early-Close Participation Gate.
+                                             # LIVE ONLY — BacktestEngine ignores
+                                             # it and always replays those dates.
+                                             # Mechanism per option A, initial
+                                             # policy per option B: the system
+                                             # KNOWS the real close everywhere,
+                                             # and separately declines to trade
+                                             # on it until backtest says it is
+                                             # worth doing. Same evaluate-but-
+                                             # don't-enforce posture as R-4's
+                                             # breaker and shadow mode.
+  # session_hard_exit_time is no longer a fixed literal: it resolves to that
+  # date's trading_calendar.after_hours_end — '200000' ordinarily, '170000' on
+  # an early-close day, where the venue's extended session ends at 17:00. Held
+  # at a fixed 20:00 the process would idle three hours past any possible
+  # activity, and auxiliary_stream.md's tail_minutes anchors on this value and
+  # so follows without a change of its own.
+  # The literal below is the ORDINARY resolution, kept for reference.
   session_hard_exit_time:         "20:00"    # R-9: process hard cap — see
                                              # "Session Shutdown". Wall-clock
                                              # America/New_York. Matches the
@@ -3162,7 +3233,7 @@ live_mode:
                                              # drain_timeout_seconds was sized
                                              # against. Ordinary exit is
                                              # earlier: all-flat past
-                                             # execution.session_close_exit_time.
+                                             # utils.md exit_deadline(today).
   min_watchlist_size:             30         # seed value — Feed Outage
                                              # trigger condition 2 (see "Feed
                                              # Outage Recovery"). TWO roles,

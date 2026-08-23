@@ -39,7 +39,9 @@ Do not load other module docs unless checking an interface boundary.
 Feature input:         bars t-1, t-2, ..., t-N  (fully closed OHLCV bars only)
 P_entry:               t bar open  →  reference value only, NOT a feature
 Forbidden as input:    t bar high / low / close / volume
-Label search range:    t bar open → 15:59 close or 60th valid bar close (whichever first)
+Label search range:    t bar open → last_bar(date) close or 60th valid bar close
+                       (whichever first). last_bar() is PER DATE — utils.md —
+                       and is 12:59 on an early-close day, not 15:59
 10-tick for features:  ticks with timestamp < t bar open only
 10-tick for backtest:  ticks from t bar onward
                        (entry slippage: entry_hour ~ entry_hour+100s;

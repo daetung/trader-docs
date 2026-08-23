@@ -126,7 +126,7 @@ python tools/migrate_json_to_duckdb.py \
      Halt handling applied per metric type (see utils.md for details):
        - Cumulative metrics: halt bars contribute volume=0; full-day no-data sessions excluded
        - Per-bar metrics: halt slots excluded per hour slot; count may differ by hour
-       - gap_pct: nearest non-halt bar fallback for 155900/093000; session excluded if none
+       - gap_pct: nearest non-halt bar fallback for last_bar(date)/093000; session excluded if none
      Corporate-event adjustment (from Step 5b's data) applied per metric type
      before aggregation — see utils.md populate_precomputed_session_stats() D.
      buy_ratio_baseline requires tick_10 data (lee_ready classification).
@@ -358,6 +358,7 @@ Post-migration:
   trading_calendar        : 1,260 dates populated
   ticker_data_coverage    : 11,847 tickers × dates populated
   precomputed_session_stats: 11,847 tickers × 1,240 dates × 390 bars × 8 metrics populated
+                             (390 = an ordinary session; a capacity estimate)
   Duration (session stats): 8m 14s
 ```
 
@@ -372,7 +373,9 @@ Failed files are logged to `tools/migration_errors.log` with filename and except
   schema first; this tool only INSERTs and populates
 - Duplicate skip is at `(ticker, date)` granularity per table — entire file skipped if any row exists
 - Zip files: extract to tempdir, process, clean up — do not leave temp files
-- Time range filter: `hour >= '040000' AND hour <= '200000'` (no session filtering)
+- Time range filter: `hour >= '040000' AND hour <= '200000'` (no session
+  filtering). Fixed, not per-date — it excludes overnight, and an early-close
+  day has nothing past its own after_hours_end
 - Must handle malformed JSON files gracefully (log and continue, do not crash)
 - Post-migration calendar/coverage population is mandatory — not optional
 - Post-migration corporate events crawl (Step 5b) is mandatory — not optional,

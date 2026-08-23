@@ -161,7 +161,9 @@ pivot_points(bars)
     → S2  = PP - (prev_high - prev_low)
     → S3  = prev_low - 2 * (prev_high - PP)
     → output: constant value per session bar (step function)
-    → "previous session" = previous date's regular session (093000~155900)
+    → "previous session" = previous date's regular session
+      (093000~last_bar(previous date)) — PER DATE, so a session following an
+      early close reads that day's real range and not a 15:59 that never existed
     → output columns: pp, r1, r2, r3, s1, s2, s3 (absolute prices)
     → distance features derived in Vectorizer via level_distance()
 
@@ -180,7 +182,13 @@ fibonacci_retracement(bars, window_bars)
     → output columns: fib_0, fib_236, fib_382, fib_500, fib_618, fib_786, fib_1000
       (absolute prices — varies per bar as window slides)
     → distance features derived in Vectorizer via level_distance()
-    → window_bars default: 390 (1 trading session)
+    → window_bars default: 390 — chosen as roughly one ordinary session's bar
+      count, which is the RATIONALE for the number, not a property of the window.
+      This is a SLIDING window over the bars frame ("varies per bar as window
+      slides", monotonic-deque max/min, NaN for the first window_bars-1 bars);
+      it is a CONTINUOUS indicator and spans session boundaries by design, so it
+      neither aligns to a session nor needs a per-date bound. Its sibling
+      sr_levels.window_bars is 480, which is no session length at all.
 
     Implementation note (monotonic deque):
         When called on the full ticker bars DataFrame, fibonacci_retracement()
@@ -360,7 +368,7 @@ rvol(bars, date, n_sessions, session_mode, session_stats)
     → baseline = session_stats["rvol_baseline"][T]
       (prior N sessions avg cumulative volume at hour T; precomputed and stored in DB)
     → session_mode: follows entry_detector.session_mode
-         "regular": prior regular session bars only (093000~155900)
+         "regular": prior regular session bars only (093000~last_bar(date))
          "pre":     prior pre-market bars (040000~092900)
          "combined": both
     → output: per-bar ratio series (today session only; prior session bars → NaN)
@@ -375,7 +383,9 @@ rel_dvol(bars, date, n_sessions, session_mode, session_stats)
 gap_percentile(bars, date, n_sessions, session_stats, dividend_amount=0.0)
     → Today's gap = (today_regular_open - adjusted_prev_close) / adjusted_prev_close
       today_regular_open = open price of 093000 bar
-      prev_close = close price of previous date's 155900 bar
+      prev_close = close price of previous date's last_bar(previous date)
+                   — PER DATE. last_bar(), never exit_deadline(): this is the
+                   session's final print, a data fact, not the exit policy
       adjusted_prev_close = prev_close - dividend_amount
       (split scale is already consistent — bars are pre-adjusted by the caller
        via adjust_bars_for_corporate_events() before reaching this method;

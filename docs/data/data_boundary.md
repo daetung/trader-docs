@@ -68,7 +68,12 @@ The t bar does not satisfy this condition at entry detection time.
 This is the clock time at which detection fired — it is not t bar OHLCV data
 and does not constitute data leakage.
 
-**Lookback window (default):** last 5 trading days of 1min bars = ~1950 bars (390 min/day × 5).
+**Lookback window (default):** last 5 trading days of 1min bars = ~1950 bars
+(390 min/day × 5). The 390 names the REGULAR session, while bars are actually
+loaded across the full 040000~200000 range — so the real supply is nearer
+960 min/day and the stated margin understates itself. Left as written because
+the check it feeds (`04_feature_extractor.md`'s `calculate_required_history()`)
+has no date in it and cannot be reached by a calendar fact.
 Actual lookback per indicator is configured in `configs/pipeline_config.yaml`.
 
 ---
@@ -209,18 +214,18 @@ into features computed for dates before the filing existed. See
 ## Label Search Boundary
 
 ```
-Search range: t bar open → session close (15:59 bar), up to 60 valid bars
+Search range: t bar open → session close (last_bar(date)), up to 60 valid bars
 
 Priority:
   1. ±3pp breach → immediate label assignment
-  2. 15:59 bar reached → exit at 15:59 close, assign label by pnl
+  2. last_bar(date) reached → exit at that bar's close, assign label by pnl
   3. 60 valid bars exhausted → exit at last valid bar close, assign label by pnl
 
 Priority 2 and 3 are mutually exclusive — whichever condition is reached first determines
 the exit. After-market fallback and dead position apply to priority 2 only.
 Priority 3 exits at the last valid bar close directly, with no fallback needed.
 
-After-market data used only as fallback when 15:59 bar is halt/no_data (priority 2 only).
+After-market data used only as fallback when last_bar(date) is halt/no_data (priority 2 only).
 Dead position (overnight hold) only when after-market fallback also unavailable.
 No overnight holds in normal flow.
 ```
@@ -304,22 +309,25 @@ tick_10 `hour` field represents the **last tick** timestamp of each 10-tick bund
 ## Session Mode and Data Coverage
 
 All data is stored without session-of-day filtering beyond the 040000~200000
-ingestion range (see db_schema.md Ingestion Rules).
+ingestion range (see db_schema.md Ingestion Rules). That range is NOT per-date
+and does not move: its purpose is to exclude OVERNIGHT, and an early-close day
+simply has no data past its own after_hours_end, so the fixed upper bound still
+admits everything real and still excludes overnight.
 Pre-market, regular session, and after-market bars are all ingested and available.
 
 Session mode (`entry_detector.session_mode`) controls which entry points are used during training:
 ```
-"regular"  : regular session entry points only (093000~155900) [default]
+"regular"  : regular session entry points only (093000~last_bar(date)) [default]
 "pre"      : pre-market entry points only (040000~092900)
 "combined" : both pre-market and regular session
 ```
 
-After-market entry points (hour > 155900) are excluded in all modes.
+After-market entry points (hour > last_bar(date)) are excluded in all modes.
 Session mode filtering is applied at the training stage — preprocessing runs for all entry points.
 
 Session mode also controls which prior session bars are used in REFERENCE_SESSION baselines:
 ```
-"regular"  : prior regular session bars only (093000~155900)
+"regular"  : prior regular session bars only (093000~last_bar(date))
 "pre"      : prior pre-market bars only (040000~092900)
 "combined" : both pre-market and regular session bars
 ```
@@ -363,11 +371,15 @@ Before submitting any module, verify:
 - [ ] P_entry is present as an identifier column in parquet output
 - [ ] Temporal features use entry.hour (clock time only) — not t bar OHLCV
 - [ ] Label calculation starts from t bar open as the zero reference
-- [ ] When no ±3pp breach: if 60 valid bars collected before 15:59 → exit at last valid bar close
+- [ ] When no ±3pp breach: if 60 valid bars collected before last_bar(date) → exit at last valid bar close
        (time-limit; no after-market fallback, no dead position);
-       if 15:59 reached within 60 valid bars → exit at 15:59 close
+       if last_bar(date) reached within 60 valid bars → exit at that bar's close
        (session-end; with after-market fallback and dead position as last resort)
-- [ ] After-market used only as fallback for 15:59 halt/no_data (session-end path only)
+- [ ] After-market used only as fallback for last_bar(date) halt/no_data (session-end path only)
+- [ ] Every session-boundary read goes through utils.md's session_close() /
+       last_bar() / exit_deadline() — never a 155900 or 160000 literal, and never
+       the wrong derivation: last_bar() is a data fact, exit_deadline() a policy,
+       and they coincide only at the default offset of 1 minute
 - [ ] 10-tick data used in features is strictly filtered to before t bar open
 - [ ] Labeler uses track_label_breach() with fill_second = t bar open + 5s;
        tracking starts strictly after fill_bundle (fill_bundle excluded)

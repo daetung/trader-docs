@@ -464,12 +464,39 @@ execution:
                                    # that protection follows from these two
                                    # values' relative size, not from any
                                    # structural guard.
-  session_close_exit_time: "155900"  # R-7: single source. Was declared under
+  session_close_exit_offset_minutes: 1
+                                   # R-7: single source. Was declared under
                                    # live_mode: while 09_backtest_engine.md
                                    # carried the bare literal — the same
                                    # one-sided declaration of a value both
                                    # engines must agree on that R-6 fixed for
                                    # max_hold_bars.
+                                   # RENAMED AND RE-MEANT from the former
+                                   # session_close_exit_time: "155900". It is now
+                                   # an OFFSET, resolved per date through
+                                   # utils.md's exit_deadline() as that date's
+                                   # session_close minus this many minutes —
+                                   # 155900 ordinarily, 125900 on an early close.
+                                   # NOT deleted in favour of pure calendar
+                                   # derivation: 155900 happened to equal the
+                                   # last bar, but the value is a POLICY —
+                                   # being flat by 15:50 must stay expressible —
+                                   # and deriving it entirely from the calendar
+                                   # would remove that freedom. R-7's
+                                   # single-source property survives untouched:
+                                   # both engines resolve from the same calendar
+                                   # and the same offset.
+                                   # An OFFSET here while trading_calendar
+                                   # .after_hours_end is a COLUMN is not an
+                                   # inconsistency — a measured FACT about the
+                                   # venue gets a column, a chosen POLICY gets an
+                                   # offset. after_hours_end is not ours to
+                                   # choose; this is.
+                                   # THE ENGINES THAT MUST AGREE are backtest,
+                                   # live AND the labeler: 05_labeler.md carried
+                                   # its own session_close_hour: "155900" until
+                                   # this change deleted it. R-7's "both engines"
+                                   # framing named a set it did not enumerate.
   ws_ticker_limit:           50    # R-7: tickers ONE WS CONNECTION can carry.
                                    # A VENDOR fact, not a preference — kept in
                                    # config rather than as a literal because
@@ -748,7 +775,7 @@ def simulate_exit_fill(
             live_positions.exiting_since.
         reference_price: the last print strictly BEFORE that instant, for all
             four exit reasons. Backtest's former "close of the last valid bar"
-            / "15:59 bar close" is not the general form — a 1-minute bar's
+            / "last bar close" is not the general form — a 1-minute bar's
             close IS that minute's last print, so the two agree exactly when
             the trigger falls on a bar boundary (session_end) and differ only
             when it does not (time_limit, whose anchor is arbitrary). The
@@ -890,16 +917,37 @@ The vendor permits order types by session phase:
 
 | Phase (America/New_York) | limit | market |
 |---|---|---|
-| Premarket 04:00–09:30 | yes | no |
-| Regular 09:30–16:00 | yes | yes |
-| After-hours 16:00–20:00 | yes | no |
+| Premarket 04:00 – regular open | yes | no |
+| Regular regular open – `session_close` | yes | yes |
+| After-hours `session_close` – `after_hours_end` | yes | no |
+
+**The boundaries are PER DATE, resolved ONCE at session start** into three
+wall-clock values held for the session, rather than re-derived at each
+consultation — the close cannot change mid-session, so a function call per
+submission would buy nothing. Ordinarily this yields the familiar
+04:00 / 09:30 / 16:00 / 20:00; on an early-close day it yields
+04:00 / 09:30 / 13:00 / 17:00.
+
+WHICH BOUNDARIES MOVE: every boundary sourced from `trading_calendar` — the
+close, which is at once Regular's upper bound and After-hours' lower bound, and
+`after_hours_end`, which is After-hours' upper bound. Between them they touch
+every row of the table. The premarket open is the exception and stays a literal:
+the NYSE regular open does not move except under exchange outage, which the
+calendar library would not reflect in any case.
+
+WHY THIS TABLE IS THE SHARPEST EARLY-CLOSE FAILURE. Held at a fixed 16:00, the
+window 13:00–16:00 on a half day reads as Regular while the venue is already in
+after-hours and refuses market orders. Every consumer above is affected, and the
+worst is the stuck-exit escalation: it escalates to a market order "inside the
+regular session", so the final backstop would submit an order the venue rejects,
+precisely when an exit is already stuck.
 
 **The authority is wall clock, not a market-data field.** The trade stream
 carries a session marker, but a tick-borne signal is unavailable exactly
 when no tick arrives — the same ground on which R-3 rejected putting
 `session_end` on the WS path. Phase is evaluated against
 America/New_York wall clock under the same `clock_check` discipline as
-`session_close_exit_time` and `session_hard_exit_time`.
+`exit_deadline()` and `session_hard_exit_time`.
 
 Two consequences worth stating, because both were verified against vendor
 documentation rather than assumed:
@@ -958,7 +1006,8 @@ The ladder that advances k while an exit is stuck, and its seed/increment/
 cap keys, live under `live_mode:` rather than here — BacktestEngine has no
 bid/ask model to mirror them. If backtest is later extended to replay
 `bid_ask_snapshots` history, they move here for the same reason
-`max_hold_bars` and `session_close_exit_time` did.
+`max_hold_bars` and `session_close_exit_time` did (the latter now
+`session_close_exit_offset_minutes`).
 
 ---
 
