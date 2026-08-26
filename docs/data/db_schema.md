@@ -419,6 +419,14 @@ CREATE TABLE IF NOT EXISTS trading_calendar (
                                           -- session_close. Class (2) above: this
                                           -- value does NOT come from the calendar
                                           -- library.
+                                          -- Read through utils.md's
+                                          -- after_hours_end(), which raises on a
+                                          -- date absent from the map rather than
+                                          -- falling back to '200000'. Unlike
+                                          -- session_close it has NO derivations —
+                                          -- every site consumes it as-is — so the
+                                          -- accessor exists to host that raise, not
+                                          -- to compute anything.
     has_data        BOOLEAN   NOT NULL,
     updated_at      VARCHAR
 );

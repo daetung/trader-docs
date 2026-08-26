@@ -77,6 +77,10 @@ Evaluated FIRST, before the premarket wait below — there is no reason to wait 
 markers for a session that will not open.
 
 ```
+closes, ends = load_session_boundaries(db_conn)     # utils.md, once per process
+                                                    # DuckDB is already open here:
+                                                    # this block writes
+                                                    # live_session_state below.
 today_close = session_close(today)                  # utils.md, per date
 if today_close != the ordinary close
        and not config["live_mode"]["trade_early_close_days"]:   # default false
@@ -264,7 +268,7 @@ zero; they are session totals.
 first:
 ```
 (a) all positions are flat AND now >= exit_deadline(today)
-(b) now >= config["live_mode"]["session_hard_exit_time"]   # hard cap
+(b) now >= after_hours_end(today) - session_hard_exit_offset_minutes  # cap
 ```
 (a) is the ordinary path — on a normal day the 15:59 `session_end` exits
 fill within minutes and the process leaves shortly after 16:00; on an
@@ -276,12 +280,19 @@ at `exit_order_stuck_minutes`, and exit tracking has NO give-up timeout, so
 without a cap a single unfillable position would keep the process alive
 indefinitely.
 
-`session_hard_exit_time` defaults to `"20:00"` ET. This is not a new
-number: it is the after-market ingestion boundary (`200000`, see
-db_schema.md's Ingestion Rules) and it is the value health_report.md's
-`drain_timeout_seconds` was already sized against — roughly 50 minutes of
-margin before the 21:00 evening batch. Making it a config key turns that
-arithmetic's assumption into a declared value.
+The cap resolves per date: that date's `after_hours_end` minus
+`session_hard_exit_offset_minutes` — `'200000'` ordinarily, `'170000'` on an
+early close, at the default offset of zero. It is NOT the after-market
+INGESTION boundary, though the two once read as one number: that range is fixed
+by decision and does not move with the calendar (data_boundary.md,
+metadata_crawler.md), while this instant does. They coincided at `200000` and
+the coincidence was doing the explaining.
+
+The offset is kept rather than derived away because what the cap is FOR is a
+policy: leaving margin before the 21:00 evening batch, which is what
+health_report.md's `drain_timeout_seconds` is sized against. R-7 kept
+`session_close_exit_offset_minutes` on the same ground. An early close ends the
+extended session at 17:00 and so widens that margin rather than narrowing it.
 
 **Positions still open at the hard cap** are NOT force-liquidated. They are
 left as `live_positions` rows and handed to the next session's Broker
@@ -339,7 +350,9 @@ LiveModeRunner.start_session(today_date):
           are automatically excluded by the API response)
 
   1a. Token coverage gate. Read the cached access token's expiry and
-      require it to cover today's `live_mode.session_hard_exit_time`.
+      require it to cover today's hard cap. TODAY's, not a fixed 20:00:
+      demanding coverage to 20:00 on a 13:00-close day would abort a session
+      whose own cap is 17:00.
       Insufficient coverage ABORTS the session; nothing here refreshes the
       token. Refresh happens only in its own scheduled stage
       (metadata_crawler.md) — refreshing at session start would spend the
@@ -408,7 +421,10 @@ LiveModeRunner.start_session(today_date):
              session_stats_raw,
              delta_minutes=config["indicators"]["reference_session"]["delta_minutes"],
              session_mode=config["entry_detector"]["session_mode"],
+             closes=closes,
          )
+         # closes has been in scope since the early-close gate, which runs
+         # before this Lifecycle.
          # all_stats_nested: {today_date: {ticker: {metric: {hour: smoothed_avg_value}}}}
          session_stats_bulk = all_stats_nested[today_date]
          # session_stats_bulk: {ticker: {metric: {hour: smoothed_avg_value}}}
@@ -633,6 +649,8 @@ LiveModeRunner.start_session(today_date):
              likely failed — alert operator)
 
   7. Inferencer init:
+         Pass closes and ends in — this process holds them already, so the
+             Inferencer does not open a second acquisition for the same fact
          calculate_required_history() → self.required_bars
          Load model artifacts (run_id from config)
 
@@ -2075,6 +2093,7 @@ after any gap):
           n_sessions=config_n_sessions,
           delta_minutes=config_delta_minutes,
           session_mode=config_session_mode,
+          closes=closes,
       )
       calc_X.set_session_stats(stats_X)
       calculators[ticker_X] = calc_X
@@ -2480,7 +2499,7 @@ interval, and it is OURS rather than the SDK's (docs/api/sdk_dependency.md
 explains why the SDK's own pacer is replaced). After
 `live_mode.ws_reconnect_max_attempts` consecutive failures the ladder
 escalates; there is NO permanent give-up within a session, the only bound
-being the process itself at `live_mode.session_hard_exit_time` — the same
+being the process itself at the R-9 hard cap — the same
 principle already applied to an unfilled exit order below.
 
 **Escalation ladder**, on repeated reconnect failure:
@@ -2623,7 +2642,7 @@ loop every position_check_interval_seconds (config, default: 5s):
         an unsold remainder is still exposed to the very risk that triggered
         the exit, so the order stays tracked for as long as the session runs.
         # The one bound is the process itself (R-9): at
-        # live_mode.session_hard_exit_time the order is canceled and the
+        # the R-9 hard cap the order is canceled and the
         # position is handed to the next session's Broker Reconcile under
         # the Unified Overnight Policy — see Session Shutdown. That is a
         # process-level cap, not a per-order give-up: nothing here abandons
@@ -3216,23 +3235,45 @@ live_mode:
                                              # worth doing. Same evaluate-but-
                                              # don't-enforce posture as R-4's
                                              # breaker and shadow mode.
-  # session_hard_exit_time is no longer a fixed literal: it resolves to that
-  # date's trading_calendar.after_hours_end — '200000' ordinarily, '170000' on
-  # an early-close day, where the venue's extended session ends at 17:00. Held
-  # at a fixed 20:00 the process would idle three hours past any possible
-  # activity, and auxiliary_stream.md's tail_minutes anchors on this value and
-  # so follows without a change of its own.
-  # The literal below is the ORDINARY resolution, kept for reference.
-  session_hard_exit_time:         "20:00"    # R-9: process hard cap — see
-                                             # "Session Shutdown". Wall-clock
-                                             # America/New_York. Matches the
-                                             # after-market ingestion boundary
-                                             # (200000) and is the value
-                                             # health_report.md's
-                                             # drain_timeout_seconds was sized
-                                             # against. Ordinary exit is
-                                             # earlier: all-flat past
-                                             # utils.md exit_deadline(today).
+  session_hard_exit_offset_minutes: 0        # R-9: process hard cap — see
+                                             # "Session Shutdown". RENAMED AND
+                                             # RE-MEANT from the former
+                                             # session_hard_exit_time: "20:00".
+                                             # It is now an OFFSET, resolved
+                                             # per date as that date's
+                                             # trading_calendar.after_hours_end
+                                             # minus this many minutes —
+                                             # 200000 ordinarily, 170000 on an
+                                             # early close, where the venue's
+                                             # extended session ends at 17:00.
+                                             # NOT deleted in favour of pure
+                                             # calendar derivation, on R-7's
+                                             # ground for the same shape: 20:00
+                                             # happened to equal the extended
+                                             # session's end, but the value is
+                                             # a POLICY — margin before the
+                                             # 21:00 evening batch must stay
+                                             # expressible, and that margin is
+                                             # what health_report.md's
+                                             # drain_timeout_seconds is sized
+                                             # against. Default 0 puts the cap
+                                             # at the extended-session end,
+                                             # today's behaviour, so the
+                                             # position is a choice rather than
+                                             # an absence.
+                                             # NOT the after-market ingestion
+                                             # boundary, though the two once
+                                             # read as one number: that range
+                                             # is fixed by decision and does
+                                             # not move (data_boundary.md,
+                                             # metadata_crawler.md).
+                                             # auxiliary_stream.md's
+                                             # tail_minutes is the same instant
+                                             # offset the other way and needs
+                                             # no change of its own.
+                                             # Ordinary exit is earlier:
+                                             # all-flat past utils.md
+                                             # exit_deadline(today).
   min_watchlist_size:             30         # seed value — Feed Outage
                                              # trigger condition 2 (see "Feed
                                              # Outage Recovery"). TWO roles,

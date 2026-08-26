@@ -22,7 +22,8 @@ def build_effective_bar_sequence(
     halts_df: pd.DataFrame,
     date: str,
     t_hour: str,
-    target_valid_bars: int = 60,
+    closes: dict[str, str],
+    target_valid_bars: int,
 ) -> pd.DataFrame:
     """
     Build sequence of valid (non-halt) bars starting from t_hour.
@@ -62,7 +63,18 @@ def build_effective_bar_sequence(
         halts_df:           trading_halts rows for (ticker, date)
         date:               'YYYYMMDD'
         t_hour:             'HHMMSS' — t bar open time (start of search)
-        target_valid_bars:  number of valid bars to collect (default: 60)
+        closes:             the {date: session_close} map, for last_bar(date).
+                            Without it this function had no way to know the
+                            boundary its own docstring states four times above.
+        target_valid_bars:  number of valid bars to collect. NO DEFAULT — the
+                            caller passes execution.max_hold_bars. A default
+                            equal to the configured value is a silent bypass no
+                            test detects while the two agree, and here it broke
+                            WITHIN one engine: 09_backtest_engine.md checks that
+                            key's worth of valid bars elapsed over a sequence
+                            this function would have capped at 60, so raising
+                            the key past 60 made its time-limit exit
+                            unreachable rather than merely late.
 
     Returns:
         pd.DataFrame with columns [hour, open, high, low, close, volume, is_halt, is_valid]
@@ -416,11 +428,21 @@ def save_encoding_map(map_name: str, mapping: dict, configs_dir: str = "configs"
 
 ### Session Boundary Derivations
 
-One column, several names. `trading_calendar.session_close` holds the exchange
-close; everything else in the system derives from it through exactly one of
-the derivations below.
+Two columns, and they are not symmetric. `trading_calendar.session_close` holds
+the exchange close, and everything else in the system derives from it through
+exactly one of the derivations below. `trading_calendar.after_hours_end` holds
+the end of the venue's extended session and is consumed verbatim wherever it is
+needed: it has NO derivations, and none should be invented here for symmetry.
 
-CALL-SITE NOTATION. Signatures below take the `{date: close}` map (and, for
+WHICH BOUNDARIES MOVE: every boundary sourced from `trading_calendar` — the
+close, which is at once Regular's upper bound and After-hours' lower bound in
+`execution_common.md`'s session-phase table, and `after_hours_end`, which is
+that table's upper bound. Between them they touch every row of it. The premarket
+open is the exception and stays a literal: the NYSE regular open does not move
+except under exchange outage, which the calendar library would not reflect in
+any case.
+
+CALL-SITE NOTATION. Signatures below take the boundary map (and, for
 `exit_deadline()`, config) explicitly — nothing here queries DuckDB, matching
 `halts_df` and `session_stats`. Other specs write the single-argument forms
 `last_bar(date)` / `exit_deadline(today)` for readability; the map argument is
@@ -428,13 +450,36 @@ ELIDED IN PROSE, never fetched internally. A call site that has no map in scope
 is a design error at that site, not a case for a lookup inside these functions. They are named so that no call site can confuse them — that legibility is
 the point, and it is why the arithmetic is NOT inlined at each use site.
 
+WHO LOADS. A process loads the maps once at its entry and passes them down;
+callers pass no `dates`, since the default loads every row and the corpus runs
+to thousands of rows in total. The exception is a function IN THIS FILE that
+owns a `db_conn` AND is reached from a tool entry point which preloads nothing
+— `populate_precomputed_session_stats()` and `compute_vol_regime_holdout()` —
+which loads them at its own start. That is a class, not a per-function
+exception, and it does not breach the rule above: those functions load the maps
+and then call these accessors WITH the argument, rather than putting a lookup
+inside them.
+
+THE AUTHORITY IS WALL CLOCK, not a market-data field. The trade stream carries
+a session marker, but a tick-borne signal is unavailable exactly when no tick
+arrives — the same ground on which R-3 rejected putting `session_end` on the WS
+path. Every boundary here is evaluated against America/New_York wall clock,
+`exit_deadline()` and `after_hours_end()` included. In LIVE mode that
+evaluation sits under `live_mode.clock_check`'s offset discipline; the training
+and backtest paths have no live clock to check and read their dates from stored
+data, so the discipline is named here as live-only rather than as a property of
+the boundaries. `execution_common.md`'s session-phase table inherits this rather
+than restating it.
+
 ```python
 def session_close(date: str, closes: dict[str, str]) -> str:
     """
     That date's EXCHANGE close, 'HHMMSS' — the trading_calendar column verbatim.
     '160000' ordinarily, '130000' on an early-close day.
 
-    `closes` is the canonical {date: close} map (see load_session_boundaries()).
+    `closes` is the {date: session_close} map — the FIRST of the two that
+    load_session_boundaries() returns, the second being {date: after_hours_end}
+    for after_hours_end() below.
 
     RAISES on a date absent from the map. It must NOT fall back to '160000':
     that fallback restores the silent 16:00 assumption this whole mechanism
@@ -489,13 +534,49 @@ def exit_deadline(date: str, closes: dict[str, str], config: dict) -> str:
     ...
 
 
+def after_hours_end(date: str, ends: dict[str, str]) -> str:
+    """
+    trading_calendar.after_hours_end for that date, VERBATIM. '200000'
+    ordinarily, '170000' on an early-close day, where the venue's extended
+    session ends at 17:00.
+
+    `ends` is the {date: after_hours_end} map — the SECOND of the two that
+    load_session_boundaries() returns, stated here because session_close()
+    states the same for its own map.
+
+    RAISES on a date absent from the map. It must NOT fall back to '200000':
+    that fallback restores the silent 20:00 assumption this mechanism exists to
+    remove, and it is wrong on exactly the days that matter. Identical posture
+    to session_close()'s refusal to fall back to '160000'. Nothing carried this
+    rule before — the column had no accessor to host it.
+
+    Callers: execution_common.md's session-phase table, for After-hours' upper
+    bound; live_mode_runner.md's process hard cap, which subtracts
+    live_mode.session_hard_exit_offset_minutes from this value rather than
+    equalling it; 05_labeler.md's after-market boundary.
+
+    NO DERIVATIONS, deliberately. session_close earned three names because three
+    different quantities come off it; this column is consumed as-is at every
+    site. Stated so that a later session does not build a sibling family here
+    for symmetry's sake.
+    """
+    ...
+
+
 def load_session_boundaries(
     db_conn: duckdb.DuckDBPyConnection,
     dates: list[str] | None = None,
-) -> dict[str, str]:
+) -> tuple[dict[str, str], dict[str, str]]:
     """
-    Load the canonical {date: session_close} map in ONE query, alongside
-    session_stats_bulk rather than inside it.
+    Load the canonical {date: session_close} and {date: after_hours_end} maps —
+    two flat maps, both columns in ONE query. Called ONCE PER PROCESS at entry,
+    not alongside session_stats_bulk: the earliest consumer is
+    live_mode_runner.md's early-close participation gate, which is evaluated
+    before the Session Lifecycle that loads those stats.
+
+    Normalisation is NOT performed here. This function SELECTs and delegates to
+    session_boundaries_from_frame() below, so the two entry points cannot
+    diverge on which rows enter the maps.
 
     NOT folded into the session_stats dict. That dict's grain is
     (date, ticker, metric, hour) while a close is one per DATE, so folding would
@@ -509,10 +590,32 @@ def load_session_boundaries(
     Rows number in the thousands even across the whole corpus. Vectorised
     consumers attach it to their own frame — bars["session_close"] =
     bars["date"].map(closes) — which is a derivation of this map, not a second
-    source. dates=None loads every row.
+    source. dates=None loads every row, which is what every caller passes:
+    narrowing buys nothing at this size and a caller cannot enumerate the prior
+    sessions it will ask about without a calendar it does not yet hold.
+    """
+    ...
 
-    after_hours_end is loaded by the same mechanism where needed; it is a separate
-    column with the same NULL rule.
+
+def session_boundaries_from_frame(
+    calendar_df: pd.DataFrame,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """
+    The same two maps, built from an already-loaded trading_calendar frame, for
+    consumers that hold the table already — run_preprocess.md SELECTs it at
+    Step 1 and passes it on to 05_labeler.md — so that neither issues a second
+    query for a fact it has in hand.
+
+    SOLE OWNER OF THE NORMALISATION, which is why the name does not near-miss
+    load_session_boundaries(): that one delegates here.
+
+    Rows whose session_close is NULL are EXCLUDED, so a non-trading day raises
+    as absent rather than returning a null and pushing a None branch into every
+    accessor. Membership is is_trading_day, NEVER has_data: a forward-filled row
+    carries has_data=FALSE and today's row has no bars at session start, so a
+    has_data filter — the condition 09_backtest_engine.md's next-trading-day
+    lookup uses, and the one an implementer is likeliest to copy — would break
+    the early-close gate on its first call.
     """
     ...
 ```
@@ -1034,6 +1137,12 @@ def populate_precomputed_session_stats(
     """
     Compute and store REFERENCE_SESSION baselines for given as_of_dates.
 
+    Loads the boundary maps at its own start, under Session Boundary
+    Derivations' WHO LOADS rule: it owns db_conn and its callers
+    (metadata_crawler.md, migration_tool.md) preload nothing. gap_pct's
+    prev_close anchors on last_bar(D-k) for each prior session, so the maps are
+    needed here and not merely passed through.
+
     For each as_of_date in dates:
         For each ticker with ohlcv_1min data:
             Compute per-bar average over prior n_sessions trading sessions.
@@ -1212,6 +1321,7 @@ def load_session_stats(
     n_sessions: int,
     delta_minutes: int,
     session_mode: str,
+    closes: dict[str, str],
 ) -> dict:
     """
     Load and smooth precomputed_session_stats for a ticker on a given date.
@@ -1219,9 +1329,9 @@ def load_session_stats(
     Steps:
         1. Query precomputed_session_stats WHERE ticker=?, as_of_date=?, n_sessions=?
         2. Apply session_mode filter:
-               "regular":  keep hours 093000~last_bar(as_of_date) only
-               "pre":      keep hours 040000~092900 only
-               "combined": keep 040000~last_bar(as_of_date)
+               "regular":  hours 093000~last_bar(as_of_date)
+               "pre":      hours 040000~092900
+               "combined": hours 040000~last_bar(as_of_date)
                Day-level metrics (hour='000000') always included regardless of session_mode.
            The last sentence is COPIED VERBATIM from build_session_stats_dict()
            below, where it was already stated and here was not. Read literally,
@@ -1247,6 +1357,7 @@ def build_session_stats_dict(
     raw_df: pd.DataFrame,
     delta_minutes: int,
     session_mode: str,
+    closes: dict[str, str],
 ) -> dict:
     """
     Convert a bulk-loaded precomputed_session_stats DataFrame into a nested dict.
@@ -1259,9 +1370,9 @@ def build_session_stats_dict(
 
     Processing:
         1. Filter rows by session_mode (apply hour range filter per metric):
-               "regular":  include hours in 093000~last_bar(as_of_date) (bar-level metrics only)
-               "pre":      include hours in 040000~092900
-               "combined": include all hours
+               "regular":  hours 093000~last_bar(as_of_date)
+               "pre":      hours 040000~092900
+               "combined": hours 040000~last_bar(as_of_date)
                Day-level metrics (hour='000000') always included regardless of session_mode.
         2. For each (as_of_date, ticker, metric):
                Apply delta_minutes smoothing over the time dimension:
@@ -1297,6 +1408,11 @@ def compute_vol_regime_holdout(
     """
     Compute holdout dates based on rolling volatility percentile.
     Uses regular session bars only (093000~last_bar(date)) from ohlcv_1min.
+
+    Loads the boundary maps at its own start, under Session Boundary
+    Derivations' WHO LOADS rule: it owns db_conn and pipeline_optimizer.md
+    preloads nothing. It reads ohlcv_1min rather than precomputed_session_stats,
+    so nothing another consumer already holds would serve here.
 
     vol_metric = "avg_intraday_range":
         per date = mean of (high - low) / open across all tickers

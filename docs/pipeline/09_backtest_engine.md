@@ -41,7 +41,18 @@ class BacktestEngine:
         self,
         config: dict,
         db_conn: duckdb.DuckDBPyConnection,
-    ): ...
+    ):
+        """
+        Loads the boundary maps via utils.md's load_session_boundaries(db_conn),
+        once for the run. ACQUIRED rather than received because run_backtest.py
+        holds none to give — unlike the Inferencer, whose LiveModeRunner already
+        has them. The asymmetry is about which caller holds the maps, not about
+        the kind of module.
+
+        The trading_calendar read elsewhere in this file is a one-row
+        next-trading-day lookup for dead position resolution and is unrelated.
+        """
+        ...
 
     def run(
         self,
@@ -673,7 +684,10 @@ zero fill there means liquidity was absent, which is a different fact.
 
 ```python
 if config["execution"]["max_hold_bars"] valid bars elapsed since entry
-   (via build_effective_bar_sequence):
+   (via build_effective_bar_sequence, which is passed THAT SAME key as its
+    target_valid_bars — the parameter carries no default, because a default of
+    60 would cap the sequence below the count this line tests and make the
+    exit unreachable whenever the key exceeds 60):
     exit_reason = "time_limit"
     if not config["execution"]["simulate_nondirectional_exit_fill"]:
         exit_price = close of last valid bar

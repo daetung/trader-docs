@@ -59,6 +59,10 @@ items ahead of it.
    it collects what the items above establish.
 5. **Real-time bid/ask spread** is blocked on calendar time, not design time,
    so it is not sequenced against anything here.
+6. **Config-duplicating signature defaults** is unblocked but is hygiene
+   rather than a design blocker, so it is not sequenced against the items
+   above either. It is listed because a new item left out of this list is the
+   carry-forward defect this file exists to prevent, inverted.
 
 ---
 
@@ -270,3 +274,47 @@ for comparing against the live one, which `auxiliary_stream.md` builds) but
 having a method is not having a result: it stays grade A and stays a Pilot
 precondition. Which of the rest are answerable at a desk has not been sorted
 through.
+
+---
+
+## Config-duplicating signature defaults
+
+A LATENT risk, not an active defect. A caller that passes the argument is
+unaffected, and the failure needs both an omission and a later config change.
+
+**The class.** A function-argument default equal to the configured value.
+Omitting the argument silently reads the default, and no test detects the
+omission while the two agree.
+
+**Members**, default site — config site:
+
+- `02_indicator_calculator.md` `reset_mode` `"date"` — its own config block
+- `02_indicator_calculator.md` `regular_start` `"093000"` — its own config block
+- `utils.md` `ambiguity_priority` `"up"`, TWICE in one file — `05_labeler.md`
+- `utils.md` `n_sessions` `20` — `02_indicator_calculator.md`
+- `utils.md` `vol_metric` `"avg_intraday_range"` — `pipeline_optimizer.md`
+- `utils.md` `embargo_days` `5` — `06_class_balancer.md`
+- `01_entry_detection.md` `max_sideways_ratio` `0.6` — its own config block
+- `execution_common.md` `use_all_cash` `True` — its own config block
+- `08_dimensionality_reducer.md` `bottom_pct` `0.20` — its own config block
+
+**Not members**, having no config counterpart: `utils.md`'s `window_days` and
+`val_fraction`, `07_lgbm_pipeline.md`'s `importance_type`, and the local
+defaults — `return_intermediate`, `balance`, `fold_idx`, `dry_run`,
+`return_data`.
+
+**`target_valid_bars` is excluded**, its default already removed. That one was
+removed because it broke WITHIN one engine: `09_backtest_engine.md` counts
+`config["execution"]["max_hold_bars"]` valid bars over a sequence the function
+would have capped at 60, so raising the key past 60 made the time-limit exit
+unreachable rather than merely late. No equivalent internal contradiction is
+shown for the members above, and that is what makes the class latent.
+
+**The open question is which resolution the class takes**, not whether each
+site is a duplicate. Removal, as `target_valid_bars` took; or the `None`
+sentinel already present in `06_class_balancer.md` for the same parameter
+`utils.md` defaults to `5`; or a per-site judgement. Two patterns for one
+parameter already coexist, which is itself the argument for settling it once.
+
+**`01_entry_detection.md`'s `max_sideways_ratio` is the sharpest instance**:
+its own inline comment reads `# from config` beside the hardcoded default.

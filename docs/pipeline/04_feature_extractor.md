@@ -261,6 +261,7 @@ class FeatureExtractor:
         ticks: pd.DataFrame,
         meta: dict,
         halts_df: pd.DataFrame,
+        closes: dict[str, str],
         session_stats: dict | None = None,
     ) -> pd.DataFrame:
         """
@@ -304,6 +305,7 @@ class FeatureExtractor:
         meta: dict,
         entry: dict,
         halts_df: pd.DataFrame,
+        session_close: str,
         return_intermediate: bool = False,
         session_stats: dict | None = None,
     ) -> dict[str, float] | tuple[dict[str, float], dict]:
@@ -501,6 +503,12 @@ and `session_stats` — "passed explicitly, not fetched internally" is this
 module's standing rule and it never queries DuckDB directly. It is not folded
 into `meta`: `meta` is date-keyed so the shape would fit, but it carries
 stock_meta-sourced per-ticker values and a session close is neither.
+
+The SHAPE differs by entry point, following `meta`'s own precedent below:
+`extract_batch()` takes the `{date: session_close}` map because it spans many
+entry dates for one ticker, while `extract()` takes that date's close flat
+because it handles exactly one. Both are needed — `is_near_close` is in the
+shared feature dict, so live serving computes it too.
 
 Holiday calendar sourced from `us_holidays` table in DuckDB.
 `day_of_week` encoding map loaded via `utils.load_encoding_map("day_of_week_map")`.

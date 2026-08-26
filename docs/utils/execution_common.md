@@ -434,12 +434,24 @@ execution:
                                    # .max_positions, which was a single
                                    # global count and so could not express
                                    # "N positions, all on one ticker".
-  max_hold_bars:             60    # R-6: single source, and THREE consumers,
-                                   # not two: backtest's time-limit exit,
-                                   # live's ORDINARY Position Manager
-                                   # time_limit exit (previously omitted from
-                                   # this list entirely), and live's
-                                   # restart_gap_exit / overnight_exit cutoff.
+  max_hold_bars:             60    # R-6: single source. Consumers are given
+                                   # as a LIST, not a count: a count reads as
+                                   # complete while a member sits outside it,
+                                   # which is how the Labeler was missed.
+                                   #   - backtest's time-limit exit
+                                   #   - live's ORDINARY Position Manager
+                                   #     time_limit exit
+                                   #   - live's restart_gap_exit /
+                                   #     overnight_exit cutoff
+                                   #   - the Labeler's collection stop
+                                   # The first and the last reach it by the
+                                   # same route: 09_backtest_engine.md and
+                                   # 05_labeler.md each pass this key into
+                                   # utils.md's build_effective_bar_sequence()
+                                   # as target_valid_bars, which carries no
+                                   # default of its own. A grep on this key
+                                   # therefore reaches that near-miss argument
+                                   # name from either end.
                                    # One key serves both readings because they
                                    # are the same quantity:
                                    #   valid bars (build_effective_bar_sequence)
@@ -921,19 +933,13 @@ The vendor permits order types by session phase:
 | Regular regular open – `session_close` | yes | yes |
 | After-hours `session_close` – `after_hours_end` | yes | no |
 
-**The boundaries are PER DATE, resolved ONCE at session start** into three
-wall-clock values held for the session, rather than re-derived at each
-consultation — the close cannot change mid-session, so a function call per
-submission would buy nothing. Ordinarily this yields the familiar
-04:00 / 09:30 / 16:00 / 20:00; on an early-close day it yields
+**The boundaries are PER DATE**, resolved through the named accessors in
+`utils.md`'s Session Boundary Derivations — `session_close(date)` for the
+Regular/After-hours seam and `after_hours_end(date)` for the upper bound —
+against the map this process loaded at entry. Which of them move, and which
+stay literals, is stated there rather than here. Ordinarily this yields the
+familiar 04:00 / 09:30 / 16:00 / 20:00; on an early-close day it yields
 04:00 / 09:30 / 13:00 / 17:00.
-
-WHICH BOUNDARIES MOVE: every boundary sourced from `trading_calendar` — the
-close, which is at once Regular's upper bound and After-hours' lower bound, and
-`after_hours_end`, which is After-hours' upper bound. Between them they touch
-every row of the table. The premarket open is the exception and stays a literal:
-the NYSE regular open does not move except under exchange outage, which the
-calendar library would not reflect in any case.
 
 WHY THIS TABLE IS THE SHARPEST EARLY-CLOSE FAILURE. Held at a fixed 16:00, the
 window 13:00–16:00 on a half day reads as Regular while the venue is already in
@@ -942,12 +948,10 @@ worst is the stuck-exit escalation: it escalates to a market order "inside the
 regular session", so the final backstop would submit an order the venue rejects,
 precisely when an exit is already stuck.
 
-**The authority is wall clock, not a market-data field.** The trade stream
-carries a session marker, but a tick-borne signal is unavailable exactly
-when no tick arrives — the same ground on which R-3 rejected putting
-`session_end` on the WS path. Phase is evaluated against
-America/New_York wall clock under the same `clock_check` discipline as
-`exit_deadline()` and `session_hard_exit_time`.
+Phase is evaluated against America/New_York wall clock, never against the
+trade stream's session marker. That rule is not specific to phase and is
+stated with the boundaries themselves, in `utils.md`'s Session Boundary
+Derivations.
 
 Two consequences worth stating, because both were verified against vendor
 documentation rather than assumed:

@@ -145,10 +145,13 @@ ticks_from_t = ticks_df filtered to hour >= t_hour, sorted by (hour, seq_id)
 
 --- Step 1: Build effective bar sequence ---
 
-Use build_effective_bar_sequence() from utils.py.
+Use build_effective_bar_sequence() from utils.py, passing
+execution.max_hold_bars as its target_valid_bars and the {date: session_close}
+map as its closes. Neither has a default there: the cap is config's, and the
+boundary is the calendar's.
 Collect bars from t onward for this (ticker, date).
 Collection stops at whichever comes first:
-    - 60 valid (non-halt) bars collected, or
+    - execution.max_hold_bars valid (non-halt) bars collected, or
     - last_bar(date) reached
 After-market bars (hour > last_bar(date)) are never included.
 
@@ -184,13 +187,13 @@ else:
 Triggered when track_label_breach() returns None (no ±3pp breach).
 Exit path determined by which condition terminated Step 1:
 
-    Case A — time-limit exit (60 valid bars collected before last_bar(date) reached):
+    Case A — time-limit exit (execution.max_hold_bars valid bars collected before last_bar(date) reached):
         exit_price = close of last valid bar in effective_bars
         pnl = (exit_price - P_entry) / P_entry
         apply label by pnl threshold (same rules as Case B below)
         → no after-market fallback; no dead position
 
-    Case B — session close exit (last_bar(date) reached within 60 valid bars):
+    Case B — session close exit (last_bar(date) reached within execution.max_hold_bars valid bars):
         exit_price = last_bar(date) close
         # last_bar(), not exit_deadline(): Case B is not an exit POLICY but the
         # terminal condition of Step 1's collection, so it must land where
@@ -289,6 +292,13 @@ class Labeler:
     ) -> pd.DataFrame:
         """
         Generate label matrix for all entry points.
+
+        The boundary maps are derived from the trading_calendar frame this
+        method already receives, through utils.md's
+        session_boundaries_from_frame(). No second query, and no second
+        normalisation: that constructor solely owns which rows enter the maps.
+        The frame is still needed in its own right, for has_data in dead
+        position resolution, which the maps do not carry.
         One and only one label column is 1 per row.
         dead_position_case is None for non-dead-position rows.
         is_ambiguous reflects bundle-level simultaneous breach in Stage 1 only.
@@ -304,10 +314,10 @@ Note: `build_effective_bar_sequence()` is an internal delegation to
 ## Constraints
 
 - t bar high/low/close/volume must NOT be used — only t bar open (P_entry) is permitted as reference
-- Halt bars are excluded from the 60-bar valid count — search extends to compensate
-- Time-limit exit (Step 3 Case A): triggered when 60 valid bars collected before last_bar(date);
+- Halt bars are excluded from the valid count — search extends to compensate
+- Time-limit exit (Step 3 Case A): triggered when execution.max_hold_bars valid bars collected before last_bar(date);
   exit_price = last valid bar close; no after-market fallback; no dead position
-- Session close exit (Step 3 Case B): triggered when last_bar(date) reached within 60 valid bars;
+- Session close exit (Step 3 Case B): triggered when last_bar(date) reached within execution.max_hold_bars valid bars;
   after-market fallback applies when last_bar(date) is halt/no_data
 - Dead position triggered from Step 3 Case B only — time-limit exit never leads to dead position
 - After-market data usage limited to last_bar(date) halt/no_data fallback only (Step 3 Case B)
@@ -360,10 +370,16 @@ labeler:
   # build_effective_bar_sequence()'s collection bound, so the shared function
   # is no longer reached through this module's key on one side and
   # execution:'s on the other.
-  # after_market_close_hour REMOVED. It duplicated the 200000 after-market
-  # boundary already carried by live_mode.session_hard_exit_time, the
-  # ingestion range, and metadata_crawler.md's evening-cron derivation. Where
-  # this module needs it, it reads trading_calendar.after_hours_end.
+  # after_market_close_hour REMOVED. It duplicated the after-market boundary
+  # already carried by trading_calendar.after_hours_end, which is what the
+  # live process's R-9 hard cap resolves from and what metadata_crawler.md's
+  # evening-cron derivation is stated against.
+  # NOT the ingestion range, which also reads 200000: that range is fixed by
+  # decision and does not move with the calendar, while after_hours_end does.
+  # The two coincided at 200000, and grouping them as one boundary was the
+  # coincidence doing the explaining.
+  # Where this module needs it, it calls utils.md's after_hours_end(date)
+  # against the map built below, rather than reading the column directly.
   # max_holding_bars REMOVED — execution.max_hold_bars is the single source.
   # R-6 established that and enumerated the consumers it knew of; this module
   # was not among them, because the key here was max_holDING_bars and no grep
@@ -387,13 +403,13 @@ labeler:
 | +3pp hit at bar 10, -3pp hit at bar 15 (before +5pp) | label_up3 |
 | -3pp hit first, -5pp reached | label_dn5 |
 | -3pp hit first, +3pp cuts off before -5pp | label_dn3 |
-| Neither ±3pp breached, last_bar(date) reached within 60 bars | label_sw (session close exit) |
-| Neither ±3pp breached, 60 valid bars collected before last_bar(date) | label_sw (time-limit exit, last valid bar close) |
+| Neither ±3pp breached, last_bar(date) reached within execution.max_hold_bars bars | label_sw (session close exit) |
+| Neither ±3pp breached, execution.max_hold_bars valid bars collected before last_bar(date) | label_sw (time-limit exit, last valid bar close) |
 | Ambiguous bundle (both ±3pp in same bundle), priority="up" | label_up3/up5, is_ambiguous=True |
 | Dead position Case A (ticker in coverage, has_data=True next day) | is_dead_position=True, case="A", label by pnl threshold (dividend/split adjusted) |
 | Dead position Case B (ticker missing, has_data=True next day) | is_dead_position=True, case="B", pnl=-1.0, label_dn5 |
 | Dead position Case C (no next day with has_data=True) | is_dead_position=True, case="C", label_sw |
 | Dead position Case D (Case A entered, exit_price unresolvable — extended halt) | is_dead_position=True, case="D", pnl=-1.0, label_dn5 |
 | Dead position Case A with split effective D+1 | pnl computed against split-adjusted P_entry, not raw P_entry |
-| Halt bar skipped in 60-bar count | label assigned after halt |
-| Time-limit exit: 60 valid bars collected, last_bar(date) not yet reached | exit at last valid bar close, no dead position |
+| Halt bar skipped in valid count | label assigned after halt |
+| Time-limit exit: execution.max_hold_bars valid bars collected, last_bar(date) not yet reached | exit at last valid bar close, no dead position |

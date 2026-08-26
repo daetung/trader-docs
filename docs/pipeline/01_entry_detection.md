@@ -336,10 +336,20 @@ class EntryPointDetector:
         bars: pd.DataFrame,           # full date range including t bar
         ticker: str,
         meta: dict,                   # date-keyed: {date: {"shares_outstanding": value}}
+        closes: dict[str, str],       # {date: session_close}, see utils.md
     ) -> pd.DataFrame:
         """
         Training only. Scan all bars for a ticker and return all detected
         entry points.
+
+        HOW THE BOUNDARY ARRIVES. Both exclusions below need it and they need
+        DIFFERENT derivations of it: the after-market exclusion reads
+        last_bar(date), the late-day exclusion reads max_entry_hour(date),
+        which is last_bar(date) minus the offset. So the map arrives, not a
+        pre-resolved cutoff — a cutoff would also vanish when
+        max_entry_offset_minutes is null, while the after-market exclusion
+        still applies. Passed explicitly, never fetched: bars cannot supply it,
+        since they contain the after-market rows the first exclusion removes.
 
         bars must include the t bar for each detected entry point so that
         p_entry = bars[i+1]["open"] can be retrieved. If t bar does not
@@ -420,6 +430,7 @@ def scan_with_balance_check(
     bars: pd.DataFrame,
     ticker: str,
     meta: dict,                        # date-keyed, same shape as scan()
+    closes: dict[str, str],            # forwarded to scan()
     max_sideways_ratio: float = 0.6,   # from config
 ) -> pd.DataFrame:
     """

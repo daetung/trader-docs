@@ -311,7 +311,8 @@ def load_from_db(
     the watchdog working set):
         calc = CachingIndicatorCalculator(config)
         calc.load_from_db(db_conn, today_date, ticker)
-        stats = load_session_stats(db_conn, ticker, today_date, ...)
+        stats = load_session_stats(db_conn, ticker, today_date, ...,
+                                   closes=closes)
         calc.set_session_stats(stats)
         # then replay today's intraday bars via on_bar_close()
     """

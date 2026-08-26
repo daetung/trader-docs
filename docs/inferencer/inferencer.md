@@ -174,7 +174,10 @@ step 0: bars = self._prepare_bars(bars, entry)
        ).df()
 
 6. FeatureExtractor.extract(bars, ticks, meta, entry, halts_df,
-                             session_stats=session_stats)
+                             session_stats=session_stats,
+                             session_close=session_close(entry["date"]))
+       # is_near_close needs the exchange close. Flat, not the map: extract()
+       # handles exactly one date, the same reason its meta stays flat.
        → feature_vector dict[str, float]
        (CachingIndicatorCalculator used via DI in FeatureExtractor)
        (Encoding maps loaded internally by FeatureExtractor)
@@ -324,10 +327,17 @@ class Inferencer:
         db_conn: duckdb.DuckDBPyConnection,
         run_id: str,
         feature_extractor: FeatureExtractor,   # DI: CachingIndicatorCalculator injected
+        closes: dict[str, str],
+        ends: dict[str, str],
     ):
         """
         feature_extractor is injected with CachingIndicatorCalculator by LiveModeRunner.
         calculate_required_history() result stored as self.required_bars at init.
+
+        closes/ends are RECEIVED, not loaded here: LiveModeRunner holds them from
+        its early-close gate, which runs before this init, and a second load would
+        be a second delivery path for one fact. They are held for the session the
+        same way required_bars is — the calendar cannot change mid-session.
         """
         ...
 

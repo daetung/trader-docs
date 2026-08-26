@@ -299,8 +299,11 @@ the current market regime.
 metadata_crawler.md's "Dual Schedule", N-1/N-3 — 09:30 regular session
 open, `last_bar(date)` session close, `session_close(date)` regular session
 close — past which the venue refuses market orders, so order type branches on
-it, see execution_common.md's session-phase table — `after_hours_end(date)`
-`session_hard_exit_time`, 21:00 ET evening batch run, 23:30 ET
+it, see execution_common.md's session-phase table for the permission and
+utils.md's Session Boundary Derivations for the instant — `after_hours_end(date)`,
+which is also the live process's R-9 hard cap once
+`live_mode.session_hard_exit_offset_minutes` is subtracted and so is ONE entry
+here rather than two, 21:00 ET evening batch run, 23:30 ET
 `evening_wait_hard_deadline`) are wall-clock America/New_York times, which
 observe DST. The set above is every wall-clock time the system schedules or
 gates behaviour against, whatever the mechanism — a cron entry, an

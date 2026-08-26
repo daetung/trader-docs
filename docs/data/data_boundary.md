@@ -214,12 +214,14 @@ into features computed for dates before the filing existed. See
 ## Label Search Boundary
 
 ```
-Search range: t bar open → session close (last_bar(date)), up to 60 valid bars
+Search range: t bar open → session close (last_bar(date)), up to
+execution.max_hold_bars valid bars
 
 Priority:
   1. ±3pp breach → immediate label assignment
   2. last_bar(date) reached → exit at that bar's close, assign label by pnl
-  3. 60 valid bars exhausted → exit at last valid bar close, assign label by pnl
+  3. execution.max_hold_bars valid bars exhausted → exit at last valid bar
+     close, assign label by pnl
 
 Priority 2 and 3 are mutually exclusive — whichever condition is reached first determines
 the exit. After-market fallback and dead position apply to priority 2 only.
@@ -371,15 +373,21 @@ Before submitting any module, verify:
 - [ ] P_entry is present as an identifier column in parquet output
 - [ ] Temporal features use entry.hour (clock time only) — not t bar OHLCV
 - [ ] Label calculation starts from t bar open as the zero reference
-- [ ] When no ±3pp breach: if 60 valid bars collected before last_bar(date) → exit at last valid bar close
+- [ ] When no ±3pp breach: if execution.max_hold_bars valid bars collected before last_bar(date) → exit at last valid bar close
        (time-limit; no after-market fallback, no dead position);
-       if last_bar(date) reached within 60 valid bars → exit at that bar's close
+       if last_bar(date) reached within execution.max_hold_bars valid bars → exit at that bar's close
        (session-end; with after-market fallback and dead position as last resort)
 - [ ] After-market used only as fallback for last_bar(date) halt/no_data (session-end path only)
 - [ ] Every session-boundary read goes through utils.md's session_close() /
-       last_bar() / exit_deadline() — never a 155900 or 160000 literal, and never
-       the wrong derivation: last_bar() is a data fact, exit_deadline() a policy,
-       and they coincide only at the default offset of 1 minute
+       last_bar() / exit_deadline() / after_hours_end() — never a 155900 or
+       160000 literal, and never the wrong derivation: last_bar() is a data
+       fact, exit_deadline() a policy, and they coincide only at the default
+       offset of 1 minute. 200000 is NOT on that forbidden list: the ingestion
+       range is fixed by decision and keeps that literal legitimately, while
+       after_hours_end() moves — the two once read as one number
+- [ ] Every valid-bar cap reads execution.max_hold_bars — never a literal, and
+       never a function-argument default standing in for it, which reads correct
+       until the key changes and then silently does not
 - [ ] 10-tick data used in features is strictly filtered to before t bar open
 - [ ] Labeler uses track_label_breach() with fill_second = t bar open + 5s;
        tracking starts strictly after fill_bundle (fill_bundle excluded)

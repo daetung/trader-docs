@@ -62,6 +62,11 @@ pd.DataFrame  # full labeled feature matrix, unsplit
                      # multiple rows per ticker now; NOT a single per-ticker snapshot
        halts_df    = SELECT * FROM trading_halts
        calendar_df = SELECT * FROM trading_calendar
+       closes, ends = session_boundaries_from_frame(calendar_df)
+                     # utils.md — derived from the frame just loaded, not a
+                     # second query. calendar_df is still passed on in its own
+                     # right, for has_data in Labeler's dead position
+                     # resolution, which the maps do not carry.
        coverage_df = SELECT * FROM ticker_data_coverage
        corp_events_df = SELECT * FROM corporate_events
                      # small table — loaded in full, filtered internally by
@@ -79,6 +84,7 @@ pd.DataFrame  # full labeled feature matrix, unsplit
            session_stats_raw,
            delta_minutes=config["indicators"]["reference_session"]["delta_minutes"],
            session_mode=config["entry_detector"]["session_mode"],
+           closes=closes,
        )
        # If precomputed_session_stats is empty (e.g., baseline not yet computed):
        # session_stats = {}  → extract_batch() receives session_stats=None per ticker
@@ -108,7 +114,7 @@ pd.DataFrame  # full labeled feature matrix, unsplit
        }
        for date in bars_for_ticker["date"].unique()
    }
-   detector.scan(bars_for_ticker, ticker, meta=scan_meta)
+   detector.scan(bars_for_ticker, ticker, meta=scan_meta, closes=closes)
 
 3. Save entry_points to DuckDB entry_points table (INSERT OR IGNORE)
 
@@ -187,6 +193,7 @@ pd.DataFrame  # full labeled feature matrix, unsplit
 
        extractor.extract_batch(
            entry_points_td, bars_td, ticks_td, ticker_meta, halts_td,
+           closes=closes,
            session_stats=ticker_session_stats,
        )
 

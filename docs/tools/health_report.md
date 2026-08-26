@@ -817,14 +817,23 @@ before draining would leave that invariant false for up to the drain timeout.
 Delaying them costs nothing: a crash leaves no marker at all, which is what
 crash detection keys on.
 
-Timing: the session process runs to `live_mode.session_hard_exit_time`
-(default 20:00 ET — see live_mode_runner.md's Session Shutdown) and the
-evening batch starts at 21:00, so a 600s drain leaves roughly 50 minutes'
-margin. That margin is why `drain_timeout_seconds` cannot simply be raised.
-The two values are coupled: raising `session_hard_exit_time` eats the same
-margin as raising the drain, and the ordinary exit is earlier still (all
-positions flat past `execution.session_close_exit_time`), so the 50 minutes
-is a floor rather than the typical case.
+Timing: the session process runs to that date's `after_hours_end` minus
+`live_mode.session_hard_exit_offset_minutes` (see live_mode_runner.md's Session
+Shutdown) and the evening batch starts at 21:00, so on an ordinary 20:00 close
+at the default zero offset a 600s drain leaves roughly 50 minutes' margin. That
+margin is why `drain_timeout_seconds` cannot simply be raised.
+
+The two values are still coupled, but the far end is now half calendar and half
+policy: the instant is `after_hours_end`, which no one sets, while the offset
+against it is a second knob on the same margin. Lowering the drain and raising
+the offset buy the same thing. The ordinary exit is earlier still — all
+positions flat past `exit_deadline(today)`, named as the derivation rather than
+the config key, since `session_close_exit_offset_minutes` is an OFFSET and
+reads as an instant nowhere.
+
+So the 50 minutes is a floor twice over: the ordinary exit precedes the cap,
+and an early close ends the extended session at 17:00 and widens the gap to the
+evening batch rather than narrowing it.
 
 Steps 2-4 failing does NOT stop 5-6. Holding the DB open on an alerting
 failure would make the evening batch wait to its own deadline and abort,
