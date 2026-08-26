@@ -62,11 +62,14 @@ pd.DataFrame  # full labeled feature matrix, unsplit
                      # multiple rows per ticker now; NOT a single per-ticker snapshot
        halts_df    = SELECT * FROM trading_halts
        calendar_df = SELECT * FROM trading_calendar
-       closes, ends = session_boundaries_from_frame(calendar_df)
+       closes, _   = session_boundaries_from_frame(calendar_df)
                      # utils.md — derived from the frame just loaded, not a
-                     # second query. calendar_df is still passed on in its own
-                     # right, for has_data in Labeler's dead position
-                     # resolution, which the maps do not carry.
+                     # second query. The after_hours_end map is discarded: the
+                     # only consumer of it on this path is the Labeler, which
+                     # derives its own from calendar_df.
+                     # calendar_df is still passed on in its own right, for
+                     # has_data in Labeler's dead position resolution, which
+                     # the maps do not carry.
        coverage_df = SELECT * FROM ticker_data_coverage
        corp_events_df = SELECT * FROM corporate_events
                      # small table — loaded in full, filtered internally by

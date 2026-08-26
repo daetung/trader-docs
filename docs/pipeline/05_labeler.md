@@ -360,7 +360,7 @@ labeler:
   threshold_5pp: 0.05
   # session_close_hour REMOVED. It re-declared the session boundary under a
   # key of its own; the calendar is the single source whichever derivation a
-  # site needs. It is NOT simply a duplicate of
+  # site needs. It is NOT simply a duplicate of the former
   # execution.session_close_exit_time: the two held the same value but not the
   # same concept, this one being a COLLECTION bound. R-7's ground still
   # applies — "a value both engines must agree on cannot be declared on one

@@ -148,7 +148,8 @@ second. Any consumer joining the two must treat a missing delayed row for a
 recent second as **not yet arrived**, not as absent — the join is meaningful
 only for seconds older than the delay.
 
-Production's session ends at `after_hours_end(today)`; this process runs on
+Production's session ends at the live process's hard cap (see
+live_mode_runner.md's Session Shutdown); this process runs on
 until the delayed tail is complete, roughly fifteen minutes later. The evening
 batch's analysis stage (`metadata_crawler.md`) clears that by about an hour.
 

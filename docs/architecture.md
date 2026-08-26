@@ -30,7 +30,7 @@ Raw JSON (1min / 10tick, all sessions)
         ▼                                         ▼
  FeatureExtractor                              Labeler
    (internally calls:                    5 independent binary labels per entry point
-    IndicatorCalculator                  Exit at last_bar(date) or 60-bar limit;
+    IndicatorCalculator                  Exit at last_bar(date) or execution.max_hold_bars;
     → Vectorizer                         after-market fallback for session-end halt only
     + MetaFeatures                       is_dead_position flag for overnight hold cases
     + TemporalFeatures)                  [labels, is_dead_position,

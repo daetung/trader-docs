@@ -328,16 +328,19 @@ class Inferencer:
         run_id: str,
         feature_extractor: FeatureExtractor,   # DI: CachingIndicatorCalculator injected
         closes: dict[str, str],
-        ends: dict[str, str],
     ):
         """
         feature_extractor is injected with CachingIndicatorCalculator by LiveModeRunner.
         calculate_required_history() result stored as self.required_bars at init.
 
-        closes/ends are RECEIVED, not loaded here: LiveModeRunner holds them from
-        its early-close gate, which runs before this init, and a second load would
-        be a second delivery path for one fact. They are held for the session the
-        same way required_bars is — the calendar cannot change mid-session.
+        closes is RECEIVED, not loaded here: LiveModeRunner holds it from its
+        early-close gate, which runs before this init, and a second load would be
+        a second delivery path for one fact. Held for the session the same way
+        required_bars is — the calendar cannot change mid-session.
+
+        The after_hours_end map is NOT taken: nothing here reads it, and utils.md's
+        after_hours_end() Callers list does not name this module. A caller takes
+        only the maps it reads.
         """
         ...
 

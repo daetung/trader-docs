@@ -649,8 +649,9 @@ LiveModeRunner.start_session(today_date):
              likely failed — alert operator)
 
   7. Inferencer init:
-         Pass closes and ends in — this process holds them already, so the
-             Inferencer does not open a second acquisition for the same fact
+         Pass closes in — this process holds it already, so the Inferencer
+             does not open a second acquisition for the same fact. Not ends:
+             nothing there reads it
          calculate_required_history() → self.required_bars
          Load model artifacts (run_id from config)
 
