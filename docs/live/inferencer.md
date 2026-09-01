@@ -1,6 +1,6 @@
 # Module: Inferencer
 
-**File:** `src/inference/inferencer.py`
+**File:** `src/live/inferencer.py`
 
 ---
 
@@ -12,7 +12,7 @@ and returns entry signals for live trading decisions.
 
 Inferencer is a **service object** — it does not manage execution loops.
 LiveModeRunner is the orchestrator that calls `infer()` at appropriate times.
-See `docs/inferencer/live_mode_runner.md`.
+See `docs/live/live_mode_runner.md`.
 
 ---
 

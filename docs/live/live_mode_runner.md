@@ -1,6 +1,6 @@
 # Module: LiveModeRunner
 
-**File:** `src/inference/live_mode_runner.py`
+**File:** `src/live/live_mode_runner.py`
 
 ---
 

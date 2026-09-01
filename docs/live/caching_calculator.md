@@ -1,6 +1,6 @@
 # Module: CachingIndicatorCalculator
 
-**File:** `src/inference/caching_calculator.py`
+**File:** `src/live/caching_calculator.py`
 
 ---
 

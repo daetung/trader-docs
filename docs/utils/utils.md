@@ -847,7 +847,7 @@ def adjust_bars_for_corporate_events(
           the max date in the loaded bars range for that call (today for live
           mode's session_start_compute(), the last date in the ticker's
           loaded range for training)
-        - inferencer/caching_calculator.md session_start_compute(),
+        - live/caching_calculator.md session_start_compute(),
           reference_date = today
 
     Returns a new DataFrame — does not mutate the input `bars` in place.

@@ -1,6 +1,6 @@
 # Auxiliary Stream Host
 
-**File:** `inferencer/auxiliary_stream.py`
+**File:** `src/live/auxiliary_stream.py`
 **In-process component of LiveModeRunner — runs on its own event loop
 (loop A) on a dedicated thread, not as a separate process**
 

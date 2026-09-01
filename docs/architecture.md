@@ -140,10 +140,10 @@ Standalone scripts:
 | `api/sdk_dependency.md` | The vendored SDK as an external artifact — adoption form, the three fork modifications and why none could be avoided, and the costs accepted with it |
 | `utils/execution_common.md` | Execution-time decisions shared between BacktestEngine and LiveModeRunner — signal resolution, cooldown guard, entry/exit fill simulation over a time-valued anchor, position sizing, late-entry residual-edge gate |
 | `utils/utils.md` | Shared utilities: bar sequence, signal resolution, slippage/fill simulation, label breach detection, encoding maps, trading calendar, REFERENCE_SESSION stats (populate + load), corporate-event adjustment (cum_split_ratio, adjust_bars_for_corporate_events, adjust_tick_derived_series_for_corporate_events, estimate_historical_meta, ticker rename stitching) |
-| `inferencer/inferencer.md` | Live inference service object — _prepare_bars, infer/infer_batch, inference_log |
-| `inferencer/live_mode_runner.md` | Live mode execution orchestrator — prefix-scan watchdog loop, recovery lane, position manager loop, session lifecycle, ticker-scoped 1-tick acquisition, real-path-parallel shadow fills |
-| `inferencer/caching_calculator.md` | CachingIndicatorCalculator — Layer 1/2 cache, fibonacci deque, sr_levels per-entry-point |
-| `inferencer/auxiliary_stream.md` | In-process host (loop A) for non-trading WebSocket subscriptions on a separate account — delayed-quote capture for feed-coverage measurement is its first consumer |
+| `live/inferencer.md` | Live inference service object — _prepare_bars, infer/infer_batch, inference_log |
+| `live/live_mode_runner.md` | Live mode execution orchestrator — prefix-scan watchdog loop, recovery lane, position manager loop, session lifecycle, ticker-scoped 1-tick acquisition, real-path-parallel shadow fills |
+| `live/caching_calculator.md` | CachingIndicatorCalculator — Layer 1/2 cache, fibonacci deque, sr_levels per-entry-point |
+| `live/auxiliary_stream.md` | In-process host (loop A) for non-trading WebSocket subscriptions on a separate account — delayed-quote capture for feed-coverage measurement is its first consumer |
 | `tools/init_db.md` | Schema bootstrap CLI — creates every table from db_schema.md's canonical DDL; `--verify` reports schema drift read-only. Sole DDL-issuing component; prerequisite for migration_tool |
 | `tools/migration_tool.md` | JSON → DuckDB migration, trading_calendar/coverage init, precomputed_session_stats population |
 | `tools/detection_benchmark.md` | Entry detection threshold tuning + timing benchmark, plus the diagnostic delayed-entry decay sweep |
@@ -198,7 +198,7 @@ stock-scalping/
 │   ├── utils/
 │   │   ├── utils.md
 │   │   └── execution_common.md
-│   ├── inferencer/
+│   ├── live/
 │   │   ├── inferencer.md
 │   │   ├── live_mode_runner.md
 │   │   ├── caching_calculator.md
@@ -239,7 +239,7 @@ stock-scalping/
 │   │   └── optimizer.py
 │   ├── backtest/
 │   │   └── engine.py
-│   ├── inference/
+│   ├── live/
 │   │   ├── inferencer.py
 │   │   ├── live_mode_runner.py
 │   │   ├── caching_calculator.py
