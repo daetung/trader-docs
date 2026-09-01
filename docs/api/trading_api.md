@@ -288,9 +288,9 @@ is that anything solvable in this module is not solved by a fork.
 mechanics past dispatch are already described above under Async Boundary —
 each REST call goes through `asyncio.to_thread`, and rate waits and retry
 backoff block a pool thread — so they are not out of scope here. What is
-undesigned is how that meets the caller's loop structure, and that is the
-async boundary open item's question rather than this one. The queue answers
-only WHICH call is handed over next.
+how that meets the caller's loop structure is settled above — one event loop
+per SDK client, each on its own thread — and is not this queue's concern. The
+queue answers only WHICH call is handed over next.
 
 Entry submission is ordered by `execution.entry_fill_delay_seconds` but is
 NOT hard-gated on it: an entry past its reference time is still submitted
@@ -375,7 +375,7 @@ the policy is not.
 
 **Writes are never re-attempted, regardless of the budget a caller passes.**
 This is a hard rule, not a default: the vendor exposes no idempotency key and
-`live_positions` writes its `'pending'` row at SUBMISSION time, so a
+`live_positions` writes its row at SUBMISSION time, so a
 submission that failed locally but landed server-side would produce an order
 the system does not track. Recovery for writes belongs to the paths that
 already exist — the vanished-order rule and Broker Reconcile.

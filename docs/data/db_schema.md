@@ -1270,8 +1270,8 @@ CREATE TABLE IF NOT EXISTS indicator_cache (
 );
 
 -- Real (non-shadow) position lifecycle, persisted so a mid-session crash
--- is recoverable (R-2). The 'pending' row is written at ORDER SUBMISSION
--- time (not fill), so a limit order pending across a crash is
+-- is recoverable (R-2). The row is written at ORDER SUBMISSION
+-- time (not fill), so a limit order outstanding across a crash is
 -- reconcilable by order_id, and the submission-vs-fill window is covered
 -- even for market orders.
 -- Retention: purge-registry member — date_column `date`, retention_days: inf
@@ -1338,7 +1338,8 @@ CREATE TABLE IF NOT EXISTS live_positions (
     entry_mgnrt  DOUBLE NOT NULL,    -- the margin rate (vendor Mgnrt0, PERCENT)
                                      --   in force when this entry was sized;
                                      --   pinned at entry, or at submission for
-                                     --   a 'pending' row, and NEVER revised.
+                                     --   a row still entry_state='awaiting',
+                                     --   and NEVER revised.
                                      --   NOT NULL because sizing cannot run
                                      --   without it (execution_common.md's
                                      --   compute_position_size() takes it as
@@ -2151,7 +2152,8 @@ to run independently inside the window: `detection_benchmark.py`,
 
 Referencing this section: `live_mode_runner.md`'s DB Connection Management
 (P-5) and Session Start Gating, `metadata_crawler.md`'s evening job start
-gate, `detection_benchmark.md`, `run_preprocess.md`, `run_train.md`,
+gate, `init_db.md`, `migration_tool.md`, `shadow_retraining.md`,
+`detection_benchmark.md`, `run_preprocess.md`, `run_train.md`,
 `run_backtest.md` and `pipeline_optimizer.md`.
 
 ---

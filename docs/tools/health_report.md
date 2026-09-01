@@ -838,11 +838,14 @@ before draining would leave that invariant false for up to the drain timeout.
 Delaying them costs nothing: a crash leaves no marker at all, which is what
 crash detection keys on.
 
-Timing: the session process runs to that date's `after_hours_end` minus
-`live_mode.session_hard_exit_offset_minutes` (see live_mode_runner.md's Session
-Shutdown) and the evening batch starts at 21:00, so on an ordinary 20:00 close
-at the default zero offset a 600s drain leaves roughly 50 minutes' margin. That
-margin is why `drain_timeout_seconds` cannot simply be raised.
+Timing: shutdown STAGE 1 — trading end and DB RELEASE — falls at that date's
+`after_hours_end` minus `live_mode.session_hard_exit_offset_minutes` (see
+live_mode_runner.md's Session Shutdown), and the evening batch starts at 21:00,
+so on an ordinary 20:00 close at the default zero offset a 600s drain leaves
+roughly 50 minutes' margin. The margin is measured to stage 1, not to process
+exit: the process lives on through stage 2 for `auxiliary_stream.tail_minutes`,
+but it holds no DB connection then, so the ownership handoff is already free.
+That margin is why `drain_timeout_seconds` cannot simply be raised.
 
 The two values are still coupled, but the far end is now half calendar and half
 policy: the instant is `after_hours_end`, which no one sets, while the offset

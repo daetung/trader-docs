@@ -1155,9 +1155,11 @@ loop every poll_interval_seconds:
               predicate >= execution.max_positions_per_ticker → skip.
             - can_enter(ticker, current_hour, last_entry_hour,
               execution.entry_cooldown_minutes) → skip if False.
-            Both caps read live_positions DB status, never the
+            Both caps read the live_positions row, never the
             in_flight_orders runtime cache (R-2: the row is the SSoT);
-            pending rows count as reserved capacity. last_entry_hour is the
+            rows under entry_state='awaiting' AND quantity IS NULL — the
+            former 'pending' — count as reserved capacity. A partially
+            filled row holds real shares and is ordinary capacity. last_entry_hour is the
             SUBMISSION time of this ticker's most recent entry attempt this
             session, including attempts that ended 'canceled' or
             'entry_rejected' — the same definition Warm Restart's cooldown
@@ -1221,7 +1223,7 @@ loop every poll_interval_seconds:
                 # guarantees a value exists to pass.
                 t_bar_volume=...,
                 ticker_margin_used=..., total_margin_used=...,
-                # margin, not notional: each open or pending row contributes
+                # margin, not notional: every lifecycle='live' row contributes
                 # at its OWN pinned live_positions.entry_mgnrt, so an open
                 # position's margin never moves retroactively
                 position_size_cash_pct=config["execution"]["position_size_cash_pct"],
@@ -1331,10 +1333,10 @@ loop every poll_interval_seconds:
                  order_id = submit order via trading API: quantity=`quantity`,
                      order_type=config["execution"]["entry_order_type"],
                      limit_price=limit_price (omitted/ignored for "market")
-                 # R-2: write the pending row FIRST (SSoT — see
+                 # R-2: write the row FIRST (SSoT — see
                  # db_schema.md's live_positions), for BOTH order types —
                  # closes the submit-before-fill-response crash window even
-                 # for market orders, and gives a pending limit order a
+                 # for market orders, and gives an outstanding limit order a
                  # durable record a crash-recovery reconcile can match by
                  # order_id (see "Session Restart (Warm Start)" below).
                  db_write: INSERT live_positions (run_id, ticker, date,
@@ -1913,12 +1915,18 @@ view (open orders + open positions) against `live_positions` rows.
     "Pending limit-entry tracking," R-2) — the same idempotent path an
     ordinary cancel-after-timeout uses, so re-running this step (e.g. a
     re-crash mid-recovery) is safe and cannot double-log.
-  - A broker order with no matching pending row → record_health_event(
+  - A broker order with no matching row under lifecycle='live' AND
+    entry_state='awaiting' AND quantity IS NULL → record_health_event(
     finding_name='unknown_broker_order_or_position', detail={call_site,
     kind: 'order', order_id, ticker}) — see health_report.md finding 12.
 
 **Positions** (broker open positions):
-  - Match to `live_positions` rows (`status` `'open'`|`'halted'`).
+  - Match to `live_positions` rows (`lifecycle='live' AND quantity > 0`) —
+    the same set the Warm Restart branch uses. Halt is not a live_positions
+    value and cannot appear in this match. This set is WIDER than the former
+    `'open'|'halted'`, deliberately: that one omitted `'partial_open'`, so a
+    partially filled position matched nothing and fell to the adopt-and-
+    liquidate-immediately path below despite being a legitimate holding.
   - Matched row's `date` is a PRIOR trading day → Unified Overnight Policy
     (below).
   - Matched row's `date` is TODAY (only possible at Feed Outage / Warm
@@ -2027,7 +2035,8 @@ so a re-crash during recovery re-enters warm restart on the same signature.
        lifecycle='canceled' via the single canceled-transition point (see Pending
        limit-entry tracking) — same idempotent path an ordinary expiry
        uses, so re-running this step is safe. A broker order with no
-       matching pending row -> "unknown broker order" health_report finding.
+       matching row under lifecycle='live' AND entry_state='awaiting' AND
+       quantity IS NULL -> "unknown broker order" health_report finding.
      - Open positions (broker): match to live_positions rows
        (lifecycle='live' AND quantity > 0). A broker position with no
        matching row -> adopt conservatively and liquidate immediately
@@ -2121,8 +2130,13 @@ so a re-crash during recovery re-enters warm restart on the same signature.
    the scan has nothing else to do for those tickers anyway.
 
 6. Cooldown restore: per ticker, last entry-attempt time = max over
-   today's live_positions rows in {pending, open, canceled, closed} (read
-   from DB status — the SSoT — not any in-memory cache) and trade_log rows
+   today's live_positions rows REGARDLESS of lifecycle (read
+   from the row — the SSoT — not any in-memory cache). This is WIDER than the
+   former `{pending, open, canceled, closed}`, deliberately: that set omitted
+   `'partial_open'`, `'halted'` and `'exiting'`, yet every live_positions row
+   is an entry attempt, being written at submission. Omitting them
+   underestimates the ticker's last entry time and opens
+   `entry_cooldown_minutes` early. Also read: trade_log rows
    with exit_reason IN ('entry_canceled', 'entry_rejected'). The
    pending_entries in-memory dict is rebuilt from live_positions rows with
    lifecycle='live' AND entry_state='awaiting' AND quantity IS NULL.
@@ -2239,7 +2253,8 @@ double, being a `trading/` endpoint (trading_api.md), and
 listings serialise at 2 TPS and would land inside the bar-close decision
 deadline. First listing sits outside that deadline.
 
-The rate in force at entry, or at submission for a pending row, is PINNED
+The rate in force at entry, or at submission for a row still
+entry_state='awaiting', is PINNED
 ONTO THE `live_positions` ROW (db_schema.md). That row and `live_ticker_terms`
 are NOT redundant and neither may be dropped for the other: the position row
 is WHAT THAT ENTRY ACTUALLY USED, fixed against any later observation, while
@@ -2810,7 +2825,9 @@ loop every position_check_interval_seconds (config, default: 5s):
                (execution_common.md — regular session only) and this
                order_id's own type != "market":
                 cancel this order_id; submit a new market order for the
-                    remaining (position.quantity - cum_filled_qty) shares;
+                    remaining (quantity - exit_filled_quantity) shares — the
+                    row, not the runtime recomputation, which is empty after
+                    a warm restart;
                     update in_flight_orders to the new order_id
                 # Final backstop inside regular hours, regardless of
                 # exit_order_type (execution_common.md) — an escalation,

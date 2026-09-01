@@ -604,6 +604,11 @@ They are used by ClassBalancer for pre-balance filtering.
 
 ## Constraints
 
+- `obv`/`ad` requests to the Vectorizer exclude `{name}_window_ratio` and
+  `{name}_intercept`. `03_vectorizer.md`'s Constraints name THIS caller as
+  where both exclusions are enforced: every remaining output for those two
+  indicators is origin-invariant, which is what makes the training and live
+  accumulation origins agree
 - Feature column names must be deterministic and stable across runs
 - `extract_batch()` uses Strategy A/B (ticker당 1회) for CONTINUOUS indicators and fibonacci
 - `extract_batch()` uses Strategy C (date당 1회) for sr_levels by default

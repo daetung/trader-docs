@@ -29,9 +29,10 @@ side effect of a data job.
 **Concurrency assumption**: identical to `migration_tool.md`'s. Run
 manually and rarely — in the ordinary case exactly once, when a database is
 first created — never on an automated schedule, and never concurrently with
-a live trading session or the evening/premarket batch jobs (see P-5's DB
-ownership design in `live_mode_runner.md` / `metadata_crawler.md`, which
-this tool does not participate in — no `batch_runs` marker writes here).
+a live trading session or the evening/premarket batch jobs (see
+`db_schema.md`'s DB File Ownership Windows, the single site of that design,
+which this tool does not participate in — no `batch_runs` marker writes
+here).
 Running it while any of those hold the writer connection fails with a DuckDB
 lock error rather than corrupting anything: an operator error to avoid, not
 a case this tool detects or works around.
@@ -57,14 +58,21 @@ Statements are already written `CREATE TABLE IF NOT EXISTS` in `db_schema.md`,
 so idempotency is not something this tool decides or adds.
 
 **When `db_schema.md` changes, `SCHEMA_STATEMENTS` is re-transcribed from it.**
-Re-transcription has now been required SIX times. The most recent occasion
-added NO table — the count stays at 34 — but gave `trading_calendar` two new
+Re-transcription has now been required SEVEN times. The most recent occasion
+added NO table — the count stays at 34 — but restructured `live_positions`:
+`status` was RENAMED to `lifecycle` and redefined, and `entry_state`,
+`exit_state` and `exit_filled_quantity` were added. `feed_coverage_daily`
+gained `delayed_uncovered_seconds` in the same change. Every part of it is
+class 2 — the three additions are `ADD COLUMN` and the rename is
+`RENAME COLUMN` — so no rebuild is required, only hand-applied statements
+after re-transcription.
+The occasion before it also added NO table but gave `trading_calendar` two new
 columns, `session_close` and `after_hours_end`. Both are class 2 below and need
 a hand `ALTER` that init alone will not perform. They arrive in ONE
 re-transcription rather than two: they were decided together and neither is
 usable without the other being at least considered, so splitting them would fire
 this consequence twice for one change.
-The occasion before it added `live_ticker_terms`, moving the table count
+The occasion before that added `live_ticker_terms`, moving the table count
 33 -> 34; `live_positions` gained `entry_mgnrt` in the same change, also class 2.
 The occasion before that added `live_halt_episodes` and
 `exit_trigger_agreement_daily` (31 -> 33), with a column each on
@@ -145,7 +153,8 @@ What it reports, by class of difference:
 |---|---|
 | Table in `SCHEMA_STATEMENTS`, absent from the DB | re-run init — this class is absorbed automatically |
 | Column in the statement, absent from the table | ALTER needed — names the table and the column |
-| Column type, nullability, or PRIMARY KEY differs | REBUILD needed — names the table and the mismatch |
+| Column type, nullability, or PRIMARY KEY differs | names the table and the mismatch. Class 2 unless the column carries a PRIMARY KEY or UNIQUE constraint, or the change drops a PRIMARY KEY — then REBUILD |
+| Column in the table, absent from `SCHEMA_STATEMENTS` | reported, not actioned — may be a renamed, removed, or stale column |
 | Table in the DB, absent from `SCHEMA_STATEMENTS` | reported, not actioned — may be a retired table or a stale transcription |
 
 Exit status is non-zero when any difference is found, so the check is usable
@@ -160,12 +169,20 @@ live database, and they need different responses:
 
 1. **New table.** Re-transcribe `SCHEMA_STATEMENTS`, re-run init. The new
    table is created empty; existing tables are untouched. Nothing else to do.
-2. **New column on an existing table.** Re-transcribe, then apply an
-   `ALTER TABLE ... ADD COLUMN` by hand. Init alone will not do it.
-3. **Structural change — type, nullability, or primary key.** Not reachable
-   by `ALTER`. Requires an explicit rebuild: create the new-shaped table
-   under a temporary name, copy the data across, swap. By hand, deliberately,
-   with the data volume in mind.
+2. **Reachable by a single `ALTER`, data preserved.** Re-transcribe, then
+   apply the statement by hand; init alone will not do it. MEASURED against
+   DuckDB as supported: `ADD COLUMN`, `RENAME COLUMN`, `ALTER COLUMN ...
+   SET`/`DROP NOT NULL`, `ADD PRIMARY KEY`, and `ALTER COLUMN ... SET DATA
+   TYPE` where the column carries no PRIMARY KEY or UNIQUE constraint.
+3. **Rebuild.** Create the new-shaped table under a temporary name, copy the
+   data across, swap. By hand, deliberately, with the data volume in mind.
+   Members, and why each is here rather than in class 2: `DROP COLUMN`, which
+   an `ALTER` does perform but which DESTROYS that column's data, so it goes
+   through a rebuild where the copy step is explicit; a type change on a
+   column carrying a PRIMARY KEY or UNIQUE constraint, which DuckDB rejects;
+   and `DROP PRIMARY KEY`, which DuckDB does not implement at all.
+   The dividing line is data loss or an unsupported statement, NOT
+   "unreachable by `ALTER`" — most structural changes are reachable.
 
 `--verify` is what tells you which class you are in. Run it after
 re-transcribing and before assuming the change has landed.
@@ -186,6 +203,10 @@ verify: 34 tables checked, 1 difference
 verify: 34 tables checked, 2 differences         # two columns, one table
         trading_calendar: column 'session_close' missing — ALTER needed
         trading_calendar: column 'after_hours_end' missing — ALTER needed
+verify: 34 tables checked, 2 differences         # a rename, seen from both sides
+        live_positions: column 'lifecycle' missing — ALTER needed
+        live_positions: column 'status' not in statements — reported
+        # a rename seen from both sides; one RENAME COLUMN settles both
 ```
 
 ---

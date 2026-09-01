@@ -58,7 +58,9 @@ Applies to: price close, moving averages
 
 Output keys:
     {name}_slope             ← OLS slope (normalized by price level)
-    {name}_intercept
+    {name}_intercept         ← NOT emitted for obv/ad: the indicator mapping
+                               routes those two here, and an intercept is a
+                               level of an origin-dependent cumulative series
     {name}_r_squared
 ```
 
@@ -262,3 +264,8 @@ class Vectorizer:
 - `window_comparison()` on `obv`/`ad`: caller (FeatureExtractor) requests only
   `{name}_window_delta`; `{name}_window_ratio` must not be generated for these
   two indicators — see "obv/ad mapping rationale" above
+- `linear_trend()` on `obv`/`ad`: caller (FeatureExtractor) requests only
+  `{name}_slope` and `{name}_r_squared`; `{name}_intercept` must not be
+  generated for these two indicators — an intercept is a LEVEL, and the same
+  argument that excludes `statistical_summary` for a cumulative series
+  excludes it. Same rationale paragraph as the line above

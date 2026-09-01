@@ -343,8 +343,8 @@ against the column.
 nightly file-level copy, scheduled in the quiescent window after the
 evening batch completes and before the next premarket batch begins —
 concretely, after `batch_runs` shows `stage='evening_session_stats',
-status='success'` for the day (see P-5's ownership windows in
-live_mode_runner.md / metadata_crawler.md). Retention: N most recent
+status='success'` for the day (see db_schema.md's DB File Ownership
+Windows, the single site of that design). Retention: N most recent
 nightly copies (N TBD) plus one longer-retained weekly snapshot. Recovery
 is a plain file-copy restore of the single `.duckdb` file — no
 WAL/point-in-time replay involved.
