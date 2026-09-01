@@ -287,8 +287,8 @@ is that anything solvable in this module is not solved by a fork.
 **This module owns dispatch ORDER, not the structure that consumes it.** The
 mechanics past dispatch are already described above under Async Boundary —
 each REST call goes through `asyncio.to_thread`, and rate waits and retry
-backoff block a pool thread — so they are not out of scope here. What is
-how that meets the caller's loop structure is settled above — one event loop
+backoff block a pool thread — so they are not out of scope here. How that
+meets the caller's loop structure is settled above — one event loop
 per SDK client, each on its own thread — and is not this queue's concern. The
 queue answers only WHICH call is handed over next.
 

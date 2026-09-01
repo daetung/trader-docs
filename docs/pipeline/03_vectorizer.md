@@ -71,6 +71,9 @@ Applies to: volume, TPM, avg_vol_per_tick, REFERENCE_SESSION today series
 Split window into current_half and prev_half:
 Output keys:
     {name}_window_ratio      ← mean(current_half) / mean(prev_half)
+                               NOT emitted for obv/ad: a ratio of two segments
+                               of a cumulative series can divide by a
+                               near-zero value, which the delta form cannot
     {name}_window_delta      ← mean(current_half) - mean(prev_half)
 ```
 
