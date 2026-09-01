@@ -293,12 +293,12 @@ ticker badly distorted all session.
 Schedule" below for why they differ:
 
 ```
-04:00 ET (--premarket-open, single process — see Premarket Schedule):
+04:00 ET (--premarket-open, single process — see Dual Schedule below):
     1. detect_rename_candidates()                          # writes batch_runs
                                                              #   stage='premarket_rename'
     2. quotes       = bulk_fetch_today_first_price(...)     # trading API, chunked
        halt_status  = utils.query_halt_status(...)           # trading API, chunked
-       # sequential, not parallel — see Premarket Schedule for why
+       # sequential, not parallel — see Dual Schedule below for why
     3. for ticker in active_ticker_universe:
            crawl_corporate_events(ticker, db_conn)            # yfinance — dominant cost
                                                              # writes batch_runs
@@ -344,7 +344,7 @@ endpoint's published rate; the halt side is a different vendor entirely
 them concurrently was considered and rejected: the gain is bounded by the
 slower of two independent budgets, while a wrong guess about either risks
 throttling both. Minutes each, comfortably inside both passes' available
-window (see Premarket Schedule).
+window (see Dual Schedule below).
 
 ```python
 def bulk_fetch_today_first_price(

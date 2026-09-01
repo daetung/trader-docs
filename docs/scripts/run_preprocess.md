@@ -277,7 +277,11 @@ CLI always runs in standalone mode (`return_data=False`).
 ## Config Keys Used
 
 ```yaml
-data_paths.*
+data_paths:                       # declared here; no other file declares it
+  db_path:      data/market.duckdb
+  processed_dir: data/processed
+  model_dir:    models
+  log_dir:      logs
 entry_detector.*
 indicators.*            # includes reference_session.n_sessions, reference_session.delta_minutes
 vectorizer.*

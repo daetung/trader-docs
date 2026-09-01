@@ -27,7 +27,7 @@ Live inference endpoint: LiveModeRunner (execution orchestrator)
                   (CachingIndicatorCalculator injected via DI)
             └── model.load(run_id)                     ← load trained artifacts
             └── model.predict(models, X)               ← probability output
-            └── utils.resolve_signal(row, threshold, suppress_threshold)
+            └── execution_common.resolve_signal(row, threshold, suppress_threshold)
             └── inference_log writes (DuckDB)
 ```
 
@@ -185,7 +185,7 @@ step 0: bars = self._prepare_bars(bars, entry)
    row = probs_df.iloc[0]
 
 8. Signal resolution:
-       signal = utils.resolve_signal(row, threshold, suppress_threshold)
+       signal = execution_common.resolve_signal(row, threshold, suppress_threshold)
        suppressed = (
            signal is None
            and suppress_threshold is not None
@@ -379,7 +379,7 @@ class Inferencer:
   internally by FeatureExtractor via `utils.load_encoding_map()` —
   Inferencer does not load or inject encoding maps directly
 - `categorical_cols` loaded from model artifact meta — no heuristic pattern matching
-- `utils.resolve_signal()` used for signal thresholding — same function as BacktestEngine
+- `execution_common.resolve_signal()` used for signal thresholding — same function as BacktestEngine
 - `suppress_threshold` read from `config["backtest"]["suppress_threshold"]`
 - No data leakage: t bar OHLCV must not be used as feature input
 - Preprocessor is NOT used in live inference — FeatureExtractor.extract() called directly

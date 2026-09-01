@@ -251,12 +251,12 @@ class LGBMPipeline(BaseModel[dict[str, lgb.Booster]]):
 ## Entry Decision Logic
 
 Entry signal determination is the responsibility of the **caller** (BacktestEngine or live inference),
-not the model. `predict()` returns raw probabilities; the caller applies `utils.resolve_signal()`
+not the model. `predict()` returns raw probabilities; the caller applies `execution_common.resolve_signal()`
 against a configurable threshold.
 
 ```python
 # Caller-side logic (BacktestEngine, Inferencer)
-from utils import resolve_signal
+from execution_common import resolve_signal
 
 probs = model.predict(models, X)   # → prob_up5, prob_up3, prob_dn3, prob_dn5, ...
 threshold          = config["backtest"]["entry_threshold"]
@@ -265,7 +265,7 @@ signal = resolve_signal(row, threshold, suppress_threshold)
 # → "up5" | "up3" | None
 ```
 
-`resolve_signal()` is defined in `src/utils/utils.py`. See utils.md for full spec.
+`resolve_signal()` is defined in `src/utils/execution_common.py`. See execution_common.md for full spec.
 
 Threshold and suppress_threshold are configurable via `config["backtest"]`.
 Initial values: entry_threshold=0.5, suppress_threshold=0.5.
@@ -279,7 +279,7 @@ Initial values: entry_threshold=0.5, suppress_threshold=0.5.
 - `categorical_cols` derived from FeatureExtractor.get_feature_schema() by caller
 - Early stopping patience (50 rounds) is fixed; not exposed to optimizer in phase 1
 - Model artifacts must include `feature_names`, `categorical_cols`, and config snapshot for full reproducibility
-- `predict()` returns probabilities, not binary labels — thresholding done by caller via `utils.resolve_signal()`
+- `predict()` returns probabilities, not binary labels — thresholding done by caller via `execution_common.resolve_signal()`
 - `sample_weight_col` applied to train only — val and test always use uniform weights
 - Weight column must exist in train DataFrame if `sample_weight_col` is not None — caller is responsible
 - `is_unbalance=True` and `sample_weight_col` may be used simultaneously; effective weight = class_weight × per_sample_weight

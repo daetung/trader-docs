@@ -515,10 +515,12 @@ def run_trial_round(
     Worker function. Runs one (trial, inner_fold) pair.
     Opens its own DuckDB read-only connection (no write).
     Returns result dict — train_log INSERT deferred to coordinator.
-    db_conn=None passed to Trainer (dry_run=True).
+    db_conn=None passed to Trainer (dry_run=True), so a worker opens NO
+    database connection: nothing here reads one. That also removes the only
+    overlap this file had with its own coordinator, which opens read-write
+    between rounds and would be blocked by a live worker's read-only handle.
     """
-    import duckdb, sys
-    db_conn = duckdb.connect(db_path, read_only=True)
+    import sys
 
     # Windows spawn: load outer_train_df from parquet
     if sys.platform == "win32" and outer_train_path is not None:
@@ -561,7 +563,6 @@ def run_trial_round(
         dry_run=True,
     )
 
-    db_conn.close()
     return {
         "trial_idx":     trial_idx,
         "run_id":        run_id,

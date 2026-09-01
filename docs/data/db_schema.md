@@ -2055,8 +2055,9 @@ CREATE TABLE IF NOT EXISTS health_events (
 -- Retention: purge-registry member — date_column `date`, retention_days: inf
 -- (see metadata_crawler.md's evening purge stage), same reasoning as the two
 -- tables above: delivery history is operational, not a record whose loss is
--- unrecoverable. Note a window here also orphans older health_events.event_ids
--- references, which is a reason to keep any window no shorter than
+-- unrecoverable. Note a window here also orphans older alert_log.event_ids
+-- references — alert_log holds the column and health_events the rows it
+-- points at — which is a reason to keep any window no shorter than
 -- health_events'.
 -- ONE EXCEPTION, structural: the evening job's hard-deadline abort
 -- (metadata_crawler.md's evening job start gate) cannot write here at all — it
@@ -2128,12 +2129,14 @@ CREATE TABLE IF NOT EXISTS alert_log (
 
 ## DB File Ownership Windows
 
-`market.duckdb` admits EXACTLY ONE process at any instant. DuckDB refuses a
-second open of the same file under a different configuration within one
-process, and its file lock is exclusive across processes — a read-only open
-from elsewhere fails while a writer holds it. Ownership is therefore
-TEMPORAL, and this section is the single site of that design; the files
-below reference it rather than restating it.
+A WRITER on `market.duckdb` is exclusive. Measured: DuckDB refuses a second
+open of the same file under a different configuration within one process, and
+its file lock blocks every other open across processes while a writer holds
+it — read-only included. With NO writer, concurrent read-only opens from
+several processes all succeed, which is what `pipeline_optimizer.md`'s
+workers rely on. Ownership is therefore TEMPORAL, and this section is the
+single site of that design; the files below reference it rather than
+restating it.
 
 | Window | Owning process | Entry condition | Exit condition |
 |---|---|---|---|
