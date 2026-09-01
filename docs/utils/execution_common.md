@@ -306,8 +306,9 @@ def compute_position_size(
         ticker_margin_used:  sum(margin_of(entry_price_i, quantity_i,
                              rate_i)) across this ticker's currently-open
                              positions, PLUS its submitted-but-unfilled ones
-                             (R-5: live live_positions status
-                             'pending'/'partial_open' — priced at
+                             (R-5: live_positions rows with
+                             lifecycle='live' AND entry_state='awaiting' —
+                             priced at
                              limit_price, or p_entry for a market order).
                              Each row contributes at its OWN PINNED RATE
                              (live_positions.entry_mgnrt), never the current
@@ -509,6 +510,21 @@ execution:
                                    # its own session_close_hour: "155900" until
                                    # this change deleted it. R-7's "both engines"
                                    # framing named a set it did not enumerate.
+  breach_confirm_window_seconds: 10
+                                   # A pending first breach is discarded if no
+                                   # confirming second tick arrives within this
+                                   # window. "Two consecutive raw ticks" is
+                                   # SEQUENCE adjacency, not time adjacency, so
+                                   # without a bound a quiet ticker leaves a
+                                   # pending state alive indefinitely and pairs
+                                   # ticks minutes apart. Pre-measurement
+                                   # placeholder: it covers several REST
+                                   # backstop poll cycles at
+                                   # position_check_interval_seconds and is a
+                                   # sixth of a 1-minute bar against
+                                   # max_hold_bars. It joins the guard
+                                   # constants feed_coverage_daily's density
+                                   # buckets exist to resolve against data.
   ws_ticker_limit:           50    # R-7: tickers ONE WS CONNECTION can carry.
                                    # A VENDOR fact, not a preference — kept in
                                    # config rather than as a literal because

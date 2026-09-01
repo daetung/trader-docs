@@ -41,20 +41,14 @@ items ahead of it.
    NYSE page that already fills `trading_halts` is not a candidate, since a
    live signal drawn from it would make the evening comparison a source
    against itself.
-2. **Async boundary** and the **manual-intervention CLI** are independent of
-   each other and of the above. The async boundary is the more constrained:
-   the watchdog scan fires N speculative REST calls per cycle and alternates
-   across two accounts, so how many clients exist and where the boundary
-   falls has consequences it did not have before. It shares a review surface
-   with (3)'s two undesigned sub-questions — the 2-print guard runs inside
-   the tick callback, so settling handover semantics before knowing what that
-   callback may do inline is work done in the wrong order — and the two are
-   best taken together.
+2. **Manual-intervention CLI** is independent of the above and unblocked.
+   The async boundary that used to sit here is closed: how many clients exist
+   and where the boundary falls are both decided, and its shared review
+   surface with (3)'s sub-questions no longer exists because those are
+   settled too.
 3. **WS/REST tape asymmetry and exit-trigger path transitions** is blocked on
    SHADOW-PERIOD DATA rather than on design time, so it is not sequenced
-   against the items above. Its two undesigned sub-questions (guard state at
-   each handover direction) could be taken at any point; its deferred part
-   cannot.
+   against the items above. Only its deferred part remains.
 4. **`api_contract_checklist.md` re-evaluation** goes last by construction —
    it collects what the items above establish.
 5. **Real-time bid/ask spread** is blocked on calendar time, not design time,
@@ -63,6 +57,8 @@ items ahead of it.
    rather than a design blocker, so it is not sequenced against the items
    above either. It is listed because a new item left out of this list is the
    carry-forward defect this file exists to prevent, inverted.
+7. **Watchdog scan cycle is not instrumented (F-1)** is likewise unblocked
+   and likewise not a design blocker — nothing is waiting on it.
 
 ---
 
@@ -103,12 +99,13 @@ density, the axis `feed_coverage_daily` already buckets
 constants resolvable against data, presumes the guard unsettled, which the
 sentence above contradicted from the neighbouring section.
 
-**Two sub-questions, both undesigned and both takeable now:**
-
-(a) Guard-state semantics at WS-death handover, where a "consecutive pair"
-    may straddle the transition from a half tape to a full one.
-(b) The same at WS recovery — subtler, because it moves TOWARD lower
-    density, so an in-progress confirmation weakens silently.
+**Settled since.** Guard-state semantics at both handover directions —
+WS-death, where a "consecutive pair" could straddle the move from a half
+tape to a full one, and WS recovery, which moves toward lower density so an
+in-progress confirmation would weaken silently. Both are closed by the
+pending state carrying its `source_path` and being discarded on any
+mismatch, so no state survives a tape change
+(`live_mode_runner.md`'s Exit Architecture).
 
 **Deferred, and explicitly not to be decided yet.** Whether the full-tape
 REST buffer should serve as a COMPARATOR rather than only a fallback. That
@@ -120,6 +117,12 @@ divergence are unmeasured, and `exit_trigger_agreement_daily` is the
 instrument built to measure them — its L-vs-M term is exactly the tape
 effect. Deciding before that data exists would repeat this project's
 most-reversed failure. Blocked on shadow-period data, not on design time.
+
+Also deferred to the same instrument: telling a legitimately quiet ticker
+from an undelivered one. The `breach_confirm_window_seconds` bound closes
+the FALSE-FIRING half of that — a frozen pending state can no longer pair
+ticks minutes apart — but not the DETECTION half, which needs the same
+L-vs-M term.
 ## Halt-status source
 
 **Problem.** `utils.query_halt_status()` is specified as the single access
@@ -170,26 +173,6 @@ interface is drawn.
 
 ---
 
-## Async boundary
-
-**Problem.** The SDK's client is an async facade over a synchronous core:
-every REST call is dispatched through a thread, and both rate-limit waits
-and retry backoff block that thread for their duration. The WebSocket path
-is natively async, and its message callbacks are synchronous functions
-invoked from inside the receive loop — a callback that blocks stalls
-reception for every subscription on that connection, and the tick handler
-(2-print guard, `bid_ask_snapshots` piggyback) runs there.
-
-The decision already taken is that only the API-calling layer becomes
-async-premised; forcing the rest into a synchronous shape was judged the
-larger risk. Where exactly that boundary falls in the loop structure — and
-what the tick callback is allowed to do inline — is not designed.
-
-**Not yet designed.** Independent of the other items; can be taken at any
-point.
-
----
-
 ## Real-time bid/ask spread — model-feature / entry-gate paths
 
 **Problem.** Both paths originally described here needed two things:
@@ -222,6 +205,30 @@ there for the same reason. If backtest is ever extended to replay
 
 **Not yet designed** — still. Not actionable again until `bid_ask_snapshots`
 has enough history; revisit then, not before.
+
+---
+
+## Watchdog scan cycle is not instrumented (F-1)
+
+**Problem.** `live_scan_daily`'s five metrics (`barclose_fetch_ms`,
+`infer_ms`, `submit_dispatch_ms`, `broker_ack_ms`, `order_to_fill_ms`)
+decompose the BAR-CLOSE sequence against its 5-second decision deadline. The
+watchdog polling loop's own cycle — the `t=0/250/500/750ms` slot allocation
+and its ~850ms completion bound — is measured by none of them.
+
+`live_mode_runner.md` names an operator adjustment against a quantity nothing
+observes: reduce `N` when RTT drifts above ~600ms. Any overrun — RTT drift, a
+leg becoming unavailable, added per-slot work — runs into the next cycle and
+is absorbed silently by the poll loop. The same remark that produced the
+bar-close instrumentation applies here: the target is unverified and each
+stage moves independently.
+
+**Open questions.** Whether to instrument the cycle in `live_scan_daily`
+beside the bar-close stages; whether the ~850ms bound is an assertion or an
+observation; what an overrun should do.
+
+**Not a design blocker** — nothing is waiting on it. `F` is the identifier
+prefix for findings; `D I N P R T V Y` are taken.
 
 ---
 

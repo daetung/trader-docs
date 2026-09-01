@@ -89,12 +89,29 @@ is dispatched through `asyncio.to_thread`, and rate-limit waits and retry
 backoff both block a pool thread for their duration. REST therefore needs an
 event loop only at this boundary — caller loop bodies stay synchronous.
 
+**Where the boundary falls: one event loop PER CLIENT, each on its own
+thread.** Production's client runs on loop P, the demo account's on loop A
+(`auxiliary_stream.md`). Two loops rather than one is what keeps a blocking
+callback on one connection from stalling reception on the other, and it gives
+each loop its own default executor, so `asyncio.to_thread` is separated and
+the demo leg's rate-limit waits cannot starve production's pool — with no SDK
+modification. LiveModeRunner's main thread stays synchronous and reaches loop
+A's client through `run_coroutine_threadsafe(...).result()`.
+
 The WebSocket path is different and is the constraint that matters: its
 receive loop is natively async and its message callbacks are synchronous
 functions invoked from inside that loop. **A callback that blocks stalls
 reception for every subscription on that connection.** The tick handler
 (`live_mode_runner.md`'s Exit Architecture, including the 2-print guard and
 the `bid_ask_snapshots` piggyback) runs there.
+
+**What a callback may do inline:** pure computation and in-memory state
+mutation, and no I/O. In the tick handler that means dedup, the breach
+comparisons and the 2-print guard's per-position state update inline —
+required there, not merely allowed, since deferring the guard update would
+fold queue delay into its confirmation window — while the
+`bid_ask_snapshots` piggyback extracts inline and writes only on the
+Position Manager Loop's flush cadence.
 
 The SDK logs and swallows a callback exception rather than propagating it,
 so the callback owns its own error path; a raised exception is otherwise
@@ -129,8 +146,9 @@ the trade stream's own level-1 piggyback, and the per-connection subscription
 budget is spent on price tracking.
 
 That exclusion rests on a budget premise, and the premise is now separable:
-`auxiliary_stream.md` runs non-trading subscriptions on a different account
-with its own session allowance. V61 is recorded there as a known future
+`auxiliary_stream.md`'s subscriptions belong to a different ACCOUNT with its
+own session allowance — the account split, not any process split, is what
+separates the budgets. V61 is recorded there as a known future
 consumer. This does not admit it into scope here — the exclusion above stands
 until someone designs the consumer and its storage — but it records where the
 question would be reopened.

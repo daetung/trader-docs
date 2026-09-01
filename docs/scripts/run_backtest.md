@@ -18,6 +18,8 @@ and the best trial or consensus config is selected. Also runnable standalone.
 
 ## Input / Output
 
+**Session-window exclusion.** This entry point opens `market.duckdb` and so must NOT run while LiveModeRunner holds the connection — see db_schema.md's DB file ownership windows.
+
 **Input:**
 ```python
 test_df: pd.DataFrame   # test split with features, labels, p_entry

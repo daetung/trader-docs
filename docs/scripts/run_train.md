@@ -16,6 +16,8 @@ Called per fold by PipelineOptimizer (rolling walk-forward) or standalone via CL
 
 ## Class Interface
 
+**Session-window exclusion.** This entry point opens `market.duckdb` and so must NOT run while LiveModeRunner holds the connection — see db_schema.md's DB file ownership windows.
+
 ```python
 class Trainer:
     def __init__(

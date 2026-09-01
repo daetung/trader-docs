@@ -587,15 +587,16 @@ roughly fifteen minutes against a 20:00 session end, which the 21:00 slot
 clears by about an hour.
 
 **SKIP and FAILURE are different outcomes, and conflating them breaks in one
-direction or the other** — treating a disabled feature as failure would
-accumulate a retry every day, while treating a dead auxiliary process as a
-skip would lose the data silently.
+direction or the other** — treating an absent day as failure would
+accumulate a retry every day, while treating a dead collector as a
+skip would lose the data silently. There is no deliberately-disabled case:
+loop A always starts and always subscribes, the former
+`auxiliary_stream.enabled` switch having been retired.
 
 | Condition | Outcome |
 |---|---|
-| `auxiliary_stream.enabled` is false | SKIP — no-op `batch_runs` row, the same shape the non-trading-day crons already write |
-| Neither file exists | SKIP |
-| Exactly one file exists | FAILURE — live-only means the auxiliary process died; delayed-only means LiveModeRunner never wrote its aggregates |
+| Neither file exists | SKIP — no-op `batch_runs` row, the same shape the non-trading-day crons already write |
+| Exactly one file exists | FAILURE — one process writes both sides now, so live-only means loop A's thread died and delayed-only means the runner never wrote its own aggregates; loop A's per-session health event corroborates the former |
 | Either file fails to parse | FAILURE |
 | A file stops mid-session | SUCCESS — analysed for what it holds |
 
@@ -605,12 +606,30 @@ seconds in memory and an abrupt death loses the last interval.
 
 **The ticker population is the DELAYED side's.** A ticker present in live but
 absent from delayed would compute as total dropout, and that is
-indistinguishable from the auxiliary process having subscribed it late — so
-it is EXCLUDED rather than recorded as a 100% miss. The delayed stream
+indistinguishable from the collector having subscribed it LATE — the gap
+between a lost set publication and the next `lifecycle` transition. Eviction
+is no longer part of that ambiguity: it is marked, so a ticker uncovered for
+the whole session by eviction is NOT excluded — a row is written with every
+counter at zero and `delayed_uncovered_seconds` carrying the interval. Rows
+with zero denominators are therefore an expected output and every ratio
+consumer must handle them. The delayed stream
 carries the complete tape, which is what makes it the correct population. The
-excluded count goes to the log and to `health_report.md`'s observation
+EXCLUDED-TICKER count goes to the log and to `health_report.md`'s observation
 section only; it does not get a `batch_runs` column, since a large count is
-already a signal without changing the schema for a diagnostic.
+already a signal without changing the schema for a diagnostic. Per-second
+non-coverage is different in kind — it distorts counters on a row that DOES
+exist — and is carried by `delayed_uncovered_seconds`.
+
+**Uncovered records.** A delayed-side record carrying the `covered` key is
+not an aggregate: it is collected into that ticker's uncovered second-set and
+enters none of `delayed_seconds`, `delayed_prints`, `delayed_volume`, the
+density-bucket keying, or the second-set `live_zero_seconds_*` tests against.
+When the live side is streamed against the delayed side, a `(ticker, second)`
+in that set is SKIPPED ON BOTH SIDES — a second the delayed side could not
+observe reaches none of `live_zero_seconds_d*`,
+`live_missed_high_seconds`, `live_missed_low_seconds`.
+`delayed_uncovered_seconds` is written as the size of that set. These records
+are sparse and do not shift the memory figure below.
 
 **A partial failure writes nothing.** If some tickers aggregate and others
 fault, the whole date fails rather than being written short: this table
@@ -1021,11 +1040,20 @@ following day, and never inside a session.
 
 ```bash
 # Overnight token refresh — config token_refresh_time (this file's Config
-# Keys), default "03:00" America/New_York.
+# Keys), default "03:00" America/New_York. ONE STAGE PER ACCOUNT: the same
+# structure duplicated, not one stage extended.
 python tools/collect_daily.py \
     --db-path data/market.duckdb \
-    --token-refresh
+    --token-refresh --account production
+python tools/collect_daily.py \
+    --db-path data/market.duckdb \
+    --token-refresh --account demo
 ```
+
+The one-per-minute issuance limit is PER ACCOUNT (measured), so the two do
+not interfere and no ordering between them is fixed here. Separate stages
+also give each its own idempotency skip and its own retry budget, which is
+why no partial-failure rule is needed.
 
 **Why after midnight, and why that early.** After midnight because the
 previous evening run can overrun past its own deadline, and because
@@ -1038,9 +1066,11 @@ against a one-per-minute issuance limit, which makes lead time the sole
 recovery capacity; the dead window between the evening batch and the
 premarket batch is where the most of it is available.
 
-**Idempotency.** Writes `stage='overnight_token_refresh'` — `'running'` at
+**Idempotency.** Each account's stage writes its own marker —
+`stage='overnight_token_refresh_production'` or
+`'overnight_token_refresh_demo'`, `'running'` at
 its start, then `'success'` or `'failed'` — and is SKIPPED when today's row
-for that stage already exists. A duplicate revoke-and-reissue would spend
+for THAT stage already exists. A duplicate revoke-and-reissue would spend
 the issuance budget and can leave no usable token at all.
 
 **Not a gate.** The marker is for observability and the skip above, not for
@@ -1351,7 +1381,7 @@ resolves LiveModeRunner's liveness — this closes the failure mode where a
 crash (not a clean shutdown) turned into a silent, unbounded wait and,
 via next-day Health Gate 1a, a two-day outage:
 ```
-loop:
+loop:   # the evening half of db_schema.md's DB file ownership windows
   if batch_runs has stage='live_session_end', date=today, status='success':
       → open RW, run normally.  # clean shutdown — the original path
   else:

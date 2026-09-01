@@ -187,7 +187,14 @@ CREATE TABLE IF NOT EXISTS tick_bar_aggregates (
 --   'ws_tick_piggyback'  : extracted from the same inbound tick handler
 --                         Exit Architecture already processes (2-print
 --                         guard) for a position's live tick subscription —
---                         no new subscription, no new call. Only covers
+--                         no new subscription, no new call. Extraction is
+--                         inline; the row goes to an in-memory buffer and
+--                         the buffer is flushed on the Position Manager
+--                         Loop's cadence through write_fn=db_write, never
+--                         from the callback, which may do no I/O.
+--                         Unflushed rows are lost on abrupt process death,
+--                         accepted: this table serves diagnostics and a
+--                         future feature path, not a trading decision. Only covers
 --                         the window a position is tracked, and only
 --                         1st-level price with side-total size, not a
 --                         5-level book.
@@ -464,7 +471,8 @@ CREATE TABLE IF NOT EXISTS batch_runs (
                                       -- 'evening_feed_coverage' |
                                       -- 'evening_detection_gap' |
                                       -- 'evening_retention_purge' |
-                                      -- 'overnight_token_refresh' |
+                                      -- 'overnight_token_refresh_production' |
+                                      -- 'overnight_token_refresh_demo' |
                                       -- 'live_session_start' | 'live_session_end'
     date         VARCHAR   NOT NULL,  -- 'YYYYMMDD' — the trading day this batch targets
     status       VARCHAR   NOT NULL,  -- 'running' | 'success' | 'failed'
@@ -472,9 +480,13 @@ CREATE TABLE IF NOT EXISTS batch_runs (
     finished_at  TIMESTAMP,           -- NULL while status='running'
     PRIMARY KEY (stage, date)
 );
--- 'overnight_token_refresh': written by metadata_crawler.md's third
--- schedule entry, after midnight, so its `date` is the trading day it
--- covers. Observability and same-day idempotency only — NOT a Health Gate
+-- 'overnight_token_refresh_production' / '_demo': one stage per account,
+-- the same structure duplicated rather than one stage extended, so each
+-- carries its own idempotency skip and its own retry budget against the
+-- per-account one-per-minute issuance limit. Written by
+-- metadata_crawler.md's third
+-- schedule entry, after midnight, so their `date` is the trading day they
+-- cover. Observability and same-day idempotency only — NOT a Health Gate
 -- blocking condition: a failed refresh followed by a batch's own automatic
 -- reissue can still leave a token that covers the session, and
 -- live_mode_runner.md's token coverage gate tests that requirement
@@ -916,7 +928,8 @@ CREATE TABLE IF NOT EXISTS trade_log (
                                         --     carry was same-day or cross-day.
                                         --   'reconcile_ghost' (R-3) — a
                                         --     live_positions row with
-                                        --     status='open' but no matching
+                                        --     lifecycle='live' AND quantity > 0
+                                        --     but no matching
                                         --     broker position at Broker Reconcile
                                         --     (quantity=0; there was never a real
                                         --     fill to attribute).
@@ -1272,10 +1285,28 @@ CREATE TABLE IF NOT EXISTS live_positions (
     limit_price  DOUBLE,             -- NULL for market orders
     submitted_at VARCHAR NOT NULL,   -- 'YYYYMMDD_HHMMSS'
     signal       VARCHAR NOT NULL,   -- 'up5' | 'up3'
-    status       VARCHAR NOT NULL,   -- 'pending'|'partial_open'|'open'|'halted'|
-                                     --   'exiting'|'closed'|'canceled'
+    lifecycle    VARCHAR NOT NULL,   -- 'live' | 'closed' | 'canceled'.
+                                     --   Renamed and redefined from the former
+                                     --   `status`, which carried four independent
+                                     --   axes in one column. Halt is NOT one of
+                                     --   them: it is a TICKER fact, judged at
+                                     --   runtime by live_mode_runner.md's
+                                     --   last_halt_state and recorded in
+                                     --   live_halt_episodes.
+    entry_state  VARCHAR NOT NULL,   -- 'awaiting' | 'settled'. Whether the entry
+                                     --   order is still live at the broker.
+                                     --   'settled' on full fill, on abandoning the
+                                     --   remainder at cancel_after_seconds, on
+                                     --   reject, and on zero-fill cancel. NOT
+                                     --   derivable from quantity vs
+                                     --   requested_quantity: those two look
+                                     --   identical while still filling and after an
+                                     --   abandoned remainder.
+    exit_state   VARCHAR NOT NULL,   -- 'none' | 'submitted'. The 'none' ->
+                                     --   'submitted' transition IS the
+                                     --   double-submission guard.
     exiting_since VARCHAR,           -- 'YYYYMMDD_HHMMSS' — set once, the FIRST
-                                     --   instant status transitions to 'exiting';
+                                     --   instant exit_state becomes 'submitted';
                                      --   never overwritten thereafter, including
                                      --   by a stuck-timeout market escalation or a
                                      --   halt-clear resubmission (see
@@ -1289,7 +1320,15 @@ CREATE TABLE IF NOT EXISTS live_positions (
     fill_price   DOUBLE,             -- NULL until first fill; weighted average across
                                      --   partial fills once there is more than one
     fill_second  INTEGER,            -- HHMMSS of the first fill, NULL until then
-    quantity     INTEGER,            -- shares filled SO FAR; NULL until first fill
+    quantity     INTEGER,            -- shares filled SO FAR on the ENTRY side;
+                                     --   NULL until first fill
+    exit_filled_quantity INTEGER,    -- shares filled on the EXIT side, cumulative;
+                                     --   NULL until the first exit fill. The unsold
+                                     --   remainder during a partial exit is
+                                     --   quantity - exit_filled_quantity, held here
+                                     --   rather than only in the runtime
+                                     --   recomputation, so warm restart, the R-9
+                                     --   carry and Broker Reconcile read one number.
     requested_quantity INTEGER,      -- shares submitted; fixed at submission. The
                                      --   in-flight tracker compares quantity against
                                      --   this to decide partial vs. complete (see
@@ -1340,23 +1379,29 @@ CREATE TABLE IF NOT EXISTS live_positions (
 --   suppression, overnight-liquidation blocking, and fit_execution_params —
 --   ask only whether a REAL order was placed, which does not separate pilot
 --   from scale. Rollout attribution lives in live_session_state.stage.
--- status lifecycle:
---   'pending' -> 'open' -> 'exiting' -> 'closed'
---   'pending' -> 'partial_open' -> 'open' -> ... (R-7: fills arrive on a
---     separate channel, not in the order API's response, so an order can sit
---     partially filled. The filled shares ARE a real position from that
---     moment — they enter exit management and count toward
---     execution.max_tickers / max_positions_per_ticker — while the order
---     itself stays in flight awaiting the rest.)
---   'pending' -> 'canceled'   (expired or rejected with NOTHING filled)
---   'open'|'partial_open' <-> 'halted'  (position-scoped halt; clears itself)
--- No 'full_open': the two ways 'partial_open' ends — reaching
---   requested_quantity, or abandoning the remainder at cancel_after_seconds —
---   both mean "no longer awaiting fills", which is exactly 'open'. This also
---   matches backtest, where a partially-filled entry simply proceeds sized
---   down.
--- 'partial_open' NEVER goes to 'canceled': shares were actually bought, so
---   the outcome is a smaller position, not a non-event.
+-- Axis lifecycles, independent of one another:
+--   lifecycle:   inserted 'live'; -> 'canceled' when the entry order ends with
+--                NOTHING ever filled (reject, zero-fill cancel-after-timeout,
+--                Broker Reconcile's pending cancel), all through the single
+--                canceled-transition point; -> 'closed' once flat having held
+--                shares. Both terminals absorb.
+--   entry_state: inserted 'awaiting'; -> 'settled', absorbing. A partial fill
+--                does NOT transition it (R-7: fills arrive on a separate
+--                channel, not in the order API's response, so an order can sit
+--                partially filled. The filled shares ARE a real position from
+--                that moment — they enter exit management and count toward
+--                execution.max_tickers / max_positions_per_ticker — while the
+--                order itself stays in flight awaiting the rest.)
+--   exit_state:  inserted 'none'; -> 'submitted', absorbing within the session.
+-- The former 'pending' / 'partial_open' distinction is not stored: under
+--   entry_state='awaiting', quantity IS NULL means nothing filled yet and
+--   quantity > 0 means partially filled. The two ways that state ends —
+--   reaching requested_quantity, or abandoning the remainder at
+--   cancel_after_seconds — both mean "no longer awaiting fills", which is
+--   entry_state='settled'. This also matches backtest, where a
+--   partially-filled entry simply proceeds sized down.
+-- A partially filled row NEVER reaches lifecycle='canceled': shares were
+--   actually bought, so the outcome is a smaller position, not a non-event.
 -- Never deleted intra-day -- closed/canceled rows retained so cooldown
 --   state is derivable after a restart.
 -- No entry_ticks column: tp/sl detection is WS/REST-tick driven (see
@@ -1631,6 +1676,17 @@ CREATE TABLE IF NOT EXISTS feed_coverage_daily (
 
     -- Totals. A "second" counts only if it carried at least one print on
     -- the side in question.
+    delayed_uncovered_seconds INTEGER, -- seconds the DELAYED side could not
+                                       --   observe because the ticker was
+                                       --   evicted for execution.ws_ticker_limit
+                                       --   (auxiliary_stream.md). Only the
+                                       --   delayed side can be uncovered: the
+                                       --   live side's subscription set is
+                                       --   production's own, which the cap
+                                       --   already bounds. Excluded from every
+                                       --   counter below — a second with no
+                                       --   delayed observation is structurally
+                                       --   unobservable, not an omission.
     delayed_seconds  INTEGER,
     live_seconds     INTEGER,
     delayed_prints   INTEGER,
@@ -1896,7 +1952,7 @@ CREATE TABLE IF NOT EXISTS live_ticker_terms (
 -- Written by LiveModeRunner per settled exit, ALWAYS — deliberately NOT
 -- merged into feed_coverage_daily despite the identical grain and the shared
 -- purpose. That table is evening-batch-written and single-writer, skips
--- entirely when auxiliary_stream.enabled is false, excludes tickers missing
+-- entirely when neither side's file exists, excludes tickers missing
 -- from the delayed side, and writes NOTHING for a date on partial failure;
 -- all three rules protect a RATIO, which an agreement observation is not, so
 -- it would inherit the constraints without the protection. Paired reading is
@@ -2066,6 +2122,37 @@ CREATE TABLE IF NOT EXISTS alert_log (
     PRIMARY KEY (alert_id)
 );
 ```
+
+---
+
+## DB File Ownership Windows
+
+`market.duckdb` admits EXACTLY ONE process at any instant. DuckDB refuses a
+second open of the same file under a different configuration within one
+process, and its file lock is exclusive across processes — a read-only open
+from elsewhere fails while a writer holds it. Ownership is therefore
+TEMPORAL, and this section is the single site of that design; the files
+below reference it rather than restating it.
+
+| Window | Owning process | Entry condition | Exit condition |
+|---|---|---|---|
+| 03:00 ET | metadata_crawler `--token-refresh` | cron | `batch_runs stage IN ('overnight_token_refresh_production','overnight_token_refresh_demo')` complete |
+| 04:00 ET– | metadata_crawler `--premarket-open` | cron | `stage IN ('premarket_rename','premarket_corporate_events')` status='success' |
+| Session | LiveModeRunner | both markers success, or 05:00 ET wait_deadline reached (degraded start) | RELEASE of the DB connection at shutdown stage 1, which PRECEDES process exit |
+| 21:00 ET– | metadata_crawler evening batch | `stage='live_session_end'` status='success', or a read-write open succeeding (the runner-absent verdict) | `stage='evening_retention_purge'` complete |
+| Nightly backup | file copy, not a connection | `stage='evening_session_stats'` status='success' | before the next premarket start |
+
+While the runner holds the DB connection no separate process may open
+`market.duckdb`, read-only included. That window ends at shutdown stage 1,
+not at process exit, so the runner's stage-2 tail is outside it. Forbidden
+to run independently inside the window: `detection_benchmark.py`,
+`run_preprocess.py`, `run_train.py`, `run_backtest.py`, and
+`pipeline_optimizer`'s workers and coordinator.
+
+Referencing this section: `live_mode_runner.md`'s DB Connection Management
+(P-5) and Session Start Gating, `metadata_crawler.md`'s evening job start
+gate, `detection_benchmark.md`, `run_preprocess.md`, `run_train.md`,
+`run_backtest.md` and `pipeline_optimizer.md`.
 
 ---
 

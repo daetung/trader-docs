@@ -165,13 +165,11 @@ step 0: bars = self._prepare_bars(bars, entry)
            return None
 
 4. Insert entry point to DuckDB:
-       INSERT OR IGNORE INTO entry_points (ticker, date, hour, p_entry)
+       write_fn("INSERT OR IGNORE INTO entry_points (ticker, date, hour,
+                 p_entry) ...", params)
 
-5. Load halts_df (Inferencer-side DB query):
-       halts_df = db_conn.execute(
-           "SELECT * FROM trading_halts WHERE ticker = ? AND date = ?",
-           [entry["ticker"], entry["date"]]
-       ).df()
+5. Obtain halts_df from the injected accessor — no DB query here:
+       halts_df = halt_accessor(entry["ticker"], entry["date"])
 
 6. FeatureExtractor.extract(bars, ticks, meta, entry, halts_df,
                              session_stats=session_stats,
@@ -197,8 +195,9 @@ step 0: bars = self._prepare_bars(bars, entry)
 
 9. Log to inference_log:
        event = "signal_fired" if signal else ("suppressed" if suppressed else "no_signal")
-       INSERT INTO inference_log (logged_at, ticker, date, hour, event, signal,
-                                  prob_up5, prob_up3, prob_sw, prob_dn3, prob_dn5, run_id)
+       write_fn("INSERT INTO inference_log (logged_at, ticker, date, hour,
+                 event, signal, prob_up5, prob_up3, prob_sw, prob_dn3,
+                 prob_dn5, run_id) ...", params)
 
 10. Return InferenceResult(
        ticker=entry["ticker"], date=entry["date"], hour=entry["hour"],
@@ -224,7 +223,9 @@ def infer_batch(
 ) -> tuple[list[InferenceResult], dict]:
     """
     Process multiple candidates efficiently.
-    halts_df loaded once per (ticker, date) pair — not per candidate.
+    The halt accessor is called once per (ticker, date) pair — not per
+    candidate — and the result is cached for the duration of THIS
+    infer_batch() call only, never held on the instance.
     session_stats shared across all candidates (same session).
     meta_by_ticker: per-ticker resolved flat dicts, same per-field fallback
         contract as infer()'s meta (see Input/Output above) — not raw
@@ -251,10 +252,7 @@ def infer_batch(
         ticker, date = entry["ticker"], entry["date"]
         cache_key = (ticker, date)
         if cache_key not in halts_cache:
-            halts_cache[cache_key] = db_conn.execute(
-                "SELECT * FROM trading_halts WHERE ticker = ? AND date = ?",
-                [ticker, date]
-            ).df()
+            halts_cache[cache_key] = halt_accessor(ticker, date)
         result = self._infer_single(
             bars_by_ticker[ticker], ticks_by_ticker[ticker],
             meta_by_ticker[ticker], entry,
@@ -273,7 +271,7 @@ def infer_batch(
 ```
 
 `_infer_single()` performs steps 0–10 of `infer()` with pre-loaded `halts_df`.
-`infer()` loads `halts_df` then delegates to `_infer_single()`.
+`infer()` calls the halt accessor and passes the result to `_infer_single()`.
 
 ---
 
@@ -324,10 +322,11 @@ class Inferencer:
     def __init__(
         self,
         config: dict,
-        db_conn: duckdb.DuckDBPyConnection,
         run_id: str,
         feature_extractor: FeatureExtractor,   # DI: CachingIndicatorCalculator injected
         closes: dict[str, str],
+        halt_accessor: Callable[[str, str], pd.DataFrame],
+        write_fn: Callable[[str, list], None],
     ):
         """
         feature_extractor is injected with CachingIndicatorCalculator by LiveModeRunner.
@@ -391,9 +390,31 @@ class Inferencer:
   max_entry_hour(date) are not fired, where max_entry_hour(date) = last_bar(date)
   - max_entry_offset_minutes (> operator consistent with scan() exclusion logic;
   boundary is inclusive). null disables the cutoff entirely
-- `halts_df` queried from trading_halts table via db_conn at inference time;
-  passed explicitly to FeatureExtractor.extract()
-- `infer_batch()` caches halts_df per (ticker, date) — not per candidate
+- `halts_df` is SUPPLIED by LiveModeRunner through `halt_accessor` and is
+  never queried here; it is passed explicitly to FeatureExtractor.extract().
+  Its source is `live_halt_episodes` filtered by the configured source list,
+  defaulting to `['api']`. `trading_halts` is structurally empty for today's
+  date during a session — its crawl runs in the evening batch — and is not a
+  live source. Unresolved intervals (`halt_end IS NULL`) are closed at supply
+  time, so only closed intervals arrive here
+- No `db_conn`: the Inferencer has no remaining reader for one, and its two
+  writes go through `write_fn` — LiveModeRunner supplies `db_write`, so both
+  pass the `write_lock` funnel that P-5 declares the single write path
+- `infer_batch()` caches the accessor's result per (ticker, date) — not per
+  candidate — for that call only
 - `session_stats` is supplied by LiveModeRunner at session start; None is allowed (graceful degradation)
 - Model artifacts loaded from `run_id` at init — not reloaded per call
 - `feature_names` and `categorical_cols` derived from FeatureExtractor at init
+
+---
+
+## Config Keys (pipeline_config.yaml)
+
+```yaml
+inference:
+  halt_source_filter: ["api"]   # which live_halt_episodes.source values reach
+                                # the feature path. Heuristic halts continue to
+                                # drive the runner's trading decisions (exit
+                                # hold-off, ladder branching) regardless of
+                                # this key
+```

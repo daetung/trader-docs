@@ -21,6 +21,8 @@ are handled entirely by ClassBalancer.
 
 ## Input / Output
 
+**Session-window exclusion.** This entry point opens `market.duckdb` and so must NOT run while LiveModeRunner holds the connection — see db_schema.md's DB file ownership windows.
+
 **Input:**
 ```python
 # From DuckDB:
@@ -138,7 +140,11 @@ pd.DataFrame  # full labeled feature matrix, unsplit
 5. Save labeled_samples to DuckDB labeled_samples table (INSERT OR IGNORE)
 
 6. FeatureExtractor.extract_batch() for each ticker:
-       bars_td   = ohlcv_df filtered to (ticker, date, hour < t_hour)  [t-1 and earlier]
+       bars_td   = ohlcv_df filtered to (ticker)
+       # No date or hour axis: the batch carries several entry dates
+       # (ticker_dates below) and several entry hours, so neither is unique
+       # within it. extract_batch() slices per entry point internally; that
+       # docstring is the contract's single site.
 
        # Ticker rename stitching (Item 4): if get_ticker_history(ticker, db_conn)
        # is not None (the common case is None — no query cost beyond the small
@@ -149,7 +155,7 @@ pd.DataFrame  # full labeled feature matrix, unsplit
        # ohlcv_df under their original symbol — no additional DB query needed
        # for the bars themselves, only for the small ticker_history table.
 
-       ticks_td  = ticks_df filtered to (ticker, date, hour < t_hour)  [before t bar]
+       ticks_td  = ticks_df filtered to (ticker)
        halts_td  = halts_df filtered to (ticker, date)
        ticker_dates = entry_points_td["date"].unique()
 
@@ -297,7 +303,8 @@ misc.lookback_bars
 - Empty `precomputed_session_stats` is not an error: `extract_batch()` receives `None`, REFERENCE_SESSION indicators return NaN
 - `ticks_df` loaded as full day per ticker/date:
   - Labeler receives full day (hour >= t_hour filtered internally per entry point)
-  - FeatureExtractor receives ticks before t bar only (hour < t_hour)
+  - FeatureExtractor receives the unbounded per-ticker frame and slices per
+    entry point internally
 - `halts_df` loaded per ticker/date and passed explicitly to both Labeler and FeatureExtractor
 - `coverage_df` loaded once at step 1 and passed explicitly to Labeler.label()
 - `corp_events_df` loaded once at step 1 (full table) and passed explicitly to

@@ -143,11 +143,11 @@ Standalone scripts:
 | `inferencer/inferencer.md` | Live inference service object — _prepare_bars, infer/infer_batch, inference_log |
 | `inferencer/live_mode_runner.md` | Live mode execution orchestrator — prefix-scan watchdog loop, recovery lane, position manager loop, session lifecycle, ticker-scoped 1-tick acquisition, real-path-parallel shadow fills |
 | `inferencer/caching_calculator.md` | CachingIndicatorCalculator — Layer 1/2 cache, fibonacci deque, sr_levels per-entry-point |
+| `inferencer/auxiliary_stream.md` | In-process host (loop A) for non-trading WebSocket subscriptions on a separate account — delayed-quote capture for feed-coverage measurement is its first consumer |
 | `tools/init_db.md` | Schema bootstrap CLI — creates every table from db_schema.md's canonical DDL; `--verify` reports schema drift read-only. Sole DDL-issuing component; prerequisite for migration_tool |
 | `tools/migration_tool.md` | JSON → DuckDB migration, trading_calendar/coverage init, precomputed_session_stats population |
 | `tools/detection_benchmark.md` | Entry detection threshold tuning + timing benchmark, plus the diagnostic delayed-entry decay sweep |
 | `tools/metadata_crawler.md` | Daily metadata fetch, new data ingestion, session stats daily update, evening detection-gap stage |
-| `tools/auxiliary_stream.md` | Host for non-trading WebSocket subscriptions on a separate account — delayed-quote capture for feed-coverage measurement is its first consumer |
 | `tools/health_report.md` | Findings gathering, log/Discord/email alert delivery, alert-level config |
 | `visualization/viz_connector.md` | Abstract base class for visualization backends |
 
@@ -201,14 +201,14 @@ stock-scalping/
 │   ├── inferencer/
 │   │   ├── inferencer.md
 │   │   ├── live_mode_runner.md
-│   │   └── caching_calculator.md
+│   │   ├── caching_calculator.md
+│   │   └── auxiliary_stream.md
 │   ├── tools/
 │   │   ├── init_db.md
 │   │   ├── migration_tool.md
 │   │   ├── detection_benchmark.md
 │   │   ├── metadata_crawler.md
-│   │   ├── health_report.md
-│   │   └── auxiliary_stream.md
+│   │   └── health_report.md
 │   └── visualization/
 │       └── viz_connector.md
 ├── models/                        # trained model artifacts (.lgb, _meta.json)
@@ -242,7 +242,8 @@ stock-scalping/
 │   ├── inference/
 │   │   ├── inferencer.py
 │   │   ├── live_mode_runner.py
-│   │   └── caching_calculator.py
+│   │   ├── caching_calculator.py
+│   │   └── auxiliary_stream.py
 │   ├── api/
 │   │   └── trading_api.py
 │   ├── utils/
@@ -257,7 +258,6 @@ stock-scalping/
 │   ├── init_db.py
 │   ├── migrate_json_to_duckdb.py
 │   ├── collect_daily.py
-│   ├── collect_auxiliary_stream.py
 │   └── detection_benchmark.py
 ├── api_doc/                       # vendor API documentation (markdown).
 │                                  #   External read-only reference, not a

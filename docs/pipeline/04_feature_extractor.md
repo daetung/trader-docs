@@ -266,7 +266,11 @@ class FeatureExtractor:
     ) -> pd.DataFrame:
         """
         Batch feature extraction for all entry points of a single ticker.
-        bars and ticks must be strictly before t bar open (data boundary enforced by caller).
+        bars and ticks are UNBOUNDED per-ticker frames; the caller does not
+        enforce the data boundary and cannot — a batch spans several entry
+        hours and dates, so no single "before t bar open" predicate exists
+        for it. The boundary is enforced INTERNALLY, by the per-entry slice
+        to t-1 that Strategies A, B and C specify below.
         halts_df passed explicitly for MissingBarClassifier and market_structure_features.
         meta: date-keyed stock_meta resolution for this ticker's entry dates.
             Format: {date_str: {field: value}}
@@ -311,6 +315,9 @@ class FeatureExtractor:
     ) -> dict[str, float] | tuple[dict[str, float], dict]:
         """
         Single entry point feature extraction.
+        bars and ticks must be strictly before t bar open (data boundary
+        enforced by caller). One `entry` means one t_hour, so caller
+        enforcement is achievable here — unlike extract_batch() above.
         Used in live inference (Inferencer) and visualization.
         halts_df passed explicitly — consistent with extract_batch() pattern.
         meta: flat {field: value} dict for this single entry point's (ticker, date) —

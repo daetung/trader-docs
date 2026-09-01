@@ -183,11 +183,24 @@ value, and is not comparable across samples. `rate_of_change`'s ratio form is
 also unsuitable near a zero-crossing (division instability). `linear_trend`
 (slope, r_squared) captures the classic OBV/AD interpretation — sustained
 directional money flow — independent of the series' arbitrary origin, so it is
-the primary method. For `window_comparison` (secondary), only
+the primary method. `{name}_intercept` is EXCLUDED for these two indicators
+specifically: an intercept is a level, and the same argument that rules out
+`statistical_summary` rules it out. For `window_comparison` (secondary), only
 `{name}_window_delta` (a difference) is used for `obv`/`ad` —
 `{name}_window_ratio` is excluded for these two indicators specifically,
 since a ratio of two segments of a cumulative series can still divide by a
 near-zero value even though the delta form cannot.
+
+After these exclusions every output remaining for `obv`/`ad` is
+ORIGIN-INVARIANT: `slope` and `r_squared` are unchanged by adding a constant
+to the series, and `window_delta` is a difference. That is what makes the two
+paths agree. Both vectorize the same `lookback_days * 390` window
+(`data_boundary.md`'s `bars t-N ... t-1`); what differs is the accumulation
+ORIGIN carried into it, because the cumulative sum is computed before the
+slice — training accumulates from the ticker's full history, live from the
+`lookback_days` seed window (`caching_calculator.md`). No re-accumulation
+after slicing: it would break Strategy A's once-per-ticker computation and
+the calculator's O(1) incremental discipline for no gain.
 
 ---
 

@@ -126,7 +126,13 @@ unreconstructable.
 quote stream (V10/V11) carries the COMPLETE tape without a separate
 application, against the free real-time stream's roughly 50% of prints, so
 comparing the two answers the granularity question with an instrument rather
-than an invented exercise — `auxiliary_stream.md` builds it. The row stays
+than an invented exercise — `auxiliary_stream.md` builds it, now as an
+in-process component of LiveModeRunner rather than a separate process. That
+binds collection to the runner's lifetime: on a trading day where the runner
+does not start, no delayed-side data is gathered. Accepted — the live side is
+not written either, so the comparison would not be computable regardless, and
+the coverage stage's verdict table already treats that as FAILURE. The row
+stays
 grade A and stays a Pilot precondition: having a method is not having a result.
 
 **T-12 is deliberately answer-agnostic.** The halt-clear handling for an

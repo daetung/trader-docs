@@ -23,6 +23,8 @@ Supports three operational phases with distinct objectives:
 
 ## Architecture Position
 
+**Session-window exclusion.** This entry point opens `market.duckdb` and so must NOT run while LiveModeRunner holds the connection — see db_schema.md's DB file ownership windows.
+
 ```
 Training endpoint:  PipelineOptimizer
     └── Preprocessor.run(return_data=True)    ← returns full_labeled_df (unsplit), called once

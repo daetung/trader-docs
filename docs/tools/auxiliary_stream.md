@@ -1,7 +1,8 @@
-# Tool: Auxiliary Stream Host
+# Auxiliary Stream Host
 
-**File:** `tools/collect_auxiliary_stream.py`
-**Standalone CLI tool — runs alongside a live session, not inside it**
+**File:** `inferencer/auxiliary_stream.py`
+**In-process component of LiveModeRunner — runs on its own event loop
+(loop A) on a dedicated thread, not as a separate process**
 
 ---
 
@@ -13,7 +14,7 @@ measurement, is its first consumer — not its definition.
 
 The defining property is where the subscriptions live: a separate 모의투자
 account with its own app key, its own token cache, and its own session
-allowance, driven from a separate OS process. Production keeps its two
+allowance. Production keeps its two
 sessions for V60 and IS2, which `api_contract_checklist.md` T-6 measured as
 necessarily separate connections.
 
@@ -44,18 +45,28 @@ own.
 
 ---
 
-## Why a separate process
+## Why a separate event loop
 
 Not for the cache — fork modification 3 already handles that. **For the event
 loop.**
 
 `trading_api.md`'s Async Boundary states that a blocking WebSocket callback
 stalls reception for every subscription on that connection. Two clients
-sharing one event loop would extend that across connections, so this process's
-buffering and file writes could stall production's tick handler — which is the
-2-print guard's path, and therefore a direct trading risk. Separate processes
-also make the SDK's `threading.Lock` refresh guard irrelevant rather than
-misleading.
+sharing ONE event loop would extend that across connections, so this
+component's buffering and file writes could stall production's tick handler —
+which is the 2-print guard's path, and therefore a direct trading risk. A
+separate loop on its own thread removes that: it is not one loop, and each
+loop carries its own default executor, so `asyncio.to_thread` is separated
+and this component's rate-limit waits cannot starve production's pool —
+without modifying the SDK.
+
+A separate OS PROCESS is not used. Its remaining advantage over a separate
+loop is fault and GIL isolation, and the GIL cost is bounded: the callback
+mutates a dict and the flush serialises at most `flush_seconds` ×
+`execution.ws_ticker_limit` records, since callbacks aggregate into
+`(ticker, second)` buckets rather than accumulating rows. Fault isolation is
+provided instead by loop A's thread catching at its top level, stopping only
+itself, and recording one health event per session (live_mode_runner.md).
 
 Rate governance does **not** force separation: the SDK's rate controller is
 per client and the two accounts carry different app keys, so their server-side
@@ -75,12 +86,24 @@ source that can say which prints the live stream is missing —
 sampling axis, so they can establish that prints differ but never which are
 absent.
 
-- **Subscription set mirrors production's V60 set**, derived from
-  `live_positions` rather than through a new coordination channel: Exit
-  Architecture subscribes on entry fill and unsubscribes on exit, so the
-  subscribed set is the set of open positions. The same
-  `execution.ws_ticker_limit` bound therefore governs both sides without being
-  restated.
+- **Subscription set mirrors production's V60 set.** It is HANDED OVER
+  in-process: LiveModeRunner derives the full set (`lifecycle='live'`,
+  distinct ticker) after every committed `lifecycle` write and publishes it
+  to a single lock-protected slot this component reads. Full set each time,
+  never a delta. This component never reads `live_positions` — it opens no
+  database connection. The same `execution.ws_ticker_limit` bound governs the
+  two clients without being restated.
+- **Hold-down on departure.** A ticker leaving the set stays subscribed for
+  `tail_minutes` after it leaves. Dropping it immediately would lose the
+  delayed tail: subscribing at X delivers prints originally timed X minus the
+  15-minute lag onward, so the last stretch before departure arrives after
+  it. `tail_minutes` therefore has a LOWER BOUND of the lag: it must be at
+  least 15.
+- **Eviction.** On reaching `execution.ws_ticker_limit`, hold-down tickers
+  are evicted first, oldest departure first; a ticker in the current set is
+  never evicted. An eviction's ACTUAL non-coverage interval —
+  `[eviction, resubscription minus the 15-minute lag]`, empty when the
+  eviction is shorter than the lag — is marked in the output below.
 - **One session only.** Production is already subscribed to V60 for these
   tickers, so duplicating a realtime subscription here would add nothing. That
   also leaves the demo account's second session free, and means T-6's
@@ -93,8 +116,9 @@ absent.
 
 `trading_api.md`'s Scope excludes V61 from production for a budget reason —
 the per-connection subscription budget is spent on price tracking — and that
-reason is exactly what this process removes, since its budget is a different
-account's. Recorded so the extension axis is visible as real rather than
+reason is exactly what this component removes, since its budget is a
+different ACCOUNT's — the account split, not the process split, is what
+frees it. Recorded so the extension axis is visible as real rather than
 speculative. It is **not** admitted to scope here: the exclusion stands until
 someone designs the consumer and its storage. It would consume the demo
 account's remaining session; a third consumer would need a third account.
@@ -106,18 +130,30 @@ account's remaining session; a third consumer would need a third account.
 Per-second aggregates, written **append-only** as JSONL, one file per day:
 
 ```
-data/feed_coverage/live/YYYYMMDD.jsonl        ← written by LiveModeRunner
-data/feed_coverage/delayed/YYYYMMDD.jsonl     ← written by this process
+data/feed_coverage/live/YYYYMMDD.jsonl        ← written by the runner's own path
+data/feed_coverage/delayed/YYYYMMDD.jsonl     ← written by this component
 ```
 
-The directory names the **analysis**, not the writing process, so the two
+The directory names the **analysis**, not the writer, so the two
 sides of one comparison sit together. A future consumer such as V61 gets its
 own purpose-named directory. Each file has exactly one writer, so DuckDB's
 per-file single-writer constraint (`live_mode_runner.md`'s P-5) is not
 engaged by either — these are not database files.
 
 Recorded per `(ticker, second)`: print count, price min and max, and summed
-`exevol`. **Print-level matching is impossible and is not attempted**: the
+`exevol`.
+
+**Non-coverage is marked sparsely.** A record for an uncovered
+`(ticker, second)` carries only the key fields plus `"covered":0`, the
+aggregate fields omitted entirely rather than written null. Absence of the
+`covered` key means covered, so existing records are untouched and gain no
+field — the file is consumed only by the same day's evening analysis, so
+only the analysis-side contract has to hold. Because an evicted ticker
+produces no callbacks, the flush cannot be driven by the callback dict
+alone: it SYNTHESISES these records from the eviction set, under the same
+sealed-second rule as any other record.
+
+**Print-level matching is impossible and is not attempted**: the
 V60 body carries no execution ID and `loctime` is second-granularity, so two
 prints in the same second at the same price and size are indistinguishable.
 Second-bucket comparison is enough to detect bias.
@@ -129,14 +165,15 @@ favour it dissolves because raw is purged after analysis — retention is one
 day, or two while a retry is pending.
 
 **Flush cadence.** Callbacks mutate an in-memory dict only; the flush writes
-on a simple cadence. Only **sealed** seconds are written — those strictly
+on a simple cadence, and it also synthesises the uncovered records described
+above from the eviction set. Only **sealed** seconds are written — those strictly
 older than the current wall-clock second — so a second is never emitted twice
 in partial form. That matters because the comparison counts prints per
 second: a split row would read as two seconds at half the density each, which
 is exactly the shape systematic omission produces.
 
-**Unflushed aggregates are lost on abrupt process death, accepted
-deliberately.** This data characterises the feed rather than driving a
+**Unflushed aggregates are lost on abrupt process death — or on loop A's
+thread stopping — accepted deliberately.** This data characterises the feed rather than driving a
 decision, and a partial day does not invalidate the statistic.
 
 ---
@@ -148,23 +185,23 @@ second. Any consumer joining the two must treat a missing delayed row for a
 recent second as **not yet arrived**, not as absent — the join is meaningful
 only for seconds older than the delay.
 
-Production's session ends at the live process's hard cap (see
-live_mode_runner.md's Session Shutdown); this process runs on
-until the delayed tail is complete, roughly fifteen minutes later. The evening
-batch's analysis stage (`metadata_crawler.md`) clears that by about an hour.
+Trading ends at shutdown stage 1 (see live_mode_runner.md's Session
+Shutdown); loop A runs on through stage 2 until the delayed tail is
+complete, `tail_minutes` later. The 15-minute lag is a fixed vendor
+constant, not a config key, and is what `tail_minutes` must cover. The
+evening batch's analysis stage (`metadata_crawler.md`) clears stage 2 by
+about an hour.
 
 ---
 
-## Cron / Scheduler Setup
+## Startup
 
-```bash
-# Auxiliary stream host — starts with the session, outlives it by the
-# delayed stream's lag
-0 4 * * 1-5 cd /path/to/stock-scalping && \
-    source .venv/bin/activate && \
-    python tools/collect_auxiliary_stream.py \
-        --consumer delayed_quote >> logs/auxiliary_stream.log 2>&1
-```
+No cron entry: loop A starts with LiveModeRunner and stops at shutdown
+stage 2. The former `0 4 * * 1-5` entry existed to have the client
+initialised, its token held and its WS session established before the first
+entry — not to collect anything, since the subscription set derives from
+open positions and is empty until the first fill. Starting with the runner
+leaves that preparation more than four hours before 09:30.
 
 ---
 
@@ -172,8 +209,6 @@ batch's analysis stage (`metadata_crawler.md`) clears that by about an hour.
 
 ```yaml
 auxiliary_stream:
-  enabled:            true      # master switch; false disables the process
-                                # and the health-report observation section
   sdk_config_path:    "configs/dbsec_demo.yaml"
                                 # the demo account's SDK Config — this
                                 # project owns the location and injects it
@@ -183,15 +218,18 @@ auxiliary_stream:
                                 # differ from production's, or the two
                                 # clients erase each other's cache
   flush_seconds:      5         # sealed-second flush cadence
-  tail_minutes:       20        # how long to run past session end, covering
-                                # the delayed stream's ~15-minute lag
+  tail_minutes:       20        # three roles: the length of shutdown stage 2,
+                                # the per-ticker subscription hold-down, and
+                                # covering the delayed stream's 15-minute lag.
+                                # MUST be >= 15 for the last of these
 ```
 
 ---
 
 ## Constraints
 
-- Runs in its own OS process — never inside LiveModeRunner's event loop
+- Runs on its own event loop (loop A) on a dedicated thread inside
+  LiveModeRunner — never on production's loop
 - Uses a 모의투자 account distinct from production's, with its own app key,
   SDK config path and token cache path
 - Trades nothing, holds nothing, and submits no orders. It is not
@@ -199,7 +237,8 @@ auxiliary_stream:
 - Writes only to `data/feed_coverage/<side>/`; issues no DDL, opens no
   database connection, and writes no `batch_runs` row — the evening analysis
   stage owns that marker
-- Its subscription set is derived from `live_positions`, read-only
+- Its subscription set is handed over in-process by LiveModeRunner, which
+  owns the derivation; this component issues no query for it
 - Never subscribes V60: production already holds that subscription for the
   same tickers
 - A new consumer is added here rather than to production's session; if it

@@ -18,6 +18,8 @@ class sample counts and computation time before committing to a full pipeline ru
 
 ## CLI Usage
 
+**Session-window exclusion.** This entry point opens `market.duckdb` and so must NOT run while LiveModeRunner holds the connection — see db_schema.md's DB file ownership windows.
+
 ```bash
 # Full run: detect + label, report class counts and timing
 python tools/detection_benchmark.py \

@@ -171,10 +171,12 @@ has no counterpart spec.
   `auxiliary_stream.md`'s is not that, and neither is the READ-ONLY quote leg
   the watchdog scan runs on the second account: it fetches bars against that
   account's own allowance and never places an order, so no position
-  accounting, per-account sizing or cross-account reconcile arises. What the
-  scan's leg does raise, and this file does not settle, is PROCESS TOPOLOGY —
-  whether a second SDK client lives inside the trading process or behind a
-  subprocess boundary belongs to the async-boundary open item, not here
+  accounting, per-account sizing or cross-account reconcile arises. PROCESS
+  TOPOLOGY for that second client is now settled: it lives INSIDE the trading
+  process, on its own event loop on its own thread (loop A), which is what
+  keeps its callbacks from stalling production's reception and gives it a
+  separate executor — see trading_api.md's Async Boundary and
+  auxiliary_stream.md
 - Vendor account and session limits, recorded because they now bound design
   rather than merely describing the vendor. An app registration is
   effectively an account — `prd_app_key` and `vtl_app_key` are separate

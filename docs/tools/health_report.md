@@ -1,10 +1,18 @@
 # Tool: Health Report
 
 **File:** `tools/health_report.py`
-**Called IN-PROCESS, not as a subprocess** — findings 5, 8, 12, 21, 22, 24
-and 25 are handed LiveModeRunner's in-memory aggregates directly, which a
-separate process could not receive. A CLI entry point still exists for manual
-runs, but those can only produce the DB/log-derived findings.
+**Called IN-PROCESS, not as a subprocess** — while the runner holds the DB
+connection it is the only process that may open `market.duckdb`
+(db_schema.md's DB file ownership windows), so every path firing inside that
+window can only be in-process. The former ground for this — findings handed
+LiveModeRunner's in-memory aggregates directly, which a separate process
+could not receive — no longer holds: R-9 moved every one of them to the DB
+axis and `live_aggregates` is EMPTY.
+A CLI entry point still exists for manual runs and is TWO-MODE. Inside that
+window it opens no DB and reads the most recent `scope="whole"` record from
+`log_dir/health_report_{today_date}.log`, reporting it with its `ts`.
+Outside it, including the runner's shutdown stage-2 tail, it opens the DB and
+gathers normally. Both modes yield the same findings set.
 **Seven call paths** — two scheduled per session, five event-driven, two of
 the five from outside any session. See Invocation Contract below.
 
@@ -207,7 +215,8 @@ def gather_findings(db_conn, today_date, log_dir,
         crash; the count itself is diagnostic (frequency/severity of
         crashes), not an error signal on its own.
     14. Position held overnight: halted through close (R-3) — count of
-        positions that skipped `session_end` while `status='halted'` and
+        positions that skipped `session_end` while `last_halt_state` judged
+        their ticker halted, and
         were carried to the next session's Broker Reconcile. Surfaces what
         was previously a silent skip (see live_mode_runner.md's Position
         Manager Loop Step 1).
@@ -618,8 +627,8 @@ the entry most worth watching — R-9 widened its writers from one finding to
 six and finding 29 has since made seven, and findings 18 and 24 both emit
 repeatedly during a broker-latency episode.
 
-**Feed coverage is reported the same way**, and for the same reason. When
-`auxiliary_stream.enabled` is true, the evening batch's coverage stage writes
+**Feed coverage is reported the same way**, and for the same reason. The
+evening batch's coverage stage writes
 `feed_coverage_daily`, and this report carries the day's figures: total
 coverage ratio, the per-bucket dropout curve, and the two price-extreme
 counts. Like the observation above it is **not a finding** — not collected by
@@ -645,6 +654,18 @@ most three times a day, so `rate_limited` is not expected to engage.
 ```python
 def write_to_log(findings: dict, log_path: Path) -> None:
     """
+    Appends ONE JSONL record per invocation:
+
+      {"ts":"<UTC ISO-8601>","alert_key":"<the invoking path's alert_key>",
+       "scope":"whole"|"partial","severity":"ok"|"warn"|"abort",
+       "finding_count":<int>,"findings":{...}}
+
+    `scope` is what marks a subset invocation, so a reader cannot mistake
+    one for a whole report. `severity` is the highest among that
+    invocation's findings, and `findings` is gather_findings()'s returned
+    dict verbatim. The scalar fields lead so the head of a line is readable
+    without parsing the body, and the CLI's in-window mode selects on them.
+
     Findings are always written to the local log file first, independent of
     whether any alert channel delivery succeeds below. Delivery and logging
     are deliberately independent — logging is not a "fallback" for a failed
