@@ -1912,7 +1912,8 @@ view (open orders + open positions) against `live_positions` rows.
     entry_state='awaiting' AND quantity IS NULL` by `order_id`.
   - Cancel (unknown staleness — conservative); the matched row transitions
     to `lifecycle='canceled'` via the single canceled-transition point (see
-    "Pending limit-entry tracking," R-2) — the same idempotent path an
+    Position Manager Loop's "In-flight order tracking", R-2) — the same
+    idempotent path an
     ordinary cancel-after-timeout uses, so re-running this step (e.g. a
     re-crash mid-recovery) is safe and cannot double-log.
   - A broker order with no matching row under lifecycle='live' AND
@@ -2032,8 +2033,9 @@ so a re-crash during recovery re-enters warm restart on the same signature.
        lifecycle='live' AND entry_state='awaiting' AND quantity IS NULL by
        order_id. Cancel all such orders (unknown
        staleness — conservative); each matched row transitions to
-       lifecycle='canceled' via the single canceled-transition point (see Pending
-       limit-entry tracking) — same idempotent path an ordinary expiry
+       lifecycle='canceled' via the single canceled-transition point (see
+       Position Manager Loop's "In-flight order tracking") — same idempotent
+       path an ordinary expiry
        uses, so re-running this step is safe. A broker order with no
        matching row under lifecycle='live' AND entry_state='awaiting' AND
        quantity IS NULL -> "unknown broker order" health_report finding.

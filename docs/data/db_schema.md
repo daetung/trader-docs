@@ -2152,7 +2152,8 @@ to run independently inside the window: `detection_benchmark.py`,
 
 Referencing this section: `live_mode_runner.md`'s DB Connection Management
 (P-5) and Session Start Gating, `metadata_crawler.md`'s evening job start
-gate, `init_db.md`, `migration_tool.md`, `shadow_retraining.md`,
+gate, `health_report.md`, `init_db.md`, `migration_tool.md`,
+`shadow_retraining.md`,
 `detection_benchmark.md`, `run_preprocess.md`, `run_train.md`,
 `run_backtest.md` and `pipeline_optimizer.md`.
 
