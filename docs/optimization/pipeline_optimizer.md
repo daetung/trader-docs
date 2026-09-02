@@ -240,7 +240,6 @@ for outer_train_df, _, outer_test_df, outer_fold_meta in balancer.generate_folds
             config=config,
             effective_num_threads=effective_num_threads,
             optimizer_run_id=optimizer_run_id,
-            db_path=config["data_paths"]["db_path"],
         )
 
         # Coordinator: sequential DB flush (single write connection)
@@ -509,16 +508,15 @@ def run_trial_round(
     effective_num_threads: int,
     optimizer_run_id: str,
     outer_fold_idx:   int,
-    db_path:          str,
 ) -> dict | None:
     """
     Worker function. Runs one (trial, inner_fold) pair.
-    Opens its own DuckDB read-only connection (no write).
     Returns result dict — train_log INSERT deferred to coordinator.
-    db_conn=None passed to Trainer (dry_run=True), so a worker opens NO
-    database connection: nothing here reads one. That also removes the only
-    overlap this file had with its own coordinator, which opens read-write
-    between rounds and would be blocked by a live worker's read-only handle.
+    A worker opens NO database connection and takes no `db_path`: it passes
+    `db_conn=None` to Trainer under `dry_run=True`, so nothing here reads
+    one. That also removes the only overlap this file had with its own
+    coordinator, which opens read-write between rounds and would be blocked
+    by a live worker's read-only handle.
     """
     import sys
 
