@@ -134,7 +134,12 @@ def gather_findings(db_conn, today_date, log_dir,
     8. Halt-check signal-source rate (N-4: data path matches finding 5's
        pattern) — fraction of today's Position Manager Loop halt checks
        (see live_mode_runner.md's Position Manager Loop Step 1) tagged
-       signal_source='tick_rate_fallback' vs. 'api'. Not recomputed here —
+       signal_source='tick_rate_fallback' vs. 'api'. The denominator is one
+       check per TICKER per cycle, not one per position: the halt query is
+       deduplicated per ticker, and the ticker transition pass derives the
+       judgment once for the whole ticker, so counting per position would
+       inflate the denominator wherever max_positions_per_ticker allows
+       several positions on one. Not recomputed here —
        LiveModeRunner tallies signal_source per check as the session runs
        and persists the counts (R-9) to
        live_session_state.session_diagnostics on the bar_latency_daily flush
@@ -172,13 +177,18 @@ def gather_findings(db_conn, today_date, log_dir,
        finding 7 — a rejected fit and a magnitude-off predicted-vs-actual
        gap are different failure modes. Never merged with finding 7 or
        with each other for the same reason findings 6 and 7 stay separate.
-    10. investing.com match rate (item N) — per run, the fraction of
-        scraped investing.com calendar rows that FAILED to match
-        active_ticker_universe. A rising rate signals symbology drift
-        beyond what query-time normalization (metadata_crawler.md's
-        crawl_corporate_events_investing()) already resolves — kept in
-        place after that normalization was added, since best-effort
-        matching does not guarantee zero residual mismatches. Threshold
+    10. Residual symbol-mismatch rate, PER SOURCE — for each vendor source
+        whose symbol strings are folded by utils.md's
+        normalize_vendor_symbol(), the fraction of that source's rows which
+        FAILED to match after folding, reported as one tally per source
+        rather than pooled. The sources are investing.com's calendar rows
+        against active_ticker_universe (item N), and the halt feed's items
+        against the held-ticker set (live_mode_runner.md's halt-status
+        poller). A rising rate for a source signals symbology drift in that
+        source beyond what normalization resolves — kept in place after
+        normalization was added, since best-effort matching does not
+        guarantee zero residual mismatches. Pooling the sources would hide
+        which one drifted, which is the only actionable part. Threshold
         TBD, same deferral status as finding 8's warn cutoff.
     11. Session end marker missing (R-2) — set when the evening job's
         DuckDB-lock liveness probe (see metadata_crawler.md's "Evening job
@@ -595,6 +605,23 @@ def gather_findings(db_conn, today_date, log_dir,
         Level: warn. Threshold TBD, same deferral as findings 3/6/7/8: the
         rate is always computed and loggable, only the warn cutoff is
         undecided.
+    35. Watchdog scan-cycle overrun (`scan_cycle_overrun`) — the count of
+        cycles whose scan completion passed 1000ms, from
+        `live_scan_daily.overrun_cycles`, with the
+        `scan_cycle_ms_p50 | _p95` pair carried in the detail. The threshold
+        is the CYCLE PERIOD itself, not the ~850ms slack target: 850ms is
+        derived from the reserved slot at t=250 plus the measured round
+        trip and describes how much room the schedule leaves, whereas
+        passing 1000ms means the next cycle's reserved slots arrive while
+        this one is still outstanding — the head slots' per-second coverage
+        premise breaks there, so that is where a threshold belongs and it
+        needs no baseline to justify. A COUNT of cycles rather than a
+        distribution tail: the question is how often the premise broke, not
+        how slow the slow cycles were. Causes are enumerated in
+        live_mode_runner.md's scan-cycle description, loop P scheduling
+        delay among them.
+        Level: warn. Overrun costs detection latency, not correctness —
+        a response that came back is still evaluated.
 
     Returns: dict of {finding_name: {severity: 'ok'|'warn'|'abort', detail: ...}}
     """
@@ -796,20 +823,21 @@ entries are recorded (`outcome='dropped_queue'`), not merely counted.
 ### Shutdown Order and Drain
 
 At session end, four requirements fix the order: finding 26 reads
-`bar_latency_daily`, findings 30-32 read `live_scan_daily`,
+`bar_latency_daily`, findings 30-32 and 35 read `live_scan_daily`,
 `gather_findings()` needs the DB, and the evening batch needs the write lock
 released.
 ```
 1. final flush of bar_latency_daily      (else finding 26 loses the last
                                           un-flushed minute)
-1a. LiveModeRunner writes live_scan_daily (else findings 30-32 read a table
-                                          this session never wrote — same
-                                          layer as step 1, and for the same
-                                          reason. gap_* are NOT written here:
-                                          the evening detection-gap stage
-                                          writes those hours later, which is
-                                          why finding 33 reports the previous
-                                          day on a session-end call)
+1a. LiveModeRunner writes live_scan_daily (else findings 30-32 and 35 read a
+                                          table this session never wrote —
+                                          same layer as step 1, and for the
+                                          same reason. gap_* and halt_* are
+                                          NOT written here: the evening
+                                          detection-gap and halt-comparison
+                                          stages write those hours later,
+                                          which is why finding 33 reports the
+                                          previous day on a session-end call)
 1b. LiveModeRunner closes any OPEN live_halt_episodes interval, same layer
                                          (a clean shutdown observed the
                                           session's end, so leaving an
@@ -957,8 +985,8 @@ present.
 - **`log_dir` files**: findings 4, 10, and the missing-`SUMMARY` finding.
   Readable without the DB, which is why path (7) can produce anything at all.
 - **DB**: findings 1, 2, 3, 5, 8, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
-  22, 23, 24, 25, 26, 27, 29, 30, 31, 32, 33. The last four read
-  `live_scan_daily`; 33 alone reads a row written by the evening batch
+  22, 23, 24, 25, 26, 27, 29, 30, 31, 32, 33, 34, 35. Of those, 30-33 and 35
+  read `live_scan_daily`; 33 alone reads a row written by the evening batch
   rather than by the session being reported, so on a session-end call it
   describes the PREVIOUS day.
 - **Neither**: findings 6, 7 (placeholders) and 28.

@@ -87,7 +87,10 @@ Callers pass a ticker. They do not construct either form.
 The SDK's client is an async facade over a synchronous core; every REST call
 is dispatched through `asyncio.to_thread`, and rate-limit waits and retry
 backoff both block a pool thread for their duration. REST therefore needs an
-event loop only at this boundary — caller loop bodies stay synchronous.
+event loop only at this boundary. The MAIN-THREAD caller's loop bodies stay
+synchronous; a caller that is itself a coroutine on loop P awaits instead, on
+the loop it is already running on. One boundary reached from the two
+execution contexts a caller can be in — not two boundaries.
 
 **Where the boundary falls: one event loop PER CLIENT, each on its own
 thread.** Production's client runs on loop P, the demo account's on loop A
@@ -95,8 +98,27 @@ thread.** Production's client runs on loop P, the demo account's on loop A
 callback on one connection from stalling reception on the other, and it gives
 each loop its own default executor, so `asyncio.to_thread` is separated and
 the demo leg's rate-limit waits cannot starve production's pool — with no SDK
-modification. LiveModeRunner's main thread stays synchronous and reaches loop
-A's client through `run_coroutine_threadsafe(...).result()`.
+modification.
+
+**Loop P's executors are partitioned; loop A's are not.** Loop P's DEFAULT
+executor serves the SDK's production REST dispatch, whose threads are held
+for the whole of a rate-limit wait or a retry backoff; it is bounded by the
+rate controller's concurrent in-flight ceiling. A separate CALLER EXECUTOR
+serves caller offload, reached through `run_in_executor(caller_pool, ...)`
+rather than `asyncio.to_thread`, which would land on the default pool; it is
+bounded by the shadow positions resolving in one cycle — both shadow fill
+simulations' tick scans are its consumers there, entry side and exit side
+(`live_mode_runner.md`). Loop A is not partitioned — the
+auxiliary stream is its only consumer.
+
+**How a caller reaches a method here.** This module's methods are coroutines,
+each scheduled on its own leg's loop. A caller that is a coroutine on loop P
+awaits them. A main-thread synchronous caller reaches them through the
+SYNCHRONOUS ADAPTER this module provides, which is the only site where
+`run_coroutine_threadsafe(...).result()` appears. A call site does not select
+between the two forms; the caller's execution context does. Leg selection and
+loop selection are both owned here, so a caller names the method and nothing
+else.
 
 The WebSocket path is different and is the constraint that matters: its
 receive loop is natively async and its message callbacks are synchronous
@@ -251,9 +273,13 @@ demo leg          everything else quote/
 
 Two `quote/` consumers are exceptions and stay on BOTH legs:
 
-- **The watchdog scan.** Its 850ms bound comes from taking t=0 and t=250 on
-  each leg; confining it to one doubles its pacing interval and the bound
-  breaks. Half stays on production by necessity.
+- **The watchdog scan.** Its ~850ms figure is a DERIVED slack target — the
+  reserved slot at t=250 plus T-16's measured 400-600ms round trip — and not
+  an observation of cycle completion; `live_scan_daily`'s
+  `scan_cycle_ms_p50 | _p95` is what verifies the derivation holds. The
+  t=0/t=250 pair is taken one slot per leg; confining the scan to one leg
+  doubles its pacing interval and the derivation no longer stands. Half
+  stays on production by necessity.
 - **The exit ladder's orderbook round-robin.** Pinning it to demo alone
   would cap it at that leg's endpoint ceiling of 2/s, and at
   `max_tickers`'s default that returns re-quote latency to exactly what the

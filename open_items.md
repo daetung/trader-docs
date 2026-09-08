@@ -26,39 +26,22 @@ confirmation that it still reads correctly.
 
 ## Suggested order
 
-**Ordering caveat.** Halt-status leads this list on dependency grounds, but
-its actual blocker is SOURCE SELECTION, not design time: until a source
-exists there is nothing to design, since the shape of the fix (a market-wide
-feed versus a per-ticker query) is what decides whether chunking survives and
-whether the ticker list is a request or a filter. Sequence the unblocked
-items ahead of it.
-
-1. **Halt-status source** is independent and blocks nothing else, but the
-   halt path has no primary signal until it lands. `live_halt_episodes`'
-   `source` column now gives it an audit axis: once a real source exists its
-   intervals can be compared against the heuristic's directly, which nothing
-   in the system could do before. It is open FOR AN INDEPENDENT SOURCE: the
-   NYSE page that already fills `trading_halts` is not a candidate, since a
-   live signal drawn from it would make the evening comparison a source
-   against itself.
-2. **Manual-intervention CLI** is independent of the above and unblocked.
+1. **Manual-intervention CLI** is unblocked.
    The async boundary that used to sit here is closed: how many clients exist
    and where the boundary falls are both decided, and its shared review
-   surface with (3)'s sub-questions no longer exists because those are
+   surface with (2)'s sub-questions no longer exists because those are
    settled too.
-3. **WS/REST tape asymmetry and exit-trigger path transitions** is blocked on
+2. **WS/REST tape asymmetry and exit-trigger path transitions** is blocked on
    SHADOW-PERIOD DATA rather than on design time, so it is not sequenced
    against the items above. Only its deferred part remains.
-4. **`api_contract_checklist.md` re-evaluation** goes last by construction —
+3. **`api_contract_checklist.md` re-evaluation** goes last by construction —
    it collects what the items above establish.
-5. **Real-time bid/ask spread** is blocked on calendar time, not design time,
+4. **Real-time bid/ask spread** is blocked on calendar time, not design time,
    so it is not sequenced against anything here.
-6. **Config-duplicating signature defaults** is unblocked but is hygiene
+5. **Config-duplicating signature defaults** is unblocked but is hygiene
    rather than a design blocker, so it is not sequenced against the items
    above either. It is listed because a new item left out of this list is the
    carry-forward defect this file exists to prevent, inverted.
-7. **Watchdog scan cycle is not instrumented (F-1)** is likewise unblocked
-   and likewise not a design blocker — nothing is waiting on it.
 
 ---
 
@@ -123,27 +106,6 @@ from an undelivered one. The `breach_confirm_window_seconds` bound closes
 the FALSE-FIRING half of that — a frozen pending state can no longer pair
 ticks minutes apart — but not the DETECTION half, which needs the same
 L-vs-M term.
-## Halt-status source
-
-**Problem.** `utils.query_halt_status()` is specified as the single access
-point for trading-halt state, with `live_mode_runner.md`'s tick-rate
-heuristic as its FALLBACK. The primary does not exist: the dbsec vendor's
-catalogue publishes 20 REST endpoints across quote and trading and none
-returns halt state, so this cannot be served through `trading_api.md` at all.
-The intent is another vendor's API or a web source; which one is undecided.
-
-The SHAPE is open too, and it matters more than the identity. Halt data may
-be a market-wide feed rather than a per-ticker query, which would settle
-whether any chunking survives and whether the function's ticker list is a
-request or a filter. Until a source is chosen the function returns `None`
-unconditionally and both call sites take their fallback path, which is
-specified and buildable — so this blocks nothing, but the halt path runs on
-its fallback alone.
-
-**Not yet designed.**
-
----
-
 ## Manual-intervention CLI
 
 **Problem.** A clean Session Shutdown cancels in-flight exit orders precisely
@@ -205,30 +167,6 @@ there for the same reason. If backtest is ever extended to replay
 
 **Not yet designed** — still. Not actionable again until `bid_ask_snapshots`
 has enough history; revisit then, not before.
-
----
-
-## Watchdog scan cycle is not instrumented (F-1)
-
-**Problem.** `live_scan_daily`'s five metrics (`barclose_fetch_ms`,
-`infer_ms`, `submit_dispatch_ms`, `broker_ack_ms`, `order_to_fill_ms`)
-decompose the BAR-CLOSE sequence against its 5-second decision deadline. The
-watchdog polling loop's own cycle — the `t=0/250/500/750ms` slot allocation
-and its ~850ms completion bound — is measured by none of them.
-
-`live_mode_runner.md` names an operator adjustment against a quantity nothing
-observes: reduce `N` when RTT drifts above ~600ms. Any overrun — RTT drift, a
-leg becoming unavailable, added per-slot work — runs into the next cycle and
-is absorbed silently by the poll loop. The same remark that produced the
-bar-close instrumentation applies here: the target is unverified and each
-stage moves independently.
-
-**Open questions.** Whether to instrument the cycle in `live_scan_daily`
-beside the bar-close stages; whether the ~850ms bound is an assertion or an
-observation; what an overrun should do.
-
-**Not a design blocker** — nothing is waiting on it. `F` is the identifier
-prefix for findings; `D I N P R T V Y` are taken.
 
 ---
 

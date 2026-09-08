@@ -145,11 +145,12 @@ def crawl_corporate_events_investing(date: str, db_conn) -> int:
         DIVIDEND_CALENDAR_URL  = <TBD placeholder>
 
     Filters scraped rows to active_ticker_universe via query-time symbol
-    normalization — the same case/separator/class-suffix rules
-    detect_rename_candidates() already applies, reused here rather than
-    reimplemented, since both are "does this vendor's symbol string
-    identify a ticker we track" problems (resolved this design pass; no
-    longer a naive exact match). Normalization is best-effort, not a
+    normalization — utils.md's normalize_vendor_symbol(), which owns the
+    case/separator/class-suffix rules, reused here rather than
+    reimplemented, since every consumer of it faces the same "does this
+    vendor's symbol string identify a ticker we track" problem (resolved
+    this design pass; no longer a naive exact match). Normalization is
+    best-effort, not a
     guarantee — health_report.md finding 10 keeps tracking the residual
     mismatch rate — then writes each row through the shared
     upsert_corporate_event() helper below with source='investing'.
@@ -171,8 +172,8 @@ Notes:
 - Also called forward-looking, for the next trading day, during the
   evening run (investing.com's calendar is populated ahead of the
   effective date)
-- Symbol matching applies the same query-time normalization rules as
-  ticker-rename detection (case/separator/class-suffix) — no longer naive
+- Symbol matching applies utils.md's normalize_vendor_symbol()
+  (case/separator/class-suffix) — no longer naive
   exact matching. Best-effort, not a guarantee: residual mismatches stay
   visible via health_report.md finding 10's match-rate tracking rather
   than being treated as a solved-and-closed gap.
@@ -297,7 +298,9 @@ Schedule" below for why they differ:
     1. detect_rename_candidates()                          # writes batch_runs
                                                              #   stage='premarket_rename'
     2. quotes       = bulk_fetch_today_first_price(...)     # trading API, chunked
-       halt_status  = utils.query_halt_status(...)           # trading API, chunked
+       halt_status  = utils.query_halt_status(...)           # NOT a dbsec call;
+                                                             #   no chunk size
+                                                             #   (utils.md)
        # sequential, not parallel — see Dual Schedule below for why
     3. for ticker in active_ticker_universe:
            crawl_corporate_events(ticker, db_conn)            # yfinance — dominant cost
@@ -316,18 +319,22 @@ Schedule" below for why they differ:
 "In-Process Premarket Recheck"; --premarket-recheck below is manual/debug
 only, cannot open the DB read-write during a live session):
     1. quotes       = bulk_fetch_today_first_price(...)     # trading API, chunked
-       halt_status  = utils.query_halt_status(...)           # trading API, chunked
+       halt_status  = utils.query_halt_status(...)           # NOT a dbsec call;
+                                                             #   no chunk size
+                                                             #   (utils.md)
        # sequential — same function, same reasoning as above
-    2. check_corporate_event_anomaly(db_conn, config, quotes, halt_status)
-                                                             # writes batch_runs
-                                                             #   stage='premarket_quarantine_recheck'
-       # full-universe fresh re-evaluation, NOT a delta
-    3. crawl_corporate_events_investing(today, db_conn)      # item N: yes, this
+    2. crawl_corporate_events_investing(today, db_conn)      # item N: yes, this
                                                              # pass DOES refresh
                                                              # corporate_events now
                                                              # (contrast the old
                                                              # design, which never
                                                              # re-crawled at 09:20)
+    3. check_corporate_event_anomaly(db_conn, config, quotes, halt_status)
+                                                             # writes batch_runs
+                                                             #   stage='premarket_quarantine_recheck'
+       # full-universe fresh re-evaluation, NOT a delta;
+       # ordered after the investing refresh, as at 04:00, so the
+       # re-evaluation reads that pass's own corporate_events
     4. yfinance narrow crawl (crawl_corporate_events(ticker, db_conn)) for
        any ticker newly quarantined in step 2                      # item N
     5. scoped-recompute trigger for any ticker that gained a new same-day
@@ -730,6 +737,35 @@ stated rather than silently absorbed.
 
 ---
 
+## Halt Comparison (`stage='evening_halt_comparison'`)
+
+Compares the date's `source='api'` `live_halt_episodes` intervals, which the
+halt-status poller drew from the Nasdaq Trader feed, against the date's
+`trading_halts` rows, which `crawl_nyse_halts()` drew from the NYSE page.
+Two publishers, so this reads as agreement between independent observations
+rather than as a source checked against itself.
+
+Writes `live_scan_daily` metrics for the date: `halt_live_only` for intervals
+the `live_halt_episodes` side carries alone and `halt_nyse_only` for those
+`trading_halts` carries alone — each direction counted separately rather than
+pooled into one disagreement count, since which side is missing an interval
+is the diagnosis — and `halt_start_delta_ms_p50 | _p95` for the start-time
+difference where both sides carry the same interval. As for every other key
+in that table, db_schema.md's schema comment is the canonical key list.
+
+`source='tick_rate_fallback'` intervals are NOT pooled into those metrics.
+Those measure a heuristic against an authority; these measure two sources
+against each other, and averaging the two questions together answers
+neither.
+
+**Placed after the NYSE halt crawl and before Retention Purge.** It reads
+`trading_halts`, so the crawl that fills it for the date has to have run;
+both tables it reads are purge-registry members, so running after the purge
+would leave it counting rows already gone for the retention edge. Nothing
+downstream reads its output, so a failure here blocks nothing.
+
+---
+
 ## Retention Purge (R-9) — final evening stage
 
 The last stage of the evening run, after every other stage has completed.
@@ -900,10 +936,10 @@ def build_trading_api_symbol_map(db_conn) -> list[dict]:
        ticker returned by a given call is tagged with that call's exchange
        directly, never parsed out of the response.
     2. Match each returned ticker to a ticker_cik_map row: exact match
-       first, then the same normalization rules as
-       detect_rename_candidates() (case, separator, class-suffix handling)
-       — reused rather than reimplemented, since both are "does this
-       vendor's symbol string identify a row we already track" problems.
+       first, then utils.md's normalize_vendor_symbol() (case, separator,
+       class-suffix handling) — reused rather than reimplemented, since
+       every consumer of it faces the same "does this vendor's symbol
+       string identify a row we already track" problem.
     3. Matched: UPDATE ticker_cik_map SET trading_api_symbol = ?,
        trading_api_exchange = ? WHERE cik=? AND ticker=? (see
        db_schema.md — trading_api_symbol stores the raw code only, never
@@ -1540,13 +1576,14 @@ quarantine:
   single evening run must not change; the premarket refresh is intentionally
   a separate, later, supplementary crawl that session_stats does NOT re-read
 - `populate_trading_calendar()`, `populate_ticker_coverage()`, and `populate_precomputed_session_stats()` sourced from `utils.py`
-- The evening run writes seven `batch_runs` rows as it progresses —
+- The evening run writes one `batch_runs` row per stage as it progresses —
   `stage='evening_ingestion'` (around Steps 3-4 above), `stage='evening_tick_bar_aggregates'`
   (Tick Bar Aggregates Update), `stage='evening_session_stats'` (Session Stats
   Update), `stage='evening_investing_forward_check'` (Evening
   Forward-Looking Corporate-Events Check, item N),
   `stage='evening_feed_coverage'` (Feed Coverage Analysis),
-  `stage='evening_detection_gap'` (Detection-Gap Analysis), and finally
+  `stage='evening_detection_gap'` (Detection-Gap Analysis),
+  `stage='evening_halt_comparison'` (Halt Comparison), and finally
   `stage='evening_retention_purge'` (Retention Purge, R-9 — last, after
   every other stage, being the only destructive one) — each
   `status='running'` at its own start, `'success'`/`'failed'`

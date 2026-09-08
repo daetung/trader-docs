@@ -68,6 +68,15 @@ mutates a dict and the flush serialises at most `flush_seconds` ×
 provided instead by loop A's thread catching at its top level, stopping only
 itself, and recording one health event per session (live_mode_runner.md).
 
+**"Itself" is not this component alone.** Loop A also carries the watchdog
+scan's demo REST quote leg (live_mode_runner.md), so that thread stopping
+also costs the scan that leg — the scan continues on production's leg alone,
+at the doubled pacing interval trading_api.md quantifies. That cost does not
+change the conclusion here: a separate process would not avoid it, because
+the demo REST quote leg has to live wherever the demo account's client
+lives, and moving it out means a second client on that account or a third
+account entirely.
+
 Rate governance does **not** force separation: the SDK's rate controller is
 per client and the two accounts carry different app keys, so their server-side
 buckets are independent.
@@ -174,7 +183,9 @@ is exactly the shape systematic omission produces.
 
 **Unflushed aggregates are lost on abrupt process death — or on loop A's
 thread stopping — accepted deliberately.** This data characterises the feed rather than driving a
-decision, and a partial day does not invalidate the statistic.
+decision, and a partial day does not invalidate the statistic. Those
+aggregates are not the whole cost of that thread stopping: the scan's demo
+leg goes with it, as above.
 
 ---
 

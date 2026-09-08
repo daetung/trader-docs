@@ -279,10 +279,13 @@ reading the other's result.
 
 **I-2 is deliberately observable rather than solved.** Matching now applies
 query-time normalization (`metadata_crawler.md`'s
-`crawl_corporate_events_investing()`, the same rules as ticker-rename
-detection) rather than a naive exact match, but the match-rate finding
-(`health_report.md` finding 10) stays in place — normalization is
-best-effort, not a guarantee, so the residual gap remains worth tracking.
+`crawl_corporate_events_investing()`, through `utils.md`'s
+`normalize_vendor_symbol()`) rather than a naive exact match, but the
+mismatch-rate finding stays in place — normalization is best-effort, not a
+guarantee, so the residual gap remains worth tracking. That finding
+(`health_report.md` finding 10) now reports PER SOURCE; the branch that
+verifies this row is its investing.com tally, not the finding as a whole,
+since a halt-feed mismatch says nothing about forward-check row matching.
 
 ---
 

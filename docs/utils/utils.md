@@ -778,6 +778,38 @@ def load_ohlcv_with_history(
     query — see run_preprocess.md Step 6 for that variant).
     """
     ...
+
+
+def normalize_vendor_symbol(
+    symbol: str,
+) -> str:
+    """
+    Fold a vendor's symbol string toward the SEC notation this project's
+    `ticker` column carries, so a caller can match it against a ticker set
+    it already holds.
+
+    A DIFFERENT AXIS from get_ticker_history() above. That one resolves one
+    security's symbol changing over TIME; this one resolves two sources
+    spelling the SAME security differently at one INSTANT — case, separator,
+    and class-suffix rendering (a warrant reaching us as `ACHR.W` from one
+    source and `UCFIW` from another). Neither substitutes for the other.
+
+    Pure string transform. Takes no db_conn, reads no table, and returns no
+    CIK: a caller that needs the row looks it up itself with the returned
+    candidate. That keeps this callable from a context holding no database
+    handle.
+
+    BEST-EFFORT, NOT A GUARANTEE. A vendor may spell a security in a way no
+    rule here folds, and the residual mismatch is measured rather than
+    assumed away — health_report.md's per-source symbol-mismatch finding.
+    Callers treat a non-match as unmatched, never as a different security.
+
+    Called by:
+        - metadata_crawler.md's crawl_corporate_events_investing()
+        - metadata_crawler.md's build_trading_api_symbol_map()
+        - live_mode_runner.md's halt-status poller
+    """
+    ...
 ```
 
 ---
@@ -1497,49 +1529,54 @@ def query_halt_status(
 
     NOT a dbsec vendor call. That vendor's catalogue publishes no
     halt-status endpoint: 20 REST endpoints across quote and trading, none
-    returning halt state. So this cannot be served through trading_api.md,
-    and the source is another vendor's API or a web source — undecided, and
-    tracked in open_items.md. Its SHAPE is open too: halt data may be a
-    market-wide feed rather than a per-ticker query, which would remove any
-    need for chunking here.
+    returning halt state. So this cannot be served through trading_api.md.
+    The source is the Nasdaq Trader trade-halt feed, and this function does
+    not fetch it: live_mode_runner.md's halt-status poller holds it and
+    keeps an in-process snapshot, which is what this function reads.
 
     Takes no URL and no chunk size, and no config key backs it. The former
-    `trading_api_url` reuse went with that key, and inventing a replacement
-    now would assume a URL-shaped source that a market-wide feed may not be.
+    `trading_api_url` reuse went with that key; the feed URL and the poll
+    interval are the poller's keys, not this function's, because a
+    market-wide feed is fetched once per interval rather than per call.
 
-    Returns {ticker: is_halted} for tickers the source recognizes. A ticker
-    requested but absent from the response is the caller's problem to handle
-    (treated as "unknown", not as False) — this function does not silently
-    default a missing ticker to not-halted. A market-wide source is filtered
-    to the requested tickers, so the contract holds either way.
+    Returns {ticker: is_halted} for every requested ticker. The source is a
+    market-wide feed of OUTSTANDING halts, so a fresh snapshot is a complete
+    observation of what is halted: a requested ticker absent from it is
+    not-halted, and the returned dict says so rather than omitting the key.
+    That reading belongs to this source's shape. It does NOT generalize: a
+    per-ticker source, which this contract was first written against, cannot
+    distinguish "not halted" from "not recognized", and absence there would
+    stay unknown. Feed symbols are folded toward this project's notation by
+    normalize_vendor_symbol() before the requested tickers are matched.
 
-    Returns None (not an exception) on total failure of the query. This
-    function does not decide the degraded-mode behavior for that case; each
-    call site interprets None per its own context, since the two current
-    call sites have different fallback signals available:
+    Returns None (not an exception) when no snapshot is available — the
+    poller has not produced one yet, or the one it holds is older than its
+    freshness ceiling, whose config key is a multiple of the poll interval.
+    A stale snapshot is NOT returned quietly: silently serving one would let
+    a dead poller read as a market with nothing halted. This function does
+    not decide the degraded-mode behavior for that case; each call site
+    interprets None per its own context, since the call sites have different
+    fallback signals available:
         - live_mode_runner.md's Position Manager Loop: falls back to the
-          existing tick-rate heuristic per position.
-        - metadata_crawler.md's check_corporate_event_anomaly(): no
-          live-tick fallback exists in that offline batch context: treats
-          an unresolved ticker as not-halted (conservative direction — see
-          that function for why).
-
-    UNTIL A SOURCE IS CHOSEN this returns None unconditionally, which both
-    call sites already handle. Stating that is deliberate: the fallback
-    paths are designed and specified, so an always-None keeps the Position
-    Manager Loop buildable, whereas marking the function unimplemented would
-    put a second unbuildable point in it.
+          existing tick-rate heuristic per ticker.
+        - the premarket passes: no live-tick fallback exists there, and the
+          heuristic is disabled outside the regular session anyway, so an
+          unresolved ticker is passed to
+          metadata_crawler.md's check_corporate_event_anomaly() and treated
+          as not-halted (conservative direction — see that function for why).
 
     This function's contract — bulk ticker list in, {ticker: bool} | None
-    out — is fixed now so both call sites can be designed against it
-    immediately.
+    out — is fixed, so every call site is designed against it.
 
     Called by:
         - live_mode_runner.md's Position Manager Loop, Step 1 (halt check,
           source-primary + tick-rate fallback; was Step 1a before the former
           bar-fetch Step 1 was removed)
-        - metadata_crawler.md's check_corporate_event_anomaly() (premarket
-          quarantine check, P-8)
+        - metadata_crawler.md's 04:00 --premarket-open pass
+        - live_mode_runner.md's In-Process Premarket Recheck (09:20)
+      The two premarket callers pass the result INTO
+      check_corporate_event_anomaly(); that function takes halt_status as an
+      already-fetched argument and calls nothing here itself.
     """
     ...
 ```
@@ -1775,12 +1812,17 @@ def stitch_ticks(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame
 - `resolve_xbrl_tag_value()`'s tag-priority list per metric lives in
   `configs/xbrl_tag_map.json`, not hardcoded in this function — adding a
   fallback tag for an existing metric is a config change, not a code change
-- `query_halt_status()` is the sole halt-status access point — neither
-  live_mode_runner.md nor metadata_crawler.md queries a halt source
+- `query_halt_status()` is the sole LIVE halt-status access point — neither
+  live_mode_runner.md nor metadata_crawler.md reads the live halt source
   directly, for the same single-source-of-truth reason
   `compute_tick_bar_aggregates()` is the sole IndicatorCalculator wrapper.
   It is NOT a trading-API endpoint: the dbsec catalogue has none, so this
-  function sits outside trading_api.md's boundary entirely
+  function sits outside trading_api.md's boundary entirely. The scope is
+  LIVE status, not halts as such: metadata_crawler.md's
+  `crawl_nyse_halts()` does query a halt source directly, the NYSE page
+  filling `trading_halts` as a historical record, and the two staying
+  separate is what lets the evening comparison read as two publishers
+  rather than one source against itself
 - `query_halt_status()` returning `None` is a call failure, not "no tickers
   halted" — callers must not conflate the two; conflating them would mean a
   dead endpoint silently reads as "everything is fine"

@@ -535,8 +535,9 @@ CREATE TABLE IF NOT EXISTS execution_params (
 -- correction of raw bars feeding CONTINUOUS/cumulative indicators, by
 -- adjust_tick_derived_series_for_corporate_events() (utils.md) for the
 -- entry-date-direct correction of tick-derived indicator series, and by
--- gap_percentile() / dead-position pnl (labeler.md, backtest_engine.md) for
--- scalar dividend/split adjustment across overnight boundaries.
+-- gap_percentile() and by dead-position pnl (05_labeler.md's Case A/D,
+-- 09_backtest_engine.md) for scalar dividend/split adjustment across
+-- overnight boundaries.
 -- Retention: NEVER purged — structurally excluded from the purge registry
 --   (historical fact, not reconstructable).
 CREATE TABLE IF NOT EXISTS corporate_events (
@@ -1765,6 +1766,20 @@ CREATE TABLE IF NOT EXISTS feed_coverage_daily (
 --                            the measured watchdog gap (api_contract_checklist
 --                            T-17), not an assumed one
 --   rotation_misses          visits finding nothing
+--   scan_cycle_ms_p50 | _p95
+--                            cycle start -> the cycle's last scan call
+--                            complete. The ~850ms slack target is DERIVED
+--                            (live_mode_runner.md, trading_api.md) and was
+--                            measured by nothing before this key; the
+--                            threshold that matters is the 1s cycle period
+--                            itself, which the next key counts against
+--   overrun_cycles           cycles whose completion passed that 1s period.
+--                            A COUNT, in carryover_cycles' shape and for the
+--                            same kind of question — how often a structural
+--                            premise broke — which the p50/p95 pair above
+--                            cannot answer and a per-cycle health event
+--                            would answer at thousands of rows a session.
+--                            health_report.md's finding 35 reads it
 --   superset_k_p50 | _p95    size of the mid-bar candidate superset fetched at
 --                            bar close. The design assumes roughly 10
 --   barclose_fetch_ms_p50 | _p95
@@ -1798,6 +1813,13 @@ CREATE TABLE IF NOT EXISTS feed_coverage_daily (
 --                            distribution its page-size question needed
 --   gap_total | _disagreed | _unevaluated
 --                            evening detection-gap stage (metadata_crawler.md)
+--   halt_live_only | halt_nyse_only
+--                            halt intervals carried by one side only, each
+--                            direction counted separately — evening
+--                            halt-comparison stage (metadata_crawler.md)
+--   halt_start_delta_ms_p50 | _p95
+--                            start-time difference where both sides carry
+--                            the same interval, same stage
 --   promotions_total         completed-bar detections found by the rotation
 --                            slot and promoted
 --   late_entry_gate_pass | _reject
@@ -1809,15 +1831,17 @@ CREATE TABLE IF NOT EXISTS feed_coverage_daily (
 -- outer set and promotions_total names a known, already-handled part of it.
 -- These two must never be added together.
 -- Re-run rule: UPSERT PER (date, metric) — NOT feed_coverage_daily's
--- DELETE-the-date-then-INSERT. Two writers touch one date at different times:
--- LiveModeRunner writes the in-session keys at session end, and
--- metadata_crawler.md's evening_detection_gap stage writes the gap_* keys
--- hours later. A blanket delete by date on the second write would erase the
--- first writer's rows. The tables on either side of this one warn about the
--- opposite errors — bar_latency_daily against a blanket `+=`,
--- feed_coverage_daily against an additive merge — and this is the third form
--- of the same trap: the right granularity for the re-run rule is whatever the
--- writer actually owns, which here is a key, not a date.
+-- DELETE-the-date-then-INSERT. Its writers touch one date at different
+-- times: LiveModeRunner writes the in-session keys at session end, and
+-- metadata_crawler.md's evening run writes the gap_* keys from its
+-- evening_detection_gap stage and the halt_* keys from its
+-- evening_halt_comparison stage, hours later. A blanket delete by date on a
+-- later write would erase an earlier writer's rows. The tables on either
+-- side of this one warn about the opposite errors — bar_latency_daily
+-- against a blanket `+=`, feed_coverage_daily against an additive merge —
+-- and this is the third form of the same trap: the right granularity for
+-- the re-run rule is whatever the writer actually owns, which here is a
+-- key, not a date.
 -- Retention: purge-registry member — date_column `date`, retention_days: inf.
 -- Growth is a few dozen rows per day, bounded by the metric list above rather
 -- than by ticker count.
@@ -1872,11 +1896,18 @@ CREATE TABLE IF NOT EXISTS live_halt_episodes (
     halt_start  VARCHAR NOT NULL,   -- 'HHMMSS'
     halt_end    VARCHAR,            -- NULL = open / unresolved
     source      VARCHAR NOT NULL,   -- 'api' | 'tick_rate_fallback'
+    reason_code VARCHAR,            -- the halt feed's own ReasonCode element
+                                    -- (e.g. "T1", "T6", "LUDP"), carried
+                                    -- through on source='api' intervals
     PRIMARY KEY (ticker, date, halt_start)
 );
 -- No run_id: a market observation rather than a run artifact, and a warm
 --   restart must be able to write the same row idempotently.
--- No reason_code: the heuristic cannot produce one.
+-- reason_code is NULL on 'tick_rate_fallback' intervals: the heuristic reads
+--   a print-rate collapse and cannot produce a reason. That NULL is the
+--   source's own signature rather than a gap to be filled, so it is never
+--   backfilled from trading_halts — a different publisher's code for a
+--   separately observed halt, not a second copy of this one.
 
 -- Per-ticker trading terms, as published by the vendor and observed ONCE PER
 -- TICKER PER SESSION at watchdog first listing (live_mode_runner.md's

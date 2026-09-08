@@ -7,7 +7,9 @@
 ## Role
 
 Execution orchestrator for live trading mode.
-Manages two independent loops (watchdog polling and position monitoring),
+Manages two loops (watchdog polling and position monitoring) that are
+independent in WHAT they decide, not in where they run — see Architecture
+for the assignment,
 coordinates session initialization, and integrates all live-mode components.
 
 LiveModeRunner is the **execution subject** — Inferencer, CachingIndicatorCalculator,
@@ -27,8 +29,12 @@ LiveModeRunner
     ├── FeatureExtractor              (uses CachingIndicatorCalculator via DI)
     ├── Inferencer                    (owns FeatureExtractor)
     ├── EntryPointDetector            (used internally by Inferencer)
-    ├── [Watchdog polling loop]       (async / threaded)
-    ├── [Position manager loop]       (async / threaded)
+    │
+    │   CALLER LOOPS — execution units that decide and act
+    ├── [Watchdog polling loop]       synchronous, on the main thread
+    ├── [Position manager loop]       coroutine, on loop P
+    │
+    │   BOUNDARY THREADS — one per SDK client, not execution units
     ├── loop P  (thread)              production SDK client: V60/IS2
     │                                 reception and production REST
     └── loop A  (thread)              auxiliary_stream.md's component:
@@ -37,12 +43,55 @@ LiveModeRunner
                                       watchdog scan's demo REST quote leg
 ```
 
+**The two lists above are different KINDS.** A caller loop is a unit of
+work that runs on something; loop P and loop A are what it runs on, or
+reaches across. Reading them as one list is what leaves the assignment
+looking undeclared, so the assignment is stated here and every other
+statement in this file defers to it.
+
 **Two event loops, one per SDK client, each on its own thread.** This is
 what keeps a blocking callback on one connection from stalling reception on
 the other, and it gives each loop its own default executor, so
 `asyncio.to_thread` is separated and the demo leg's rate-limit waits cannot
-starve production's pool — without modifying the SDK. The main thread stays
-synchronous (trading_api.md's Async Boundary).
+starve production's pool — without modifying the SDK.
+
+**Loop P carries two executors, not one** (trading_api.md's Async Boundary
+owns the split). Its DEFAULT executor serves the SDK's production REST
+dispatch, whose threads are held for the whole of a rate-limit wait or a
+retry backoff. A separate CALLER EXECUTOR serves this file's own offload —
+work reached through `run_in_executor(caller_pool, ...)` rather than
+`asyncio.to_thread`, which would land on the default pool. Without the
+split, a burst of production REST would queue caller work behind
+rate-limit waits, and the delay would not surface anywhere because loop P
+itself stays busy. The same reasoning that separates the two loops'
+executors applies one level down inside loop P.
+
+Its consumers here are BOTH shadow fill simulations' tick scans — the entry
+side in the Watchdog Polling Loop's submission path and the exit side in
+Position Manager Loop Step 3, each running its scan once per position
+lifetime — and the halt-status poller below. The pool is bounded by the
+shadow positions resolving in one cycle; the SDK's is bounded by the rate
+controller's concurrent in-flight ceiling. Loop A is not split — the
+auxiliary stream is its only consumer.
+
+**Where each caller loop runs, and why it matters.**
+
+- The **watchdog polling loop** is synchronous on the main thread. Its
+  bar-close work — indicator updates, feature extraction, inference — is a
+  CPU burst arriving at the same instant as the tick flood, and a burst
+  with no yield point inside an event loop stops that loop's reception
+  outright, where a separate thread only degrades it. It reaches both loops
+  across the boundary, production REST through loop P and the demo quote
+  leg through loop A.
+- The **position manager loop** is a coroutine on loop P, alongside the WS
+  readers. That is what makes the `exit_state` single-submission guard
+  sufficient without a lock: a WS price breach and the periodic exit
+  evaluation cannot preempt each other on one event loop, so the
+  read-then-write between them is not interleaved.
+
+Neither loop selects its own idiom for reaching a boundary thread; the
+caller's context does, and `trading_api.md`'s Async Boundary states which
+form belongs to which.
 
 Loop A's thread catches exceptions at its top level, logs, stops only that
 thread, and records ONE health event per session; trading continues. The
@@ -442,9 +491,12 @@ LiveModeRunner.start_session(today_date):
       rather than re-querying the balance, which would reflect a
       post-fills value, not the session's original basis.
 
-  1d. Broker Reconcile (shared procedure — R-3, see "Broker Reconcile
-      (shared procedure)" below): run at EVERY session start, cold start
-      included. At cold start, any broker position found is by
+  1d. In-flight exit settle pass, then Broker Reconcile (shared procedure
+      — R-3, see "Broker Reconcile (shared procedure)" below): run at
+      EVERY session start, cold start included. The settle pass is a no-op
+      here at cold start — `in_flight_orders` is empty until this session
+      submits something — and is named anyway so every call site reads
+      the same. At cold start, any broker position found is by
       definition an overnight orphan — nothing has opened yet today. This
       is the standing guard against a prior-day position that never
       appeared in a warm restart (e.g. a cleanly-shut-down session that
@@ -712,8 +764,8 @@ LiveModeRunner.start_session(today_date):
          calculate_required_history() → self.required_bars
          Load model artifacts (run_id from config)
 
-  8. Start watchdog polling loop (async)
-  9. Start position manager loop (async)
+  8. Start watchdog polling loop (synchronous, main thread — Architecture)
+  9. Start position manager loop (coroutine on loop P — Architecture)
 ```
 
 **Bulk Load Memory Profile** (Steps 2-3, 5 — renamed from "Phase 1" now that
@@ -900,16 +952,40 @@ promotion — and re-derivable from EDF slack, so nothing here is left open.
 Last scan call completes at `250ms + RTT`, i.e. 850ms worst case at the
 measured 400-600ms round trip (that check is retired as
 `api_contract_checklist.md` T-16; the `scan:` keys below are its record) —
-inside a 1s cycle. Giving the whole
+inside a 1s cycle. That 850ms is DERIVED, not observed: the reserved slot
+at t=250 plus T-16's measured round-trip ceiling. It describes how much
+room the schedule leaves, and `live_scan_daily`'s scan-cycle completion
+metrics are what verify the derivation. The threshold that matters is the
+1s cycle period itself, which is a structural constraint rather than a
+derived figure — health_report.md's scan-cycle overrun finding counts
+cycles that pass it. Giving the whole
 auxiliary leg to the recovery lane instead would force the scan onto one
 leg, firing its last call at 750ms and completing at 1150-1350ms, so the
 allocation is BY PACING SLOT, not by leg. N and M are config keys: if RTT
 drifts up past ~600ms, N must come down. The demo leg's client lives on
-loop A (see DB Connection Management and auxiliary_stream.md), so its slots
-are issued across the loop boundary via
-`run_coroutine_threadsafe(...).result()` from this loop's thread; the wait
-releases the GIL. This is the only structure the in-process auxiliary adds
-to the trading path.
+loop A (see Architecture and auxiliary_stream.md), so its slots are issued
+across the loop boundary. This loop is synchronous on the main thread, so
+it reaches loop A through the synchronous adapter trading_api.md provides,
+which blocks that thread and releases the GIL while it waits. The
+production leg crosses into loop P through the same adapter. This is the
+only structure the in-process auxiliary adds to the trading path.
+
+**What makes a cycle overrun.** Round-trip drift, a leg becoming
+unavailable, added per-slot work — and LOOP P SCHEDULING DELAY, which the
+caller-loop assignment introduces: this loop blocks on the adapter while
+loop P starts the coroutine, so a loop P busy with a tick burst or a WS
+callback delays slot issue here. An overrun is absorbed rather than acted
+on — a response that came back is evaluated, so the cost is detection
+latency, not correctness — and health_report.md's scan-cycle overrun
+finding is what makes it visible.
+
+**Reducing N on overrun is NOT the response.** N does not enter the
+`250ms + RTT` completion figure at all: the head slots fire speculatively,
+all N going out before any lands, so dropping one does not move the last
+call earlier. What it does move is coverage — a ticker taken off the head
+falls to the rotation's ~50-cycle period, which is exactly the per-second
+guarantee the head exists to give. The operator adjustment against RTT
+above stays a human judgment on observed completion, not an automatic one.
 
 **The three slot kinds and what each fetches.**
 
@@ -1300,8 +1376,15 @@ loop every poll_interval_seconds:
                      # of ONE moment, never composed — adding the delay to
                      # submitted_at double-counts a wait live has already
                      # lived through (execution_common.md).
-                 Once the 1-tick buffer covers anchor + cancel_after_seconds,
-                 recompute STATELESSLY from the anchor:
+                 The RESOLUTION-CONDITION test — has the 1-tick buffer
+                 reached anchor + cancel_after_seconds — is a comparison of
+                 two times and stays INLINE on loop P. The scan runs ONCE
+                 per position lifetime, on the pass that test first passes,
+                 and is offloaded to loop P's CALLER EXECUTOR (Architecture's
+                 executor split): it walks every tick from the anchor
+                 forward, and a walk of that size taken inline would stall
+                 the loop the WS readers share. Recompute STATELESSLY from
+                 the anchor:
                  weighted_avg_fill_price, filled, unfilled, status =
                      execution_common.simulate_entry_fill(
                          ticks_entry=<1-tick buffer, anchor forward>,
@@ -1774,6 +1857,18 @@ handled by finding 29 without a freeze.
   at all, or no bar) bears directly on how large a "normal" miss rate can
   be, and this condition is set with that in mind.
 
+**Where this runs.** DETECTION stays at its trigger sites and is not
+relocated: condition 1 wherever the trading-API call raises, condition 2 at
+the close of Bar-Close Authority's per-minute window, on the watchdog
+thread. Neither site runs a recovery — each HANDS the trigger to loop P,
+which owns the procedure. Of the steps below, step 3 stays on the WATCHDOG
+side, because it is not work this procedure schedules at all: it is the
+scan's own next bar-fetch call arriving per ticker. Steps 1, 2, 4, 5 and 6
+run on loop P. One consequence worth stating: step 1 sets the freeze from
+loop P while the gates that read it are checked on the watchdog thread and
+in the position manager loop, which is the existing arrangement for every
+other freeze reason rather than something this pinning introduces.
+
 **Recovery procedure**, on detecting the trigger:
 ```
 1. Freeze: add 'feed_outage' to freeze_reasons.
@@ -1819,12 +1914,16 @@ handled by finding 29 without a freeze.
    a true, unrecoverable data gap — not engineered around here; falls
    through to whatever the vendor's own missing-data convention is.)
 
-4. Reconcile: run the Broker Reconcile shared procedure (R-3 — see
-   "Broker Reconcile (shared procedure)" below). The feed-outage-specific
-   case (broker shows a position closed that LiveModeRunner still tracks
-   as open → an exit order placed just before the outage evidently filled;
-   adopt the broker's fill as authoritative, not simulated/estimated) is
-   part of that shared procedure. `feed_gap_exit` (step 5 below) still
+4. Reconcile: run the in-flight exit settle pass and then the Broker
+   Reconcile shared procedure (R-3 — see "Broker Reconcile (shared
+   procedure)" below). The settle pass matters most at THIS call site: an
+   exit submitted just before the outage may have filled during it, with
+   the fill reports for it arriving on a channel that was down. The
+   feed-outage-specific case (broker shows a position closed that
+   LiveModeRunner still tracks as open → an exit order placed just before
+   the outage evidently filled; adopt the broker's fill as authoritative,
+   not simulated/estimated) is what the settle pass resolves, ahead of the
+   comparison rather than inside it. `feed_gap_exit` (step 5 below) still
    applies only to positions that remained open through the outage.
 
 5. Re-evaluate exits: for each position that remained open through the
@@ -1906,6 +2005,21 @@ One implementation, three call sites: (a) every Session Lifecycle start,
 cold start included (Session Lifecycle Step 1d), (b) Feed Outage Recovery
 step 4, (c) Warm Restart step 1 (R-2, below). Compares the trading API's
 view (open orders + open positions) against `live_positions` rows.
+
+**An in-flight exit settle pass runs FIRST, at every one of those call
+sites.** For each `order_id` in `in_flight_orders` with `side == 'exit'`,
+read the broker's own fill state for that order and settle it exactly as
+Position Manager Loop's exit-side loop does — `exit_filled_quantity` written
+from `cum_filled_qty`, and the row transitioned to `lifecycle='closed'` with
+its `trade_log` exit where the fill is complete. Only then does the
+comparison below run.
+
+Without the pass, an exit that filled while nothing was watching arrives at
+the Positions branch as a `live_positions` row with no broker position, and
+**reconcile_ghost** records a position that did exist and did close as one
+that never existed — PnL-excluded, the real fill discarded. The pass is a
+NO-OP wherever `in_flight_orders` holds no exit order, which is every cold
+start, since nothing has opened yet there.
 
 **Orders** (broker open entry orders):
   - Match to `live_positions` rows with `lifecycle='live' AND
@@ -2027,8 +2141,16 @@ safely re-runnable. Throughout, the `live_session_start` marker stays
 so a re-crash during recovery re-enters warm restart on the same signature.
 
 ```
-1. Broker Reconcile (shared procedure — see R-3's "Broker Reconcile" for
-   the fully general form; the behaviors relevant at this call site):
+1. Rebuild `in_flight_orders`, run the in-flight exit settle pass, then
+   Broker Reconcile (shared procedure — see R-3's "Broker Reconcile" for
+   the fully general form; the behaviors relevant at this call site). That
+   internal order is load-bearing: `in_flight_orders` does not survive the
+   crash and is rebuilt from `live_positions` (Position Manager Loop's
+   "In-flight order tracking"), the settle pass reads what the rebuild
+   produces, and the reconcile must see the settled state rather than rows
+   whose exit filled while the process was down. The pass sits INSIDE this
+   step rather than becoming a step ahead of it, so the numbering this
+   procedure is cited by elsewhere is unchanged:
      - Open entry orders (broker): match to live_positions rows with
        lifecycle='live' AND entry_state='awaiting' AND quantity IS NULL by
        order_id. Cancel all such orders (unknown
@@ -2465,6 +2587,36 @@ buffered ticks at once; they are evaluated in sequence, so detection
 accuracy matches WS — only detection TIME lags. `utils.track_price_breach()`
 is NOT used on this path; it is backtest-only as of this patch.
 
+**`halt_tick_counts` — what the halt heuristic counts.** Both paths above
+also increment a per-ticker count of DEDUP-PASSING ticks keyed by second.
+The WS handler increments it inline alongside its other per-tick work; the
+backstop increments it as it evaluates each poll's ticks in sequence. It is
+the only structure the halt heuristic reads, and the heuristic never
+fetches ticks of its own.
+
+- **Counting by second, not retaining ticks, is what bounds it.** Its size
+  is `execution.max_tickers` × `execution.halt_check_window_seconds`
+  independently of print rate, where a list of tick timestamps would grow
+  with how busy a ticker is — precisely when the memory matters least to
+  the answer, since the heuristic only asks whether the rate is BELOW a
+  floor. Entries older than the window expire, and a ticker's counter is
+  dropped when it leaves the halt check's query domain.
+- **Dedup-passing ticks only.** Gap-filled replays reach the handler again
+  (Warm Restart's tick catch-up); counting them would inflate the rate and
+  mask a real halt.
+- **NOT discarded on a `source_path` change** — the opposite of the pending
+  breach state above, deliberately. That state is discarded because a
+  consecutive pair straddling a tape change is not a real pair. This
+  counter records that prints EXISTED, which is true whichever path
+  observed them, and clearing it at the moment WS dies and the backstop
+  takes over would manufacture an empty window and read every affected
+  ticker as halted — at exactly the moment the backstop exists to keep
+  exits alive.
+- **Accumulated outside the regular session too**, even though the
+  heuristic's verdict is disabled there (Position Manager Loop Step 1). The
+  verdict is what premarket liquidity would distort, not the count; halting
+  accumulation as well would leave the first window after the open empty.
+
 **Time-based triggers are not on the WS path.** `time_limit` and
 `session_end` are wall-clock conditions — `time_limit` on elapsed minus
 halted minutes, `session_end` on the clock alone — evaluated by the
@@ -2486,8 +2638,8 @@ the same iteration; see the ordering rule in Position Manager Loop Step 2
 (tp/sl wins, the `exit_state='none'` -> `'submitted'` transition
 guarantees a single submission).
 
-**Concurrency.** WS readers and the periodic loop run on production's
-event loop (loop P — see DB Connection Management and the Async Boundary in
+**Concurrency.** WS readers and this periodic loop both run on production's
+event loop (loop P — see Architecture and the Async Boundary in
 trading_api.md), so position axis transitions serialize naturally; the
 `exit_state` transition is the single-submission guard where WS and the
 periodic loop could otherwise race (e.g. a simultaneous price breach and
@@ -2516,9 +2668,93 @@ as `get_execution_param()`'s hard bounds.
 
 ---
 
+## Halt-Status Poller
+
+Owns the live halt source. `utils.query_halt_status()` reads the snapshot
+this keeps; nothing else fetches halt state.
+
+**Source.** The Nasdaq Trader trade-halt RSS feed,
+`http://www.nasdaqtrader.com/rss.aspx?feed=tradehalts`. It carries
+OUTSTANDING halts regardless of how long ago each began, so a halt carried
+in from a prior session is present rather than absent — the overnight-carry
+case (R-3) gets an authoritative signal rather than only the heuristic's.
+Its `Mkt` field distinguishes NASDAQ from NYSE and other listings, so
+coverage is not limited to one venue. It is a DIFFERENT PUBLISHER from the
+NYSE page `crawl_nyse_halts()` scrapes into `trading_halts`, which is what
+lets metadata_crawler.md's evening comparison read as agreement between two
+observations rather than a source checked against itself.
+
+**Cadence.** Polls every `live_mode.halt_poll_interval_seconds`, FLOORED AT
+60. The floor is not tuning: the publisher's terms cap querying at once a
+minute, so a configuration must not be able to violate it. No polling
+outside the session — the 04:00 and 09:20 premarket call sites each take a
+single poll, since neither runs a loop and the heuristic that would
+otherwise cover them is disabled outside the regular session anyway.
+
+**Freshness.** A snapshot older than
+`live_mode.halt_snapshot_max_age_seconds` — a multiple of the poll interval
+— is not served: `utils.query_halt_status()` returns `None` and every call
+site takes its own fallback. A dead poller must not read as a market with
+nothing halted, which is what quietly serving the last good snapshot would
+produce.
+
+**Placement.** On loop P's caller executor (Architecture's executor split).
+It is external HTTP, off the trading path, and belongs on the pool that
+already serves caller offload rather than on the SDK's, whose threads are
+held by rate-limit waits. It holds no database handle: the snapshot is
+in-process and the tickers it is asked about arrive as arguments.
+
+**Parsing.** The `ndaq:`-namespaced elements: `HaltDate`, `HaltTime`,
+`IssueSymbol`, `IssueName`, `Mkt`, `ReasonCode`, `PauseThresholdPrice`,
+`ResumptionDate`, `ResumptionQuoteTime`, `ResumptionTradeTime`. The item's
+`description` CDATA repeats the same values as an HTML table and is NOT
+parsed — one representation is enough and the elements are the structured
+one. `HaltDate` and `HaltTime` are ET; `HaltTime` arrives with or without
+milliseconds and the parser accepts both.
+
+**Symbol matching.** Feed symbols are folded by
+`utils.normalize_vendor_symbol()` before being matched against the tickers
+asked about — the feed renders a warrant as `ACHR.W` where another source
+renders it `UCFIW`. Matching is best-effort: a feed item that folds to
+nothing we hold is simply not ours, and the residual rate is
+health_report.md's per-source symbol-mismatch finding.
+
+**Deriving `is_halted` for one ticker.**
+
+```
+item = the snapshot's entry for this ticker, if any
+
+no item                                   -> not halted
+item, no resumption code                  -> halted
+item, resumption code, ResumptionTradeTime not yet passed
+                                          -> halted
+item, ReasonCode == 'T7'                  -> halted
+item, resumption code, ResumptionTradeTime passed
+                                          -> not halted
+```
+
+`T7` is the case the rule exists for: quotations resume while trading stays
+paused, so a resumption code alone does not mean trading resumed.
+`ResumptionQuoteTime` and `ResumptionTradeTime` are separate fields for
+that reason, and only the latter governs here.
+
+The resumption codes are `T3`, `T7`, `R4`, `R9`, `C3`, `C4`, `C9`, `C11`,
+`R1`, `R2`, `IPOQ`, `IPOE`, `MWCQ`, `M` and `D`, defined by the publisher
+at `https://www.nasdaqtrader.com/Trader.aspx?id=TradeHaltCodes`. The set is
+cited rather than asserted so a reader can check it against the source.
+
+`ReasonCode` is carried through to `live_halt_episodes.reason_code` on
+`source='api'` intervals (db_schema.md). The heuristic cannot produce one,
+so its intervals leave that column NULL.
+
+---
+
 ## Position Manager Loop
 
-Monitors open positions independently of the watchdog loop. A single
+Monitors open positions independently of the watchdog loop's DECISIONS,
+though not of its execution context — this loop is a coroutine on loop P
+while the watchdog is synchronous on the main thread (Architecture). A
+single
 shared loop serves all open positions on one global timing grid (not a
 per-position independent timer) — a shared clock beats per-position phase
 alignment on every axis measured (compute batching, backtest reproducibility,
@@ -2597,8 +2833,13 @@ in_flight_orders: dict[order_id, dict]
 # R-2: runtime CACHE only — the SSoT is the live_positions row
 # (entry_state='awaiting' for entries, exit_state='submitted' for exits).
 # Populated at submission, and rebuilt from live_positions WHERE
-# lifecycle='live' AND (entry_state='awaiting' OR exit_state='submitted')
-# on a warm restart. NOT the subscription set's predicate: that one is
+# lifecycle='live' AND is_shadow=FALSE AND (entry_state='awaiting' OR
+# exit_state='submitted') on a warm restart. is_shadow=FALSE does not
+# merely restate the header above: a shadow row carries the same
+# entry_state/exit_state values and no order_id at all, so without the
+# term the rebuild would key shadow rows into a dict of real broker
+# orders and every loop reading it would then chase orders that do not
+# exist. NOT the subscription set's predicate: that one is
 # lifecycle='live', since an open position with no order outstanding still
 # needs its price watched.
 ```
@@ -2622,8 +2863,8 @@ contends for one and there is no eviction rule to state.
 
 **The subscription set is DERIVED, never held as independent state** — it
 is `live_positions WHERE lifecycle='live'`. That is NOT the query that
-rebuilds `in_flight_orders`, which is
-`lifecycle='live' AND (entry_state='awaiting' OR exit_state='submitted')`:
+rebuilds `in_flight_orders`, which is `lifecycle='live' AND
+is_shadow=FALSE AND (entry_state='awaiting' OR exit_state='submitted')`:
 in-flight ORDERS and tracked TICKERS are different sets, and an open
 position with no order outstanding still needs its price watched. One
 consequence covers three cases with one mechanism: warm restart,
@@ -2990,9 +3231,14 @@ loop every position_check_interval_seconds (config, default: 5s):
         # numbers, so nothing referring to them shifts; health_report.md's
         # findings 8 and 25 now name this step as Step 1. The label keeps
         # its old width so the block below is not re-indented.
-        # This step issues NO REST call — query_halt_status() is not a
-        # dbsec call and the fallback reads the WS tick buffer — so the
-        # Position Manager Loop is no longer a chart/min consumer at all.
+        # This step issues NO REST call — query_halt_status() reads the
+        # poller's snapshot (utils.md) and the fallback reads
+        # halt_tick_counts, which the Exit Architecture's two-path tick
+        # source already fills — so the Position Manager Loop is no longer
+        # a chart/min consumer at all.
+        # Structured as [bulk query] -> [ticker transition pass] ->
+        # [per-position loop] -> [in-flight-exit clear-edge loop]. The pass
+        # owns the ticker-grain work; the two loops read what it produced.
 
         Once per Position Manager Loop iteration (not once per position —
         same single-shared-loop batching principle as the global polling
@@ -3004,38 +3250,85 @@ loop every position_check_interval_seconds (config, default: 5s):
                     [o["ticker"] for o in in_flight_orders.values()
                      if o["side"] == "exit"],
             # In-flight exit tickers folded into the SAME bulk call rather
-            # than a second query — see "Halt-clear handling for an
-            # in-flight exit order" below for why this list needed
-            # extending at all. Deduplicated: a ticker already covered via
-            # open_positions is not queried twice.
-            # No URL and no chunk size: halt status is not a dbsec call and
-            # its source is undecided (utils.md, open_items.md). The list is
-            # small regardless (bounded by
+            # than a second query. The term is DEFENSIVE REDUNDANCY, not a
+            # required extension: an exit order implies exit_state
+            # ='submitted', which implies a filled position, so its ticker
+            # is already in open_positions — the settle pass that now
+            # precedes Broker Reconcile is what closes the one path that
+            # could strand an order past its row. Kept because the union
+            # deduplicates to the same set either way and costs nothing.
+            # Deduplicated: a ticker already covered via open_positions is
+            # not queried twice.
+            # No URL and no chunk size: halt status is not a dbsec call
+            # (utils.md). The list is small regardless (bounded by
             # execution.max_tickers × execution.max_positions_per_ticker,
             # the two axes that replaced the old single max_positions —
-            # see execution_common.md's Config Keys), almost always one
-            # chunk regardless of value.
+            # see execution_common.md's Config Keys).
         )
         ```
 
-        For each open position:
+        `last_halt_state: dict[ticker, bool]` is runtime only — this
+        iteration's is_halted vs. the PRIOR iteration's, one entry per
+        ticker in the bulk query's key set, not persisted. On a warm
+        restart the first post-restart iteration has no "prior" to compare
+        against, so at most one edge is missed per crash, not a correctness
+        gap: the order is still tracked and re-evaluated on the next
+        ordinary cycle regardless. The pass below owns it; nothing else
+        writes it.
+
+        TICKER TRANSITION PASS — runs once over the bulk query's key set,
+        before either loop below. Halt status, the episode record and
+        last_halt_state are all TICKER-grain; deriving them per position
+        would repeat one ticker's work per position on it and inflate
+        finding 8's denominator, which counts endpoint checks.
         ```
-        if halt_status is not None and position.ticker in halt_status:
-            is_halted = halt_status[position.ticker]   # API authoritative
-            signal_source = "api"
-        else:
-            # whole call failed, or this ticker missing from the response —
-            # fall back to the tick-rate heuristic
-            Fetch recent ticks from trading API (trailing
-            halt_check_window_seconds, config default: 60s)
-            tick_rate_per_min = len(ticks) * (60 / halt_check_window_seconds)
-            is_halted = tick_rate_per_min < halt_heuristic_tpm (config, default: 10)
-            signal_source = "tick_rate_fallback"
-            # DISABLED in premarket: normal premarket liquidity in this
-            # universe sits below halt_heuristic_tpm, so the heuristic
-            # would report a session-wide halt. Outside the regular
-            # session the fallback yields is_halted = False and the API
-            # signal is the only halt authority.
+        for ticker in <the bulk query's key set>:
+            if halt_status is not None and ticker in halt_status:
+                is_halted = halt_status[ticker]        # API authoritative
+                signal_source = "api"
+            else:
+                # no snapshot, or this ticker missing from it —
+                # fall back to the tick-rate heuristic
+                ticks_in_window = halt_tick_counts window sum for ticker
+                    (Exit Architecture; filled by whichever tick path is
+                     live for this ticker, WS or the REST backstop)
+                tick_rate_per_min = ticks_in_window * (60 / halt_check_window_seconds)
+                is_halted = tick_rate_per_min < halt_heuristic_tpm (config, default: 10)
+                signal_source = "tick_rate_fallback"
+                # A ticker whose window is not yet full reads NOT HALTED.
+                # Its rate is meaningless before the window fills, and the
+                # cost of the two errors is not symmetric: a false halt
+                # skips Steps 2-4, freezing exits, and it would fire for
+                # every newly held ticker for a whole window.
+                # DISABLED in premarket: normal premarket liquidity in this
+                # universe sits below halt_heuristic_tpm, so the heuristic
+                # would report a session-wide halt. Outside the regular
+                # session the fallback yields is_halted = False and the API
+                # signal is the only halt authority. Accumulation into
+                # halt_tick_counts continues there regardless — stopping it
+                # would leave the first window after the open empty and
+                # read every ticker as halted.
+
+            was_halted = last_halt_state.get(ticker, False)
+            if not was_halted and is_halted:
+                open a live_halt_episodes interval (db_schema.md), carrying
+                signal_source as its source and, on the api path, the
+                feed's ReasonCode
+            if was_halted and not is_halted:
+                close that ticker's open interval, and record the ticker in
+                halt_cleared_this_cycle
+            last_halt_state[ticker] = is_halted
+        ```
+
+        `halt_cleared_this_cycle` is what the clear-edge loop below reads.
+        It has to be emitted here rather than recomputed there: this pass
+        overwrites last_halt_state, so the prior value is gone by the time
+        that loop runs.
+
+        For each open position — reading the pass's result, deriving
+        nothing:
+        ```
+        is_halted = last_halt_state[position.ticker]
 
         if is_halted:
             # No status write: halt is NOT a live_positions value. The
@@ -3097,21 +3390,20 @@ loop every position_check_interval_seconds (config, default: 5s):
         this is built to be correct under any of the three:
 
         ```
-        last_halt_state: dict[ticker, bool]   # runtime only, this
-            # iteration's is_halted vs. the PRIOR iteration's, per ticker
-            # in the combined query above — not persisted; on a warm
-            # restart the first post-restart iteration simply has no
-            # "prior" to compare against, so at most one clear-edge event
-            # is missed per crash, not a correctness gap (the order is
-            # still tracked and re-evaluated on the next ordinary cycle
-            # regardless)
+        in_flight_exit_tickers = the tickers of the exit-side entries in
+            in_flight_orders this cycle — the same set the bulk query's
+            union term folded in above, named here because this loop is
+            its only consumer.
 
-        for ticker in in_flight_exit_tickers:
-            was_halted = last_halt_state.get(ticker, False)
-            is_halted  = halt_status.get(ticker, was_halted)  # missing
-                # from the response this cycle → assume unchanged, do not
-                # manufacture a spurious clear-edge from a partial response
-            if was_halted and not is_halted:
+        for ticker in in_flight_exit_tickers & halt_cleared_this_cycle:
+            # The transition pass above already made the edge judgment for
+            # every ticker in its domain, this one included; intersecting
+            # its output is what keeps one judgment from being made twice
+            # and possibly differently. A ticker missing from the snapshot
+            # this cycle produced no edge there — the pass assumes
+            # unchanged rather than manufacturing a spurious clear-edge
+            # from a partial response — so it does not reach this loop.
+            if True:
                 # clear edge — re-query THIS order's own status immediately,
                 # not waiting for the next position_check_interval_seconds
                 # cycle's ordinary fill-tracking pass
@@ -3136,15 +3428,16 @@ loop every position_check_interval_seconds (config, default: 5s):
                 # filled/partially filled through the resumption cross) —
                 # no action; the ordinary fill-tracking pass on this same
                 # loop's next cycle picks up whatever state it is in
-            # live_halt_episodes (db_schema.md) is written from this same
-            # transition: False → True INSERTs (ticker, date,
-            # halt_start=now, source), True → False sets halt_end=now on
-            # the open row. TICKER-scoped, so several positions on one
-            # ticker share one interval instead of each storing it, and
-            # source carries signal_source ('api' | 'tick_rate_fallback')
-            # so the evening comparison against trading_halts can tell the
-            # two apart. NEVER written into trading_halts itself.
-            last_halt_state[ticker] = is_halted
+            # live_halt_episodes and last_halt_state are NOT written here.
+            # The transition pass owns both: this loop reacts to an edge it
+            # was handed, and writing the record from two places is what
+            # let the episode record be narrower than the halt check's own
+            # domain. That record is TICKER-scoped, so several positions on
+            # one ticker share one interval instead of each storing it, and
+            # its source carries signal_source ('api' |
+            # 'tick_rate_fallback') so the evening comparison against
+            # trading_halts can tell the two apart. NEVER written into
+            # trading_halts itself.
         ```
 
     2. Exit decision for this position:
@@ -3198,10 +3491,28 @@ loop every position_check_interval_seconds (config, default: 5s):
            anchor    = position.exiting_since      # a TIME, never an index
            reference = last print strictly before anchor, from the 1-tick
                        buffer for this ticker
-           Each cycle, recompute STATELESSLY from the anchor (no cursor, no
-           residual counter — the window only grows, so an intermediate
-           answer is under-determined rather than wrong, and a warm restart
-           restores no state because the anchor is a durable column):
+           The RESOLUTION-CONDITION test runs INLINE on loop P each cycle:
+           session end reached, or `sell_rate` times the buffer's volume at
+           or after the anchor having reached `position.quantity`. That is
+           an aggregate over the buffer rather than a walk of it, and it is
+           an UPPER BOUND on what the scan can return — the scan sums
+           `floor(per_tick_vol * sell_rate)` (execution_common.md), which
+           cannot exceed it — so a full fill cannot be passed over by
+           testing this first.
+
+           The scan runs ONCE per position lifetime, on the cycle that test
+           first passes, and is offloaded to loop P's CALLER EXECUTOR
+           (Architecture's executor split): it walks every tick from the
+           anchor forward, and a walk of that size taken inline would stall
+           the loop the WS readers and this one share.
+
+           Recompute STATELESSLY from the anchor (no cursor, no residual
+           counter — the window only grows, so an intermediate answer is
+           under-determined rather than wrong, and a warm restart restores
+           no state because the anchor is a durable column). That is a
+           DURABILITY property, not a schedule: it is what makes the single
+           pass safe to repeat after a restart, and nothing in it asks for
+           the answer to be recomputed on cycles that cannot change it:
            weighted_avg_exit_price, filled, unfilled, _ = execution_common.simulate_exit_fill(
                ticks_exit=<1-tick buffer, anchor forward>,
                position_size=position.quantity,
@@ -3236,6 +3547,16 @@ loop every position_check_interval_seconds (config, default: 5s):
                order_id = submit order via trading API: quantity=`position.quantity`
                    - `cum_filled_qty so far`, order_type="limit",
                    limit_price=`ask - k * (ask - bid)` (execution_common.md)
+           in_flight_orders[order_id] = {ticker, side: 'exit',
+               submitted_at: now, limit_price,
+               requested_quantity: the quantity just submitted}
+           # limit_price is None in the market case. Registered on the same
+           # beat the entry side registers on (step 5c's accept branch),
+           # and for the same reason: the exit-side loop below iterates
+           # in_flight_orders, so an exit absent from it is an order no
+           # loop is tracking — its fills would be folded by nothing, and
+           # the settle pass that precedes Broker Reconcile would not
+           # reach it either.
            # Re-priced every position_check_interval_seconds cycle
            # thereafter while still outstanding (limit case only) — see
            # In-flight order tracking's exit-side loop below, which also
@@ -3595,7 +3916,10 @@ live_mode:
   retained in calc._session_stats
 - Inferencer is instantiated once per session with the DI FeatureExtractor
 - on_bar_close() called by LiveModeRunner for each ticker per bar — not by IndicatorCalculator
-- Position manager loop runs independently of watchdog polling loop
+- Position manager loop is independent of the watchdog polling loop in what
+  it decides; the two do not share an execution context either, the
+  position manager being a coroutine on loop P and the watchdog synchronous
+  on the main thread (Architecture)
 - The watchdog scan governs WHAT IS FETCHED and WHICH TICKER IS
   PRIORITISED — it never changes an entry's ELIGIBILITY. Eligibility
   remains the full A-G expression over a COMPLETED bar in every path:
@@ -3622,18 +3946,20 @@ live_mode:
 - The WATCHDOG LOOP's share of `live_scan_daily` is written once per session
   at shutdown, at the same layer as `bar_latency_daily`'s final flush
   (health_report.md's Shutdown Order and Drain) — scan depth histogram,
-  carryover, rotation visits/hits/misses, superset size, bar-close fetch
-  latency, the bar-close stage timings and promotions. These are the only
-  in-session evidence that N, M and the 5-second target hold, and
-  health_report.md's findings 30-32 read them
-- That list is this LOOP's share, NOT the table. `live_scan_daily` has three
-  other writers and none of them is here: `fill_page_rows_*` comes from the
+  carryover, rotation visits/hits/misses, superset size, scan-cycle
+  completion (`scan_cycle_ms_p50 | _p95` and `overrun_cycles`), bar-close
+  fetch latency, the bar-close stage timings and promotions. These are the
+  only in-session evidence that N, M, the 5-second target and the derived
+  ~850ms slack hold, and health_report.md's findings 30-32 and 35 read
+  them
+- That list is this LOOP's share, NOT the table. `live_scan_daily` has other
+  writers and none of them is here: `fill_page_rows_*` comes from the
   Position Manager Loop's fill inquiry, `late_entry_gate_pass`/`_reject`
-  from the late-entry path, and `gap_*` from `metadata_crawler.md`'s evening
-  detection-gap stage hours after this process has exited — which is why
-  finding 33 reports the previous day when called at session end. The
-  canonical key list is the schema comment in `db_schema.md`, not this
-  bullet
+  from the late-entry path, and `gap_*` and `halt_*` from
+  `metadata_crawler.md`'s evening detection-gap and halt-comparison stages,
+  hours after this process has exited — which is why finding 33 reports the
+  previous day when called at session end. The canonical key list is the
+  schema comment in `db_schema.md`, not this bullet
 - `live_halt_episodes` is written by the Position Manager Loop's halt check
   as intervals open and close, and any interval still OPEN at a clean
   shutdown is closed there, at the same layer as the `live_scan_daily`
