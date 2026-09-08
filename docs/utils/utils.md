@@ -800,9 +800,13 @@ def normalize_vendor_symbol(
     handle.
 
     BEST-EFFORT, NOT A GUARANTEE. A vendor may spell a security in a way no
-    rule here folds, and the residual mismatch is measured rather than
-    assumed away — health_report.md's per-source symbol-mismatch finding.
-    Callers treat a non-match as unmatched, never as a different security.
+    rule here folds. Where a caller has no manual path for the residue, that
+    residue is measured rather than assumed away — health_report.md's
+    per-source symbol-mismatch finding covers those callers. Where a caller
+    has one, the residue goes there instead: build_trading_api_symbol_map()'s
+    candidates log is worked off by manual registration, making it a backlog
+    rather than a rate to watch. Callers treat a non-match as unmatched,
+    never as a different security.
 
     Called by:
         - metadata_crawler.md's crawl_corporate_events_investing()
@@ -1535,9 +1539,13 @@ def query_halt_status(
     keeps an in-process snapshot, which is what this function reads.
 
     Takes no URL and no chunk size, and no config key backs it. The former
-    `trading_api_url` reuse went with that key; the feed URL and the poll
-    interval are the poller's keys, not this function's, because a
-    market-wide feed is fetched once per interval rather than per call.
+    `trading_api_url` reuse went with that key. The poll interval and the
+    freshness ceiling are the poller's config keys, not this function's,
+    because a market-wide feed is fetched once per interval rather than per
+    call. The feed URL is not a config key at all: it is stated in the
+    poller's Source paragraph, as every external source URL in this project
+    is. The poll floor is grounded in one named publisher's terms, and a
+    configurable URL would decouple the floor from what it bounds.
 
     Returns {ticker: is_halted} for every requested ticker. The source is a
     market-wide feed of OUTSTANDING halts, so a fresh snapshot is a complete
@@ -1599,7 +1607,7 @@ def record_health_event(
 
     Sole access point for health-event writes — no detection site mints its
     own identifier, for the same single-source-of-truth reason
-    `query_halt_status()` is the sole halt-status-endpoint access point.
+    `query_halt_status()` is the sole halt-status access point.
 
     `event_id` format: '{YYYYMMDD}_{HHMMSSmmm}_{4 random chars}' — the same
     date_time shape as `run_id` elsewhere, extended to millisecond precision
@@ -1812,9 +1820,11 @@ def stitch_ticks(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame
 - `resolve_xbrl_tag_value()`'s tag-priority list per metric lives in
   `configs/xbrl_tag_map.json`, not hardcoded in this function — adding a
   fallback tag for an existing metric is a config change, not a code change
-- `query_halt_status()` is the sole LIVE halt-status access point — neither
-  live_mode_runner.md nor metadata_crawler.md reads the live halt source
-  directly, for the same single-source-of-truth reason
+- `query_halt_status()` is the sole LIVE halt-status READ access point, and
+  live_mode_runner.md's Halt-Status Poller is the sole FETCH owner of that
+  source — one side reads a snapshot, the other holds the feed that fills
+  it, and no third site does either, for the same single-source-of-truth
+  reason
   `compute_tick_bar_aggregates()` is the sole IndicatorCalculator wrapper.
   It is NOT a trading-API endpoint: the dbsec catalogue has none, so this
   function sits outside trading_api.md's boundary entirely. The scope is
@@ -1823,6 +1833,8 @@ def stitch_ticks(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame
   filling `trading_halts` as a historical record, and the two staying
   separate is what lets the evening comparison read as two publishers
   rather than one source against itself
-- `query_halt_status()` returning `None` is a call failure, not "no tickers
-  halted" — callers must not conflate the two; conflating them would mean a
-  dead endpoint silently reads as "everything is fine"
+- `query_halt_status()` returning `None` is a failure to SERVE, not "no
+  tickers halted" — either the fetch failed or the snapshot sits past
+  `halt_snapshot_max_age_seconds`, and to a caller those are one case.
+  Callers must not conflate it with an empty result; conflating them would
+  mean a dead poller silently reads as "everything is fine"

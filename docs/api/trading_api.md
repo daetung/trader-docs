@@ -106,10 +106,12 @@ for the whole of a rate-limit wait or a retry backoff; it is bounded by the
 rate controller's concurrent in-flight ceiling. A separate CALLER EXECUTOR
 serves caller offload, reached through `run_in_executor(caller_pool, ...)`
 rather than `asyncio.to_thread`, which would land on the default pool; it is
-bounded by the shadow positions resolving in one cycle — both shadow fill
-simulations' tick scans are its consumers there, entry side and exit side
-(`live_mode_runner.md`). Loop A is not partitioned — the
-auxiliary stream is its only consumer.
+bounded by the shadow positions resolving in one cycle PLUS the halt-status
+poller's single task. Its consumers are both shadow fill simulations' tick
+scans, entry side and exit side, and that poller, whose concurrency is one
+by construction — its poll interval carries a 60-second floor
+(`live_mode_runner.md`). Loop A is not partitioned — the auxiliary stream is
+its only consumer.
 
 **How a caller reaches a method here.** This module's methods are coroutines,
 each scheduled on its own leg's loop. A caller that is a coroutine on loop P
@@ -328,8 +330,10 @@ cancellation threshold.
 
 **Two needs are NOT reachable here, and their absence is the finding.**
 Trading-halt status has no endpoint in the vendor's catalogue at all, so
-`utils.query_halt_status()` is not a call of this module and its source is
-tracked in `open_items.md`. A server-clock endpoint is likewise absent, which
+`utils.query_halt_status()` is not a call of this module. Its source is
+selected and owned elsewhere: `live_mode_runner.md`'s Halt-Status Poller
+holds the feed and the snapshot that function reads. A server-clock endpoint
+is likewise absent, which
 is what `api_contract_checklist.md` T-11 asks about; the nearest available
 substitute is the broker-stamped timestamp on every order and fill (below).
 

@@ -70,8 +70,10 @@ Its consumers here are BOTH shadow fill simulations' tick scans — the entry
 side in the Watchdog Polling Loop's submission path and the exit side in
 Position Manager Loop Step 3, each running its scan once per position
 lifetime — and the halt-status poller below. The pool is bounded by the
-shadow positions resolving in one cycle; the SDK's is bounded by the rate
-controller's concurrent in-flight ceiling. Loop A is not split — the
+shadow positions resolving in one cycle PLUS that poller's single task, its
+concurrency being one by construction: the poll interval carries a
+60-second floor. The SDK's is bounded by the rate controller's concurrent
+in-flight ceiling. Loop A is not split — the
 auxiliary stream is its only consumer.
 
 **Where each caller loop runs, and why it matters.**
@@ -3224,8 +3226,8 @@ loop every position_check_interval_seconds (config, default: 5s):
   entry_state='awaiting' is included, its filled shares already being a
   real position:
     1.  Halt check — position-scoped only, not applied to new-entry
-        candidates. API-primary, tick-rate fallback (see P-1's halt-status
-        endpoint integration — utils.query_halt_status()):
+        candidates. API-primary, tick-rate fallback (P-1's halt-status feed
+        integration, shipped — utils.query_halt_status()):
         # Was Step 1a. The former Step 1 (fetch bars entry → now) is GONE
         # with bars_since_entry, its only product. Steps 2-4 keep their
         # numbers, so nothing referring to them shifts; health_report.md's
@@ -3280,15 +3282,19 @@ loop every position_check_interval_seconds (config, default: 5s):
         before either loop below. Halt status, the episode record and
         last_halt_state are all TICKER-grain; deriving them per position
         would repeat one ticker's work per position on it and inflate
-        finding 8's denominator, which counts endpoint checks.
+        finding 8's denominator, which counts halt-feed checks.
         ```
         for ticker in <the bulk query's key set>:
-            if halt_status is not None and ticker in halt_status:
+            if halt_status is not None:
                 is_halted = halt_status[ticker]        # API authoritative
                 signal_source = "api"
+                # No presence test. The contract keys EVERY requested
+                # ticker, one absent from the feed included, and this loop
+                # walks the set that was requested (utils.md). A KeyError
+                # here would mean that contract broke, which is worth
+                # surfacing rather than reading quietly as not-halted.
             else:
-                # no snapshot, or this ticker missing from it —
-                # fall back to the tick-rate heuristic
+                # no fresh snapshot — fall back to the tick-rate heuristic
                 ticks_in_window = halt_tick_counts window sum for ticker
                     (Exit Architecture; filled by whichever tick path is
                      live for this ticker, WS or the REST backstop)
@@ -3843,10 +3849,20 @@ live_mode:
   # Halt detection (Position Manager Loop only — see is_tradable() in
   # execution_common.md for the separate, unrelated new-entry rename gate).
   # The dbsec vendor API publishes NO halt-status endpoint, so the primary
-  # signal cannot come from it; utils.query_halt_status()'s source is
-  # undecided and tracked in open_items.md, and it returns None until one is
-  # chosen. The two keys below configure the tick-rate FALLBACK, which is
-  # therefore the only specified path today.
+  # signal cannot come from it. It comes from the Nasdaq Trader trade-halt
+  # feed, which the Halt-Status Poller owns — that section carries the feed
+  # URL, why the poll interval is floored, and what
+  # utils.query_halt_status() serves from the snapshot. The first two keys
+  # below are the poller's; the last two configure the tick-rate FALLBACK,
+  # which is now one path of two rather than the only specified one.
+  halt_poll_interval_seconds:     60      # FLOORED AT 60 by the publisher's
+                                          # terms, not by tuning — a smaller
+                                          # value does not take effect
+  halt_snapshot_max_age_seconds:  180     # freshness ceiling, a multiple of
+                                          # the poll interval. Past it
+                                          # query_halt_status() returns None
+                                          # rather than serve a stale
+                                          # snapshot
   halt_check_window_seconds:      60
   halt_heuristic_tpm:             10      # ticks/min below this → halted, in
                                           # last_halt_state; not a live_positions value

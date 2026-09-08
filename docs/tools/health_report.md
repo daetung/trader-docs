@@ -149,9 +149,10 @@ def gather_findings(db_conn, today_date, log_dir,
        session_diagnostics is JSON and not a scalar column. Loss on a crash
        is bounded by one flush interval instead of the whole session. Unlike findings 6/7, this is NOT a placeholder — no
        pilot-stage accumulation is needed, since the signal is tagged on
-       every check from the day P-1's halt-status endpoint integration
-       ships. A high fallback rate means the halt-status endpoint is
-       degrading or down, not that the strategy itself is underperforming
+       every check from the day P-1's halt-status feed integration
+       shipped. A high fallback rate means the halt feed, or the poller that
+       reads it, is degrading or down, not that the strategy itself is
+       underperforming
        — this is an infrastructure-health signal, distinct in kind from
        findings 6/7. Threshold TBD (same deferral status as the rate
        itself always being computed and loggable, only the warn cutoff
@@ -179,9 +180,14 @@ def gather_findings(db_conn, today_date, log_dir,
        with each other for the same reason findings 6 and 7 stay separate.
     10. Residual symbol-mismatch rate, PER SOURCE — for each vendor source
         whose symbol strings are folded by utils.md's
-        normalize_vendor_symbol(), the fraction of that source's rows which
-        FAILED to match after folding, reported as one tally per source
-        rather than pooled. The sources are investing.com's calendar rows
+        normalize_vendor_symbol() AND whose residue has no manual
+        resolution path, the fraction of that source's rows which FAILED to
+        match after folding, reported as one tally per source rather than
+        pooled. That qualifier is what leaves out
+        metadata_crawler.md's build_trading_api_symbol_map(): its unmatched
+        rows go to a candidates log that manual registration works off, so
+        they are a backlog to clear rather than a rate to watch. The
+        sources are investing.com's calendar rows
         against active_ticker_universe (item N), and the halt feed's items
         against the held-ticker set (live_mode_runner.md's halt-status
         poller). A rising rate for a source signals symbology drift in that
@@ -1125,7 +1131,7 @@ alerting:
   no accumulation gate and is always computable from the current session's
   halt checks alone — only its warn threshold is undecided. It must not be
   merged with finding 6 or 7 either, for the same reason those two stay
-  separate from each other — a degraded halt-status endpoint, a model
+  separate from each other — a degraded halt feed, a model
   drift, and an execution-fill drift are three distinct failure modes with
   three distinct responses.
 - Date-scoped queries over `trade_log` use `exit_date`, not `date`, wherever

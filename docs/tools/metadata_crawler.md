@@ -380,9 +380,12 @@ def check_corporate_event_anomaly(
 
     This offline batch context has no live tick stream, so there is no
     tick-rate fallback available here the way live_mode_runner.md has one
-    for its own query_halt_status() call: if halt_status is None (total
-    fetch failure) or a ticker is absent from it, that ticker is treated
-    as NOT halted — the conservative direction. Suppressing a quarantine
+    for its own query_halt_status() call: if halt_status is None — no fresh
+    snapshot, the poller having produced none yet or holding one past its
+    freshness ceiling — every ticker in that call is treated as NOT halted,
+    the conservative direction. There is no per-ticker absence to handle
+    beside it: the contract keys every requested ticker. Suppressing a
+    quarantine
     because halt status is merely unresolved would be wrong: this
     function's whole premise is that a false-positive quarantine (cost:
     one ticker's trades for one day) is far cheaper than trading a
