@@ -2027,7 +2027,9 @@ CREATE TABLE IF NOT EXISTS exit_trigger_agreement_daily (
 -- samples by the tens of thousands, this records individual ABNORMAL events.
 -- Written ONLY through utils.record_health_event() — no detection site mints
 -- its own event_id and none writes this table directly, the same
--- single-access-point discipline utils.query_halt_status() has.
+-- single-access-point discipline utils.query_halt_status() has on the READ
+-- side of halt status (utils.md's Constraints, which assigns fetch
+-- ownership to live_mode_runner.md's poller).
 -- WHY: a finding that reports "N occurrences today" loses WHEN they occurred,
 -- and the when is frequently the diagnosis. It also makes an alert traceable
 -- back to the specific events it reported (see alert_log.event_ids below).

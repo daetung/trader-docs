@@ -1607,7 +1607,9 @@ def record_health_event(
 
     Sole access point for health-event writes — no detection site mints its
     own identifier, for the same single-source-of-truth reason
-    `query_halt_status()` is the sole halt-status access point.
+    `query_halt_status()` is the sole halt-status READ access point — the
+    verb differs, the discipline does not (see Constraints, which splits
+    that read access from the poller's fetch ownership).
 
     `event_id` format: '{YYYYMMDD}_{HHMMSSmmm}_{4 random chars}' — the same
     date_time shape as `run_id` elsewhere, extended to millisecond precision

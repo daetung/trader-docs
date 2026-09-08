@@ -3282,7 +3282,9 @@ loop every position_check_interval_seconds (config, default: 5s):
         before either loop below. Halt status, the episode record and
         last_halt_state are all TICKER-grain; deriving them per position
         would repeat one ticker's work per position on it and inflate
-        finding 8's denominator, which counts halt-feed checks.
+        finding 8's denominator, which counts one halt check per ticker
+        per cycle whatever source answered it — fallback-sourced checks
+        included.
         ```
         for ticker in <the bulk query's key set>:
             if halt_status is not None:
