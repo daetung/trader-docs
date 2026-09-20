@@ -205,7 +205,11 @@ def gather_findings(db_conn, today_date, log_dir,
     12. Unknown broker order/position at reconcile (R-2/R-3) — a broker
         open order or open position with no matching live_positions row at
         any Broker Reconcile call site (session start, warm restart, feed
-        outage). Should not occur under normal operation; a nonzero count
+        outage). On the order side this means an order this system never
+        submitted: since Broker Reconcile matches broker orders to
+        live_positions.order_id, a prior-session order of this system
+        matches its own row and is handled there rather than arriving
+        here. Should not occur under normal operation; a nonzero count
         points at a gap in the reconcile/adopt logic, not at strategy
         performance.
         Source (R-9): aggregated from health_events where
@@ -282,9 +286,15 @@ def gather_findings(db_conn, today_date, log_dir,
         regime that replaced the PDT rule in June 2026 a rejection count
         that rises with exposure is normal — without the reason there is
         nothing to separate that from a real fault.
-    18. Exit order still in flight (R-7) — exit orders whose in_flight age
-        exceeds live_mode.exit_order_stuck_minutes without completing, with the
-        (ticker, order_id, age, cum_filled_qty / quantity) detail. An exit
+    18. Exit order still in flight (R-7) — exit orders whose age exceeds
+        live_mode.exit_order_stuck_minutes without completing, with the
+        (ticker, order_id, age, cum_filled_qty / quantity) detail. The age
+        is the POSITION's exit-attempt age, measured from
+        live_positions.exiting_since, which survives a resubmission that
+        assigns a new order_id — a halt-clear resubmission, a stuck-timeout
+        escalation, or a cross-session carry whose exit is resubmitted by
+        the next session. An overnight_exit liquidation is therefore one of
+        this finding's cases, not an exception to it. An exit
         has no give-up timeout by design — an unsold remainder stays
         exposed to the very risk that triggered the exit — so on a thin
         name an order can in principle stay open indefinitely. The same

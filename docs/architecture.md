@@ -247,7 +247,8 @@ stock-scalping/
 │   ├── api/
 │   │   └── trading_api.py
 │   ├── utils/
-│   │   └── utils.py
+│   │   ├── utils.py
+│   │   └── execution_common.py
 │   └── visualization/
 │       └── viz_connector.py
 ├── scripts/
@@ -258,7 +259,8 @@ stock-scalping/
 │   ├── init_db.py
 │   ├── migrate_json_to_duckdb.py
 │   ├── collect_daily.py
-│   └── detection_benchmark.py
+│   ├── detection_benchmark.py
+│   └── health_report.py
 ├── api_doc/                       # vendor API documentation (markdown).
 │                                  #   External read-only reference, not a
 │                                  #   spec file — the source for the

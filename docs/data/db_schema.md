@@ -302,10 +302,10 @@ CREATE TABLE IF NOT EXISTS ticker_cik_map (
                                           -- input parameter, not parsed from the
                                           -- response. Source of whatever exchange
                                           -- prefix the trading API's own symbol
-                                          -- format requires at call time (exact
-                                          -- prefix mapping: TBD, pending the
-                                          -- normalization pass over the trading
-                                          -- API's symbol-format documentation).
+                                          -- format requires at call time; the
+                                          -- prefix mapping is owned by
+                                          -- trading_api.md's Symbol and Exchange
+                                          -- Encoding and is not restated here.
                                           -- NULL until matched.
     PRIMARY KEY (cik, ticker)
 );
@@ -570,13 +570,16 @@ CREATE TABLE IF NOT EXISTS corporate_events (
 --   no existing row               -> INSERT
 --   existing row, values agree    -> no-op (agreement needs no second row)
 --   existing row, values disagree -> corporate_events keeps the
---                                    investing.com value (the confirmed
---                                    tie-break: date-scoped same-day query,
---                                    treated as fresher), AND both values
---                                    are recorded in corporate_event_conflicts
---                                    below so the disagreement is fully
---                                    inspectable without endangering the
---                                    one-row invariant.
+--                                    investing.com value as a PROVISIONAL
+--                                    default, not a reasoned preference:
+--                                    which source is right once the effective
+--                                    date has passed is unobserved
+--                                    (api_contract_checklist.md I-3). Both
+--                                    values are recorded in
+--                                    corporate_event_conflicts below, which is
+--                                    the record that will settle it, and the
+--                                    disagreement stays fully inspectable
+--                                    without endangering the one-row invariant.
 -- Consequence: no reader needs tie-break logic, and none was added.
 
 -- Vendor disagreements for the same event (item N). Diagnostic only — no
@@ -649,7 +652,16 @@ CREATE TABLE IF NOT EXISTS labeled_samples (
 --                 >=0 = rolling inner fold index (0-based)
 -- outer_fold_idx: -1  = non-nested run (standalone, selection, full, non-nested exploitation)
 --                 >=0 = nested validation outer fold index (0-based)
--- fold_train_end: last date of train window ('YYYYMMDD'); NULL for standalone.
+-- fold_train_start, fold_train_end:
+--                 first and last date of the train window ('YYYYMMDD'); NULL for
+--                 standalone. The pair bounds the window so the EXPECTED trading
+--                 day count is derivable by joining trading_calendar, which is
+--                 why it is not stored.
+-- fold_train_days: trading days the train window ACTUALLY held, counted after the
+--                 embargo step. Not derivable — dates removed by the regime
+--                 holdout leave no record elsewhere. Diagnostic only: no fold is
+--                 skipped, rejected or reordered on it. session_mode filtering
+--                 precedes the count, so the value varies by trial.
 -- auc_std:        std of AUC across all folds in the same run or trial.
 --                 Pruned trials retain auc_std = NULL; is_pruned = TRUE on fold_run_ids[-1].
 -- phase:          "selection" | "exploitation" | "full" | NULL (standalone)
@@ -666,7 +678,10 @@ CREATE TABLE IF NOT EXISTS train_log (
     trial_idx           INTEGER      NOT NULL DEFAULT 0,
     fold_idx            INTEGER      NOT NULL DEFAULT -1,
     outer_fold_idx      INTEGER      NOT NULL DEFAULT -1,
+    fold_train_start    VARCHAR,                 -- 'YYYYMMDD'; NULL for standalone
     fold_train_end      VARCHAR,                 -- 'YYYYMMDD'; NULL for standalone
+    fold_train_days     INTEGER,                 -- realised trading days in the
+                                                 --   train window; NULL for standalone
     feature_config      VARCHAR      NOT NULL,
     n_features          INTEGER,
     n_features_reduced  INTEGER,
@@ -691,6 +706,10 @@ CREATE TABLE IF NOT EXISTS train_log (
 -- eval_type:       NULL              = standard backtest (standalone or non-nested exploitation)
 --                  "outer_validation"= nested validation outer fold evaluation
 --                  "regime_holdout"  = regime holdout robustness check
+--   The two are scored on DIFFERENT populations: "outer_validation" rows come
+--   from the volatility-truncated remainder the regime holdout leaves behind,
+--   "regime_holdout" rows from the excluded dates. Neither is an estimate over
+--   the whole distribution, and configuration selection runs on the former.
 -- fold_test_start, fold_test_end:
 --   Optimizer context: derived from fold_meta["fold_test_start/end"].
 --   Standalone mode:   derived from test_df["date"].min() and .max() (never NULL).
@@ -709,6 +728,11 @@ CREATE TABLE IF NOT EXISTS experiment_log (
                                                  -- "regime_holdout"
     fold_test_start      VARCHAR,                -- 'YYYYMMDD'
     fold_test_end        VARCHAR,                -- 'YYYYMMDD'
+    fold_test_days       INTEGER,                -- realised trading days in the test
+                                                 --   window, counted after the embargo
+                                                 --   step; expected count derivable by
+                                                 --   joining trading_calendar against
+                                                 --   the pair above. Diagnostic only.
     winning_rate         DOUBLE,
     total_trades         INTEGER,
     winning_trades       INTEGER,
@@ -1282,7 +1306,9 @@ CREATE TABLE IF NOT EXISTS live_positions (
     ticker       VARCHAR NOT NULL,
     date         VARCHAR NOT NULL,   -- 'YYYYMMDD'
     entry_bar    INTEGER NOT NULL,   -- HHMMSS, mirrors trade_log
-    order_id     VARCHAR NOT NULL,   -- trading-API order id (submission)
+    order_id     VARCHAR,            -- trading-API order id (submission).
+                                     --   NULL on shadow rows, which submit no
+                                     --   order.
     limit_price  DOUBLE,             -- NULL for market orders
     submitted_at VARCHAR NOT NULL,   -- 'YYYYMMDD_HHMMSS'
     signal       VARCHAR NOT NULL,   -- 'up5' | 'up3'
@@ -1305,7 +1331,10 @@ CREATE TABLE IF NOT EXISTS live_positions (
                                      --   abandoned remainder.
     exit_state   VARCHAR NOT NULL,   -- 'none' | 'submitted'. The 'none' ->
                                      --   'submitted' transition IS the
-                                     --   double-submission guard.
+                                     --   double-submission guard. Broker
+                                     --   Reconcile resets it to 'none' when it
+                                     --   cancels a carried row's broker-side
+                                     --   exit order — the only path back.
     exiting_since VARCHAR,           -- 'YYYYMMDD_HHMMSS' — set once, the FIRST
                                      --   instant exit_state becomes 'submitted';
                                      --   never overwritten thereafter, including
@@ -1316,7 +1345,14 @@ CREATE TABLE IF NOT EXISTS live_positions (
                                      --   new order_id. exit_order_stuck_minutes
                                      --   is measured against THIS column, not
                                      --   submitted_at, precisely so a resubmission
-                                     --   cannot reset the clock. NULL until the
+                                     --   cannot reset the clock. Broker
+                                     --   Reconcile's cross-session exit_state
+                                     --   reset does not touch it either: the
+                                     --   prior-day value is retained on purpose,
+                                     --   so a carried position's re-submitted
+                                     --   exit is measured from when the exit
+                                     --   attempt began rather than from today.
+                                     --   NULL until the
                                      --   first 'exiting' transition.
     fill_price   DOUBLE,             -- NULL until first fill; weighted average across
                                      --   partial fills once there is more than one
@@ -1395,6 +1431,9 @@ CREATE TABLE IF NOT EXISTS live_positions (
 --                execution.max_tickers / max_positions_per_ticker — while the
 --                order itself stays in flight awaiting the rest.)
 --   exit_state:  inserted 'none'; -> 'submitted', absorbing within the session.
+--                Across sessions it is NOT absorbing: Broker Reconcile owns the
+--                reset, setting it back to 'none' when it cancels a carried
+--                row's broker-side exit order (live_mode_runner.md).
 -- The former 'pending' / 'partial_open' distinction is not stored: under
 --   entry_state='awaiting', quantity IS NULL means nothing filled yet and
 --   quantity > 0 means partially filled. The two ways that state ends —

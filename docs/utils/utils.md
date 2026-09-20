@@ -1599,7 +1599,8 @@ def record_health_event(
     occurred_at: str,
     ticker: str | None,
     detail: dict,
-    write_fn: Callable[[str, tuple], None],
+    write_fn: Callable[[str, tuple], None],   # the contract live_mode_runner.md's
+                                              # db_write() owns; see below
 ) -> str:
     """
     Append one row to `health_events` (see db_schema.md) and return the
@@ -1620,8 +1621,12 @@ def record_health_event(
     Takes `write_fn`, NOT a `db_conn`. In a live session every write must go
     through LiveModeRunner's `db_write()` funnel (see live_mode_runner.md);
     a function handed a raw connection would bypass `write_lock`, which is
-    exactly the defect `persist_to_db()` carried until R-2 GAP-FIX 9. Offline
-    callers pass a direct wrapper.
+    exactly the defect `persist_to_db()` carried until R-2 GAP-FIX 9. The
+    contract is `Callable[[str, tuple], None]` and it is owned by
+    `db_write()` in live_mode_runner.md; this signature cites it rather than
+    declaring a second one. Offline callers pass `direct_write(db_conn)`,
+    the wrapper this module supplies for that purpose, which satisfies the
+    same contract.
 
     A write failure is caught here and never propagated — a diagnostic write
     must not abort trading (db_schema.md states this as a general principle

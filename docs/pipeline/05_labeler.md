@@ -406,6 +406,8 @@ labeler:
 | Neither ±3pp breached, last_bar(date) reached within execution.max_hold_bars bars | label_sw (session close exit) |
 | Neither ±3pp breached, execution.max_hold_bars valid bars collected before last_bar(date) | label_sw (time-limit exit, last valid bar close) |
 | Ambiguous bundle (both ±3pp in same bundle), priority="up" | label_up3/up5, is_ambiguous=True |
+| +3pp and +5pp in the SAME bundle | label_up3 — Stage 2 starts at exit_hour_1 with the Stage 1 breach bundle excluded, so the +5pp print in it is never scanned |
+| +3pp, +5pp and -3pp in the SAME bundle, priority="up" | label_up3, is_ambiguous=True — priority resolves direction, then the same bundle exclusion applies |
 | Dead position Case A (ticker in coverage, has_data=True next day) | is_dead_position=True, case="A", label by pnl threshold (dividend/split adjusted) |
 | Dead position Case B (ticker missing, has_data=True next day) | is_dead_position=True, case="B", pnl=-1.0, label_dn5 |
 | Dead position Case C (no next day with has_data=True) | is_dead_position=True, case="C", label_sw |

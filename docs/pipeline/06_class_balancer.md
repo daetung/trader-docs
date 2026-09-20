@@ -171,15 +171,25 @@ Rolling:
     where W=window_weeks, V=val_weeks, T=test_weeks, S=step_weeks
 
     Week boundaries are aligned to calendar weeks (Monday start).
-    Partial weeks at dataset boundaries are included if >= 3 trading days.
+    Partial weeks at DATASET BOUNDARIES are included if >= 3 trading days.
+    Interior weeks are not tested: a week thinned by the regime holdout still
+    counts as one week.
 
 Per fold:
     1. Apply session_mode filter (if session_mode is not None)
     2. Slice train/val/test by date ranges
-    3. Apply embargo gap (trading days)
+    3. Apply embargo gap (trading days) at each boundary the window has
     4. Apply pre-balance filters to train
     5. Apply downsampling to train if balance=True
-    6. Yield (train_balanced, val, test, fold_meta)
+    6. Count the trading days each split ACTUALLY holds, as of step 3, and
+       carry them in fold_meta — the train count reaches train_log as
+       fold_train_days, the test count reaches experiment_log as
+       fold_test_days (db_schema.md). Diagnostic only: no fold is skipped,
+       rejected or reordered on it. A count below three times that segment's
+       configured week count — window_weeks for train, val_weeks for val,
+       test_weeks for test — is degenerate; the comparison is against config
+       here, and no separate flag is stored.
+    7. Yield (train_balanced, val, test, fold_meta)
 
 fold_meta contents:
     fold_idx:        0-based integer index of this fold
@@ -200,7 +210,7 @@ Termination:
 
 **Recommended parameters for inner folds (10-month dataset, ~210 trading days):**
 ```
-window_weeks: 8    → ~40 trading days
+window_weeks: 8    → ~40 trading days (no holdout removing dates; see below)
 val_weeks:    2    → ~10 trading days
 test_weeks:   2    → ~10 trading days
 step_weeks:   2    → ~14–17 folds from 10-month data
@@ -210,7 +220,7 @@ max_folds:    4    → cap inner folds for nested validation efficiency
 
 **Recommended parameters for outer folds (nested validation):**
 ```
-window_weeks: 16   → ~80 trading days (consistent, recent history)
+window_weeks: 16   → ~80 trading days (consistent, recent history; see below)
 val_weeks:    0    → no val at outer level; val generated separately from outer_train
 test_weeks:   6    → ~30 trading days (enough trades for backtest evaluation)
 step_weeks:   6    → non-overlapping outer_test windows
@@ -254,7 +264,8 @@ class ClassBalancer:
         Order of operations:
           1. session_mode filter
           2. Sort by date, split by date boundaries
-          3. Apply embargo gap (trading days)
+          3. Apply embargo gap (trading days) at the train/val and val/test
+             boundaries
           4. Apply pre-balance filters to train (Case C, Case D, ambiguous)
           5. Apply downsampling to train if balance=True
 

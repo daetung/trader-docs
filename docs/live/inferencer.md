@@ -326,7 +326,8 @@ class Inferencer:
         feature_extractor: FeatureExtractor,   # DI: CachingIndicatorCalculator injected
         closes: dict[str, str],
         halt_accessor: Callable[[str, str], pd.DataFrame],
-        write_fn: Callable[[str, list], None],
+        write_fn: Callable[[str, tuple], None],   # contract owned by
+                                                  # live_mode_runner.md's db_write()
     ):
         """
         feature_extractor is injected with CachingIndicatorCalculator by LiveModeRunner.

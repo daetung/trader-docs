@@ -344,7 +344,10 @@ nightly file-level copy, scheduled in the quiescent window after the
 evening batch completes and before the next premarket batch begins —
 concretely, after `batch_runs` shows `stage='evening_session_stats',
 status='success'` for the day (see db_schema.md's DB File Ownership
-Windows, the single site of that design). Retention: N most recent
-nightly copies (N TBD) plus one longer-retained weekly snapshot. Recovery
+Windows, the single site of that design). Retention follows the posture the
+table purge registry takes: nightly copies and the weekly snapshot are kept
+without limit until an operator sets a window against observed disk growth,
+so nothing is deleted by default and the growth is the operator's to watch.
+Recovery
 is a plain file-copy restore of the single `.duckdb` file — no
 WAL/point-in-time replay involved.

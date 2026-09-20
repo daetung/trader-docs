@@ -135,14 +135,43 @@ tune around that floor.
 ```python
 def crawl_corporate_events_investing(date: str, db_conn) -> int:
     """
-    Scrapes investing.com's calendar for ALL of `date`'s splits and
-    dividends in a single page-load per type — unlike
+    Scrapes investing.com's calendars for splits and dividends — unlike
     crawl_corporate_events()'s per-ticker yfinance loop, there is no ticker
     iteration here.
 
-    Two scraped pages (separate endpoints, placeholders — see Config Keys):
-        SPLIT_CALENDAR_URL     = <TBD placeholder>
-        DIVIDEND_CALENDAR_URL  = <TBD placeholder>
+    Source: https://www.investing.com/stock-split-calendar/   (splits)
+            https://www.investing.com/dividends-calendar/     (dividends)
+    Neither is a config key: each page carries its own coverage assumption
+    (I-1), and a settable address would separate that assumption from the
+    page it was made about.
+
+    Each calendar is read at the scope that page serves, not at a uniform
+    one:
+        splits    — the page's default rolling range, taken as served, with
+                    every row in it processed. The page offers no
+                    forward-dated quick filter, and splits are rare enough
+                    that re-reading the range costs little.
+        dividends — Today and Tomorrow, each queried through the page's own
+                    filter; on the last session before a weekend, Next Week
+                    as well, so the next trading day is always covered.
+    The country filter is set explicitly on each read rather than relying on
+    the page's default state.
+
+    Row parsing, per page:
+        - A row after the first of a date group carries an EMPTY date cell;
+          the parser carries the group's date forward.
+        - The ticker is not a column. It is a bracketed label inside the
+          company cell, and extracting it is this crawler's job — it runs
+          ahead of normalize_vendor_symbol(), whose scope stays
+          case/separator/class-suffix folding.
+        - splits: the ratio string parses as a:b into
+          corporate_events.value = a / b, which puts 2:1 at 2.0 and 1:20 at
+          0.05, matching that column's share-multiplier convention.
+          event_type comes from the same parse — 'split' where a > b,
+          'reverse_split' where b > a.
+        - dividends: Ex-Dividend Date is event_date; Dividend is value, the
+          per-share cash amount 05_labeler.md's adjustment formula
+          subtracts. Payment Date, Yield and Type are not stored.
 
     Filters scraped rows to active_ticker_universe via query-time symbol
     normalization — utils.md's normalize_vendor_symbol(), which owns the
@@ -159,7 +188,10 @@ def crawl_corporate_events_investing(date: str, db_conn) -> int:
     live in that helper, so neither vendor's crawler can bypass them.
 
     Returns: number of rows newly inserted or updated in corporate_events
-    (a no-op agreement with an existing row is not counted).
+    (a no-op agreement with an existing row is not counted). The unit is
+    (ticker, event_date, event_type), so re-reading a date already stored
+    resolves as a no-op agreement rather than a re-insert, and a range read
+    repeated across days costs nothing it did not already cost.
     """
     ...
 ```
@@ -208,58 +240,14 @@ def upsert_corporate_event(
                churns `source` for no gain.
         existing row, values DISAGREE
             -> corporate_events keeps (or is updated to) the investing.com
-               value — the confirmed tie-break, since investing.com is a
-               date-scoped same-day query and treated as fresher — and BOTH
-               values are written to corporate_event_conflicts (db_schema.md)
-               so the disagreement survives for inspection.
-
-    Agreement tolerance: relative, config
-    `quarantine.corporate_event_value_tolerance` (placeholder default; the
-    right magnitude is unknown until real cross-vendor values are observed
-    — the two vendors are expected to differ in rounding, e.g. a dividend
-    of 0.25 vs 0.2500, which must count as agreement, while a genuine
-    0.25-vs-0.30 disagreement must not). Compared as
-    abs(a - b) <= tol * max(abs(a), abs(b)).
-
-    Returns True if corporate_events was inserted or updated, False on a
-    no-op agreement.
-    """
-    ...
-```
-
-Note that a conflict does NOT quarantine the ticker or block anything —
-one vendor being wrong about a dividend's third decimal is not grounds to
-stop trading it. The conflict row and its health_report finding are for a
-human to look at, and for judging whether the tolerance above is set
-sensibly once real data exists.
-
-### Shared Corporate-Event Write Path (item N)
-
-Both vendors' crawlers write through this one helper. Neither writes
-`corporate_events` directly — the one-row-per-event invariant that
-`cum_split_ratio()` depends on (see db_schema.md) is enforced here, in a
-single place, rather than trusted to each caller's choice of
-`INSERT OR IGNORE` / `INSERT OR REPLACE`.
-
-```python
-def upsert_corporate_event(
-    ticker: str, event_date: str, event_type: str,
-    value: float, source: str, db_conn,
-) -> bool:
-    """
-    Vendor-agnostic write path for corporate_events.
-
-        no existing row for (ticker, event_date, event_type)
-            -> INSERT this row (source recorded).
-        existing row, values AGREE within tolerance
-            -> no-op. Agreement needs no second row, and rewriting only
-               churns `source` for no gain.
-        existing row, values DISAGREE
-            -> corporate_events keeps (or is updated to) the investing.com
-               value — the confirmed tie-break, since investing.com is a
-               date-scoped same-day query and treated as fresher — and BOTH
-               values are written to corporate_event_conflicts (db_schema.md)
-               so the disagreement survives for inspection.
+               value. This is a PROVISIONAL default, not a reasoned
+               preference: which source is right once the effective date
+               has passed is unobserved (I-3). BOTH values are written to
+               corporate_event_conflicts (db_schema.md), which is the
+               record that will settle it — its (ticker, event_date,
+               event_type, other_source) key means a repeated read updates
+               one row rather than accumulating, and observed_at shows
+               whether a disagreement persists or resolves.
 
     Agreement tolerance: relative, config
     `quarantine.corporate_event_value_tolerance` (placeholder default; the

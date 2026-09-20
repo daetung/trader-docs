@@ -81,6 +81,7 @@ outranks a shaky one that degrades gracefully.
 | T-16 | ~~REST round-trip latency range~~ | ~~Prefix-scan slot allocation~~ | **RETIRED** | Nothing to verify — measured, then transcribed | — | **Retired** — 400-600ms recorded in `live_mode_runner.md`'s `scan:` keys; ongoing drift is `health_report.md`'s finding 32, not a checklist question |
 | T-17 | The watchdog list fires for every ticker that crosses conditions A-G, so a ticker becoming eligible always rises to the head | `live_mode_runner.md` prefix scan — the soundness of stopping where bar delta stops | **B** | Self-measuring — the `evening_detection_gap` stage runs `detect()` over the day's ingested bars and compares against `inference_log` | — (no key; the rotation cursor and the promotion path bound the gap rather than a value sizing it) | |
 | T-18 | `Mgnrt0` is INTRADAY-INVARIANT, so a rate acquired at watchdog first listing stands for the session | `live_mode_runner.md`'s Per-Ticker Trading Terms — acquisition once per ticker, and the rate pinned onto each `live_positions` row | **B** | Self-measuring at zero cost — the post-dispatch entry observation already calls `able-orderqty` and its response carries `Mgnrt0` beside `AstkOrdAbleQty`, so comparing it against the PERSISTED `live_ticker_terms` row needs no extra call. A mismatch raises the same warning. Comparing against the persisted row rather than an in-memory cache is what lets the measurement survive a crash and a warm restart, which is exactly when a rate change would be least visible | — (no key; a rate that moves needs a re-acquisition rule, not a value) | |
+| T-19 | Whether a resting order survives the session-close / after-hours boundary and stays live overnight, or is canceled by the venue at that boundary | `live_mode_runner.md`'s Session Shutdown cancellation, the in-flight exit loop's amend reasoning, and the vanished-order rule's venue-cancellation cause | **B** | Self-measuring — whether Broker Reconcile's Orders branch meets a prior-session exit order at the next session start answers it directly; a session that crashed without reaching Session Shutdown is the observation | — (no key; the answer settles which statements may assert, not a value) | |
 
 **T-3 is RETIRED, not verified.** Its premise was that a real-world
 throughput ceiling had to be measured because none was published. `api_doc/`
@@ -274,8 +275,9 @@ reading the other's result.
 
 | # | Assumption | Consumed by | Grade | How to verify | Config key | Measured |
 |---|---|---|---|---|---|---|
-| I-1 | Corporate-events calendar pages: exact endpoints, and scraping is permitted by the terms of service | `metadata_crawler.md` forward check | **C** | Read the ToS; confirm page structure | — | |
-| I-2 | Symbol format matches `active_ticker_universe` closely enough for naive matching | Forward-check row matching | **C** | Self-measuring — `health_report.md`'s investing.com match-rate finding | — | |
+| I-1 | Scraping the corporate-events calendar pages is permitted by the terms of service | `metadata_crawler.md` forward check | **C** | Read the ToS | — | |
+| I-2 | The crawler's symbol extraction from the calendar's company cell, followed by `normalize_vendor_symbol()` folding, reaches an acceptable match rate against `active_ticker_universe` | Forward-check row matching | **C** | Self-measuring — `health_report.md`'s investing.com match-rate finding | — | |
+| I-3 | Which vendor is right where investing.com and yfinance disagree about an event whose effective date has passed | `metadata_crawler.md`'s `upsert_corporate_event()` disagreement branch | **C** | Self-measuring — `corporate_event_conflicts` holds both values with `observed_at`, surfaced by `health_report.md` | — | |
 
 **I-2 is deliberately observable rather than solved.** Matching now applies
 query-time normalization (`metadata_crawler.md`'s

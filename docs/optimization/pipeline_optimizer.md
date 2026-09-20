@@ -148,7 +148,13 @@ full_labeled_df = preprocessor.run(return_data=True)
 
 selected_features = load_json(config["optimizer"]["selected_features_path"])
 
-# Regime holdout — remove high-volatility dates before any fold generation
+# Regime holdout — remove high-volatility dates before any fold generation.
+# Consequence worth stating: every outer and inner fold below is generated
+# from remaining_df, the volatility-truncated remainder, while the final
+# model is evaluated on holdout_df. Configuration selection therefore runs
+# on a different population from the final evaluation, and an
+# eval_type='outer_validation' score is not an estimate over the whole
+# distribution (db_schema.md's experiment_log).
 holdout_cfg   = config["optimizer"]["regime_holdout"]
 holdout_dates = utils.compute_vol_regime_holdout(
     db_conn,
@@ -198,7 +204,6 @@ effective_num_threads = max(
 )
 
 outer_best_configs   = []
-outer_scores         = []
 
 for outer_train_df, _, outer_test_df, outer_fold_meta in balancer.generate_folds(
     remaining_df,
@@ -374,7 +379,8 @@ for outer_train_df, _, outer_test_df, outer_fold_meta in balancer.generate_folds
             )
 
     outer_best_configs.append(best_config)
-    outer_scores.append(outer_summary["winning_rate"])
+    # each fold's winning_rate is already persisted as an
+    # eval_type='outer_validation' experiment_log row; no second copy here
 
 # --- Consensus config → final model ---
 consensus_config = utils.compute_consensus_config(
@@ -677,6 +683,13 @@ class PipelineOptimizer:
         """
         Query experiment_log for the config with highest winning_rate
         belonging to this optimizer_run_id.
+
+        NO AUTOMATIC CONSUMER: nothing in the pipeline calls this. The
+        deployed configuration comes from the consensus path above, which
+        ranks inner trials on AUC and never on winning_rate, and the live
+        run_id is supplied by config (inferencer.md). This is a query, and
+        a caller reading it should weigh total_trades itself — the ranking
+        applies no sample-size guard.
 
         UNCHANGED by execution_eval: this ranks MODEL configs and reads only
         rows with execution_variant IS NULL (the baseline pass of each outer

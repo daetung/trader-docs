@@ -14,6 +14,16 @@ the stateless IndicatorCalculator used in training.
 IndicatorCalculator remains stateless (training). CachingIndicatorCalculator
 adds state only via inheritance — the base class interface is preserved.
 
+**Same inputs, same values.** Caching changes what is recomputed, never what
+is computed: for one bar and one ticker this class returns what
+IndicatorCalculator returns. The one admitted divergence is the multi-day
+component of a tick-derived indicator declared `"session-only"`, whose live
+window is today's ticks by declaration — see 02_indicator_calculator.md's
+Live-mode windowing item, which owns that declaration and is the only place a
+divergence may be introduced. The entries listed as not cached below are not
+that exception: `sr_levels` is recomputed per entry point and `vwap` is
+session-scoped in training too, so both return base-class values.
+
 ---
 
 ## Class Structure

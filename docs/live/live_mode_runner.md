@@ -87,9 +87,10 @@ auxiliary stream is its only consumer.
   leg through loop A.
 - The **position manager loop** is a coroutine on loop P, alongside the WS
   readers. That is what makes the `exit_state` single-submission guard
-  sufficient without a lock: a WS price breach and the periodic exit
-  evaluation cannot preempt each other on one event loop, so the
-  read-then-write between them is not interleaved.
+  sufficient without a lock: a WS price breach, the periodic exit
+  evaluation, and Broker Reconcile — which writes `exit_state` when it
+  cancels a carried exit order — cannot preempt each other on one event
+  loop, so the read-then-write between them is not interleaved.
 
 Neither loop selects its own idiom for reaching a boundary thread; the
 caller's context does, and `trading_api.md`'s Async Boundary states which
@@ -129,7 +130,9 @@ write_lock = Lock()
                  # Premarket Recheck task's writes (R-1, see that section —
                  # same funnel, no second writer).
 
-def db_write(sql, params):
+def db_write(sql, params):   # contract: Callable[[str, tuple], None] —
+                             # THIS is where it is declared; utils.md and
+                             # inferencer.md cite it rather than restating it
     with write_lock:
         conn.execute(sql, params)
     # synchronous — returns only after commit. This is what makes
@@ -388,10 +391,13 @@ is trying to avoid, and the row is durable (R-2), so the next session
 adopts it rather than discovering an orphan.
 
 **In-flight exit orders are canceled at shutdown**, before the markers
-below. An order left resting after the process dies could fill overnight
-with nothing watching it, and the position's state would then be wrong at
-the next session's reconcile. Note this is a wider cancellation than Broker
-Reconcile's, which cancels pending ENTRY orders only.
+below. Whether an order left resting after the process dies survives the
+session-close boundary is unverified (api_contract_checklist.md T-19); the
+cancel does not depend on the answer, since either way the position's state
+would be wrong at the next session's reconcile. Broker Reconcile cancels a
+carried exit order too, but only at the next session start and only where
+nothing is tracking it — this cancel is what keeps the ordinary path from
+relying on that.
 
 LiveModeRunner's last action before process exit, after both loops have
 been signaled to stop and any final position/order state has settled:
@@ -1885,8 +1891,12 @@ other freeze reason rather than something this pinning introduces.
      'breaker_trip'   → blocks entry_submission only (Circuit Breaker, R-4)
    A gate blocks whenever ANY active reason covers its scope, so releasing
    one reason leaves the others in force. Watchdog Polling Loop step 5c.0
-   checks entry_submission; Position Manager Loop step 3 checks
-   exit_submission. Exit *evaluation* is never frozen — it keeps running
+   checks entry_submission; exit_submission is checked at the `exit_state`
+   transitions reached from ordinary evaluation — Exit Architecture's
+   confirmed-breach handling and Position Manager Loop step 3. The explicit
+   recovery paths, step 5 below and Warm Restart step 3c, transition outside
+   the gate; without that exemption the freeze would block the recovery it
+   depends on. Exit *evaluation* is never frozen — it keeps running
    and accumulating bars/ticks; only order *submission* is held.
 
 2. Reconnect: retry the trading API connection
@@ -1934,7 +1944,8 @@ other freeze reason rather than something this pinning introduces.
    identical question. NOT track_price_breach(), which is backtest-only as
    of R-2: the call named here was the stale side of that change, against
    two declarations in this file saying so. Any position whose exit condition
-   would have triggered *during* the gap: exit at market immediately (not
+   would have triggered *during* the gap — including a confirmed breach the
+   exit_submission gate discarded, which is why discarding it is safe: exit at market immediately (not
    at the historical breach point — that price is stale by now), logged
    with `exit_reason='feed_gap_exit'` (see db_schema.md's trade_log) so
    this trade is excluded from ordinary strategy PnL attribution — it
@@ -2023,19 +2034,38 @@ that never existed — PnL-excluded, the real fill discarded. The pass is a
 NO-OP wherever `in_flight_orders` holds no exit order, which is every cold
 start, since nothing has opened yet there.
 
-**Orders** (broker open entry orders):
-  - Match to `live_positions` rows with `lifecycle='live' AND
-    entry_state='awaiting' AND quantity IS NULL` by `order_id`.
-  - Cancel (unknown staleness — conservative); the matched row transitions
-    to `lifecycle='canceled'` via the single canceled-transition point (see
-    Position Manager Loop's "In-flight order tracking", R-2) — the same
-    idempotent path an
-    ordinary cancel-after-timeout uses, so re-running this step (e.g. a
-    re-crash mid-recovery) is safe and cannot double-log.
-  - A broker order with no matching row under lifecycle='live' AND
-    entry_state='awaiting' AND quantity IS NULL → record_health_event(
+**Orders** (broker open orders — ENTRY and EXIT):
+  - Match EVERY broker open order to `live_positions` rows with
+    `lifecycle='live'` by `order_id`. That column holds whichever order is
+    currently in flight for the row, so an exit order matches its own
+    position. `entry_state='awaiting' AND quantity IS NULL` is no longer the
+    match predicate; it is what distinguishes the ENTRY sub-case.
+  - ENTRY sub-case — unchanged: cancel (unknown staleness — conservative)
+    regardless of whether the order is tracked in `in_flight_orders`; the
+    matched row transitions to `lifecycle='canceled'` via the single
+    canceled-transition point (see Position Manager Loop's "In-flight order
+    tracking", R-2) — the same idempotent path an ordinary
+    cancel-after-timeout uses, so re-running this step (e.g. a re-crash
+    mid-recovery) is safe and cannot double-log.
+  - EXIT sub-case — cancel ONLY where the `order_id` is absent from
+    `in_flight_orders`. Present means a loop is already tracking it (warm
+    restart has rebuilt it, or the process never died), and cancelling it
+    would strand a live position. Absent means it outlived the session that
+    submitted it. The cancel is order-level ONLY: it does NOT pass through
+    the canceled-transition point, because the position is still held — the
+    row stays `lifecycle='live'`. The asymmetry with ENTRY is deliberate:
+    cancelling an entry order costs an opportunity, cancelling an exit order
+    would leave a position exposed with nothing tracking its exit.
+  - After that cancel, reset the row's `exit_state` to `'none'`
+    (db_schema.md). This is the cross-session reset that column's transition
+    comment presupposes; without it the double-submission guard blocks the
+    Unified Overnight Policy's liquidation and the position carries forward
+    again. `exiting_since` is NOT reset — see db_schema.md.
+  - A broker order matching no `lifecycle='live'` row at all →
+    record_health_event(
     finding_name='unknown_broker_order_or_position', detail={call_site,
     kind: 'order', order_id, ticker}) — see health_report.md finding 12.
+    On the order side this now means an order this system never submitted.
 
 **Positions** (broker open positions):
   - Match to `live_positions` rows (`lifecycle='live' AND quantity > 0`) —
@@ -2071,9 +2101,9 @@ start, since nothing has opened yet there.
     order or position found while `stage == "shadow"` is a genuine anomaly
     (a config error, or residue from a prior real session) and
     'unknown_broker_order_or_position' stays its correct outcome. Shadow
-    rows also carry no `order_id`, so the pending-order branch could never
+    rows also carry no `order_id`, so NO sub-case of the Orders branch can
     match them — stated here as intended rather than reached by a match
-    failure.
+    failure, and load-bearing now that `order_id` is the branch's match key.
 
 **Cold-start note:** at cold start nothing has opened today, so ANY broker
 position found is by definition an overnight orphan — it always routes to
@@ -2563,8 +2593,11 @@ it, so no ordering between them is specified:
     holds without depending on where WS-down or WS-up is judged. The cost
     is the one-tick delay this guard already prefers to a false trip.
 
-On a confirmed breach: set `exit_state='submitted'` atomically — THAT
-TRANSITION IS the double-submission guard — setting
+On a confirmed breach: if any active freeze reason covers `exit_submission`
+(Feed Outage Recovery step 1), DISCARD the breach together with its 2-print
+pending state and make no transition — step 5 re-derives it over the
+caught-up ticks before unfreezing. Otherwise set `exit_state='submitted'`
+atomically — THAT TRANSITION IS the double-submission guard — setting
 `live_positions.exiting_since = now` if it is
 not already set (db_schema.md — never overwritten once populated), and
 submit the sell (shadow: record hypothetical; order-type/pricing logic —
@@ -2643,8 +2676,9 @@ guarantees a single submission).
 **Concurrency.** WS readers and this periodic loop both run on production's
 event loop (loop P — see Architecture and the Async Boundary in
 trading_api.md), so position axis transitions serialize naturally; the
-`exit_state` transition is the single-submission guard where WS and the
-periodic loop could otherwise race (e.g. a simultaneous price breach and
+`exit_state` transition is the single-submission guard where WS, this
+periodic loop and Broker Reconcile — all writers of that column, all on
+loop P — could otherwise race (e.g. a simultaneous price breach and
 `session_close` — see R-3 for the tp/sl-wins ordering rule).
 
 **Config-driven, not hardcoded.** `execution.max_tickers` (the
@@ -2819,7 +2853,7 @@ counter adds another unmeasured threshold).
 placed order is tracked and never reads as a ghost. This is an OPERATOR
 CONVENTION and is unenforceable — the system cannot prevent an operator using
 the broker's own app, and the convention is likeliest to break during exactly
-the incident `health_report.md`'s finding 11 asks for manual intervention in.
+the incident `health_report.md`'s finding 28 asks for manual intervention in.
 At a 60-second threshold there is effectively no human-in-the-loop grace,
 which is what makes the convention load-bearing. A CLI route for it is an open
 item.
@@ -3040,7 +3074,10 @@ loop every position_check_interval_seconds (config, default: 5s):
         # The one bound is the process itself (R-9): at
         # the R-9 hard cap the order is canceled and the
         # position is handed to the next session's Broker Reconcile under
-        # the Unified Overnight Policy — see Session Shutdown. That is a
+        # the Unified Overnight Policy — see Session Shutdown. That handover
+        # carries the exit_state reset: Reconcile cancels the carried order
+        # and sets exit_state back to 'none', without which the liquidation
+        # could not be submitted. That is a
         # process-level cap, not a per-order give-up: nothing here abandons
         # an unfilled remainder while the session is still running.
         # Observability, not policy: an exit order open beyond a
@@ -3099,6 +3136,10 @@ loop every position_check_interval_seconds (config, default: 5s):
             # current k every cycle, and advanced by the ladder above once
             # past exit_order_stuck_minutes. This replaces the former
             # "amend to bid every cycle" rule.
+            # A carried position's re-submitted exit starts already past
+            # that threshold, since exiting_since dates from the prior
+            # session, so k advances from its first cycle rather than after
+            # a wait. That is intended — the exposure is a day old.
             bid, ask = REST orderbook query, this ticker's current level-1
                 (one call; both sides come back from it)
             target = ask - k * (ask - bid)     # execution_common.md
@@ -3135,9 +3176,10 @@ loop every position_check_interval_seconds (config, default: 5s):
             # to be read to know whether the market moved at all.
             # An order originally submitted as MARKET is assumed NOT
             # amendable into a limit (the vendor does not document whether
-            # its amend path permits an order-type change). It is expected
-            # to be cancelled by the venue at the after-hours boundary in
-            # any case, which the vanished-order rule below already covers.
+            # its amend path permits an order-type change). Whether the venue
+            # cancels it at the after-hours boundary is unverified
+            # (api_contract_checklist.md T-19); if it does, the
+            # vanished-order rule below already covers it.
 
         # Vanished-order rule — applies every cycle, not only at a halt
         # clear. If this order_id is absent from the OUTSTANDING call AND
@@ -3148,7 +3190,7 @@ loop every position_check_interval_seconds (config, default: 5s):
         # not a new exit.
         # One mechanism, four causes: cancellation during a halt
         # (api_contract_checklist.md T-12), cancellation by the venue at a
-        # session-phase boundary, a cancel-and-resubmit whose second step
+        # session-phase boundary (T-19), a cancel-and-resubmit whose second step
         # failed, and arbitrary broker cancellation.
         # DELIBERATELY ASYMMETRIC: absence from OUTSTANDING alone never
         # triggers a replacement. A replacement is irreversible and would
@@ -3256,8 +3298,9 @@ loop every position_check_interval_seconds (config, default: 5s):
             # required extension: an exit order implies exit_state
             # ='submitted', which implies a filled position, so its ticker
             # is already in open_positions — the settle pass that now
-            # precedes Broker Reconcile is what closes the one path that
-            # could strand an order past its row. Kept because the union
+            # precedes Broker Reconcile closes that path wherever
+            # in_flight_orders is populated; at cold start it is empty and
+            # the Orders branch owns the carried order instead. Kept because the union
             # deduplicates to the same set either way and costs nothing.
             # Deduplicated: a ticker already covered via open_positions is
             # not queried twice.
@@ -3475,7 +3518,12 @@ loop every position_check_interval_seconds (config, default: 5s):
        # submission either way, and sets
        # live_positions.exiting_since = now if not already set — the
        # time_limit/session_end paths reach exit_state='submitted' here
-       # rather than in Exit Architecture, so the same "first time only"
+       # rather than in Exit Architecture — and the exit_submission gate is
+       # checked HERE, at the transition, not at submission: a transition
+       # with no order behind it is the state Broker Reconcile exists to
+       # clean up. A wall-clock condition still holds after the unfreeze, so
+       # a blocked one simply fires on a later cycle. The Unified Overnight
+       # Policy's liquidation rides this path and is gated with it — so the same "first time only"
        # write applies at this transition too (db_schema.md).
 
     3. if config["live_mode"]["stage"] == "shadow":

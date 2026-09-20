@@ -408,7 +408,12 @@ This is a hard rule, not a default: the vendor exposes no idempotency key and
 `live_positions` writes its row at SUBMISSION time, so a
 submission that failed locally but landed server-side would produce an order
 the system does not track. Recovery for writes belongs to the paths that
-already exist — the vanished-order rule and Broker Reconcile.
+already exist, one per verb: a cancel that landed leaves a tracked order gone
+from OUTSTANDING and absent from FILLED, which the vanished-order rule
+resolves; a landed order that fills leaves a broker position with no row,
+which Broker Reconcile adopts; and a landed submission whose id never
+reached us is untracked from the start, which only the ghost-order rule
+reaches.
 
 **Session-phase order types stay in `execution_common.md`.** Concealment was
 never available: `check_funds_available()` and `simulate_entry_fill()` both

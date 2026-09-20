@@ -173,10 +173,10 @@ has enough history; revisit then, not before.
 ## `api_contract_checklist.md` — verify before Pilot
 
 Not a new design problem — a pointer, so it isn't lost among the items
-above. `docs/ops/api_contract_checklist.md` holds **21 rows, of which 16 are
+above. `docs/ops/api_contract_checklist.md` holds **23 rows, of which 18 are
 still unverified** assumptions, two of those graded **A** (T-1: REST/WS tick
 granularity; T-7: fill-event stream ID stability). The numbers reconcile as
-21 = 16 unverified + 1 measured (T-6) + 4 retired (T-3, T-14, T-15, T-16),
+23 = 18 unverified + 1 measured (T-6) + 4 retired (T-3, T-14, T-15, T-16),
 and the row count does not fall as questions are settled because that
 file's Role and Constraints forbid deleting rows — a broker change would
 make a settled question live again, and a deleted row would have to be

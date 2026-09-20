@@ -58,8 +58,15 @@ Statements are already written `CREATE TABLE IF NOT EXISTS` in `db_schema.md`,
 so idempotency is not something this tool decides or adds.
 
 **When `db_schema.md` changes, `SCHEMA_STATEMENTS` is re-transcribed from it.**
-Re-transcription has now been required SEVEN times. The most recent occasion
-added NO table — the count stays at 34 — but restructured `live_positions`:
+Re-transcription has now been required EIGHT times. The most recent occasion
+added NO table — the count stays at 34 — and is a DDL set decided together:
+`live_positions.order_id` dropped `NOT NULL`, `train_log` gained
+`fold_train_start` and `fold_train_days`, and `experiment_log` gained
+`fold_test_days`. Every part is class 2 — the nullability change is
+`ALTER COLUMN ... DROP NOT NULL`, the rest are `ADD COLUMN` — so hand-applied
+statements suffice and no rebuild is required.
+The occasion before it also
+added NO table — the count stayed at 34 — but restructured `live_positions`:
 `status` was RENAMED to `lifecycle` and redefined, and `entry_state`,
 `exit_state` and `exit_filled_quantity` were added. `feed_coverage_daily`
 gained `delayed_uncovered_seconds` in the same change. Every part of it is
@@ -200,6 +207,8 @@ init:   created 1 table, 33 already present     # after a new table was added
 verify: 34 tables checked, 0 differences
 verify: 34 tables checked, 1 difference
         live_positions: column 'entry_mgnrt' missing — ALTER needed
+verify: 34 tables checked, 1 difference          # a constraint, not a column
+        live_positions: column 'order_id' nullability differs — ALTER needed
 verify: 34 tables checked, 2 differences         # two columns, one table
         trading_calendar: column 'session_close' missing — ALTER needed
         trading_calendar: column 'after_hours_end' missing — ALTER needed
