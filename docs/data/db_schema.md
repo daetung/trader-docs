@@ -587,6 +587,12 @@ CREATE TABLE IF NOT EXISTS corporate_events (
 -- disagreed about this split/dividend" is a recoverable fact rather than
 -- something a blind overwrite silently discarded. Surfaced by
 -- health_report.md.
+-- A row where kept_source = other_source = 'investing' is a SAME-VENDOR
+-- revision: investing.com changed a past-dated row after reporting it.
+-- metadata_crawler.md's crawl_corporate_events_investing() records it
+-- instead of writing the past date to corporate_events. The PK's
+-- other_source term keeps it from colliding with a cross-vendor row for the
+-- same event.
 -- Retention: NEVER purged — structurally excluded from the purge registry
 --   (historical fact, not reconstructable).
 CREATE TABLE IF NOT EXISTS corporate_event_conflicts (

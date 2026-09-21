@@ -256,11 +256,15 @@ def gather_findings(db_conn, today_date, log_dir,
     16. Corporate-event vendor conflicts (item N) — rows added to
         corporate_event_conflicts (db_schema.md) since the last run, with
         the (ticker, event_date, event_type, both values, both sources)
-        detail. A conflict is not itself an error — the investing.com value
-        is kept per the confirmed tie-break and trading continues — but a
-        rising count, or a conflict on a large split ratio rather than a
-        dividend's trailing decimal, is worth a human look: it is the only
-        place the two vendors' disagreement is visible, and it is also the
+        detail. A row is one of two kinds: a CROSS-VENDOR disagreement, or a
+        SAME-VENDOR revision — kept_source and other_source both
+        'investing', meaning investing.com changed a past row it had
+        already reported. A conflict is not itself an error — the
+        investing.com value is kept as a provisional default and trading
+        continues — but a rising count, or a conflict on a large split
+        ratio rather than a dividend's trailing decimal, is worth a human
+        look: it is the only place either kind is visible, the evidence
+        api_contract_checklist.md's I-3 is measured by, and the
         practical evidence for whether
         quarantine.corporate_event_value_tolerance is set sensibly
         (see metadata_crawler.md's upsert_corporate_event()).

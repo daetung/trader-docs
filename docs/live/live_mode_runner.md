@@ -656,7 +656,7 @@ LiveModeRunner.start_session(today_date):
              #   quotes/halt fetch
              #   + check_corporate_event_anomaly (full universe, fresh)
              #   + yfinance narrow crawl for newly-quarantined tickers
-             #   + crawl_corporate_events_investing(today)   (item N)
+             #   + crawl_corporate_events_investing("this_week")   (item N)
              run_premarket_recheck_bundle()
              in_process_recheck_done_today = True   # suppresses the
                                                      # scheduled task's own
@@ -825,7 +825,7 @@ watchdog and 5s position loops are not stalled):
    # db_write() (the existing write_lock funnel; no new serialization
    # mechanism needed). batch_runs stage='premarket_quarantine_recheck'.
 
-3. crawl_corporate_events_investing(today, db_conn)   # item N bulk vendor
+3. crawl_corporate_events_investing("this_week", db_conn)   # item N bulk vendor
    # investing.com, unconditional every recheck. Writes via db_write().
 
 4. For any ticker whose quarantine_reason was NEWLY set in step 2, run a
@@ -1893,7 +1893,7 @@ other freeze reason rather than something this pinning introduces.
    one reason leaves the others in force. Watchdog Polling Loop step 5c.0
    checks entry_submission; exit_submission is checked at the `exit_state`
    transitions reached from ordinary evaluation — Exit Architecture's
-   confirmed-breach handling and Position Manager Loop step 3. The explicit
+   confirmed-breach handling and Position Manager Loop step 2. The explicit
    recovery paths, step 5 below and Warm Restart step 3c, transition outside
    the gate; without that exemption the freeze would block the recovery it
    depends on. Exit *evaluation* is never frozen — it keeps running
@@ -3518,13 +3518,14 @@ loop every position_check_interval_seconds (config, default: 5s):
        # submission either way, and sets
        # live_positions.exiting_since = now if not already set — the
        # time_limit/session_end paths reach exit_state='submitted' here
-       # rather than in Exit Architecture — and the exit_submission gate is
-       # checked HERE, at the transition, not at submission: a transition
-       # with no order behind it is the state Broker Reconcile exists to
-       # clean up. A wall-clock condition still holds after the unfreeze, so
-       # a blocked one simply fires on a later cycle. The Unified Overnight
-       # Policy's liquidation rides this path and is gated with it — so the same "first time only"
+       # rather than in Exit Architecture, so the same "first time only"
        # write applies at this transition too (db_schema.md).
+       # The exit_submission gate is checked HERE, at the transition, not at
+       # submission: a transition with no order behind it is the state
+       # Broker Reconcile exists to clean up. A wall-clock condition still
+       # holds after the unfreeze, so a blocked one simply fires on a later
+       # cycle. The Unified Overnight Policy's liquidation rides this path
+       # and is gated with it.
 
     3. if config["live_mode"]["stage"] == "shadow":
            # REAL-PATH-PARALLEL INCREMENTAL. simulate_exit_fill() consumes

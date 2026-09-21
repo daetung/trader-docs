@@ -1594,6 +1594,18 @@ def query_halt_status(
 ### Health Event Recording
 
 ```python
+def direct_write(db_conn) -> Callable[[str, tuple], None]:
+    """
+    The write_fn offline callers pass to record_health_event() and any other
+    function taking a write_fn. Returns a closure that runs
+    db_conn.execute(sql, params). Satisfies the contract live_mode_runner.md's
+    db_write() owns. No lock: an offline caller holds the DB alone within its
+    own ownership window (db_schema.md's DB File Ownership Windows), so
+    there is no concurrent writer to exclude.
+    """
+```
+
+```python
 def record_health_event(
     finding_name: str,
     occurred_at: str,

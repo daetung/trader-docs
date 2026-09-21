@@ -128,12 +128,12 @@ Notes:
 
 Price-gap detection (`check_corporate_event_anomaly()`, below) has a
 structural noise floor — a small dividend (~0.5% gap) cannot be separated
-from ordinary premarket noise by any threshold choice. A second, date-scoped
-vendor calendar sidesteps the price signal entirely instead of trying to
-tune around that floor.
+from ordinary premarket noise by any threshold choice. A second vendor's
+calendar sidesteps the price signal entirely instead of trying to tune
+around that floor.
 
 ```python
-def crawl_corporate_events_investing(date: str, db_conn) -> int:
+def crawl_corporate_events_investing(dividends_filter: str, db_conn) -> int:
     """
     Scrapes investing.com's calendars for splits and dividends — unlike
     crawl_corporate_events()'s per-ticker yfinance loop, there is no ticker
@@ -141,19 +141,30 @@ def crawl_corporate_events_investing(date: str, db_conn) -> int:
 
     Source: https://www.investing.com/stock-split-calendar/   (splits)
             https://www.investing.com/dividends-calendar/     (dividends)
-    Neither is a config key: each page carries its own coverage assumption
-    (I-1), and a settable address would separate that assumption from the
-    page it was made about.
+    Neither is a config key: each page carries its own coverage assumption,
+    and a settable address would separate that assumption from the page it
+    was made about.
 
     Each calendar is read at the scope that page serves, not at a uniform
     one:
-        splits    — the page's default rolling range, taken as served, with
-                    every row in it processed. The page offers no
-                    forward-dated quick filter, and splits are rare enough
-                    that re-reading the range costs little.
-        dividends — Today and Tomorrow, each queried through the page's own
-                    filter; on the last session before a weekend, Next Week
-                    as well, so the next trading day is always covered.
+        splits    — the page's default rolling range, taken as served. The
+                    page offers no forward-dated quick filter.
+        dividends — the page's own week filter named by `dividends_filter`,
+                    'this_week' or 'next_week'. The caller picks it: a
+                    week filter tolerates a vendor clock a day off from ET,
+                    which a day filter would not.
+    WRITE RULE, both pages: a row is written to corporate_events only where
+    its event_date is today or later in ET. The vendor may revise a past row
+    to its confirmed value, so a re-read is not assumed idempotent. A row
+    dated before today leaves corporate_events untouched — a past event this
+    vendor never reported is not inserted either; yfinance covers the past.
+    Where such a row's value differs from the stored one beyond
+    quarantine.corporate_event_value_tolerance, the difference goes to
+    corporate_event_conflicts as a SAME-VENDOR revision — kept_source and
+    other_source both 'investing' — so the vendor's revisions are observed
+    without being adopted. This rule lives here, not in
+    upsert_corporate_event(): that helper also serves yfinance, whose rows
+    are all past-dated by nature.
     The country filter is set explicitly on each read rather than relying on
     the page's default state.
 
@@ -189,9 +200,8 @@ def crawl_corporate_events_investing(date: str, db_conn) -> int:
 
     Returns: number of rows newly inserted or updated in corporate_events
     (a no-op agreement with an existing row is not counted). The unit is
-    (ticker, event_date, event_type), so re-reading a date already stored
-    resolves as a no-op agreement rather than a re-insert, and a range read
-    repeated across days costs nothing it did not already cost.
+    (ticker, event_date, event_type). Rows dated before today are never
+    counted — they are not written, only compared (see WRITE RULE above).
     """
     ...
 ```
@@ -246,8 +256,10 @@ def upsert_corporate_event(
                corporate_event_conflicts (db_schema.md), which is the
                record that will settle it — its (ticker, event_date,
                event_type, other_source) key means a repeated read updates
-               one row rather than accumulating, and observed_at shows
-               whether a disagreement persists or resolves.
+               one row rather than accumulating. observed_at records when a
+               disagreement was last seen; the investing.com side is not
+               re-written after its event date, so a disagreement resolves
+               only through a yfinance revision.
 
     Agreement tolerance: relative, config
     `quarantine.corporate_event_value_tolerance` (placeholder default; the
@@ -294,7 +306,7 @@ Schedule" below for why they differ:
            crawl_corporate_events(ticker, db_conn)            # yfinance — dominant cost
                                                              # writes batch_runs
                                                              #   stage='premarket_corporate_events'
-    3b. crawl_corporate_events_investing(today, db_conn)     # item N: investing.com
+    3b. crawl_corporate_events_investing("this_week", db_conn) # item N: investing.com
                                                              # bulk (own db_conn — no
                                                              # LiveModeRunner running
                                                              # yet, no write-serialization
@@ -311,7 +323,7 @@ only, cannot open the DB read-write during a live session):
                                                              #   no chunk size
                                                              #   (utils.md)
        # sequential — same function, same reasoning as above
-    2. crawl_corporate_events_investing(today, db_conn)      # item N: yes, this
+    2. crawl_corporate_events_investing("this_week", db_conn)  # item N: yes, this
                                                              # pass DOES refresh
                                                              # corporate_events now
                                                              # (contrast the old
@@ -547,13 +559,16 @@ populate_precomputed_session_stats(
 
 ## Evening Forward-Looking Corporate-Events Check (item N)
 
-After Session Stats Update, query investing.com's calendar for the NEXT
-trading day — investing.com is forward-looking (scheduled events are shown
-ahead of their effective date), unlike yfinance's `crawl_corporate_events()`
-which only reflects events already recorded as having happened.
+After Session Stats Update, read investing.com's calendars again so the NEXT
+trading day is covered — investing.com is forward-looking (scheduled events
+are shown ahead of their effective date), unlike yfinance's
+`crawl_corporate_events()` which only reflects events already recorded as
+having happened. The dividends week filter is chosen from next_trading_day,
+which covers a weekend and a mid-week market holiday by one rule:
 
 ```python
-crawl_corporate_events_investing(next_trading_day, db_conn)
+week = "this_week" if same_week(next_trading_day, today) else "next_week"
+crawl_corporate_events_investing(week, db_conn)
 ```
 
 Does NOT affect tonight's `precomputed_session_stats` — those are past-date
@@ -1188,7 +1203,7 @@ are always before-market-open by convention (see `db_schema.md`
 `corporate_events`), but *when a vendor's own data reflects that event* is
 outside this tool's control. The 04:00 pass now queries BOTH yfinance
 (`crawl_corporate_events()`, per-ticker) AND investing.com
-(`crawl_corporate_events_investing()`, single date-scoped bulk query) —
+(`crawl_corporate_events_investing()`, splits range plus a dividends week) —
 either catching an event the other missed closes that gap immediately,
 since both run before Eager Pool consumes `corporate_events`. This is
 meaningfully stronger than the single-vendor case, but not a guarantee: a
