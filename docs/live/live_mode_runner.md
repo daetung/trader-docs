@@ -2174,32 +2174,17 @@ so a re-crash during recovery re-enters warm restart on the same signature.
 
 ```
 1. Rebuild `in_flight_orders`, run the in-flight exit settle pass, then
-   Broker Reconcile (shared procedure — see R-3's "Broker Reconcile" for
-   the fully general form; the behaviors relevant at this call site). That
+   Broker Reconcile (shared procedure — see R-3's "Broker Reconcile"). That
    internal order is load-bearing: `in_flight_orders` does not survive the
    crash and is rebuilt from `live_positions` (Position Manager Loop's
    "In-flight order tracking"), the settle pass reads what the rebuild
    produces, and the reconcile must see the settled state rather than rows
    whose exit filled while the process was down. The pass sits INSIDE this
    step rather than becoming a step ahead of it, so the numbering this
-   procedure is cited by elsewhere is unchanged:
-     - Open entry orders (broker): match to live_positions rows with
-       lifecycle='live' AND entry_state='awaiting' AND quantity IS NULL by
-       order_id. Cancel all such orders (unknown
-       staleness — conservative); each matched row transitions to
-       lifecycle='canceled' via the single canceled-transition point (see
-       Position Manager Loop's "In-flight order tracking") — same idempotent
-       path an ordinary expiry
-       uses, so re-running this step is safe. A broker order with no
-       matching row under lifecycle='live' AND entry_state='awaiting' AND
-       quantity IS NULL -> "unknown broker order" health_report finding.
-     - Open positions (broker): match to live_positions rows
-       (lifecycle='live' AND quantity > 0). A broker position with no
-       matching row -> adopt conservatively and liquidate immediately
-       (entry time unknown), the held quantity read from the broker rather
-       than from the row. A row with quantity > 0 but no broker position ->
-       reconcile_ghost (see R-3). Prior-trading-day positions -> overnight
-       policy (R-3).
+   procedure is cited by elsewhere is unchanged.
+   The reconcile's Orders and Positions branches are R-3's and are not
+   restated here, so there is one site to keep correct; this step owns
+   only the call order above.
 
 2. Restore session_start_cash from live_session_state (NOT re-queried —
    see Session Lifecycle Step 1c). Per-ticker trading terms are NOT
