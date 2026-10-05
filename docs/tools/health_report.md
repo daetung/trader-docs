@@ -235,7 +235,7 @@ def gather_findings(db_conn, today_date, log_dir,
         'feed_outage' | 'position_manager' — the last at the event-day exit
         gate's release), kind ('order' | 'position' | 'shortfall'), ticker,
         and for kind='order' order_date and order_id (the broker order
-        number), so the three call sites stay distinguishable and each
+        number), so each call_site value stays distinguishable and each
         occurrence keeps its own time.
     Findings 13 and 15 stay on their existing `trade_log` queries rather than
     moving to `health_events` with the other event-shaped findings (R-9).
@@ -762,7 +762,7 @@ A read-only summary emitted once at each FIRST-DB-ACCESS point: live session
 start, evening batch start, and premarket batch start. It reports:
 
 - the `data/market.duckdb` file size
-- row counts for the twenty-one purge-registry tables (see db_schema.md) and for
+- row counts for every `PURGE_REGISTRY` member (metadata_crawler.md) and for
   the structurally-excluded corpus tables
 - the latest `date` value present in each
 

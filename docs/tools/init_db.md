@@ -84,6 +84,8 @@ together, moving the table count 34 -> 40:
   NOT NULL`.
 - `live_orders` carries `reference_price` / `reference_at` and the
   `predicted_*` columns from creation; nothing to alter.
+- `experiment_log` (class 2): `execution_variant VARCHAR` is added — a
+  nullable column, added by `ADD COLUMN` alone.
 
 The occasion before it added NO table — the count stayed at 34 — and was a
 DDL set decided together:

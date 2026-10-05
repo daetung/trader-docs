@@ -182,14 +182,17 @@ has enough history; revisit then, not before.
 ## `api_contract_checklist.md` — verify before Pilot
 
 Not a new design problem — a pointer, so it isn't lost among the items
-above. `docs/ops/api_contract_checklist.md` holds **37 rows, of which 30 are
-still unverified** assumptions, with these graded **A** (T-1: REST/WS tick
-granularity; T-21: each execution reported under exactly one order number;
-T-25: `AstkExecBaseQty` reflecting same-day executions immediately). The
-numbers reconcile as 37 = 30 unverified + 1 measured (T-6) + 6 retired (T-3,
-T-7, T-8, T-14, T-15, T-16), and the row count does not fall as questions are
-settled because that
-file's Role and Constraints forbid deleting rows — a broker change would
+above. `docs/ops/api_contract_checklist.md` holds the broker-behaviour
+assumptions the specs rest on, among them:
+
+- unverified and graded **A**: T-1 (REST/WS tick granularity), T-21 (each
+  execution reported under exactly one order number), T-25
+  (`AstkExecBaseQty` reflecting same-day executions immediately)
+- measured: T-6
+- retired: T-3, T-7, T-8, T-14, T-15, T-16
+
+Rows are not removed as questions are settled, because that file's Role
+and Constraints forbid deleting rows — a broker change would
 make a settled question live again, and a deleted row would have to be
 rediscovered. T-1, T-21 and T-25 are the only A-graded rows, and each must be
 verified, or its fallback path confirmed sufficient, before Stage 2
@@ -223,13 +226,12 @@ non-existent account-level endpoint to the per-ticker one; and T-11's
 server-clock question answered negatively — no such endpoint is published,
 and the nearest substitute is the broker-stamped timestamp carried on every
 order and fill. Several rows remain answerable from vendor documentation
-alone rather than from a live exercise — the fill inquiry's paging behaviour
-and its itemised mode bear on T-7 and T-8. T-1 acquired a METHOD this
-session (the delayed stream carries the complete tape and is the instrument
-for comparing against the live one, which `auxiliary_stream.md` builds) but
-having a method is not having a result: it stays grade A and stays a Pilot
-precondition. Which of the rest are answerable at a desk has not been sorted
-through.
+alone rather than from a live exercise — the fill inquiry's itemised mode
+bears on T-21. T-1 acquired a METHOD this session (the delayed stream
+carries the complete tape and is the instrument for comparing against the
+live one, which `auxiliary_stream.md` builds) but having a method is not
+having a result: it stays grade A and stays a Pilot precondition. Which of
+the rest are answerable at a desk has not been sorted through.
 
 ---
 

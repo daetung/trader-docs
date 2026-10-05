@@ -252,6 +252,7 @@ Six things the table settles that prose had left ambiguous:
                         multiprice 4  stock-ticker 4
   trading/ (does not)   order 10      transaction-history 2
                         balance-margin 3   able-orderqty 2
+                        trade-history 2    trading-history 2
 ```
 
   The watchdog scan's slot allocation is written against the doubled

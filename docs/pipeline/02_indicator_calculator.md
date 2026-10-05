@@ -380,7 +380,7 @@ rel_dvol(bars, date, n_sessions, session_mode, session_stats)
       (prior N sessions avg cumulative dollar volume at hour T; precomputed and stored in DB)
     → output column: rel_dvol
 
-gap_percentile(bars, date, n_sessions, session_stats, dividend_amount=0.0)
+gap_percentile(bars, date, n_sessions, session_stats, dividend_amount)
     → Today's gap = (today_regular_open - adjusted_prev_close) / adjusted_prev_close
       today_regular_open = open price of 093000 bar
       prev_close = close price of previous date's last_bar(previous date)
@@ -668,7 +668,10 @@ class IndicatorCalculator:
     def gap_percentile(
         self, bars: pd.DataFrame, date: str,
         n_sessions: int, session_stats: dict,
-        dividend_amount: float = 0.0,   # ex-dividend cash amount for (ticker, date); 0.0 if none
+        dividend_amount: float,         # ex-dividend cash amount for (ticker, date); 0.0 if none.
+                                        # No default: an omitted value would silently drop the
+                                        # correction (as caching_calculator.md's
+                                        # on_regular_session_open())
     ) -> float: ...
 
     def intraday_seasonality(

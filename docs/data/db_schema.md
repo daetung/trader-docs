@@ -755,6 +755,12 @@ CREATE TABLE IF NOT EXISTS experiment_log (
     outer_fold_idx       INTEGER      NOT NULL DEFAULT -1,
     eval_type            VARCHAR,                -- NULL | "outer_validation" |
                                                  -- "regime_holdout"
+    execution_variant    VARCHAR,                -- NULL for the baseline pass;
+                                                 --   otherwise the JSON of the
+                                                 --   execution-key overrides this
+                                                 --   run applied. An identifier
+                                                 --   column, outside the metric 1:1
+                                                 --   rule (run_backtest.md)
     fold_test_start      VARCHAR,                -- 'YYYYMMDD'
     fold_test_end        VARCHAR,                -- 'YYYYMMDD'
     fold_test_days       INTEGER,                -- realised trading days in the test
