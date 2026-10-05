@@ -545,7 +545,9 @@ CREATE TABLE IF NOT EXISTS corporate_events (
     ticker      VARCHAR NOT NULL,
     event_date  VARCHAR NOT NULL,   -- 'YYYYMMDD' (effective date, before market open)
     event_type  VARCHAR NOT NULL,   -- 'split' | 'reverse_split' | 'dividend'
-    value       DOUBLE  NOT NULL,   -- split/reverse_split: ratio (>1.0 or <1.0)
+    value       DOUBLE  NOT NULL,   -- stays DOUBLE, outside the deferred type
+                                    -- conversion (utils.md's split-ratio rule)
+                                    -- split/reverse_split: ratio (>1.0 or <1.0)
                                     -- dividend: per-share cash amount (USD, >0),
                                     -- read ONLY through utils.md's
                                     -- dividend_gross_amount() or its frame
@@ -979,11 +981,12 @@ CREATE TABLE IF NOT EXISTS trade_log (
                                         --     whatever its terminal_cause
                                         --     (live_mode_runner.md); a real
                                         --     observation, not omitted from the table.
-                                        --     The rows whose entry logical order ended
-                                        --     terminal_cause='timeout' are the direct
-                                        --     signal for buy_rate/cancel_after_seconds
-                                        --     being too tight and are the ones
-                                        --     fit_execution_params() reads
+                                        --     fit_execution_params() reads every row
+                                        --     for buy_rate — an entry that ended early
+                                        --     read on the window it actually had — and,
+                                        --     for cancel_after_seconds, only the rows
+                                        --     whose entry logical order ended
+                                        --     terminal_cause='timeout'
                                         --     (shadow_retraining.md).
                                         --   'entry_rejected' (R-7, LIVE-ONLY) — the
                                         --     broker or the account refused the
@@ -1094,7 +1097,9 @@ CREATE TABLE IF NOT EXISTS trade_log (
                                         -- run counterfactually against the same tick
                                         -- data as the real fill above, AT EXIT
                                         -- COMPLETION rather than at session end
-                                        -- (see shadow_retraining.md Stage 2). NULL for
+                                        -- (see shadow_retraining.md Stage 2); an entry
+                                        -- that ended early is simulated on the window
+                                        -- it actually had (shadow_retraining.md). NULL for
                                         -- backtest/shadow rows (no "real" counterpart
                                         -- to predict against) and for scale-stage rows.
                                         -- The former session-end timing existed because
@@ -1111,7 +1116,7 @@ CREATE TABLE IF NOT EXISTS trade_log (
     predicted_partial_fills_count     INTEGER, -- same, exit side — diagnostic
                                         -- counterpart to partial_fills_count above.
                                         -- A position carried with an exit logical
-                                        -- order takes all three predicted_* from
+                                        -- order takes its predicted_* from
                                         -- that order (live_orders), stored at
                                         -- Session Shutdown, ÷ the split factor from
                                         -- its first request's order_date to the
@@ -2444,9 +2449,9 @@ CREATE TABLE IF NOT EXISTS exit_trigger_agreement_daily (
 -- back to the specific events it reported (see alert_log.event_ids below).
 -- Retention: purge-registry member — date_column `date`, retention_days: inf
 -- (see metadata_crawler.md's evening purge stage). Of the tables here this is
--- the one whose growth rate can actually matter: R-9 widened its writers from
--- one finding to six, finding 29 made seven, and findings 36-44
--- (health_report.md) have since made sixteen; findings 18 and
+-- the one whose growth rate can actually matter: its writers are every
+-- health_report.md finding whose Source is health_events, a set R-9 opened
+-- and later findings keep widening; findings 18 and
 -- 24 both emit repeatedly during a broker-latency episode. Its purpose — WHEN an occurrence happened, and
 -- alert traceability via alert_log.event_ids — is short-horizon, so a window is
 -- legitimate here once growth has been observed. The DB health observation

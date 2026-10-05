@@ -1751,10 +1751,12 @@ in `live_order_requests`, `live_fills`, `live_orders`, `live_positions`,
 - **Multiplication in DuckDB:** one operand is widened to `DECIMAL(38,6)`
   first — `DECIMAL(18,6) × DECIMAL(18,6)` is `DECIMAL(18,12)` and overflows
   above six integer digits.
-- **Division:** in Python `Decimal`, then rounded; no ledger value is divided
-  in DuckDB, where `DECIMAL ÷ DECIMAL` returns `DOUBLE`.
-- **Split ratio:** `corporate_events.value` stays `DOUBLE`; value × ratio is
-  taken in `DOUBLE` and the product rounded; the ratio itself is not rounded.
+- **Division:** in Python `Decimal`, then rounded (a split ratio excepted —
+  below); no ledger value is divided in DuckDB, where `DECIMAL ÷ DECIMAL`
+  returns `DOUBLE`.
+- **Split ratio:** `corporate_events.value` stays `DOUBLE`; value × ratio and
+  value ÷ ratio are taken in `DOUBLE` and the result rounded; the ratio
+  itself is not rounded and never enters `Decimal` arithmetic on its own.
 - **Scope:** until the deferred type conversion (open_items.md), the existing
   columns of `live_order_requests`, `live_fills`, `live_orders` and
   `live_positions` keep their current types.
@@ -1771,7 +1773,8 @@ entering `Decimal` arithmetic, a vendor value or not. The rest:
   price and `predicted_*` columns) converts the rounded `Decimal` at the
   write; V6's 'number' format.
 - **V4 — DB write:** `DECIMAL` columns are bound with `Decimal`; a float bind
-  is allowed only for the split-ratio products above.
+  is allowed only for the split-ratio results above (value × ratio and
+  value ÷ ratio).
 - **V5 — DB read:** a path reading ledger or accounting values is admissible
   only when a contract test asserts that `DECIMAL` columns arrive as
   `Decimal`; `fetchall()` is such a path; `.df()` serves analysis and report

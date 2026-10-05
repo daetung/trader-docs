@@ -137,10 +137,12 @@ def gather_findings(db_conn, today_date, log_dir,
        request's order_date (live_fills), not trade_log's blended real-side
        columns; a carried position with no exit logical order carrying
        them is excluded; for every other row, trade_log's
-       own columns. Independent of finding 6 — a model
-       divergence and an execution-parameter divergence are different
-       failure modes (retrain vs. recalibrate) and must not be merged into
-       one signal. Threshold TBD, same deferral as finding 6.
+       own columns. An entry that ended early is compared against its
+       simulation on the window it actually had (shadow_retraining.md).
+       Independent of finding 6 — a model divergence and an
+       execution-parameter divergence are different failure modes (retrain
+       vs. recalibrate) and must not be merged into one signal. Threshold
+       TBD, same deferral as finding 6.
     8. Halt-check signal-source rate (N-4: data path matches finding 5's
        pattern) — fraction of today's Position Manager Loop halt checks
        (see live_mode_runner.md's Position Manager Loop Step 1) tagged
@@ -292,8 +294,8 @@ def gather_findings(db_conn, today_date, log_dir,
         exit_reason='entry_canceled' (never filled, ended other than by
         rejection) and exit_reason='entry_rejected' (the broker
         or the account refused the submission), reported as separate
-        tallies within one finding; the entry_canceled tally is itself two
-        counts by its entry logical order's terminal_cause, 'timeout' and
+        tallies within one finding; the entry_canceled tally is itself
+        split by its entry logical order's terminal_cause, 'timeout' and
         every other. Kept apart from findings 13/15's
         operational family (restart_gap_exit / overnight_exit /
         reconcile_ghost) because the two families are excluded from PnL for
@@ -303,8 +305,10 @@ def gather_findings(db_conn, today_date, log_dir,
         families). A rising timeout entry_canceled count points at
         buy_rate / cancel_after_seconds being too tight and is calibration
         evidence (fit_execution_params() consumes it); the other count is
-        not — those entries were cut short before cancel_after_seconds
-        could decide them; a rising entry_rejected count
+        not a sign of either being too tight — those entries were cut short
+        before cancel_after_seconds could decide them, and
+        fit_execution_params() reads them for buy_rate only, on the window
+        they actually had; a rising entry_rejected count
         points at the account or the broker and is not — it is excluded
         from that calibration (see shadow_retraining.md). The
         entry_rejected tally is broken out by trade_log.reject_reason
@@ -772,8 +776,8 @@ Its purpose is to make the purge registry's `retention_days: inf` defaults
 resolvable. Every registry entry starts at `inf` precisely because no growth
 rate has ever been measured; this is what measures them, so an operator
 eventually sets a window against data instead of a guess. `health_events` is
-the entry most worth watching — R-9 widened its writers from one finding to
-six, finding 29 made seven and findings 36-44 have since made sixteen, and
+the entry most worth watching — its writers are every finding whose Source
+is `health_events`, a set R-9 opened and later findings keep widening, and
 findings 18 and 24 both emit repeatedly during a broker-latency episode.
 
 **Feed coverage is reported the same way**, and for the same reason. The

@@ -121,7 +121,9 @@ parameters is gated independently, using only the trade_log rows relevant
 to it:
 
 ```
-buy_rate, cancel_after_seconds:  gated on cumulative pilot ENTRY count >= 30
+buy_rate:                        gated on its sample's cumulative pilot ENTRY count >= 30
+cancel_after_seconds:            gated on its sample's cumulative pilot ENTRY count >= 30
+                                 (entries that ended early are not in this sample)
 sell_rate_tp:                    gated on cumulative exit_reason='take_profit' count >= 15
 sell_rate_sl:                    gated on cumulative exit_reason='stop_loss' count >= 15
 sell_rate_neutral:               gated on cumulative exit_reason IN
@@ -142,24 +144,33 @@ blended columns. A carried position with no exit logical order carrying
 `predicted_*` is excluded from both, its gate counts included. Every other
 row compares `trade_log`'s own columns.
 
-`exit_reason='entry_canceled'` rows (see db_schema.md) whose position's
-entry logical order ended `terminal_cause='timeout'` are included in the
-entry-count denominator for `buy_rate`/`cancel_after_seconds` — an entry
-left unfilled through `cancel_after_seconds` is itself a direct, relevant
-observation for those two parameters, not noise to exclude. Every other
-`entry_canceled` row (an entry cut short by Session Shutdown, the startup
-procedure, expiry, a vanished or an unsent order) is excluded from that
-denominator and from its gate count: it ended before `cancel_after_seconds`
-could decide it, so it carries no evidence about either parameter.
+**Entries that ended early.** An entry logical order ended early when it
+ended in a status other than 'filled' or 'rejected' and not with
+`terminal_cause='timeout'`, whether or not anything filled. Its end
+instant is the earlier of the anchor + `cancel_after_seconds` and the
+`sent_at` of its first 'cancel' request, or its `terminal_at` when it has
+none. Every simulation of such an entry — the stored `predicted_*` and any
+run inside this fit — calls `simulate_entry_fill()` with
+`cancel_after_seconds` set to the whole seconds elapsed from the anchor to
+that instant, so the prediction sees the window the real order had.
 
-`exit_reason='entry_rejected'` rows (R-7) are **excluded** from that same
-denominator — the opposite treatment, for the opposite reason. A rejection
-comes from the broker or the account (restriction, insufficient funds at
-the actual price, a non-permitted ticker), never from how the market
-absorbed the order, so it carries no evidence about participation rate or
-about whether `cancel_after_seconds` is set too tight. Both labels belong
-to the never-opened family in db_schema.md and both count as cooldown
-attempts in live; they diverge only here, at what they are evidence FOR.
+`exit_reason='entry_canceled'` rows (see db_schema.md) are included in the
+`buy_rate` sample and its gate count — an entry left unfilled is itself a
+direct, relevant observation of participation, not noise to exclude; one
+that ended early counts on its matched window. The `cancel_after_seconds`
+sample and its gate count take only entries that did not end early: an
+early-ended entry stopped before `cancel_after_seconds` could decide it, so
+it carries no evidence about that parameter.
+
+`exit_reason='entry_rejected'` rows (R-7) are **excluded** from the
+`buy_rate` and `cancel_after_seconds` samples — the opposite treatment, for
+the opposite reason. A rejection comes from the broker or the account
+(restriction, insufficient funds at the actual price, a non-permitted
+ticker), never from how the market absorbed the order, so it carries no
+evidence about participation rate or about whether `cancel_after_seconds`
+is set too tight. Both labels belong to the never-opened family in
+db_schema.md and both count as cooldown attempts in live; they diverge only
+here, at what they are evidence FOR.
 
 Fill-rate inputs read `trade_log.requested_quantity`, which is the quantity
 actually SUBMITTED — i.e. after `check_funds_available()` has sized the
@@ -307,9 +318,8 @@ the current market regime.
   fills and its first exit session's exit fills from `live_fills`, never on
   `trade_log`'s blended real-side columns; with no exit logical order
   carrying `predicted_*` it is excluded
-- Only `entry_canceled` rows whose entry logical order ended
-  `terminal_cause='timeout'` enter the `buy_rate`/`cancel_after_seconds`
-  denominator and its gate count
+- An entry that ended early is simulated on its matched window; it counts
+  toward `buy_rate`'s sample and gate, never toward `cancel_after_seconds`'s
 - Model-retraining divergence (winning rate vs. backtest CI) and
   execution-parameter divergence (predicted vs. actual fill price) are
   independent checks with independent `health_report.md` findings — never

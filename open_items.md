@@ -183,7 +183,7 @@ has enough history; revisit then, not before.
 
 Not a new design problem — a pointer, so it isn't lost among the items
 above. `docs/ops/api_contract_checklist.md` holds **37 rows, of which 30 are
-still unverified** assumptions, three of those graded **A** (T-1: REST/WS tick
+still unverified** assumptions, with these graded **A** (T-1: REST/WS tick
 granularity; T-21: each execution reported under exactly one order number;
 T-25: `AstkExecBaseQty` reflecting same-day executions immediately). The
 numbers reconcile as 37 = 30 unverified + 1 measured (T-6) + 6 retired (T-3,
@@ -301,7 +301,38 @@ Retired with it: V3's exception for writes to existing DOUBLE price columns,
 V6's 'number' format, and `trading_api.md`'s integrality assertion for
 INTEGER ledger columns.
 
+Excluded: `corporate_events.value` stays DOUBLE (`utils.md`'s split-ratio
+rule). A ratio such as 1:3 has no exact DECIMAL form, and the rule already
+takes value × ratio and value ÷ ratio in DOUBLE and rounds the result.
+
 Undecided: whether market data and feature tables are included.
+
+**Findings for the next session** (undecided; raised this session):
+
+- Principle raised: DECIMAL applies only where the source value is a decimal
+  value from the broker API; a value whose source is a ratio such as 1:x
+  stays DOUBLE.
+- Under it, these stay on the surface: the existing ledger table columns
+  (`live_positions.entry_mgnrt` included), `session_start_cash`,
+  `live_ticker_terms`' `mgnrt` and `order_cost`, position sizing,
+  `check_funds_available()`, the exposure limits, the exit ladder's limit
+  pricing and tick rounding, and `trade_log`'s `fill_price`, `exit_price`
+  and `weighted_avg_exit_price`.
+- Under it, these leave the surface and stay DOUBLE: `trade_log`'s and
+  `live_orders`' `predicted_*`, the fill simulator's floor computation,
+  `experiment_log`'s amount totals, and `09_backtest_engine.md`'s Case A
+  cash arithmetic, whose deferral would close as DOUBLE.
+- Market data and feature tables, though fetched from the broker's quote
+  endpoints, are proposed to stay DOUBLE — which would settle the Undecided
+  line above. A market value copied into the ledger (`reference_price`) is
+  already converted per V1.
+- Values whose source is a ratio already stay DOUBLE and are not on the
+  surface: split ratios and the factors derived from them, and configured
+  or fitted rates.
+- A restated dividend arrives rounded by its vendor after division, so
+  `utils.dividend_gross_amount()` cannot recover the exact gross. The error
+  lies within the upsert agreement test's tolerance, and no type choice
+  removes it.
 
 ---
 

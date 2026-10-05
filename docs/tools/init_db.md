@@ -78,7 +78,7 @@ together, moving the table count 34 -> 40:
   and `unfilled_quantity` become `DECIMAL(18,6)` in the same rebuild (class 2
   `ALTER COLUMN ... SET DATA TYPE` on their own).
 - `corporate_events` (class 2): `basis_date VARCHAR NOT NULL` is added. DuckDB
-  does not add a constrained column, so it is three statements — `ADD COLUMN`
+  does not add a constrained column, so it is done in sequence — `ADD COLUMN`
   without the constraint, an `UPDATE` setting each existing row's
   `basis_date` to the date its value was fetched, then `ALTER COLUMN ... SET
   NOT NULL`.

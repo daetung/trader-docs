@@ -66,7 +66,8 @@ class Trainer:
                 trained on ('YYYYMMDD'). None for standalone.
             fold_train_days:
                 Trading days that range holds. None for standalone.
-                All three are passed by the caller — from fold_meta at the
+                fold_train_start, fold_train_end and fold_train_days are
+                passed by the caller — from fold_meta at the
                 inner fold call sites, from the temporal_split_simple() train
                 split for the outer eval and the final model. Trainer does not
                 compute them.

@@ -133,7 +133,7 @@ write_lock = Lock()
                  # Premarket Recheck task's writes (R-1, see that section —
                  # same funnel, no second writer). A write that must be one
                  # transaction — a new logical order's guard check and its
-                 # two INSERTs — runs BEGIN ... COMMIT inside ONE hold of
+                 # INSERTs — runs BEGIN ... COMMIT inside ONE hold of
                  # write_lock.
 
 def db_write(sql, params):   # contract: Callable[[str, tuple], None] —
@@ -413,8 +413,9 @@ exit logical order stage 1 cancels whose `purpose` is not
   this session's 1-tick buffer, which the next session will not have;
 - in pilot stage, `predicted_fill_price`, `predicted_weighted_avg_exit_price`
   and `predicted_partial_fills_count` are computed and stored on that
-  logical order (`live_orders`); the position's eventual `trade_log` row
-  takes its `predicted_*` from there.
+  logical order (`live_orders`) — the entry side on the window the entry
+  actually had when it ended early (shadow_retraining.md); the position's
+  eventual `trade_log` row takes its `predicted_*` from there.
 A logical order with `purpose='overnight_liquidation'` writes no
 `exit_trigger_agreement_daily` contribution. A position carried without
 Session Shutdown has neither.
@@ -885,12 +886,18 @@ watchdog and 5s position loops are not stalled):
    entry (Session Lifecycle Step 4c). Then, for any ticker that gained a new
    same-day corporate_events row in steps 3-4 AND whose calculator already
    exists (i.e. Eager Pool has run — always true for this scheduled path,
-   since it only fires after Step 5), call that ticker's
+   since it only fires after Step 5), build a new CachingIndicatorCalculator
+   for that ticker (set_session_stats() first) and call its
    scoped_recompute(..., dividend_amount=today_dividends.get(ticker, 0.0))
-   (caching_calculator.md) as a background task, then
-   clear its quarantine_reason if set. NOT run on Step 4b's late-start
-   path — there, Eager Pool hasn't executed yet, so Step 0 picks up the
-   fresh corporate_events rows naturally and no scoped recompute applies.
+   (caching_calculator.md) over a snapshot of today's bars, as a background
+   task; the instance in calculators[ticker] keeps serving meanwhile. On
+   completion, swap the new instance into calculators[ticker] at a Watchdog
+   Polling Loop cycle boundary — it has absorbed bars through the
+   snapshot's last bar, and the Watchdog Polling Loop's Step 3 multi-bar
+   replay covers the bars after it — then clear its quarantine_reason if
+   set. NOT run on Step 4b's late-start path — there, Eager Pool hasn't
+   executed yet, so Step 0 picks up the fresh corporate_events rows
+   naturally and no scoped recompute applies.
 ```
 
 All writes in steps 2-5 go through `db_write()`; no lock-handoff or
@@ -2167,8 +2174,8 @@ number (health_report.md finding 12). A broker execution whose
   `amount` NULL when s < 0. It is applied automatically only when exactly
   one of the ticker's 'live' non-shadow positions holds a non-integer
   `held_qty`, on that position; otherwise the ticker defers with reason
-  'settlement_ambiguous'. The remainder B − L − s goes to the two bullets
-  below.
+  'settlement_ambiguous'. The remainder B − L − s goes to the Broker >
+  ledger and Broker < ledger bullets below.
 - Broker > ledger: one `side='entry'`, `reason='adopted'` adjustment for the
   difference, `price` = `AstkAvrPchsPrc`, on the ticker's adopted row
   (below); finding 12 `kind='position'`.
@@ -2458,9 +2465,12 @@ so a re-crash during recovery re-enters warm restart on the same signature.
    today_dividends exactly as Session Lifecycle Step 4c does (it is
    in-memory and did not survive the crash). Then, if today's Eager-Pool backup exists in
    indicator_cache, restore each ticker via load_from_db() (skipping the
-   historical_bars recompute) then replay today's bars via on_bar_close();
-   if no backup exists (Eager Pool never ran this process), fall back to
-   full session_start_compute(). Health Gate 1 re-runs unchanged (its
+   historical_bars recompute); if no backup exists (Eager Pool never ran
+   this process), fall back to full session_start_compute(). Either way,
+   today's bars are then replayed via on_bar_close() by the Watchdog
+   Polling Loop's Step 3 loop over the bars the scan backfills (step 5a),
+   which runs on_regular_session_open() with the ticker's today_dividends
+   value when it passes the 093000 bar. Health Gate 1 re-runs unchanged (its
    premarket inputs are unchanged since morning). indicator_cache is NOT
    purged on this path (see db_schema.md).
    Idempotency of this step specifically (re-crash during recovery):

@@ -402,7 +402,7 @@ Sensitivity registry for the current full set):
 Triggered by LiveModeRunner (not by `on_bar_close()`) when an
 already-Eager-Pooled ticker gains a NEW same-day `corporate_events` row —
 from either vendor (yfinance narrow crawl or investing.com bulk; see
-metadata_crawler.md), after this instance's `session_start_compute()`
+metadata_crawler.md), after the serving instance's `session_start_compute()`
 already ran on stale (pre-event) data.
 
 ```python
@@ -417,6 +417,14 @@ def scoped_recompute(
     One-shot correction for a single ticker whose indicators were seeded
     before its corporate event was known.
 
+    LiveModeRunner calls it on a NEW instance (set_session_stats() first),
+    never on the instance serving calculators[ticker]; bars_today is a
+    snapshot taken when the recompute starts. The serving instance keeps
+    answering until LiveModeRunner swaps the new one in at a Watchdog
+    Polling Loop cycle boundary; the new instance has absorbed bars through
+    the snapshot's last bar, and the Watchdog Polling Loop's Step 3
+    multi-bar replay covers the bars after it (live_mode_runner.md).
+
       1. Re-run the session_start_compute() body — Step 0
          (adjust_bars_for_corporate_events, now seeing the new row) + Layer
          1 / Layer 2 seeding — exactly as at session start. This is a
@@ -424,7 +432,7 @@ def scoped_recompute(
          O(1) per-call rule for on_bar_close() (see Constraints) is
          untouched.
       2. Replay today's bars so far via on_bar_close() from session start
-         to the current bar. Reuses the same cheap replay path Watchlist
+         to the snapshot's last bar. Reuses the same cheap replay path Watchlist
          Append and Feed Outage Recovery already rely on (on_bar_close()
          is O(1) per bar, so replaying N bars is O(N) — fine for one
          ticker).
@@ -436,7 +444,7 @@ def scoped_recompute(
          ticker's today-dividend map entry, which LiveModeRunner re-reads
          before this call (live_mode_runner.md).
 
-    After this returns, LiveModeRunner clears the ticker's
+    After the swap, LiveModeRunner clears the ticker's
     quarantine_reason if it was set (the distortion is corrected; no
     reason to keep blocking entries) — see live_mode_runner.md.
 
@@ -476,9 +484,10 @@ def scoped_recompute(
   no multi-date range within a single `session_start_compute()` call for a
   split to fall between, unlike training's ticker-batch spanning many
   historical entry dates
-- Thread safety of `_cache` and `_fixed` dicts is the responsibility of LiveModeRunner
-  (single-threaded access recommended; parallel session_start_compute() across tickers is safe
-  as instances share no state)
+- Thread safety of `_cache` and `_fixed` dicts is the responsibility of LiveModeRunner:
+  one thread touches an instance at a time. Parallel session_start_compute() across tickers
+  is safe as instances share no state; scoped_recompute() runs on a new instance swapped in
+  afterwards for the same reason
 - `persist_to_db()` / `load_from_db()`: used only when `indicator_cache_mode = "db"`
   (default: `"memory"` — these methods not called in standard operation)
 - `persist_to_db()` does not persist `_session_stats`;

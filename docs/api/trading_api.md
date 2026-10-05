@@ -475,7 +475,11 @@ arrived as a JSON number, or any other float such as a config value or
 threshold — becomes `Decimal(repr(x))`; either is then rounded per
 `utils.md`'s Ledger Numeric Rules. V1 governs every float entering `Decimal`
 arithmetic, not only vendor values. `Decimal(x)` on a float is never used — it carries
-the float's binary error into the ledger.
+the float's binary error into the ledger. A split ratio is excepted:
+it never enters `Decimal` arithmetic on its own — value × ratio and value ÷
+ratio are taken in `DOUBLE` and the result rounded (`utils.md`'s Ledger
+Numeric Rules); a `DOUBLE` result that then enters `Decimal` arithmetic is
+converted here.
 
 **Integrality is asserted only where a quantity is written to an INTEGER
 ledger column** — `live_order_requests` and `live_fills` (`db_schema.md`),

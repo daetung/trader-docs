@@ -896,6 +896,11 @@ def simulate_entry_fill(
     exactly). A float for entry_order_type="limit" (see caller — computed
     from p_entry, execution.entry_gap_type, execution.entry_gap_value).
 
+    cancel_after_seconds: for a counterfactual run of a live entry that
+    ended early (shadow_retraining.md), the caller passes the whole seconds
+    elapsed from the anchor to that entry's end instant, so the simulated
+    window matches the real order's.
+
     Per-bundle fill logic (from the anchor bundle onward, within
     cancel_after_seconds of entry_anchor_second):
         if bundle overlaps halt interval in halts_df → skip

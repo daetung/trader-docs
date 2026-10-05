@@ -74,9 +74,10 @@ pd.DataFrame  # full labeled feature matrix, unsplit
                      # the maps do not carry.
        coverage_df = SELECT * FROM ticker_data_coverage
        corp_events_df = SELECT * FROM corporate_events
-                     # small table — loaded in full, filtered internally by
-                     # Labeler (dead position Case A/D) and by FeatureExtractor's
-                     # Strategy A/D (bars adjustment, gap_percentile dividend_amount)
+                     # small table — loaded in full; its only reader on this
+                     # path is the Labeler (dead position Case A/D).
+                     # FeatureExtractor queries corporate_events itself
+                     # (Strategy A/D — see Constraints below)
 
        # REFERENCE_SESSION baselines — bulk load once, shared across all tickers/dates
        session_stats_raw = SELECT * FROM precomputed_session_stats
