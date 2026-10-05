@@ -306,14 +306,15 @@ def compute_position_size(
         ticker_margin_used:  sum(margin_of(entry_price_i, quantity_i,
                              rate_i)) across this ticker's currently-open
                              positions, PLUS its submitted-but-unfilled ones
-                             (R-5: live_positions rows with
-                             lifecycle='live' AND entry_state='awaiting' —
-                             priced at
-                             limit_price, or p_entry for a market order).
+                             (R-5: positions whose entry logical order is
+                             'open' — priced at the entry request's price,
+                             or p_entry for a market order).
                              Each row contributes at its OWN PINNED RATE
                              (live_positions.entry_mgnrt), never the current
                              one, so an open position's margin cannot move
-                             retroactively. Pending margin is reserved
+                             retroactively — except an adopted row, whose
+                             entry_mgnrt is NULL and is read as 100. Pending
+                             margin is reserved
                              capacity: excluding it lets a burst of
                              simultaneous submissions breach the cap on
                              aggregate fill, which is inert only while
@@ -800,7 +801,7 @@ def simulate_exit_fill(
             while a time is stable. The index derivation the caller used to do
             (bundle_idx_at()) happens HERE, so both engines pass the same kind
             of thing: backtest the instant its exit fired, live
-            live_positions.exiting_since.
+            live_position_state.exiting_since.
         reference_price: the last print strictly BEFORE that instant, for all
             four exit reasons. Backtest's former "close of the last valid bar"
             / "last bar close" is not the general form — a 1-minute bar's
@@ -881,9 +882,9 @@ def simulate_entry_fill(
     entry_anchor_second is the ONE anchor that does not collapse to a single
     column across the two engines: backtest COMPUTES it as
     entry_hour + execution.entry_fill_delay_seconds, live OBSERVES it as
-    live_positions.submitted_at. They are two expressions of one moment and
-    must never be composed — adding the delay to submitted_at double-counts a
-    wait live has already lived through.
+    the entry 'new' request's sent_at (live_order_requests). They are two
+    expressions of one moment and must never be composed — adding the delay
+    to sent_at double-counts a wait live has already lived through.
 
     ohlcv_entry is GONE, for the same reason as ohlcv_exit. p_entry STAYS:
     its zero-fill fallback role is inert here (a zero-fill entry is
@@ -1125,9 +1126,9 @@ bid/ask model to mirror them. If backtest is later extended to replay
   recomputes statelessly from the anchor until settlement
   (live_mode_runner.md). Neither is called by live mode's real order path (real fills
   come from the trading API; for `entry_order_type="limit"`, the real path
-  instead tracks the order via LiveModeRunner's Position Manager Loop
-  `pending_entries` mechanism until filled or timed out — see
-  live_mode_runner.md)
+  instead tracks the order as an 'open' entry logical order in
+  LiveModeRunner's Position Manager Loop (Order and fill ledger) until
+  filled or timed out — see live_mode_runner.md)
 - `simulate_entry_fill()`'s price gate (a bundle priced above `limit_price`
   is skipped, not canceled) is deliberate — this universe's volatility
   means a single bundle exceeding the limit is not reliably a sign the

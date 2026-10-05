@@ -79,7 +79,8 @@ rewrite, reorder, or normalise anything on the way through. Because the
 transcription strips `--` to end of line, no string literal in this region
 may contain `--`.
 
-Statements are written `CREATE TABLE IF NOT EXISTS` rather than leaving
+Statements are written `CREATE TABLE IF NOT EXISTS` (and the one view
+`CREATE VIEW IF NOT EXISTS`) rather than leaving
 idempotency for the transcription to decide: re-running init against an
 existing database is a per-table no-op.
 
@@ -545,22 +546,34 @@ CREATE TABLE IF NOT EXISTS corporate_events (
     event_date  VARCHAR NOT NULL,   -- 'YYYYMMDD' (effective date, before market open)
     event_type  VARCHAR NOT NULL,   -- 'split' | 'reverse_split' | 'dividend'
     value       DOUBLE  NOT NULL,   -- split/reverse_split: ratio (>1.0 or <1.0)
-                                    -- dividend: per-share cash amount (USD, >0)
+                                    -- dividend: per-share cash amount (USD, >0),
+                                    -- read ONLY through utils.md's
+                                    -- dividend_gross_amount() or its frame
+                                    -- form dividend_gross_from_events(),
+                                    -- never directly
     source      VARCHAR NOT NULL DEFAULT 'yfinance',  -- 'yfinance' | 'investing'
                                     -- which vendor supplied the value now
                                     -- stored. NOT part of the primary key —
                                     -- see the invariant below.
+    basis_date  VARCHAR NOT NULL,   -- 'YYYYMMDD', the date `value` was fetched;
+                                    -- written with it by the crawlers. A
+                                    -- source that restates past dividends by
+                                    -- later splits (corporate_events.
+                                    -- dividend_restated_sources) expresses
+                                    -- `value` in this date's basis
     PRIMARY KEY (ticker, event_date, event_type)
 );
 -- item N INVARIANT: exactly ONE row per (ticker, event_date, event_type),
--- always. This is load-bearing, not incidental: cum_split_ratio() (utils.md)
+-- always. This is load-bearing, not incidental: the split factor rule
+-- (utils.md's split_ratio_from_events(), and cum_split_ratio() through it)
 -- computes the PRODUCT of every matching row, so a second row for the same
 -- event — e.g. the same 2:1 split reported by both vendors — would yield
 -- 2.0 * 2.0 = 4.0 and silently mis-scale every adjusted price and volume
 -- that depends on it (adjust_bars_for_corporate_events(),
 -- adjust_tick_derived_series_for_corporate_events(),
 -- populate_precomputed_session_stats() section D, gap_percentile(),
--- Labeler Case A, BacktestEngine dead-position). No exception raised, no
+-- Labeler Case A, BacktestEngine dead-position, the view live_position_state,
+-- live position close). No exception raised, no
 -- log line — just wrong numbers. Any future vendor added here must respect
 -- this invariant.
 --
@@ -658,16 +671,19 @@ CREATE TABLE IF NOT EXISTS labeled_samples (
 --                 >=0 = rolling inner fold index (0-based)
 -- outer_fold_idx: -1  = non-nested run (standalone, selection, full, non-nested exploitation)
 --                 >=0 = nested validation outer fold index (0-based)
--- fold_train_start, fold_train_end:
---                 first and last date of the train window ('YYYYMMDD'); NULL for
---                 standalone. The pair bounds the window so the EXPECTED trading
---                 day count is derivable by joining trading_calendar, which is
---                 why it is not stored.
--- fold_train_days: trading days the train window ACTUALLY held, counted after the
---                 embargo step. Not derivable — dates removed by the regime
---                 holdout leave no record elsewhere. Diagnostic only: no fold is
---                 skipped, rejected or reordered on it. session_mode filtering
---                 precedes the count, so the value varies by trial.
+-- fold_train_start, fold_train_end, fold_train_days:
+--                 the date range the model was ACTUALLY trained on ('YYYYMMDD')
+--                 and the trading days it held; NULL only for standalone. Passed
+--                 by the caller (run_train.md): from fold_meta at an inner fold —
+--                 the train window, days counted after the embargo step — and
+--                 from the temporal_split_simple() train split for the outer
+--                 eval and the final model. The pair bounds the range so the
+--                 EXPECTED trading day count is derivable by joining
+--                 trading_calendar, which is why it is not stored. Dates the
+--                 regime holdout removed are in regime_holdout_dates.
+--                 fold_train_days is diagnostic only: no fold is skipped,
+--                 rejected or reordered on it. session_mode filtering precedes
+--                 the count, so the value varies by trial.
 -- auc_std:        std of AUC across all folds in the same run or trial.
 --                 Pruned trials retain auc_std = NULL; is_pruned = TRUE on fold_run_ids[-1].
 -- phase:          "selection" | "exploitation" | "full" | NULL (standalone)
@@ -716,9 +732,14 @@ CREATE TABLE IF NOT EXISTS train_log (
 --   from the volatility-truncated remainder the regime holdout leaves behind,
 --   "regime_holdout" rows from the excluded dates. Neither is an estimate over
 --   the whole distribution, and configuration selection runs on the former.
--- fold_test_start, fold_test_end:
---   Optimizer context: derived from fold_meta["fold_test_start/end"].
---   Standalone mode:   derived from test_df["date"].min() and .max() (never NULL).
+-- fold_test_start, fold_test_end, fold_test_days:
+--   Optimizer context: from fold_meta["fold_test_start/end/days"].
+--   Standalone mode:   derived from test_df["date"].min(), .max() and the count
+--                      of its distinct dates (never NULL).
+--   "regime_holdout" rows: derived the standalone way from holdout_df, so the
+--                      date pair is the ends of a NON-CONTIGUOUS date set and
+--                      the expected-day join against trading_calendar does not
+--                      apply; the dates are in regime_holdout_dates.
 -- suppressed_count: entries blocked by suppress_threshold during backtest.
 -- Retention: purge-registry member — date_column `run_at`, retention_days: inf
 --   (see metadata_crawler.md's evening purge stage). fold_test_start/end are
@@ -736,9 +757,10 @@ CREATE TABLE IF NOT EXISTS experiment_log (
     fold_test_end        VARCHAR,                -- 'YYYYMMDD'
     fold_test_days       INTEGER,                -- realised trading days in the test
                                                  --   window, counted after the embargo
-                                                 --   step; expected count derivable by
-                                                 --   joining trading_calendar against
-                                                 --   the pair above. Diagnostic only.
+                                                 --   step where one exists; expected
+                                                 --   count derivable by joining
+                                                 --   trading_calendar against the pair
+                                                 --   above. Diagnostic only.
     winning_rate         DOUBLE,
     total_trades         INTEGER,
     winning_trades       INTEGER,
@@ -852,6 +874,39 @@ CREATE TABLE IF NOT EXISTS experiment_log (
     PRIMARY KEY (run_id)
 );
 
+-- Regime holdout date set — one row per holdout date, written once per
+-- exploitation run by pipeline_optimizer.md from
+-- utils.compute_vol_regime_holdout()'s return value. The set is recomputed per
+-- run and shifts as data accumulates, so this is the only record of which
+-- dates a run's regime_holdout row tested on and its folds excluded.
+-- Retention: purge-registry member — date_column `optimizer_run_id`
+--   (YYYYMMDD_HHMMSS, the execution time; `date` is a data date),
+--   retention_days: inf (see metadata_crawler.md's evening purge stage).
+CREATE TABLE IF NOT EXISTS regime_holdout_dates (
+    optimizer_run_id VARCHAR NOT NULL,
+    date             VARCHAR NOT NULL,   -- 'YYYYMMDD', a holdout date
+    rolling_vol      DOUBLE  NOT NULL,   -- the date's rolling volatility
+    PRIMARY KEY (optimizer_run_id, date)
+);
+
+-- Regime holdout verdict — one row per exploitation run that writes a
+-- 'regime_holdout' experiment_log row (pipeline_optimizer.md's Regime Holdout
+-- Report and Verdict). Always computed; read at live session start, before
+-- Inferencer init, for the deployed run_id (live_mode_runner.md), which
+-- enforces it only when optimizer.regime_holdout.gate.enabled.
+-- Retention: purge-registry member — date_column `evaluated_at`,
+--   retention_days: inf (see metadata_crawler.md's evening purge stage).
+CREATE TABLE IF NOT EXISTS regime_holdout_verdict (
+    optimizer_run_id VARCHAR NOT NULL,
+    final_run_id     VARCHAR NOT NULL,   -- the final model's run_id
+    detail           VARCHAR NOT NULL,   -- JSON: report items beside the outer
+                                         --   folds' mean/min/max, the bootstrap
+                                         --   CI fields, each gate check's result
+    verdict          VARCHAR NOT NULL,   -- 'pass' | 'fail' | 'pass_with_warning'
+    evaluated_at     VARCHAR NOT NULL,   -- 'YYYYMMDD_HHMMSS'
+    PRIMARY KEY (optimizer_run_id)
+);
+
 -- Trade log (output of BacktestEngine — one row per executed trade;
 -- also written by LiveModeRunner at stage 'shadow' — see is_shadow below and
 -- live_mode_runner.md's Position Manager / Watchdog Loop
@@ -876,20 +931,33 @@ CREATE TABLE IF NOT EXISTS trade_log (
                                         -- it is the ENTRY date, and exit_bar is only
                                         -- HHMMSS: for a carried position the pair
                                         -- (date, exit_bar) reads as an exit BEFORE its
-                                        -- own entry. Differs from `date` in exactly
-                                        -- two situations:
+                                        -- own entry. Differs from `date` for:
                                         --   dead position Case A — resolved against
                                         --     D+1 data (09_backtest_engine.md)
                                         --   'overnight_exit' — liquidated on a later
                                         --     session, possibly several days later
-                                        --     across a weekend, holiday, or multi-day
-                                        --     halt (live_mode_runner.md)
+                                        --     across a weekend or holiday
+                                        --     (live_mode_runner.md)
+                                        --   live 'dead_position' — a halt-carried
+                                        --     position liquidated on a later session
+                                        --   a carried position closed under its
+                                        --     inherited trigger label (a prior exit
+                                        --     logical order existed)
                                         -- health_report.md's "what did this session
                                         -- close" queries key on this column, not
                                         -- `date`.
-    signal                  VARCHAR      NOT NULL,  -- "up5" | "up3"
+    signal                  VARCHAR,     -- "up5" | "up3"; NULL exactly on a live
+                                        -- adopted row (entry_bar = -1)
     fill_price              DOUBLE       NOT NULL,
-    exit_price              DOUBLE,
+    exit_price              DOUBLE,      -- live: the reference_price of the root of
+                                        -- the chain ending at the position's latest
+                                        -- exit logical order (followed back through
+                                        -- replaces_logical_order_id), ÷ the split
+                                        -- factor from that root order's created_at
+                                        -- US-local date to the close; NULL when the
+                                        -- position never had an exit logical order
+                                        -- or a shortfall adjustment completes its
+                                        -- close
     weighted_avg_exit_price DOUBLE,
     pnl_pct                 DOUBLE,
     exit_reason             VARCHAR,     -- TWO families below sit outside ordinary
@@ -906,13 +974,17 @@ CREATE TABLE IF NOT EXISTS trade_log (
                                         -- not exist. Excluded from total_trades /
                                         -- winning_rate / avg_pnl_pct / total_pnl_abs,
                                         -- but still visible via trades_by_exit:
-                                        --   'entry_canceled' — entry-side order fully
-                                        --     unfilled by cancel_after_seconds; a real
-                                        --     observation, not omitted from the table
-                                        --     (see shadow_retraining.md — a direct
+                                        --   'entry_canceled' — the entry ended with
+                                        --     nothing filled, other than by rejection,
+                                        --     whatever its terminal_cause
+                                        --     (live_mode_runner.md); a real
+                                        --     observation, not omitted from the table.
+                                        --     The rows whose entry logical order ended
+                                        --     terminal_cause='timeout' are the direct
                                         --     signal for buy_rate/cancel_after_seconds
-                                        --     being too tight, and must be visible to
-                                        --     fit_execution_params()).
+                                        --     being too tight and are the ones
+                                        --     fit_execution_params() reads
+                                        --     (shadow_retraining.md).
                                         --   'entry_rejected' (R-7, LIVE-ONLY) — the
                                         --     broker or the account refused the
                                         --     submission itself (account restriction,
@@ -949,27 +1021,32 @@ CREATE TABLE IF NOT EXISTS trade_log (
                                         --     still 'restart_gap_exit'.
                                         --   'overnight_exit' (R-3) — a position
                                         --     carried from a PRIOR trading day
-                                        --     (halt-through-close, unfilled EOD
-                                        --     exit, or an unmatched broker
-                                        --     position of unknown date),
-                                        --     liquidated at market as soon as
-                                        --     tradable. Shares its liquidation
-                                        --     mechanism with 'restart_gap_exit';
-                                        --     the two differ only by whether the
-                                        --     carry was same-day or cross-day.
-                                        --   'reconcile_ghost' (R-3) — a
-                                        --     live_positions row with
-                                        --     lifecycle='live' AND quantity > 0
-                                        --     but no matching
-                                        --     broker position at Broker Reconcile
-                                        --     (quantity=0; there was never a real
-                                        --     fill to attribute).
+                                        --     with no exit logical order before
+                                        --     the carry, or an adopted broker
+                                        --     position (origin='adopted'),
+                                        --     liquidated by the Unified Overnight
+                                        --     Policy as soon as tradable. NOT
+                                        --     covered: a halt-carried position —
+                                        --     its ticker's live_halt_episodes
+                                        --     interval on its date contains
+                                        --     exit_deadline(date) — which is
+                                        --     'dead_position', PnL included; and a
+                                        --     carried position with a prior exit
+                                        --     logical order, attributed under its
+                                        --     inherited trigger label, PnL
+                                        --     included.
+                                        --   'reconcile_ghost' (R-3) — a position
+                                        --     closed by a shortfall adjustment:
+                                        --     Broker Reconcile found fewer shares
+                                        --     at the broker than the ledger holds
+                                        --     (live_mode_runner.md's Positions
+                                        --     branch). quantity = entry_qty.
                                         -- See live_mode_runner.md's "Broker
                                         -- Reconcile (shared procedure)" and
                                         -- "Unified Overnight Policy."
     is_dead_position        BOOLEAN      NOT NULL DEFAULT FALSE,
     slippage_pct            DOUBLE,
-    quantity                INTEGER,
+    quantity                DECIMAL(18,6),
     reject_reason           VARCHAR,     -- R-8: the broker's own reason for refusing a
                                         -- submission. Populated ONLY on
                                         -- exit_reason='entry_rejected' rows; NULL
@@ -992,7 +1069,7 @@ CREATE TABLE IF NOT EXISTS trade_log (
                                         -- RISING WITH EXPOSURE is normal behaviour, so
                                         -- without the reason there is no way to separate
                                         -- normal from pathological.
-    requested_quantity      INTEGER,     -- quantity actually SUBMITTED — i.e. after
+    requested_quantity      DECIMAL(18,6), -- quantity actually SUBMITTED — i.e. after
                                         -- check_funds_available() sized the order down
                                         -- to fit available cash. Deliberately NOT the
                                         -- pre-gate sizing output: quantity /
@@ -1007,7 +1084,7 @@ CREATE TABLE IF NOT EXISTS trade_log (
                                         -- buy_rate downward exactly when the book is
                                         -- fullest.
     partial_fills_count     INTEGER,
-    unfilled_quantity        INTEGER,
+    unfilled_quantity        DECIMAL(18,6),
     is_ambiguous            BOOLEAN      NOT NULL DEFAULT FALSE,
     is_shadow               BOOLEAN      NOT NULL DEFAULT FALSE,  -- TRUE = hypothetical
                                         -- fill from LiveModeRunner shadow mode, not a
@@ -1032,9 +1109,22 @@ CREATE TABLE IF NOT EXISTS trade_log (
                                         -- day's predicted_* values.
     predicted_weighted_avg_exit_price DOUBLE,  -- same, exit side
     predicted_partial_fills_count     INTEGER, -- same, exit side — diagnostic
-                                        -- counterpart to partial_fills_count above
-    PRIMARY KEY (run_id, ticker, date, entry_bar)
+                                        -- counterpart to partial_fills_count above.
+                                        -- A position carried with an exit logical
+                                        -- order takes all three predicted_* from
+                                        -- that order (live_orders), stored at
+                                        -- Session Shutdown, ÷ the split factor from
+                                        -- its first request's order_date to the
+                                        -- close for the two prices
+    PRIMARY KEY (run_id, ticker, date, entry_bar),
+    CHECK ((signal IS NULL) = (entry_bar = -1))
 );
+-- A LIVE row's per-share price columns, predicted_* included, and its
+--   share-count columns are in the basis as of its close (live_mode_runner.md's
+--   position close). quantity × fill_price matches the entry cost only to
+--   rounding when a split ratio does not terminate; pnl_pct can differ from the
+--   price-based return by dividend cash; on a carried row, predicted_* cover
+--   the first exit session only.
 
 -- Inference log (live mode inference events and preload failures)
 -- Retention: purge-registry member — date_column `date`, retention_days: inf
@@ -1300,114 +1390,75 @@ CREATE TABLE IF NOT EXISTS indicator_cache (
     PRIMARY KEY (session_date, ticker, layer, indicator)
 );
 
--- Real (non-shadow) position lifecycle, persisted so a mid-session crash
--- is recoverable (R-2). The row is written at ORDER SUBMISSION
--- time (not fill), so a limit order outstanding across a crash is
--- reconcilable by order_id, and the submission-vs-fill window is covered
--- even for market orders.
+-- Position decision record (R-2). One row per position: what was decided —
+-- the signal, the size requested, the margin rate the sizing used — and the
+-- position's lifecycle. Execution facts are NOT here: orders live in
+-- live_orders, broker requests in live_order_requests, executions in
+-- live_fills, reconcile corrections in live_position_adjustments, and every
+-- quantity, amount, time and flag derived from them is read from the view
+-- live_position_state below.
+-- Written BEFORE the entry submission, in the same write as the entry
+-- logical order and its 'intent' request (live_mode_runner.md's intent before
+-- send), so a submission that landed but whose response was lost is still
+-- recorded. A structural refusal transitions the row to
+-- lifecycle='canceled' with trade_log exit_reason='entry_rejected', through
+-- the single canceled-transition point.
 -- Retention: purge-registry member — date_column `date`, retention_days: inf
 --   (see metadata_crawler.md's evening purge stage).
 CREATE TABLE IF NOT EXISTS live_positions (
-    run_id       VARCHAR NOT NULL,
-    ticker       VARCHAR NOT NULL,
-    date         VARCHAR NOT NULL,   -- 'YYYYMMDD'
-    entry_bar    INTEGER NOT NULL,   -- HHMMSS, mirrors trade_log
-    order_id     VARCHAR,            -- trading-API order id (submission).
-                                     --   NULL on shadow rows, which submit no
-                                     --   order.
-    limit_price  DOUBLE,             -- NULL for market orders
-    submitted_at VARCHAR NOT NULL,   -- 'YYYYMMDD_HHMMSS'
-    signal       VARCHAR NOT NULL,   -- 'up5' | 'up3'
-    lifecycle    VARCHAR NOT NULL,   -- 'live' | 'closed' | 'canceled'.
-                                     --   Renamed and redefined from the former
-                                     --   `status`, which carried four independent
-                                     --   axes in one column. Halt is NOT one of
-                                     --   them: it is a TICKER fact, judged at
-                                     --   runtime by live_mode_runner.md's
-                                     --   last_halt_state and recorded in
-                                     --   live_halt_episodes.
-    entry_state  VARCHAR NOT NULL,   -- 'awaiting' | 'settled'. Whether the entry
-                                     --   order is still live at the broker.
-                                     --   'settled' on full fill, on abandoning the
-                                     --   remainder at cancel_after_seconds, on
-                                     --   reject, and on zero-fill cancel. NOT
-                                     --   derivable from quantity vs
-                                     --   requested_quantity: those two look
-                                     --   identical while still filling and after an
-                                     --   abandoned remainder.
-    exit_state   VARCHAR NOT NULL,   -- 'none' | 'submitted'. The 'none' ->
-                                     --   'submitted' transition IS the
-                                     --   double-submission guard. Broker
-                                     --   Reconcile resets it to 'none' when it
-                                     --   cancels a carried row's broker-side
-                                     --   exit order — the only path back.
-    exiting_since VARCHAR,           -- 'YYYYMMDD_HHMMSS' — set once, the FIRST
-                                     --   instant exit_state becomes 'submitted';
-                                     --   never overwritten thereafter, including
-                                     --   by a stuck-timeout market escalation or a
-                                     --   halt-clear resubmission (see
-                                     --   live_mode_runner.md's In-flight order
-                                     --   tracking) that assigns this position a
-                                     --   new order_id. exit_order_stuck_minutes
-                                     --   is measured against THIS column, not
-                                     --   submitted_at, precisely so a resubmission
-                                     --   cannot reset the clock. Broker
-                                     --   Reconcile's cross-session exit_state
-                                     --   reset does not touch it either: the
-                                     --   prior-day value is retained on purpose,
-                                     --   so a carried position's re-submitted
-                                     --   exit is measured from when the exit
-                                     --   attempt began rather than from today.
-                                     --   NULL until the
-                                     --   first 'exiting' transition.
-    fill_price   DOUBLE,             -- NULL until first fill; weighted average across
-                                     --   partial fills once there is more than one
-    fill_second  INTEGER,            -- HHMMSS of the first fill, NULL until then
-    quantity     INTEGER,            -- shares filled SO FAR on the ENTRY side;
-                                     --   NULL until first fill
-    exit_filled_quantity INTEGER,    -- shares filled on the EXIT side, cumulative;
-                                     --   NULL until the first exit fill. The unsold
-                                     --   remainder during a partial exit is
-                                     --   quantity - exit_filled_quantity, held here
-                                     --   rather than only in the runtime
-                                     --   recomputation, so warm restart, the R-9
-                                     --   carry and Broker Reconcile read one number.
-    requested_quantity INTEGER,      -- shares submitted; fixed at submission. The
-                                     --   in-flight tracker compares quantity against
-                                     --   this to decide partial vs. complete (see
-                                     --   live_mode_runner.md's In-flight order
-                                     --   tracking), and it is what trade_log's own
-                                     --   requested_quantity is written from.
-    entry_mgnrt  DOUBLE NOT NULL,    -- the margin rate (vendor Mgnrt0, PERCENT)
-                                     --   in force when this entry was sized;
-                                     --   pinned at entry, or at submission for
-                                     --   a row still entry_state='awaiting',
-                                     --   and NEVER revised.
-                                     --   NOT NULL because sizing cannot run
-                                     --   without it (execution_common.md's
-                                     --   compute_position_size() takes it as
-                                     --   `mgnrt`), so a row existing with no
-                                     --   value is unreachable. Written for
-                                     --   SHADOW rows too: shadow omits the real
-                                     --   order, not the sizing path.
-                                     --   DISTINCT from live_ticker_terms.mgnrt
-                                     --   below, and neither may be dropped for
-                                     --   the other — this is what THAT ENTRY
-                                     --   ACTUALLY USED, fixed against any later
-                                     --   observation; that one is what was
-                                     --   OBSERVED for the ticker that session,
-                                     --   and is the baseline the order-time
-                                     --   check compares against. They hold
-                                     --   equal values whenever Mgnrt0 is 100,
-                                     --   which is exactly when the duplication
-                                     --   looks removable and is not.
-    is_shadow    BOOLEAN NOT NULL DEFAULT FALSE,
-                                     -- fixed at row creation from
-                                     --   live_mode.stage == 'shadow'. Same
-                                     --   meaning and same name as
-                                     --   trade_log.is_shadow.
-    updated_at   VARCHAR NOT NULL,
-    PRIMARY KEY (run_id, ticker, date, entry_bar)
+    run_id             VARCHAR NOT NULL,
+    ticker             VARCHAR NOT NULL,
+    date               VARCHAR NOT NULL,   -- 'YYYYMMDD'
+    entry_bar          INTEGER NOT NULL,   -- HHMMSS, mirrors trade_log; -1 on an
+                                           --   adopted row (live_mode_runner.md's
+                                           --   Positions branch)
+    signal             VARCHAR,            -- 'up5' | 'up3'; NULL exactly on an
+                                           --   adopted row
+    lifecycle          VARCHAR NOT NULL,   -- 'live' | 'closed' | 'canceled'.
+                                           --   Stored, and written in the same write
+                                           --   as its trade_log row. Halt is NOT a
+                                           --   lifecycle state: it is a TICKER fact,
+                                           --   judged at runtime by
+                                           --   live_mode_runner.md's last_halt_state
+                                           --   and recorded in live_halt_episodes.
+    requested_quantity INTEGER,            -- shares the entry submitted; fixed at
+                                           --   submission. trade_log's own
+                                           --   requested_quantity is written from it,
+                                           --   in the basis as of the close. NULL on an
+                                           --   adopted row.
+    entry_mgnrt        DOUBLE,             -- the margin rate (vendor Mgnrt0, PERCENT)
+                                           --   in force when the entry was sized, and
+                                           --   NEVER revised. NULL exactly on an
+                                           --   adopted row, which is never sized;
+                                           --   margin sums read that NULL as 100
+                                           --   (execution_common.md). Written for
+                                           --   SHADOW rows too: shadow omits the real
+                                           --   order, not the sizing path.
+                                           --   DISTINCT from live_ticker_terms.mgnrt
+                                           --   below, and neither may be dropped for
+                                           --   the other — this is what THAT ENTRY
+                                           --   ACTUALLY USED, fixed against any later
+                                           --   observation; that one is what was
+                                           --   OBSERVED for the ticker that session,
+                                           --   and is the baseline the order-time
+                                           --   check compares against. They hold
+                                           --   equal values whenever Mgnrt0 is 100,
+                                           --   which is exactly when the duplication
+                                           --   looks removable and is not.
+    is_shadow          BOOLEAN NOT NULL DEFAULT FALSE,
+                                           -- fixed at row creation from
+                                           --   live_mode.stage == 'shadow'. Same
+                                           --   meaning and same name as
+                                           --   trade_log.is_shadow.
+    origin             VARCHAR NOT NULL,   -- 'signal' | 'adopted'. 'adopted' = a
+                                           --   broker holding the ledger did not
+                                           --   explain, adopted by Broker Reconcile
+                                           --   onto one row per ticker per day.
+    created_at         VARCHAR NOT NULL,   -- 'YYYYMMDD_HHMMSS'
+    updated_at         VARCHAR NOT NULL,
+    PRIMARY KEY (run_id, ticker, date, entry_bar),
+    CHECK ((signal IS NULL) = (origin = 'adopted')),
+    CHECK ((entry_mgnrt IS NULL) = (origin = 'adopted'))
 );
 -- WHY is_shadow lives on the ROW and is not derived from the session: these
 --   rows OUTLIVE their session, which is the whole premise of the Unified
@@ -1423,30 +1474,11 @@ CREATE TABLE IF NOT EXISTS live_positions (
 --   suppression, overnight-liquidation blocking, and fit_execution_params —
 --   ask only whether a REAL order was placed, which does not separate pilot
 --   from scale. Rollout attribution lives in live_session_state.stage.
--- Axis lifecycles, independent of one another:
---   lifecycle:   inserted 'live'; -> 'canceled' when the entry order ends with
---                NOTHING ever filled (reject, zero-fill cancel-after-timeout,
---                Broker Reconcile's pending cancel), all through the single
---                canceled-transition point; -> 'closed' once flat having held
---                shares. Both terminals absorb.
---   entry_state: inserted 'awaiting'; -> 'settled', absorbing. A partial fill
---                does NOT transition it (R-7: fills arrive on a separate
---                channel, not in the order API's response, so an order can sit
---                partially filled. The filled shares ARE a real position from
---                that moment — they enter exit management and count toward
---                execution.max_tickers / max_positions_per_ticker — while the
---                order itself stays in flight awaiting the rest.)
---   exit_state:  inserted 'none'; -> 'submitted', absorbing within the session.
---                Across sessions it is NOT absorbing: Broker Reconcile owns the
---                reset, setting it back to 'none' when it cancels a carried
---                row's broker-side exit order (live_mode_runner.md).
--- The former 'pending' / 'partial_open' distinction is not stored: under
---   entry_state='awaiting', quantity IS NULL means nothing filled yet and
---   quantity > 0 means partially filled. The two ways that state ends —
---   reaching requested_quantity, or abandoning the remainder at
---   cancel_after_seconds — both mean "no longer awaiting fills", which is
---   entry_state='settled'. This also matches backtest, where a
---   partially-filled entry simply proceeds sized down.
+-- lifecycle: inserted 'live'; -> 'canceled' when the entry logical order ends
+--   in any status other than 'filled' with NOTHING ever filled, whatever its
+--   terminal_cause, all through the single canceled-transition point;
+--   -> 'closed' at position close
+--   (live_mode_runner.md). Both terminals absorb.
 -- A partially filled row NEVER reaches lifecycle='canceled': shares were
 --   actually bought, so the outcome is a smaller position, not a non-event.
 -- Never deleted intra-day -- closed/canceled rows retained so cooldown
@@ -1454,6 +1486,334 @@ CREATE TABLE IF NOT EXISTS live_positions (
 -- No entry_ticks column: tp/sl detection is WS/REST-tick driven (see
 --   live_mode_runner.md's Exit Architecture), not track_price_breach()
 --   in live mode, so no "t-bar ticks" field is needed here.
+
+-- Logical orders — one row per order INTENT (an entry, an exit, an
+-- escalation, a replacement), persisting through amends. logical_order_id is
+-- local and assigned before any request is sent: the vendor has no client
+-- order id. At most one 'open' logical order per (position, side) is the
+-- double-submission guard (live_mode_runner.md).
+-- Retention: purge-registry member — date_column `date`, retention_days: inf
+--   (see metadata_crawler.md's evening purge stage).
+CREATE TABLE IF NOT EXISTS live_orders (
+    logical_order_id           VARCHAR NOT NULL PRIMARY KEY,
+    run_id                     VARCHAR NOT NULL,   -- position key → live_positions
+    ticker                     VARCHAR NOT NULL,
+    date                       VARCHAR NOT NULL,
+    entry_bar                  INTEGER NOT NULL,
+    side                       VARCHAR NOT NULL,   -- 'entry' | 'exit'
+    purpose                    VARCHAR NOT NULL,   -- 'entry' | 'exit' | 'escalation' |
+                                                   -- 'vanished_replacement' | 'halt_clear' |
+                                                   -- 'overnight_liquidation' | 'restart_gap_exit'
+    exit_reason                VARCHAR,            -- exit side: the trigger this order
+                                                   --   executes; inherited along
+                                                   --   replaces_logical_order_id
+    replaces_logical_order_id  VARCHAR,            -- the logical order this one continues
+    requested_qty              INTEGER NOT NULL,
+    current_request_id         VARCHAR,            -- the request whose broker order
+                                                   --   number is live
+    status                     VARCHAR NOT NULL,   -- 'open' | 'filled' | 'canceled' |
+                                                   -- 'expired' | 'rejected' | 'unsent'
+    terminal_cause             VARCHAR,            -- recorded at every terminal
+                                                   --   transition: 'shutdown' | 'timeout' |
+                                                   --   'escalation' | 'vanished' |
+                                                   --   'exit_opened' | 'carried_live_canceled' |
+                                                   --   'expired_at_boundary', among others
+    predicted_fill_price              DOUBLE,      -- pilot stage, a position carried with
+    predicted_weighted_avg_exit_price DOUBLE,      --   this exit order: computed at Session
+    predicted_partial_fills_count     INTEGER,     --   Shutdown stage 1 when it cancels the
+                                                   --   order, unless its purpose is
+                                                   --   'overnight_liquidation'. NULL
+                                                   --   elsewhere.
+    reference_price            DECIMAL(18,6),      -- exit side: recorded at creation — the
+                                                   --   confirming breach tick's price for a
+                                                   --   tp/sl order, otherwise the last
+                                                   --   print strictly before creation. NULL
+                                                   --   on entry orders.
+    reference_at               VARCHAR,            -- exit side: that price's time. NULL on
+                                                   --   entry orders.
+    created_at                 VARCHAR NOT NULL,   -- 'YYYYMMDD_HHMMSS'
+    terminal_at                VARCHAR,
+    updated_at                 VARCHAR NOT NULL
+);
+
+-- Broker requests — one row per request the broker numbers: a new order, an
+-- amend, a cancel. Written 'intent' BEFORE the API call; on response it
+-- records broker_order_no and becomes 'sent'. Order identity is
+-- (order_date, broker_order_no) — an OrdNo is unique only within its date.
+-- Retention: purge-registry member — date_column `order_date`, retention_days:
+--   inf (see metadata_crawler.md's evening purge stage).
+CREATE TABLE IF NOT EXISTS live_order_requests (
+    request_id       VARCHAR NOT NULL PRIMARY KEY,
+    logical_order_id VARCHAR NOT NULL,   -- → live_orders
+    request_type     VARCHAR NOT NULL,   -- 'new' | 'amend' | 'cancel' (OrdTrdTpCode 0 | 1 | 2)
+    order_date       VARCHAR NOT NULL,   -- US-local trading date; must equal broker OrdDt
+    ticker           VARCHAR NOT NULL,   -- AstkIsuNo
+    bns_code         VARCHAR NOT NULL,   -- AstkBnsTpCode: '1' sell | '2' buy
+    price_type_code  VARCHAR NOT NULL,   -- AstkOrdprcPtnCode
+    cond_code        VARCHAR NOT NULL,   -- AstkOrdCndiTpCode
+    qty              INTEGER NOT NULL,   -- AstkOrdQty
+    price            DOUBLE,             -- AstkOrdPrc; NULL = market (sent as 0)
+    org_order_no     BIGINT,             -- OrgOrdNo (amend / cancel)
+    broker_order_no  BIGINT,             -- OrdNo returned
+    status           VARCHAR NOT NULL,   -- 'intent' | 'sent' | 'confirmed' | 'rejected' | 'unsent'
+    broker_status    VARCHAR,            -- raw AstkOrdStatCode / Sastkordstatnm, last seen
+    reported_cum_qty INTEGER,            -- broker cumulative for this order number;
+                                         --   cross-check only
+    remaining_qty    INTEGER,            -- AstkOrdRmqty / Sastkunercqty, last seen
+    reject_code      VARCHAR,
+    reject_reason    VARCHAR,
+    intent_at        VARCHAR NOT NULL,   -- 'YYYYMMDD_HHMMSS'
+    sent_at          VARCHAR,
+    confirmed_at     VARCHAR,
+    updated_at       VARCHAR NOT NULL,
+    UNIQUE (order_date, broker_order_no)
+);
+
+-- Executions — one row per execution, the ONLY source of execution
+-- quantities and prices. WS IS2 events insert provisionally (conflicts
+-- ignored); a REST itemised result replaces an order number's rows only when
+-- its Σ exec_qty equals the broker cumulative for that order number (the
+-- completeness condition), otherwise it inserts only. A broker execution
+-- recorded in an 'event_settlement' adjustment's evidence is not folded here.
+-- Retention: purge-registry member — date_column `order_date`, retention_days:
+--   inf (see metadata_crawler.md's evening purge stage).
+CREATE TABLE IF NOT EXISTS live_fills (
+    order_date      VARCHAR NOT NULL,   -- OrdDt
+    broker_order_no BIGINT  NOT NULL,   -- the order number it executed on; shadow:
+                                        --   negative synthetic
+    cum_after_qty   INTEGER NOT NULL,   -- that order number's cumulative after this
+                                        --   execution
+    exec_no         BIGINT,             -- ExecNo (REST itemised view); NULL on WS-only rows
+    request_id      VARCHAR,            -- → live_order_requests; NULL while unattributed
+    exec_qty        INTEGER NOT NULL,   -- Sastkexecqty / AstkExecQty
+    exec_price      DOUBLE  NOT NULL,   -- Sastkexecprc / AstkExecPrc
+    exec_at         VARCHAR NOT NULL,   -- 'YYYYMMDD_HHMMSS', US-local:
+                                        --   Sastklclexecdttm / AstkLclExecDttm
+    source          VARCHAR NOT NULL,   -- 'ws' (provisional) | 'rest' (authoritative) |
+                                        --   'shadow'
+    recorded_at     VARCHAR NOT NULL,
+    PRIMARY KEY (order_date, broker_order_no, cum_after_qty),
+    UNIQUE (order_date, broker_order_no, exec_no)
+);
+
+-- Reconcile corrections — one row per correction of a position's quantity
+-- that Broker Reconcile makes (live_mode_runner.md's Positions branch and
+-- settlement pending). Corrections never enter live_fills, live_orders or
+-- live_order_requests, which hold broker and shadow records only. Numeric
+-- columns follow utils.md's Ledger Numeric Rules.
+-- Retention: purge-registry member — date_column `date`, retention_days: inf
+--   (see metadata_crawler.md's evening purge stage).
+CREATE TABLE IF NOT EXISTS live_position_adjustments (
+    adjustment_id VARCHAR NOT NULL PRIMARY KEY,
+    run_id        VARCHAR NOT NULL,        -- position key → live_positions
+    ticker        VARCHAR NOT NULL,
+    date          VARCHAR NOT NULL,
+    entry_bar     INTEGER NOT NULL,
+    side          VARCHAR NOT NULL,        -- 'entry' (adds shares) | 'exit' (removes shares)
+    qty           DECIMAL(18,6) NOT NULL,  -- > 0, in the basis of observed_at's date
+    price         DECIMAL(18,6),           -- adopted: AstkAvrPchsPrc; shortfall: NULL;
+                                           --   event_settlement entry: 0;
+                                           --   event_settlement exit: amount ÷ qty,
+                                           --   rounded (display only)
+    amount        DECIMAL(28,6),           -- event_settlement exit: the cash in lieu
+                                           --   measured from the broker, or the
+                                           --   settlement-pending estimate; NULL until
+                                           --   set; NULL on every other row
+    amount_source VARCHAR,                 -- event_settlement exit: 'measured' |
+                                           --   'estimated'; NULL while amount is NULL
+    reason        VARCHAR NOT NULL,        -- 'adopted' | 'shortfall' | 'event_settlement'
+    event_date    VARCHAR,                 -- event_settlement: the corporate_events
+                                           --   event_date it settles
+    broker_qty    DECIMAL(18,6) NOT NULL,  -- the broker holding for the ticker
+    ledger_qty    DECIMAL(18,6) NOT NULL,  -- Σ held_qty of the ticker's 'live'
+                                           --   non-shadow positions before this row
+    evidence      VARCHAR,                 -- event_settlement: the broker rows read, JSON
+    call_site     VARCHAR NOT NULL,        -- 'session_start' | 'feed_outage' |
+                                           --   'warm_restart' | 'position_manager'
+    observed_at   VARCHAR NOT NULL,        -- 'YYYYMMDD_HHMMSS', US-local
+    priced_at     VARCHAR,                 -- event_settlement exit: when amount was set
+    CHECK ((event_date IS NULL) = (reason <> 'event_settlement'))
+);
+
+-- Position state — one row per live_positions row, in the CURRENT basis
+-- (today's share count). Sums, counts, times and flags only: it carries NO
+-- average price. weighted_avg_entry_price and weighted_avg_exit_price are
+-- computed in Python from its sums (live_mode_runner.md), because division
+-- is never done in DuckDB (utils.md's Ledger Numeric Rules).
+-- Basis factor of a fill or an adjustment: utils.md's single split-factor
+--   rule (split_ratio_from_events(), which cum_split_ratio() delegates to)
+--   over the window after its US-local trading date
+--   — exec_at's date for a fill, observed_at's date for an adjustment —
+--   through today (US-local, independent of the connection's TimeZone).
+-- Normalised quantity = CAST(raw quantity × factor AS DECIMAL(18,6)), the
+--   product taken in DOUBLE per the split-ratio rule.
+-- Unattributed fills (request_id NULL) are not counted until attached.
+-- Adjustments enter no count or time column.
+-- Retention: a view — it holds no rows and has no retention of its own.
+CREATE VIEW IF NOT EXISTS live_position_state AS
+WITH
+today AS (
+    SELECT strftime(timezone('America/New_York', now()), '%Y%m%d') AS d
+),
+splits AS (
+    SELECT ce.ticker, ce.event_date, ce.value
+    FROM corporate_events ce, today
+    WHERE ce.event_type IN ('split', 'reverse_split')
+      AND ce.event_date <= today.d
+),
+order_fills AS (
+    SELECT o.run_id, o.ticker, o.date, o.entry_bar, o.side,
+           f.order_date, f.exec_qty, f.exec_price, f.exec_at
+    FROM live_fills f
+    JOIN live_order_requests r ON r.request_id = f.request_id
+    JOIN live_orders o ON o.logical_order_id = r.logical_order_id
+),
+first_exit AS (
+    SELECT o.run_id, o.ticker, o.date, o.entry_bar,
+           arg_min(r.order_date, r.intent_at) AS first_exit_order_date
+    FROM live_orders o
+    JOIN live_order_requests r ON r.logical_order_id = o.logical_order_id
+    WHERE o.side = 'exit'
+    GROUP BY o.run_id, o.ticker, o.date, o.entry_bar
+),
+fills AS (
+    SELECT x.*,
+           CAST(CAST(x.exec_qty AS DOUBLE) * COALESCE((
+               SELECT product(s.value) FROM splits s
+               WHERE s.ticker = x.ticker
+                 AND s.event_date > substr(x.exec_at, 1, 8)
+           ), 1.0) AS DECIMAL(18,6)) AS norm_qty,
+           (x.side = 'exit' AND x.order_date = fe.first_exit_order_date) AS in_first_exit_session
+    FROM order_fills x
+    LEFT JOIN first_exit fe USING (run_id, ticker, date, entry_bar)
+),
+fill_agg AS (
+    SELECT run_id, ticker, date, entry_bar,
+           SUM(norm_qty) FILTER (WHERE side = 'entry') AS entry_filled_qty,
+           SUM(norm_qty) FILTER (WHERE side = 'exit')  AS exit_filled_qty,
+           SUM(norm_qty) FILTER (WHERE in_first_exit_session) AS exit_filled_qty_first_session,
+           CAST(SUM(CAST(exec_qty AS DECIMAL(38,6)) * CAST(exec_price AS DECIMAL(18,6)))
+               FILTER (WHERE side = 'entry') AS DECIMAL(28,6)) AS entry_fill_amount,
+           CAST(SUM(CAST(exec_qty AS DECIMAL(38,6)) * CAST(exec_price AS DECIMAL(18,6)))
+               FILTER (WHERE side = 'exit') AS DECIMAL(28,6)) AS exit_fill_amount,
+           MIN(exec_at) FILTER (WHERE side = 'entry') AS first_entry_fill_at,
+           COUNT(DISTINCT substr(exec_at, 1, 15)) FILTER (WHERE side = 'exit') AS exit_fill_seconds,
+           MAX(exec_at) FILTER (WHERE side = 'exit') AS last_exit_fill_at
+    FROM fills
+    GROUP BY run_id, ticker, date, entry_bar
+),
+adjustments AS (
+    SELECT a.*,
+           CAST(CAST(a.qty AS DOUBLE) * COALESCE((
+               SELECT product(s.value) FROM splits s
+               WHERE s.ticker = a.ticker
+                 AND s.event_date > substr(a.observed_at, 1, 8)
+           ), 1.0) AS DECIMAL(18,6)) AS norm_qty
+    FROM live_position_adjustments a
+),
+adj_agg AS (
+    SELECT run_id, ticker, date, entry_bar,
+           SUM(norm_qty) FILTER (WHERE side = 'entry' AND reason <> 'event_settlement') AS entry_adj_qty,
+           SUM(norm_qty) FILTER (WHERE side = 'exit'  AND reason <> 'event_settlement') AS exit_adj_qty,
+           SUM(norm_qty) FILTER (WHERE side = 'entry' AND reason = 'event_settlement')  AS settlement_in_qty,
+           SUM(norm_qty) FILTER (WHERE side = 'exit'  AND reason = 'event_settlement')  AS settlement_out_qty,
+           CAST(SUM(CAST(qty AS DECIMAL(38,6)) * price)
+               FILTER (WHERE reason = 'adopted') AS DECIMAL(28,6)) AS adopted_entry_amount,
+           CAST(SUM(CAST(qty AS DECIMAL(38,6)) * price)
+               FILTER (WHERE side = 'entry' AND price IS NOT NULL) AS DECIMAL(28,6)) AS adjustment_cost_amount,
+           SUM(amount) FILTER (WHERE side = 'exit' AND reason = 'event_settlement') AS settlement_amount,
+           bool_or(side = 'exit' AND reason = 'event_settlement' AND amount IS NULL) AS has_unpriced_settlement
+    FROM adjustments
+    GROUP BY run_id, ticker, date, entry_bar
+),
+order_agg AS (
+    SELECT run_id, ticker, date, entry_bar,
+           bool_or(side = 'entry' AND status = 'open') AS entry_open,
+           bool_or(side = 'exit'  AND status = 'open') AS exit_open,
+           MIN(created_at) FILTER (WHERE side = 'exit') AS exiting_since
+    FROM live_orders
+    GROUP BY run_id, ticker, date, entry_bar
+),
+base AS (
+    SELECT p.run_id, p.ticker, p.date, p.entry_bar, p.lifecycle, p.origin, p.is_shadow,
+           COALESCE(fa.entry_filled_qty, 0) AS entry_filled_qty,
+           COALESCE(fa.exit_filled_qty, 0)  AS exit_filled_qty,
+           COALESCE(fa.entry_filled_qty, 0) + COALESCE(aa.entry_adj_qty, 0) AS entry_qty,
+           COALESCE(fa.exit_filled_qty, 0)  + COALESCE(aa.exit_adj_qty, 0)  AS exit_qty,
+           COALESCE(aa.settlement_in_qty, 0) - COALESCE(aa.settlement_out_qty, 0) AS settlement_qty,
+           COALESCE(fa.exit_filled_qty_first_session, 0) AS exit_filled_qty_first_session,
+           COALESCE(fa.entry_fill_amount, 0) AS entry_fill_amount,
+           COALESCE(fa.exit_fill_amount, 0)  AS exit_fill_amount,
+           COALESCE(aa.adopted_entry_amount, 0) AS adopted_entry_amount,
+           CAST(COALESCE(fa.entry_fill_amount, 0) + COALESCE(aa.adjustment_cost_amount, 0)
+                AS DECIMAL(28,6)) AS pnl_cost_amount,
+           CAST(COALESCE(fa.exit_fill_amount, 0) + COALESCE(aa.settlement_amount, 0)
+                AS DECIMAL(28,6)) AS pnl_proceeds_amount,
+           fa.first_entry_fill_at,
+           COALESCE(fa.exit_fill_seconds, 0) AS exit_fill_seconds,
+           fa.last_exit_fill_at,
+           COALESCE(oa.entry_open, FALSE) AS entry_open,
+           COALESCE(oa.exit_open, FALSE)  AS exit_open,
+           oa.exiting_since,
+           COALESCE(aa.has_unpriced_settlement, FALSE) AS has_unpriced_settlement
+    FROM live_positions p
+    LEFT JOIN fill_agg    fa USING (run_id, ticker, date, entry_bar)
+    LEFT JOIN adj_agg     aa USING (run_id, ticker, date, entry_bar)
+    LEFT JOIN order_agg   oa USING (run_id, ticker, date, entry_bar)
+),
+held AS (
+    SELECT *, entry_qty - exit_qty + settlement_qty AS held_qty FROM base
+),
+pending AS (
+    SELECT *,
+           (lifecycle = 'live' AND NOT entry_open AND NOT exit_open
+            AND ((held_qty > 0 AND held_qty < 1) OR has_unpriced_settlement)) AS settlement_pending
+    FROM held
+)
+SELECT run_id, ticker, date, entry_bar, lifecycle, origin, is_shadow,
+       entry_filled_qty, exit_filled_qty, entry_qty, exit_qty, settlement_qty, held_qty,
+       exit_filled_qty_first_session,
+       entry_fill_amount, exit_fill_amount, adopted_entry_amount,
+       pnl_cost_amount, pnl_proceeds_amount,
+       first_entry_fill_at, exit_fill_seconds, last_exit_fill_at,
+       entry_open, exit_open, exiting_since,
+       (entry_open AND entry_filled_qty = 0) AS reserved,
+       settlement_pending,
+       (lifecycle = 'live' AND entry_qty > 0 AND NOT settlement_pending) AS open_positions
+FROM pending;
+-- Columns, beyond the position key, lifecycle, origin and is_shadow:
+--   entry_filled_qty / exit_filled_qty — Σ normalised exec_qty of entry-side /
+--     exit-side fills
+--   entry_qty — entry_filled_qty + Σ normalised qty of side='entry'
+--     adjustments whose reason is not 'event_settlement'
+--   exit_qty — exit_filled_qty + Σ normalised qty of side='exit' adjustments
+--     whose reason is not 'event_settlement'
+--   settlement_qty — Σ normalised qty of side='entry' 'event_settlement'
+--     adjustments − Σ of side='exit' ones
+--   held_qty — entry_qty − exit_qty + settlement_qty, exact
+--   exit_filled_qty_first_session — Σ normalised exec_qty of exit fills whose
+--     order_date equals the order_date of the position's first exit request
+--   entry_fill_amount / exit_fill_amount — Σ exec_qty × exec_price over the
+--     RAW fills (basis-invariant), one operand widened to DECIMAL(38,6), the
+--     sum rounded to DECIMAL(28,6) (as are every amount column below)
+--   adopted_entry_amount — Σ qty × price over reason='adopted' adjustments
+--   pnl_cost_amount — entry_fill_amount + Σ qty × price over side='entry'
+--     adjustments with a non-NULL price
+--   pnl_proceeds_amount — exit_fill_amount + Σ amount over side='exit'
+--     'event_settlement' adjustments
+--   first_entry_fill_at — earliest entry fill exec_at; NULL with no entry fill
+--   exit_fill_seconds — distinct exit fill exec_at values, to the second
+--   last_exit_fill_at — latest exit fill exec_at
+--   entry_open / exit_open — an 'open' logical order exists on that side
+--   exiting_since — earliest created_at among the position's exit logical
+--     orders; exit_order_stuck_minutes is measured against it, so a
+--     resubmission cannot reset the clock
+--   reserved — entry_open AND entry_filled_qty = 0
+--   settlement_pending — lifecycle='live' AND no 'open' logical order on
+--     either side AND (0 < held_qty < 1 OR the position has a side='exit'
+--     'event_settlement' adjustment with amount NULL)
+--   open_positions — lifecycle='live' AND entry_qty > 0 AND NOT
+--     settlement_pending
 
 -- One row per session date; preserves the sizing basis across a restart.
 -- Retention: purge-registry member — date_column `date`, retention_days: inf
@@ -1903,7 +2263,8 @@ CREATE TABLE IF NOT EXISTS live_scan_daily (
 -- (live_mode_runner.md). TICKER-scoped, not position-scoped: last_halt_state
 -- is keyed by ticker and max_positions_per_ticker allows several positions on
 -- one, so a per-position column would store one interval N times. A
--- position's halted minutes are derived by intersecting [fill_second, now]
+-- position's halted minutes are derived by intersecting
+-- [live_position_state.first_entry_fill_at, now]
 -- with this ticker's rows, which is what execution.max_hold_bars' live
 -- reading needs (elapsed minus halted == build_effective_bar_sequence()'s
 -- valid-bar count).
@@ -2026,7 +2387,10 @@ CREATE TABLE IF NOT EXISTS live_ticker_terms (
 -- Cannot be deferred to the evening batch, unlike its entry-side counterpart
 -- evening_detection_gap: L is an observation, and which prints live happened
 -- to receive is not reconstructable from tick_10.
--- Written by LiveModeRunner per settled exit, ALWAYS — deliberately NOT
+-- Written by LiveModeRunner per settled exit, and for each exit logical order
+-- Session Shutdown cancels, from that session's buffer — in both cases except
+-- an exit logical order whose purpose is 'overnight_liquidation', which writes
+-- no contribution — deliberately NOT
 -- merged into feed_coverage_daily despite the identical grain and the shared
 -- purpose. That table is evening-batch-written and single-writer, skips
 -- entirely when neither side's file exists, excludes tickers missing
@@ -2081,17 +2445,23 @@ CREATE TABLE IF NOT EXISTS exit_trigger_agreement_daily (
 -- Retention: purge-registry member — date_column `date`, retention_days: inf
 -- (see metadata_crawler.md's evening purge stage). Of the tables here this is
 -- the one whose growth rate can actually matter: R-9 widened its writers from
--- one finding to six and finding 29 has since made seven, and findings 18 and
+-- one finding to six, finding 29 made seven, and findings 36-44
+-- (health_report.md) have since made sixteen; findings 18 and
 -- 24 both emit repeatedly during a broker-latency episode. Its purpose — WHEN an occurrence happened, and
 -- alert traceability via alert_log.event_ids — is short-horizon, so a window is
 -- legitimate here once growth has been observed. The DB health observation
 -- (health_report.md) reports its row count for exactly that purpose.
 -- SCOPE, deliberately wider than today's use: the schema accepts any
 -- event-shaped finding. Findings 12, 14, 18, 24, 25 and 27 write here (R-9),
--- and finding 29 does too.
+-- and finding 29 does too, as do fill_ledger_mismatch, intent_match_ambiguous,
+-- exit_rejection_streak, reconcile_deferred, event_settlement_stalled,
+-- summary_vocabulary_candidate, dividend_withholding_mismatch,
+-- regime_holdout_gate_failed and regime_holdout_verdict.
 -- Findings 13 and 15 deliberately do NOT: each already writes its own
--- trade_log row (exit_reason='restart_gap_exit' / 'overnight_exit' /
--- 'reconcile_ghost') carrying the occurrence and its time, so recording them
+-- trade_log row (finding 13: exit_reason='restart_gap_exit'; finding 15:
+-- rows with exit_date > date OR exit_reason='overnight_exit', and
+-- 'reconcile_ghost' as its separate tally) carrying the occurrence and its
+-- time, so recording them
 -- here too would be a second source for one fact — the defect
 -- corporate_events' one-row invariant exists to prevent. The rule the split
 -- follows: an event belongs here when it leaves no row anywhere else.
@@ -2308,7 +2678,10 @@ session_stats_all = con.execute("""
 """, [20]).df()
 # Pass to build_session_stats_dict(); access result[date][ticker] per entry point
 
-# Check for corporate events (splits, reverse splits, dividends) for a ticker
+# Check for corporate events (splits, reverse splits, dividends) for a ticker.
+# Inspection only: a 'dividend' row's amount for any computation is read
+# through utils.md's dividend_gross_amount() or dividend_gross_from_events(),
+# never from `value`.
 events = con.execute("""
     SELECT ticker, event_date, event_type, value
     FROM corporate_events

@@ -391,9 +391,11 @@ gap_percentile(bars, date, n_sessions, session_stats, dividend_amount=0.0)
        via adjust_bars_for_corporate_events() before reaching this method;
        only the ex-dividend cash-drop component needs correcting here)
     → dividend_amount: cash dividend per share with ex-dividend date = today
-      (0.0 if none). Caller (FeatureExtractor) looks this up from
-      corporate_events for (ticker, today) and passes it in — this method
-      does not query DuckDB directly.
+      (0.0 if none). The caller looks this up from corporate_events for
+      (ticker, today) and passes it in — FeatureExtractor in training
+      (Strategy D), LiveModeRunner through CachingIndicatorCalculator's
+      on_regular_session_open() in live (live_mode_runner.md's
+      today-dividend map); this method does not query DuckDB directly.
     → Percentile rank of today's gap within prior N sessions' gap distribution
       baseline loaded from session_stats["gap_pct_mean"] and session_stats["gap_pct_std"]
       (baseline itself is already dividend/split-adjusted per-session at

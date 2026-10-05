@@ -71,8 +71,10 @@ def gather_findings(db_conn, today_date, log_dir,
     """
     `subset` (None = every finding) is applied HERE, at collection, not as a
     filter over the finished result: this function otherwise sweeps
-    batch_runs, ticker_cik_map, inference_log, trade_log, live_positions and
-    the crawler log files on every call, and finding 27 can fire dozens of
+    batch_runs, ticker_cik_map, inference_log, trade_log, live_positions, the
+    order and fill ledger (live_orders, live_order_requests, live_fills,
+    live_position_adjustments and the view live_position_state), health_events
+    and the crawler log files on every call, and finding 27 can fire dozens of
     times a minute. Filtering afterwards would leave that full sweep running
     at that rate against a live session's own DB connection.
     `live_aggregates` carries the in-memory tallies LiveModeRunner owns (see
@@ -120,14 +122,22 @@ def gather_findings(db_conn, today_date, log_dir,
        live_session_state.session_diagnostics rather than passed in as an
        in-memory tally, so a crashed session's value survives and the evening
        liveness probe can recover it.
-    6. Live winning-rate divergence vs. backtest — placeholder only;
-       method not yet defined (see the shadow/retraining spec doc for the
-       comparison methodology once shadow mode has run).
+    6. Live winning-rate divergence vs. backtest — placeholder only. Its CI
+       is computed by utils.bootstrap_ci(), the same computation as
+       shadow_retraining.md's divergence trigger; the resampling unit and the
+       threshold are not yet defined (open_items.md).
     7. Execution-parameter divergence (pilot stage onward) — mean absolute
        gap between trade_log.predicted_fill_price/predicted_weighted_avg_exit_price
        and their real (fill_price/weighted_avg_exit_price) counterparts,
        over the same cumulative pilot-period window fit_execution_params()
-       uses (see shadow_retraining.md). Independent of finding 6 — a model
+       uses (see shadow_retraining.md). Compared in one basis: for a position
+       carried with an exit logical order, the predicted_* stored on the
+       exit logical order Session Shutdown canceled (live_mode_runner.md)
+       against its raw entry fills and its exit fills of that order's first
+       request's order_date (live_fills), not trade_log's blended real-side
+       columns; a carried position with no exit logical order carrying
+       them is excluded; for every other row, trade_log's
+       own columns. Independent of finding 6 — a model
        divergence and an execution-parameter divergence are different
        failure modes (retrain vs. recalibrate) and must not be merged into
        one signal. Threshold TBD, same deferral as finding 6.
@@ -202,26 +212,34 @@ def gather_findings(db_conn, today_date, log_dir,
         (live_session_start still 'running', no live_session_end row).
         Distinct from a normal 'failed' status — this is a crash signal,
         not a stage failure.
-    12. Unknown broker order/position at reconcile (R-2/R-3) — a broker
-        open order or open position with no matching live_positions row at
-        any Broker Reconcile call site (session start, warm restart, feed
-        outage). On the order side this means an order this system never
-        submitted: since Broker Reconcile matches broker orders to
-        live_positions.order_id, a prior-session order of this system
-        matches its own row and is handled there rather than arriving
-        here. Should not occur under normal operation; a nonzero count
+    12. Unknown broker order/position at reconcile (R-2/R-3) — at any Broker
+        Reconcile call site (session start, warm restart, feed outage, and the
+        Positions branch run at the event-day exit gate's release):
+        - kind='order': a broker order absent from `live_order_requests`
+          (matched on `(order_date, broker_order_no)`) after the startup
+          procedure has resolved 'intent' requests — an order this system
+          never submitted. A broker execution recorded in an
+          'event_settlement' adjustment's evidence is not this kind.
+        - kind='position': a broker holding above the ledger, adopted onto
+          the ticker's adopted row.
+        - kind='shortfall': a broker holding below the ledger, absorbed by
+          shortfall adjustments.
+        Should not occur under normal operation; a nonzero count
         points at a gap in the reconcile/adopt logic, not at strategy
         performance.
         Source (R-9): aggregated from health_events where
         finding_name='unknown_broker_order_or_position', not from a passed-in
         tally. detail carries call_site ('session_start' | 'warm_restart' |
-        'feed_outage'), kind ('order' | 'position'), order_id and ticker, so
-        the three call sites stay distinguishable and each occurrence keeps
-        its own time.
+        'feed_outage' | 'position_manager' — the last at the event-day exit
+        gate's release), kind ('order' | 'position' | 'shortfall'), ticker,
+        and for kind='order' order_date and order_id (the broker order
+        number), so the three call sites stay distinguishable and each
+        occurrence keeps its own time.
     Findings 13 and 15 stay on their existing `trade_log` queries rather than
     moving to `health_events` with the other event-shaped findings (R-9).
-    Each already writes its own row — `exit_reason='restart_gap_exit'` /
-    `'overnight_exit'` / `'reconcile_ghost'` — carrying both the occurrence
+    Each already writes its own row — finding 13 `exit_reason='restart_gap_exit'`;
+    finding 15 rows with `exit_date > date` OR `exit_reason='overnight_exit'`,
+    and `'reconcile_ghost'` — carrying both the occurrence
     and its time, and those rows already survive a crash and already reach the
     operator through the ordinary report and the evening liveness probe.
     Recording them in `health_events` as well would create a second source for
@@ -246,9 +264,11 @@ def gather_findings(db_conn, today_date, log_dir,
         loop iteration. The same position is counted again by finding 15 when
         it is liquidated next session — two moments of one carry, deliberately
         not merged.
-    15. Overnight position liquidated at session start (R-3) — count of
-        `exit_reason='overnight_exit'` liquidations from the Unified
-        Overnight Policy, this session. Includes the `reconcile_ghost`
+    15. Overnight position liquidated at session start (R-3) — count, within
+        this session's scope, of `trade_log` rows with `exit_date > date` OR
+        `exit_reason='overnight_exit'` — every carried position closed this
+        session, whatever its label (live_mode_runner.md's Unified Overnight
+        Policy). Includes the `reconcile_ghost`
         count as a separate, distinct tally within the same finding (a row
         with no matching broker position is a data/bookkeeping issue, not
         an overnight-carry issue, even though both surface at the same
@@ -269,18 +289,22 @@ def gather_findings(db_conn, today_date, log_dir,
         quarantine.corporate_event_value_tolerance is set sensibly
         (see metadata_crawler.md's upsert_corporate_event()).
     17. Never-opened entry outcomes (R-5/R-7) — this session's counts of
-        exit_reason='entry_canceled' (submitted, never filled, canceled at
-        cancel_after_seconds) and exit_reason='entry_rejected' (the broker
-        or the account refused the submission), reported as two separate
-        tallies within one finding. Kept apart from findings 13/15's
+        exit_reason='entry_canceled' (never filled, ended other than by
+        rejection) and exit_reason='entry_rejected' (the broker
+        or the account refused the submission), reported as separate
+        tallies within one finding; the entry_canceled tally is itself two
+        counts by its entry logical order's terminal_cause, 'timeout' and
+        every other. Kept apart from findings 13/15's
         operational family (restart_gap_exit / overnight_exit /
         reconcile_ghost) because the two families are excluded from PnL for
         different reasons and mean different things: the operational ones
         held a real position that was closed for a non-strategy reason,
         while these never opened at all (see db_schema.md's two exclusion
-        families). A rising entry_canceled count points at buy_rate /
-        cancel_after_seconds being too tight and is calibration evidence
-        (fit_execution_params() consumes it); a rising entry_rejected count
+        families). A rising timeout entry_canceled count points at
+        buy_rate / cancel_after_seconds being too tight and is calibration
+        evidence (fit_execution_params() consumes it); the other count is
+        not — those entries were cut short before cancel_after_seconds
+        could decide them; a rising entry_rejected count
         points at the account or the broker and is not — it is excluded
         from that calibration (see shadow_retraining.md). The
         entry_rejected tally is broken out by trade_log.reject_reason
@@ -292,10 +316,11 @@ def gather_findings(db_conn, today_date, log_dir,
         nothing to separate that from a real fault.
     18. Exit order still in flight (R-7) — exit orders whose age exceeds
         live_mode.exit_order_stuck_minutes without completing, with the
-        (ticker, order_id, age, cum_filled_qty / quantity) detail. The age
-        is the POSITION's exit-attempt age, measured from
-        live_positions.exiting_since, which survives a resubmission that
-        assigns a new order_id — a halt-clear resubmission, a stuck-timeout
+        (ticker, order_date, order_id, age, exit_filled_qty / entry_qty)
+        detail. The age is the POSITION's exit-attempt age, measured from
+        live_position_state.exiting_since — the earliest created_at among its
+        exit logical orders — which survives a resubmission that opens a new
+        logical order — a halt-clear resubmission, a stuck-timeout
         escalation, or a cross-session carry whose exit is resubmitted by
         the next session. An overnight_exit liquidation is therefore one of
         this finding's cases, not an exception to it. An exit
@@ -303,7 +328,7 @@ def gather_findings(db_conn, today_date, log_dir,
         exposed to the very risk that triggered the exit — so on a thin
         name an order can in principle stay open indefinitely. The same
         threshold now also drives an automatic response: past it,
-        live_mode_runner.md's In-flight order tracking escalates the
+        live_mode_runner.md's Order and fill ledger (exit-side loop) escalates the
         order — to market inside the regular session (a no-op if already
         market), and outside it, where the venue refuses a market order, by
         advancing the exit limit's spread position one step per cycle
@@ -314,9 +339,10 @@ def gather_findings(db_conn, today_date, log_dir,
         the escalated order has filled by report time.
         TWO TALLIES (R-9), reported together. (a) EVENT COUNT — how many
         times the threshold was crossed this session, aggregated from
-        health_events where finding_name='exit_order_stuck'; detail carries
-        order_id, age_seconds and cum_filled_qty/quantity, and the event is
-        written ONCE per order_id on its first crossing (the 5s loop
+        health_events where finding_name='exit_order_stuck'; detail is
+        {order_date, order_id, age_seconds, exit_filled_qty, entry_qty},
+        exit_filled_qty and entry_qty read from live_position_state, and the
+        event is written ONCE per logical order on its first crossing (the 5s loop
         re-satisfies the condition every cycle). (b) SNAPSHOT — the existing
         point-in-time query above, listing what is still outstanding at report
         time. The event answers "how often", the snapshot "what is open right
@@ -354,7 +380,11 @@ def gather_findings(db_conn, today_date, log_dir,
 
     20. Circuit-breaker metrics (R-4) — the session's peak realised loss,
         longest run of consecutive losing exits, and peak rolling-hour entry
-        count. Computed EVERY session whether or not the thresholds are
+        count. Realised loss is counted per exit fill (live_mode_runner.md's
+        Circuit Breaker): fills of today, each against the position's
+        weighted_avg_entry_price, PnL-excluded exit orders left out, an
+        'event_settlement' exit adjustment counted on its priced_at date; the
+        consecutive-loss count stays per position close. Computed EVERY session whether or not the thresholds are
         armed: they all default to 0 (no limit), and Pilot is expected to
         calibrate them, which requires the numbers to have been accumulating
         beforehand. Same shape as findings 3/6/7/8 — the quantity is always
@@ -438,7 +468,8 @@ def gather_findings(db_conn, today_date, log_dir,
         delivered, sustained across more than one consecutive cycle while
         in-flight orders exist. No new freeze reason and no new polling —
         this reuses the calls already made every cycle as fill tracking's
-        backstop, comparing them against `seen_fills`'s WS-derived state.
+        backstop, comparing its `source='rest'` rows of `live_fills` against
+        the `source='ws'` rows.
         That backstop is ACCOUNT-WIDE rather than per-order (the vendor's
         fill inquiry takes no order number), so its cost does not scale
         with the number of outstanding orders and this finding adds none. Warn severity only: correctness is unaffected (the same
@@ -449,8 +480,8 @@ def gather_findings(db_conn, today_date, log_dir,
         this finding is scoped entirely to the account-wide fill-event
         stream and does not interact with `freeze_reasons`.
         Source (R-9): aggregated from health_events where
-        finding_name='fill_stream_staleness'; detail carries order_id,
-        entered_at and sustained_cycles. Written ONCE PER STALE EPISODE — on
+        finding_name='fill_stream_staleness'; detail carries order_date,
+        order_id (the broker order number), entered_at and sustained_cycles. Written ONCE PER STALE EPISODE — on
         entry into the stale state, re-armed when it clears — so a second
         episode on the same order IS counted. Deliberately unlike finding 18's
         once-per-order rule: an order with several fills can go stale, recover
@@ -470,8 +501,10 @@ def gather_findings(db_conn, today_date, log_dir,
         count is direct evidence the broker does NOT always preserve a
         resting order through a halt.
         Source (R-9): aggregated from health_events where
-        finding_name='inflight_exit_gone_at_halt_clear'; detail carries ticker
-        and order_id.
+        finding_name='inflight_exit_gone_at_halt_clear'; detail carries ticker,
+        order_date and order_id (the broker order number). The resubmission
+        it triggers is the exit logical order with purpose='halt_clear'
+        (live_orders).
     26. Bar-arrival latency (`bar_arrival_latency`, T-13) — read from
         `bar_latency_daily` (db_schema.md), not passed in: same reasoning as
         finding 19, the values have a table of their own. Severity always
@@ -643,6 +676,75 @@ def gather_findings(db_conn, today_date, log_dir,
         Level: warn. Overrun costs detection latency, not correctness —
         a response that came back is still evaluated.
 
+    36. Fill ledger mismatch (`fill_ledger_mismatch`) — an order number whose
+        Σ `exec_qty` in `live_fills` differs from the broker's
+        `reported_cum_qty` across more than one consecutive cycle
+        (live_mode_runner.md's fill folding). Source: health_events where
+        finding_name='fill_ledger_mismatch'; detail
+        `{order_date, order_id, ledger_qty, reported_cum_qty, sustained_cycles}`.
+        Recorded once per episode, re-armed when it clears. Level: warn.
+    37. Intent match ambiguous (`intent_match_ambiguous`) — the startup
+        procedure found several broker orders matching one 'intent' new-order
+        request, so its logical order stays 'open'. Source: health_events
+        where finding_name='intent_match_ambiguous'; detail
+        `{request_id, ticker, candidates}`, `candidates` a list of
+        `(order_date, order_id)`. Level: abort.
+    38. Exit rejection streak (`exit_rejection_streak`) — consecutive
+        structural rejections of a position's exit logical orders reaching
+        `live_mode.exit_reject_streak_threshold` (default 3). Source:
+        health_events where finding_name='exit_rejection_streak'; detail
+        `{ticker, logical_order_id, streak_count, reject_code, reject_reason}`.
+        Recorded once per streak per position. Level: warn.
+    39. Reconcile deferred (`reconcile_deferred`) — a ticker Broker Reconcile
+        did not compare or settle this call. Source: health_events where
+        finding_name='reconcile_deferred'; detail
+        `{ticker, reason, call_site}`, `reason` ∈ 'broker_unprocessed' |
+        'corporate_event_anomaly' | 'vendor_conflict' | 'unrecorded_event' |
+        'settlement_ambiguous'. Recorded once per deferring ticker per Broker
+        Reconcile call; at `call_site='position_manager'` (the event-day exit
+        gate), once per gate episode. Level: warn.
+    40. Event settlement stalled (`event_settlement_stalled`) — a
+        `settlement_pending` position (live_mode_runner.md) whose fraction or
+        cash in lieu has not settled. Source: health_events where
+        finding_name='event_settlement_stalled'; detail
+        `{ticker, run_id, date, entry_bar, kind, sessions_waited}`, `kind` ∈
+        'cash_unobserved' (closed at `live_mode.event_settlement_max_sessions`
+        without measured cash) | 'fraction_held' (the broker still holds the
+        fraction; recorded at each Broker Reconcile call) | 'cash_ambiguous' (a
+        cash-in-lieu row with an empty `AstkIsuNo` that is not attributable to
+        exactly one pending adjustment).
+        Level: warn.
+    41. Summary vocabulary candidate (`summary_vocabulary_candidate`) — a
+        broker trade-history row whose `SmryNm` matched no configured list
+        where one was expected. Source: health_events where
+        finding_name='summary_vocabulary_candidate'; detail
+        `{suggested_key, summary, ticker, trd_dt, context}`, `context` ∈
+        'cash_pending' | 'split_settlement' | 'dividend'. Recorded once per
+        (`suggested_key`, `summary`) while that summary is absent from the
+        key's list. The operator adds the summary to the suggested config key;
+        no config value is written by the system. Level: warn.
+    42. Dividend withholding mismatch (`dividend_withholding_mismatch`) — an
+        observed withholding rate (dividend tax ÷ dividend cash for one ticker
+        and `TrdDt`) differing from `corporate_events.dividend_withholding_rate`
+        by more than `corporate_events.dividend_withholding_tolerance`. Source:
+        health_events where finding_name='dividend_withholding_mismatch';
+        detail `{ticker, trd_dt, observed_rate, configured_rate}`, once per
+        (ticker, `TrdDt`). The configured rate is not changed by the system.
+        Level: warn.
+    43. Regime holdout gate failed (`regime_holdout_gate_failed`) — with
+        `optimizer.regime_holdout.gate.enabled`, the deployed `run_id`'s
+        verdict resolved to 'fail', and session start stopped before
+        Inferencer init (live_mode_runner.md). Source: health_events where
+        finding_name='regime_holdout_gate_failed'; detail
+        `{run_id, optimizer_run_id, verdict}`. Level: abort.
+    44. Regime holdout verdict (`regime_holdout_verdict`) — recorded at every
+        live session start: the deployed `run_id`'s `regime_holdout_verdict`
+        row (pipeline_optimizer.md's report items and verdict), or that no
+        row exists. Source: health_events where
+        finding_name='regime_holdout_verdict'; detail
+        `{run_id, verdict, report}`. Level: ok — a report, never an alert on
+        its own.
+
     Returns: dict of {finding_name: {severity: 'ok'|'warn'|'abort', detail: ...}}
     """
     ...
@@ -656,7 +758,7 @@ A read-only summary emitted once at each FIRST-DB-ACCESS point: live session
 start, evening batch start, and premarket batch start. It reports:
 
 - the `data/market.duckdb` file size
-- row counts for the fifteen purge-registry tables (see db_schema.md) and for
+- row counts for the twenty-one purge-registry tables (see db_schema.md) and for
   the structurally-excluded corpus tables
 - the latest `date` value present in each
 
@@ -671,8 +773,8 @@ resolvable. Every registry entry starts at `inf` precisely because no growth
 rate has ever been measured; this is what measures them, so an operator
 eventually sets a window against data instead of a guess. `health_events` is
 the entry most worth watching — R-9 widened its writers from one finding to
-six and finding 29 has since made seven, and findings 18 and 24 both emit
-repeatedly during a broker-latency episode.
+six, finding 29 made seven and findings 36-44 have since made sixteen, and
+findings 18 and 24 both emit repeatedly during a broker-latency episode.
 
 **Feed coverage is reported the same way**, and for the same reason. The
 evening batch's coverage stage writes
@@ -1005,7 +1107,7 @@ present.
 - **`log_dir` files**: findings 4, 10, and the missing-`SUMMARY` finding.
   Readable without the DB, which is why path (7) can produce anything at all.
 - **DB**: findings 1, 2, 3, 5, 8, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
-  22, 23, 24, 25, 26, 27, 29, 30, 31, 32, 33, 34, 35. Of those, 30-33 and 35
+  22, 23, 24, 25, 26, 27, 29, 30, 31, 32, 33, 34, 35, 36-44. Of those, 30-33 and 35
   read `live_scan_daily`; 33 alone reads a row written by the evening batch
   rather than by the session being reported, so on a session-end call it
   describes the PREVIOUS day.
@@ -1151,7 +1253,7 @@ alerting:
 - Date-scoped queries over `trade_log` use `exit_date`, not `date`, wherever
   the question is "what did this session close". `date` is the ENTRY date,
   so a position carried across the boundary — dead position Case A, and
-  live's `overnight_exit` — would otherwise be attributed to the day it was
+  every live position closed in a later session — would otherwise be attributed to the day it was
   opened and vanish from the report for the day it was actually liquidated
   (see db_schema.md's `trade_log.exit_date`). Entry-side questions still
   read `date`

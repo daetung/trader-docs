@@ -104,6 +104,10 @@ whether a real fill sits beside the simulated one — and is crash-tolerant
 per trade, where a session-end batch loses the whole day if the process dies
 first. The single exception is an exit still unfilled at session end, which
 is treated as settled at that moment, the same instant its slot is released.
+That prediction is stored on the exit logical order Session Shutdown cancels
+(`live_orders`, live_mode_runner.md) unless its purpose is
+'overnight_liquidation', and the carried position's eventual `trade_log` row
+takes its `predicted_*` from there — covering the first exit session only.
 `fit_execution_params()` itself is UNCHANGED and still runs at or after
 session end: what moved is when `predicted_*` is populated, not when the fit
 runs — a fit needs a population, not one trade.
@@ -126,10 +130,27 @@ sell_rate_neutral:               gated on cumulative exit_reason IN
 
 A parameter whose gate isn't met yet is left unchanged this cycle — the
 other four (if their own gates are met) still refit independently.
-`exit_reason='entry_canceled'` rows (see db_schema.md) are included in the
-entry-count denominator for `buy_rate`/`cancel_after_seconds` — a fully-
-unfilled entry is itself a direct, relevant observation for those two
-parameters, not noise to exclude.
+
+**Carried positions compare in one basis.** A position carried with an exit
+logical order has `predicted_*` for its first exit session only, while its
+`trade_log` real-side columns blend every session. For such a position the
+fit, and `health_report.md`'s finding 7, compare the `predicted_*` stored on
+the exit logical order Session Shutdown canceled (live_mode_runner.md)
+against its raw entry fills and its exit fills whose `order_date` equals
+that order's first request's (`live_fills`), not against `trade_log`'s
+blended columns. A carried position with no exit logical order carrying
+`predicted_*` is excluded from both, its gate counts included. Every other
+row compares `trade_log`'s own columns.
+
+`exit_reason='entry_canceled'` rows (see db_schema.md) whose position's
+entry logical order ended `terminal_cause='timeout'` are included in the
+entry-count denominator for `buy_rate`/`cancel_after_seconds` — an entry
+left unfilled through `cancel_after_seconds` is itself a direct, relevant
+observation for those two parameters, not noise to exclude. Every other
+`entry_canceled` row (an entry cut short by Session Shutdown, the startup
+procedure, expiry, a vanished or an unsent order) is excluded from that
+denominator and from its gate count: it ended before `cancel_after_seconds`
+could decide it, so it carries no evidence about either parameter.
 
 `exit_reason='entry_rejected'` rows (R-7) are **excluded** from that same
 denominator — the opposite treatment, for the opposite reason. A rejection
@@ -237,9 +258,12 @@ definition of "week" into the project):
 ```
 For the most recently completed calendar week:
     live_winning_rate = trade_log winning rate for that week (is_shadow=FALSE)
-    backtest_ci = bootstrap-resampled 95% CI of winning rate over an
+    backtest_ci = bootstrap-resampled CI of winning rate over an
                   equivalent-length backtest window, using the currently
-                  deployed model
+                  deployed model — computed by utils.bootstrap_ci() with
+                  the optimizer.bootstrap keys (confidence 0.95); the
+                  resampling unit this trigger passes is undecided
+                  (open_items.md)
     live_winning_rate outside backtest_ci → divergence flag for that week
 ```
 
@@ -279,6 +303,13 @@ the current market regime.
 - `fit_execution_params()`'s sample accumulates across the entire pilot
   period (not reset per calendar-week) — only the run *cadence* is weekly,
   the data window is cumulative-since-pilot-start
+- A position carried with an exit logical order is compared on its raw entry
+  fills and its first exit session's exit fills from `live_fills`, never on
+  `trade_log`'s blended real-side columns; with no exit logical order
+  carrying `predicted_*` it is excluded
+- Only `entry_canceled` rows whose entry logical order ended
+  `terminal_cause='timeout'` enter the `buy_rate`/`cancel_after_seconds`
+  denominator and its gate count
 - Model-retraining divergence (winning rate vs. backtest CI) and
   execution-parameter divergence (predicted vs. actual fill price) are
   independent checks with independent `health_report.md` findings — never

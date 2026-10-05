@@ -98,7 +98,7 @@ def crawl_corporate_events(ticker: str, db_conn) -> int:
         event_type = "split" if ratio > 1.0 else "reverse_split"
         if upsert_corporate_event(
             ticker, date.strftime("%Y%m%d"), event_type, float(ratio),
-            "yfinance", db_conn,
+            "yfinance", today, db_conn,
         ):
             inserted += 1
 
@@ -106,7 +106,7 @@ def crawl_corporate_events(ticker: str, db_conn) -> int:
     for date, amount in dividends.items():
         if upsert_corporate_event(
             ticker, date.strftime("%Y%m%d"), "dividend", float(amount),
-            "yfinance", db_conn,
+            "yfinance", today, db_conn,   # today = basis_date, the fetch date
         ):
             inserted += 1
 
@@ -181,8 +181,10 @@ def crawl_corporate_events_investing(dividends_filter: str, db_conn) -> int:
           event_type comes from the same parse — 'split' where a > b,
           'reverse_split' where b > a.
         - dividends: Ex-Dividend Date is event_date; Dividend is value, the
-          per-share cash amount 05_labeler.md's adjustment formula
-          subtracts. Payment Date, Yield and Type are not stored.
+          per-share cash amount, which every reader takes through utils.md's
+          dividend_gross_amount() or its frame form
+          dividend_gross_from_events(). Payment Date, Yield and Type are not
+          stored.
 
     Filters scraped rows to active_ticker_universe via query-time symbol
     normalization — utils.md's normalize_vendor_symbol(), which owns the
@@ -238,13 +240,15 @@ single place, rather than trusted to each caller's choice of
 ```python
 def upsert_corporate_event(
     ticker: str, event_date: str, event_type: str,
-    value: float, source: str, db_conn,
+    value: float, source: str, basis_date: str, db_conn,
 ) -> bool:
     """
-    Vendor-agnostic write path for corporate_events.
+    Vendor-agnostic write path for corporate_events. basis_date is the date
+    the value was fetched (today); it is written with the value, so a row's
+    basis_date always belongs to its stored value.
 
         no existing row for (ticker, event_date, event_type)
-            -> INSERT this row (source recorded).
+            -> INSERT this row (source and basis_date recorded).
         existing row, values AGREE within tolerance
             -> no-op. Agreement needs no second row, and rewriting only
                churns `source` for no gain.
@@ -268,6 +272,10 @@ def upsert_corporate_event(
     of 0.25 vs 0.2500, which must count as agreement, while a genuine
     0.25-vs-0.30 disagreement must not). Compared as
     abs(a - b) <= tol * max(abs(a), abs(b)).
+    For a 'dividend' row, a and b are the existing and the fetched GROSS
+    amounts in the event_date basis — utils.md's dividend_gross_amount() of
+    each, with its own source and basis_date — not the raw values, which a
+    restating source expresses in a later split's basis.
 
     Returns True if corporate_events was inserted or updated, False on a
     no-op agreement.
@@ -798,6 +806,12 @@ PURGE_REGISTRY = {
     "alert_log":          ("date",   float("inf")),
     "train_log":          ("run_at", float("inf")),
     "experiment_log":     ("run_at", float("inf")),
+    "live_orders":        ("date",   float("inf")),
+    "live_order_requests": ("order_date", float("inf")),
+    "live_fills":         ("order_date", float("inf")),
+    "live_position_adjustments": ("date", float("inf")),
+    "regime_holdout_dates":   ("optimizer_run_id", float("inf")),
+    "regime_holdout_verdict": ("evaluated_at",     float("inf")),
 }
 
 for table, (date_column, retention_days) in PURGE_REGISTRY.items():
@@ -819,7 +833,9 @@ new stage built under disk pressure.
 differently — `train_log` and `experiment_log` use `run_at` (execution time),
 NOT `fold_test_start`/`fold_test_end`, which are the DATA window: backtesting
 an old period writes a row whose data window is years old, and purging on
-that would delete a row the moment it was created.
+that would delete a row the moment it was created. `regime_holdout_dates`
+follows the same rule through `optimizer_run_id` (`YYYYMMDD_HHMMSS`, the
+execution time), not its `date` column, which is a data date.
 
 Runs inside the evening batch's existing writer connection — no separate
 connection and no new lock interaction — and writes its own `batch_runs`
@@ -1574,6 +1590,12 @@ quarantine:
 - corporate_events writes go through the shared upsert_corporate_event()
   helper (item N), not a bare INSERT OR IGNORE — unaffected by the
   stock_meta schema change (V-1), a separate table
+- Every corporate_events write records `basis_date` = the fetch date with the
+  value; a dividend's agreement test compares gross amounts in the
+  `event_date` basis (utils.md's `dividend_gross_amount()`)
+- The ledger tables (`live_orders`, `live_order_requests`, `live_fills`,
+  `live_position_adjustments`) and `regime_holdout_dates` /
+  `regime_holdout_verdict` are PURGE_REGISTRY members at `inf`
 - Ingestion logic delegates to `migrate_json_to_duckdb.py` — no duplicated logic
 - Calendar/coverage update always runs after ingestion — not optional
 - Session stats update runs after calendar/coverage update — not optional unless --skip-session-stats

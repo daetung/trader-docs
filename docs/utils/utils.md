@@ -833,19 +833,128 @@ def cum_split_ratio(
     (the common case — no query cost beyond a small corporate_events lookup,
     since the table itself is small regardless of match).
 
+    THE split factor rule — one rule, with the (from_date, to_date] window as
+    its parameter. Its sole owner is split_ratio_from_events() below: this
+    function SELECTs the ticker's split/reverse_split rows and delegates to
+    it, so the two entry points cannot diverge. db_schema.md's
+    live_position_state view implements the same rule in SQL; no other
+    formulation exists.
+
     Shared primitive used by:
         - adjust_bars_for_corporate_events() (below) — bar-level correction
         - 04_feature_extractor.md Strategy A per-entry rescale (f_e)
-        - 05_labeler.md / 09_backtest_engine.md dead position Case A/D
-          (there, from_date/to_date are the single-day overnight window D→D+1,
-          and dividend_amount is looked up separately by the caller — this
-          function returns the split ratio component only)
+        - 09_backtest_engine.md dead position Case A/D
+          (there, from_date/to_date are the single-day overnight window D→D+1;
+          the dividend term reads dividend_gross_amount() below — this
+          function returns the split ratio component only). 05_labeler.md's
+          Case A reads split_ratio_from_events() below instead, from the
+          frame it is passed
+        - live_mode_runner.md's trade_log close normalisation, and the
+          predicted-against-real comparison of finding 7 /
+          fit_execution_params() (shadow_retraining.md)
 
     Query:
-        SELECT value FROM corporate_events
+        SELECT ticker, event_date, event_type, value FROM corporate_events
         WHERE ticker = ? AND event_type IN ('split', 'reverse_split')
           AND event_date > ? AND event_date <= ?
-        -- product of all matching rows; 1.0 if no rows
+        -- the rows split_ratio_from_events() reads; it returns their
+        -- product, 1.0 if no rows
+    """
+    ...
+
+
+def split_ratio_from_events(
+    ticker: str,
+    from_date: str,
+    to_date: str,
+    events_df: pd.DataFrame,
+) -> float:
+    """
+    The split factor over (from_date, to_date] from an already-loaded
+    corporate_events frame, for a consumer that holds the table already —
+    run_preprocess.md SELECTs it at Step 1 and passes it on to
+    05_labeler.md, which never queries DuckDB.
+
+    SOLE OWNER OF THE SPLIT FACTOR RULE: the product of 'value' over this
+    ticker's rows with event_type IN ('split', 'reverse_split') and
+    event_date IN (from_date, to_date]; 1.0 if none. cum_split_ratio()
+    above delegates here.
+
+    Called by:
+        - cum_split_ratio() (above)
+        - dividend_gross_from_events() (below)
+        - 05_labeler.md dead position Case A (r over (D, D+1], and the
+          dividend term's factor over (D, that event_date])
+    """
+    ...
+
+
+def dividend_gross_amount(
+    ticker:      str,
+    event_date:  str,
+    value:       float,
+    source:      str,
+    basis_date:  str,
+    config:      dict,
+    db_conn:     duckdb.DuckDBPyConnection,
+) -> float:
+    """
+    Gross per-share amount of a 'dividend' corporate_events row, in its
+    event_date's basis. SELECTs the ticker's split/reverse_split rows and
+    delegates to dividend_gross_from_events() below, which solely owns the
+    rule, so the two entry points cannot diverge.
+
+    EVERY reader of a 'dividend' value reads it through this function or
+    dividend_gross_from_events() — no caller reads corporate_events.value
+    for a dividend directly.
+
+    Gross, before withholding. A cash-flow reader applies
+    corporate_events.dividend_withholding_rate (default 0.15) itself:
+    live_mode_runner.md's dividend cash at close and the dead position Case A
+    dividend term (05_labeler.md / 09_backtest_engine.md). A price reader
+    does not: gap_percentile()'s dividend_amount (04_feature_extractor.md in
+    training, live_mode_runner.md's today-dividend map in live) and
+    populate_precomputed_session_stats()'s dividend_at (below).
+
+    Called by:
+        - live_mode_runner.md's position close (dividend cash)
+        - 09_backtest_engine.md dead position Case A
+        - 04_feature_extractor.md's gap_percentile dividend_amount lookup
+        - live_mode_runner.md's today-dividend map (gap_percentile's
+          dividend_amount in live)
+        - populate_precomputed_session_stats() (below)
+        - metadata_crawler.md's upsert agreement test
+    """
+    ...
+
+
+def dividend_gross_from_events(
+    ticker:      str,
+    event_date:  str,
+    value:       float,
+    source:      str,
+    basis_date:  str,
+    config:      dict,
+    events_df:   pd.DataFrame,
+) -> float:
+    """
+    The same gross amount from an already-loaded corporate_events frame, for
+    05_labeler.md (see split_ratio_from_events() above). SOLE OWNER OF THE
+    RULE:
+        value × split_ratio_from_events(ticker, event_date, basis_date, events_df)
+            when source is in config corporate_events.dividend_restated_sources
+            (default ['yfinance'] — a source that restates past dividends by
+            later splits, basis_date being when the value was fetched)
+        value otherwise
+    Gross, before withholding, exactly as dividend_gross_amount() above.
+
+    events_df must hold the ticker's split/reverse_split rows through
+    basis_date, which may lie well after event_date — a caller passes the
+    frame whole rather than pre-filtering it to its own window.
+
+    Called by:
+        - dividend_gross_amount() (above)
+        - 05_labeler.md dead position Case A
     """
     ...
 
@@ -1305,8 +1414,8 @@ def populate_precomputed_session_stats(
                         (raw_prev_close(D-k) - dividend_at(D-k)) / split_at(D-k)
                         where split_at(D-k) = 'split'/'reverse_split' value
                             with event_date=D-k (1.0 if none)
-                        dividend_at(D-k) = 'dividend' value with
-                            event_date=D-k (0.0 if none)
+                        dividend_at(D-k) = dividend_gross_amount() of the
+                            'dividend' row with event_date=D-k (0.0 if none)
                     gap_pct(D-k) = (today_regular_open(D-k) - adjusted_prev_close(D-k))
                                    / adjusted_prev_close(D-k)
                     (applied using the halt-fallback prev_close/today_open
@@ -1440,7 +1549,7 @@ def compute_vol_regime_holdout(
     vol_percentile: float,
     window_days: int = 30,
     vol_metric: str = "avg_intraday_range",
-) -> set[str]:
+) -> dict[str, float]:
     """
     Compute holdout dates based on rolling volatility percentile.
     Uses regular session bars only (093000~last_bar(date)) from ohlcv_1min.
@@ -1457,9 +1566,13 @@ def compute_vol_regime_holdout(
     Holdout: dates with rolling_vol >= quantile(vol_percentile).
     Example: vol_percentile=0.80 → top 20% most volatile dates excluded.
 
-    Returns set of 'YYYYMMDD' date strings to exclude from training.
-    These dates are removed from labeled_df BEFORE outer fold generation:
+    Returns {'YYYYMMDD': rolling_vol} for the dates to exclude from training;
+    the keys are the holdout set. These dates are removed from labeled_df
+    BEFORE outer fold generation:
         remaining_df = full_labeled_df[~full_labeled_df["date"].isin(holdout_dates)]
+    The caller, pipeline_optimizer.md, records the returned mapping in
+    regime_holdout_dates (db_schema.md) once per exploitation run — the set
+    shifts as data accumulates, so it is not recomputable later.
     """
     ...
 
@@ -1508,6 +1621,38 @@ def temporal_split_simple(
 
     No downsampling applied — caller is responsible if needed.
     Returns (train_df, val_df) as plain DataFrames.
+    """
+    ...
+```
+
+---
+
+### Bootstrap Confidence Interval
+
+```python
+def bootstrap_ci(
+    values:       Sequence[float],
+    statistic:    Callable[[np.ndarray], float],
+    sample_size:  int,
+    n_resamples:  int,
+    confidence:   float,
+    seed:         int,
+) -> tuple[float, float]:
+    """
+    Percentile bootstrap CI of `statistic` over resamples of `sample_size`
+    drawn with replacement from `values`. Returns (ci_low, ci_high).
+    n_resamples, confidence and seed come from config optimizer.bootstrap
+    (defaults 1000, 0.95, 0) — seeded so a rerun reproduces the interval.
+
+    The resampling unit is the caller's: `values` holds one element per unit.
+
+    Called by:
+        - pipeline_optimizer.md's Regime Holdout Report — values = per-trade
+          pnl_pct of the outer_validation baseline runs, sample_size = the
+          regime total_trades; statistic = share of pnl_pct > 0
+          (winning_rate) or mean (avg_pnl_pct)
+        - shadow_retraining.md's divergence trigger and health_report.md's
+          finding 6 — the resampling unit there is undecided (open_items.md)
     """
     ...
 ```
@@ -1591,6 +1736,49 @@ def query_halt_status(
 
 ---
 
+### Ledger Numeric Rules
+
+Binding on every ledger value — quantities, per-share prices, cash amounts —
+in `live_order_requests`, `live_fills`, `live_orders`, `live_positions`,
+`live_position_adjustments`, the view `live_position_state` and `trade_log`
+(db_schema.md).
+
+- **Types:** quantities and per-share prices `DECIMAL(18,6)`; cash amounts
+  and Σ quantity × price `DECIMAL(28,6)`. Ratios and statistics (`pnl_pct`,
+  `slippage_pct`) stay `DOUBLE`.
+- **Rounding:** to 6 decimal places, ties away from zero — DuckDB `CAST` and
+  `round`; Python `ROUND_HALF_UP`, never the `Decimal` default.
+- **Multiplication in DuckDB:** one operand is widened to `DECIMAL(38,6)`
+  first — `DECIMAL(18,6) × DECIMAL(18,6)` is `DECIMAL(18,12)` and overflows
+  above six integer digits.
+- **Division:** in Python `Decimal`, then rounded; no ledger value is divided
+  in DuckDB, where `DECIMAL ÷ DECIMAL` returns `DOUBLE`.
+- **Split ratio:** `corporate_events.value` stays `DOUBLE`; value × ratio is
+  taken in `DOUBLE` and the product rounded; the ratio itself is not rounded.
+- **Scope:** until the deferred type conversion (open_items.md), the existing
+  columns of `live_order_requests`, `live_fills`, `live_orders` and
+  `live_positions` keep their current types.
+
+**Float boundary rules.** V1 (numbers in) and V6 (order requests out) are
+stated in trading_api.md's Response Normalization; V1 governs every float
+entering `Decimal` arithmetic, a vendor value or not. The rest:
+
+- **V2 — no mixing:** `Decimal` and float are neither combined nor compared;
+  a float config value or threshold is converted by V1 first.
+- **V3 — out:** only ratios and statistics leave as float, computed in
+  `Decimal` and converted once. Exceptions: until the deferred type
+  conversion, a write to an existing `DOUBLE` price column (`trade_log`'s
+  price and `predicted_*` columns) converts the rounded `Decimal` at the
+  write; V6's 'number' format.
+- **V4 — DB write:** `DECIMAL` columns are bound with `Decimal`; a float bind
+  is allowed only for the split-ratio products above.
+- **V5 — DB read:** a path reading ledger or accounting values is admissible
+  only when a contract test asserts that `DECIMAL` columns arrive as
+  `Decimal`; `fetchall()` is such a path; `.df()` serves analysis and report
+  paths only.
+
+---
+
 ### Health Event Recording
 
 ```python
@@ -1655,13 +1843,30 @@ def record_health_event(
           position is carried past session_end (finding 14), and when a
           halted→tradable transition finds the in-flight exit order gone
           (finding 25)
-        - live_mode_runner.md's in-flight exit tracking, on an order's FIRST
+        - live_mode_runner.md's exit-side order tracking, on an order's FIRST
           crossing of exit_order_stuck_minutes (finding 18)
         - live_mode_runner.md's fill-stream staleness detection, on entry into
           each stale episode (finding 24)
         - live_mode_runner.md's Watchdog Polling Loop, on entry into each
           episode of an empty working set inside the regular session
           (finding 29)
+        - live_mode_runner.md's fill folding, on a sustained ledger /
+          broker-cumulative mismatch for an order number (fill_ledger_mismatch)
+        - live_mode_runner.md's startup procedure, on an 'intent' request
+          matching several broker orders (intent_match_ambiguous)
+        - live_mode_runner.md's exit rejection handling, on a rejection streak
+          reaching its threshold (exit_rejection_streak)
+        - live_mode_runner.md's Broker Reconcile and Position Manager event-day
+          exit gate, on a deferred ticker (reconcile_deferred)
+        - live_mode_runner.md's settlement pending handling
+          (event_settlement_stalled)
+        - live_mode_runner.md's dividend withholding check
+          (dividend_withholding_mismatch)
+        - live_mode_runner.md's broker summary classification, on an
+          unclassified row (summary_vocabulary_candidate)
+        - live_mode_runner.md's Session Lifecycle step 7, on a failed regime
+          holdout gate (regime_holdout_gate_failed) and at every session start
+          (regime_holdout_verdict)
     Findings 13 and 15 deliberately do NOT call this — each already writes its
     own trade_log row, so a health_events row would be a second source for one
     fact. The rule: an event is recorded here when it leaves no row anywhere
@@ -1790,9 +1995,22 @@ def stitch_ticks(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame
   DataFrame — always returns a new copy, even when the adjustment is a no-op
 - `adjust_bars_for_corporate_events()` handles splits only, not dividends —
   dividend adjustment is a separate scalar correction owned by each caller
-  (`gap_percentile()`'s `dividend_amount`, dead position Case A/D's
-  `adjusted_p_entry`) since dividends don't create the continuous bar-level
+  (`gap_percentile()`'s `dividend_amount`, dead position Case A's dividend
+  term) since dividends don't create the continuous bar-level
   price discontinuity that motivates a full-series bar adjustment
+- `dividend_gross_amount()` and its frame form `dividend_gross_from_events()`
+  are the only readers of a 'dividend' row's `value`; the frame form owns the
+  rule, it returns the gross amount in the `event_date` basis, and only
+  cash-flow readers apply `corporate_events.dividend_withholding_rate`
+- The split factor is a single rule, with its window as a parameter, owned by
+  `split_ratio_from_events()`; `cum_split_ratio()` delegates to it and the
+  view `live_position_state` implements the same rule
+- `compute_vol_regime_holdout()` returns `{date: rolling_vol}`; its caller
+  records it in `regime_holdout_dates`
+- `bootstrap_ci()` is shared by the regime holdout report and the divergence
+  trigger; its seed is fixed by config so a rerun reproduces the interval
+- Ledger numeric values follow the Ledger Numeric Rules section above; V1–V5
+  are binding on every path that reads, computes or writes them
 - `estimate_historical_meta()` must never be called with `field="sector"` —
   sector has no derivation path; callers use the most recent stock_meta
   snapshot for sector regardless of date

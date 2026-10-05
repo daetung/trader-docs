@@ -54,12 +54,39 @@ The transcription is mechanical and must stay that way:
 - preserve document order
 - split per statement
 
-Statements are already written `CREATE TABLE IF NOT EXISTS` in `db_schema.md`,
-so idempotency is not something this tool decides or adds.
+Statements are already written `CREATE TABLE IF NOT EXISTS` (and the one view
+`CREATE VIEW IF NOT EXISTS`) in `db_schema.md`, so idempotency is not something
+this tool decides or adds.
 
 **When `db_schema.md` changes, `SCHEMA_STATEMENTS` is re-transcribed from it.**
-Re-transcription has now been required EIGHT times. The most recent occasion
-added NO table — the count stays at 34 — and is a DDL set decided together:
+Re-transcription has now been required NINE times. The most recent occasion is
+the order and fill ledger and its follow-throughs, one DDL set decided
+together, moving the table count 34 -> 40:
+- New tables (class 1): `live_orders`, `live_order_requests`, `live_fills`,
+  `live_position_adjustments`, `regime_holdout_dates`,
+  `regime_holdout_verdict`. The DB VIEW `live_position_state` is created in
+  the same run and checked by `--verify`; a view holds no rows and is not
+  counted as a table.
+- `live_positions` (REBUILD): columns `order_id`, `limit_price`,
+  `submitted_at`, `entry_state`, `exit_state`, `exiting_since`, `fill_price`,
+  `fill_second`, `quantity` and `exit_filled_quantity` are removed; `origin`
+  and `created_at` are added; `signal` and `entry_mgnrt` drop NOT NULL; table
+  CHECK constraints tie `signal` and `entry_mgnrt` to `origin`. A dropped
+  column and an added CHECK each force a rebuild.
+- `trade_log` (REBUILD): `signal` drops NOT NULL and a table CHECK constraint
+  is added — the CHECK forces the rebuild; `quantity`, `requested_quantity`
+  and `unfilled_quantity` become `DECIMAL(18,6)` in the same rebuild (class 2
+  `ALTER COLUMN ... SET DATA TYPE` on their own).
+- `corporate_events` (class 2): `basis_date VARCHAR NOT NULL` is added. DuckDB
+  does not add a constrained column, so it is three statements — `ADD COLUMN`
+  without the constraint, an `UPDATE` setting each existing row's
+  `basis_date` to the date its value was fetched, then `ALTER COLUMN ... SET
+  NOT NULL`.
+- `live_orders` carries `reference_price` / `reference_at` and the
+  `predicted_*` columns from creation; nothing to alter.
+
+The occasion before it added NO table — the count stayed at 34 — and was a
+DDL set decided together:
 `live_positions.order_id` dropped `NOT NULL`, `train_log` gained
 `fold_train_start` and `fold_train_days`, and `experiment_log` gained
 `fold_test_days`. Every part is class 2 — the nullability change is
@@ -161,6 +188,8 @@ What it reports, by class of difference:
 | Table in `SCHEMA_STATEMENTS`, absent from the DB | re-run init — this class is absorbed automatically |
 | Column in the statement, absent from the table | ALTER needed — names the table and the column |
 | Column type, nullability, or PRIMARY KEY differs | names the table and the mismatch. Class 2 unless the column carries a PRIMARY KEY or UNIQUE constraint, or the change drops a PRIMARY KEY — then REBUILD |
+| Table CHECK constraint differs (added, removed or changed) | names the table — REBUILD, DuckDB implementing no `ALTER` for a CHECK |
+| View in `SCHEMA_STATEMENTS`, absent from the DB or with a different definition | re-run init for an absent view; a changed definition is reported, not actioned |
 | Column in the table, absent from `SCHEMA_STATEMENTS` | reported, not actioned — may be a renamed, removed, or stale column |
 | Table in the DB, absent from `SCHEMA_STATEMENTS` | reported, not actioned — may be a retired table or a stale transcription |
 
@@ -187,7 +216,9 @@ live database, and they need different responses:
    an `ALTER` does perform but which DESTROYS that column's data, so it goes
    through a rebuild where the copy step is explicit; a type change on a
    column carrying a PRIMARY KEY or UNIQUE constraint, which DuckDB rejects;
-   and `DROP PRIMARY KEY`, which DuckDB does not implement at all.
+   `DROP PRIMARY KEY`, which DuckDB does not implement at all; and adding,
+   removing or changing a table CHECK constraint, which DuckDB also does not
+   implement as an `ALTER`.
    The dividing line is data loss or an unsupported statement, NOT
    "unreachable by `ALTER`" — most structural changes are reachable.
 
@@ -202,20 +233,24 @@ Plain stdout; no log file and no `batch_runs` row (this tool is outside the
 batch-marker scheme entirely — see the concurrency assumption above).
 
 ```
-init:   created 34 tables, 0 already present    # fresh database
-init:   created 1 table, 33 already present     # after a new table was added
-verify: 34 tables checked, 0 differences
-verify: 34 tables checked, 1 difference
-        live_positions: column 'entry_mgnrt' missing — ALTER needed
-verify: 34 tables checked, 1 difference          # a constraint, not a column
-        live_positions: column 'order_id' nullability differs — ALTER needed
-verify: 34 tables checked, 2 differences         # two columns, one table
+init:   created 40 tables, 0 already present    # fresh database
+init:   created 1 table, 39 already present     # after a new table was added
+verify: 40 tables checked, 0 differences
+verify: 40 tables checked, 1 difference
+        corporate_events: column 'basis_date' missing — ALTER needed
+verify: 40 tables checked, 1 difference          # a constraint, not a column
+        trade_log: column 'signal' nullability differs — ALTER needed
+verify: 40 tables checked, 1 difference          # a table constraint
+        trade_log: CHECK constraint differs — REBUILD
+verify: 40 tables checked, 2 differences         # two columns, one table
         trading_calendar: column 'session_close' missing — ALTER needed
         trading_calendar: column 'after_hours_end' missing — ALTER needed
-verify: 34 tables checked, 2 differences         # a rename, seen from both sides
+verify: 40 tables checked, 2 differences         # a rename, seen from both sides
         live_positions: column 'lifecycle' missing — ALTER needed
         live_positions: column 'status' not in statements — reported
         # a rename seen from both sides; one RENAME COLUMN settles both
+verify: 40 tables checked, 1 difference          # the view
+        live_position_state: view missing — re-run init
 ```
 
 ---

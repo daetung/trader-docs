@@ -192,17 +192,19 @@ future call sites rather than an input to an unresolved allocation.
 | Need | Call site | Endpoint | TPS |
 |---|---|---|---|
 | Tradable ticker list | Session Lifecycle Step 1; `build_trading_api_symbol_map()` (three per-exchange calls) | `quote/…/inquiry/stock-ticker` | 2 |
-| Balance and deposit | Step 1b; the funds gate; Broker Reconcile | `trading/…/inquiry/balance-margin` | 3 |
+| Balance and deposit | Step 1b; the funds gate; Broker Reconcile (the query `live_mode.balance_query_mode` selects) | `trading/…/inquiry/balance-margin` | 3 |
 | Per-ticker margin rate and order cost | watchdog first listing, once per ticker per session; and the post-dispatch entry observation | `trading/…/inquiry/able-orderqty` | 2 |
 | Bars, minute OR second resolution | Watchdog Step 2a (prefix scan, rotation window, backfill) | `quote/…/chart/min` | 4 |
 | Ticks | Watchdog Step 2b; Exit Architecture's REST tick backstop (WS-dead only) | `quote/…/chart/tick` | 4 |
 | Bulk price snapshot | `bulk_fetch_today_first_price()` | `quote/…/inquiry/multiprice` | 2 |
 | Level-1 orderbook | the exit ladder; `signal_time_rest` | `quote/…/inquiry/orderbook` | 2 |
 | Order submit, amend, cancel | Step 5c; Position Manager; Shutdown; Broker Reconcile | `trading/…/order` | 10 |
-| Filled and outstanding orders | the exit-side backstop | `trading/…/inquiry/transaction-history` | 2 |
+| Filled and outstanding orders | the exit-side backstop; the startup procedure | `trading/…/inquiry/transaction-history` | 2 |
+| Account cash and movement rows | Broker Reconcile | `trading/…/inquiry/trade-history` | 2 |
+| Executed sells for cash in lieu | Broker Reconcile | `trading/…/inquiry/trading-history` | 2 |
 | WebSocket session reset | the reconnect path | `ws_common/ws_session_disconnect` | 1 |
 | Realtime trade stream | Exit Architecture's tick handler; the watchdog scan's ranking signal | WebSocket `V60` | — |
-| Realtime order/fill stream | in-flight order tracking | WebSocket `IS2` | — |
+| Realtime order/fill stream | the order and fill ledger (IS2 routing, fill folding) | WebSocket `IS2` | — |
 
 Six things the table settles that prose had left ambiguous:
 
@@ -227,7 +229,8 @@ Six things the table settles that prose had left ambiguous:
   connections.** `api_contract_checklist.md` T-6 measured that subscription
   types are mutually exclusive per connection; V60 registers per ticker
   (`tr_type` 1/2) and IS2 registers per account (`tr_type` 3, no `tr_key`).
-  They also back different checklist rows — T-1 and T-7 respectively.
+  V60 backs checklist row T-1. IS2's row T-7 is RETIRED, its residual
+  question carried by T-21 (`api_contract_checklist.md`).
 - **Session reset is already in the SDK**, exposed as
   `client.apis.ws_common.ws_session_disconnect()`, so this project does not
   build the call. Its scope is every session for the token's account, so
@@ -358,23 +361,26 @@ that each call site interprets `None` per its own context.
 | Partial failure | — | the representation | what "absent" means |
 | Degraded mode | — | — | interpreting `None` |
 | Session-phase order types | — | validation before the call | the table; sizing |
-| Order identity | — | vendor format → opaque handle | tracking, idempotency |
+| Order identity | — | vendor format → opaque handle, keyed `(order_date, OrdNo)` | tracking, idempotency |
 | WebSocket budget | connect, reconnect | connection allocation under T-6 exclusivity | which tickers |
 
 **Paging is decided by this file's own boundary test, not by preference.**
 Returning one page plus a continuation handle would put `cont_key` in a
 caller's hands, and `cont_key` is one of the four things the test names. So
 this module pages until a caller-supplied bound is covered and returns a
-completed set. Bounds accept both fill-ID and timestamp, and both upper and
-lower, so one method serves the exit backstop's "newer than last seen",
-Broker Reconcile's "today's fills", and any bounded window; time bounds map
-onto the vendor's own `InputDate1`/`InputDate2`. This is robust to the
+completed set. Bounds are timestamps, upper and lower, so one method serves
+the exit backstop's "newer than last seen", the startup procedure's "from the
+earliest open order's date", and any bounded window; they map onto the
+vendor's own `QrySrtDt`/`QryEndDt`, which are date-only, so sub-day filtering
+is client-side. This is robust to the
 varying page size that was the fill-inquiry open item's central worry — an
 item now closed, its distribution accumulating in `live_scan_daily`'s
 `fill_page_rows_p50`/`_p95` during ordinary operation rather than through a
-separate measurement exercise. Note that an ID bound inherits `api_contract_checklist.md`
-T-7's risk — fill-ID ordering is exactly what that grade A row questions —
-while a time bound does not.
+separate measurement exercise.
+
+**Order identity is `(order_date, OrdNo)`.** An `OrdNo` is unique only within
+its order date (`OrdDt`), so every handle this module returns carries both,
+and the ledger keys on the pair (`db_schema.md`'s `live_order_requests`).
 
 **Retry has three layers, not two.** The SDK owns per-call retry
 classification and backoff execution. Above it sits the question of whether a
@@ -404,16 +410,15 @@ attempts happened stays observable rather than hidden by a second layer.
 the policy is not.
 
 **Writes are never re-attempted, regardless of the budget a caller passes.**
-This is a hard rule, not a default: the vendor exposes no idempotency key and
-`live_positions` writes its row at SUBMISSION time, so a
-submission that failed locally but landed server-side would produce an order
-the system does not track. Recovery for writes belongs to the paths that
-already exist, one per verb: a cancel that landed leaves a tracked order gone
-from OUTSTANDING and absent from FILLED, which the vanished-order rule
-resolves; a landed order that fills leaves a broker position with no row,
-which Broker Reconcile adopts; and a landed submission whose id never
-reached us is untracked from the start, which only the ghost-order rule
-reaches.
+This is a hard rule, not a default: the vendor exposes no idempotency key, so
+a re-attempt of a request that failed locally but landed server-side would
+place it twice. Instead every request row is written 'intent' before the API
+call (`live_mode_runner.md`), so a landed request whose response never reached
+us is still recorded. Recovery belongs to the paths that already exist:
+IS2 routing attaches that request's events to its 'intent' row, the
+ghost-order rule matches an untracked OUTSTANDING order against 'intent' rows
+before alerting, and the startup procedure resolves every remaining 'intent'
+row at the next start.
 
 **Session-phase order types stay in `execution_common.md`.** Concealment was
 never available: `check_funds_available()` and `simulate_entry_fill()` both
@@ -439,9 +444,10 @@ Every field is declared, and declaration puts it in one of three categories.
 A blanket "convert what looks numeric" is not available: it would turn
 `rsp_cd`'s `"00000"` into `0` and break the Result Contract's own comparison.
 
-- **CONVERT** — declared with a target type. Prices and amounts are `float`;
-  quantities are `int`; order identifiers become strings, this system's
-  canonical form for an opaque handle.
+- **CONVERT** — declared with a target type. Prices, amounts and quantities
+  become `Decimal` (V1 below), rounded to 6 decimal places per `utils.md`'s
+  Ledger Numeric Rules; order identifiers become strings, this system's canonical
+  form for an opaque handle; temporal fields are converted per format (below).
 - **PRESERVE** — declared, passed through unchanged: `rsp_cd`, `rsp_msg`,
   `AstkRjtCode`, `AstkRjtRsnCnts`, symbols.
 - **DROP** — undeclared. Dropped rather than passed through: passing through
@@ -459,22 +465,30 @@ and parses to its declared target.
 **An empty string maps to `None`, never to `0`.** Per-field semantics for
 `""` are not knowable, `None` propagates as a visible absence while `0.0`
 propagates as a plausible wrong number, and the schema already accepts it
-(`exit_price DOUBLE`, `limit_price DOUBLE` NULL for market orders). The
+(`exit_price DOUBLE`; `live_order_requests.price` NULL for a market order). The
 vendor's own use of `0` as a REAL value settles it: `AstkOrdPrc` is
 documented as `0` for a market order, so conflating `""` with `0` would make
 a market order indistinguishable from an unknown price.
 
-**Quantities are `int` in both directions**, and the integrality check is the
-guard that makes that safe rather than a feature handling an expected case.
-The vendor sends `"1.000000"`-shaped strings, so a safe `int()` must parse as
-float and assert integrality first — the check costs the same under either
-target and is therefore not a reason to prefer `float`. Given equal cost,
-`int` wins because `db_schema.md` is `INTEGER` throughout: emitting `float`
-would put a float-to-int conversion at every writer, each a site where
-truncation could later be introduced. A non-integral value is an ERROR — a
-wrong field mapped, a vendor change, or a parse fault. `Decimal` is NOT
-introduced: `db_schema.md` uses `DOUBLE` 61 times and `DECIMAL` zero times,
-and normalization inherits that rather than inventing a type policy.
+**V1 — numbers in.** A string becomes `Decimal(str)`; a float — a value that
+arrived as a JSON number, or any other float such as a config value or
+threshold — becomes `Decimal(repr(x))`; either is then rounded per
+`utils.md`'s Ledger Numeric Rules. V1 governs every float entering `Decimal`
+arithmetic, not only vendor values. `Decimal(x)` on a float is never used — it carries
+the float's binary error into the ledger.
+
+**Integrality is asserted only where a quantity is written to an INTEGER
+ledger column** — `live_order_requests` and `live_fills` (`db_schema.md`),
+until the deferred type conversion. A non-integral value there is an ERROR —
+a wrong field mapped, a vendor change, or a parse fault. Balance and
+trade-history quantities (`AstkExecBaseQty`, `AstkTrdQty`, `AstkCrbalQty`)
+accept fractions.
+
+**V6 — order requests out.** A quantity is sent as `int()` of its floor. A
+price is sent per config key `trading.order_numeric_format`, 'number' |
+'string', default 'number': 'number' sends `float()` of the rounded `Decimal`,
+'string' sends its `str()`. The remaining float boundary rules (V2–V5) are
+`utils.md`'s.
 
 **Temporal fields are per-format, and none is an identity conversion.** Four
 vendor forms exist against four schema forms that match none of them
@@ -546,6 +560,11 @@ Applying it:
   read-only material and are not part of the Spec File Structure
 - Order submission, amendment and cancellation are never re-attempted at this
   layer, whatever re-attempt budget a caller passes
+- Order identity is `(order_date, OrdNo)`, never `OrdNo` alone
+- CONVERT targets for prices, amounts and quantities are `Decimal` (V1); a
+  quantity's integrality is asserted only for an INTEGER ledger column
+- Order request quantities are sent as `int()` of their floor; prices per
+  `trading.order_numeric_format` (V6)
 - `execution.ws_ticker_limit` must not exceed `DBSecWebSocket._MAX_SUBSCRIPTIONS`
   (50). That is an SDK-side constant rather than a vendor-documented one, so
   it is a re-sync surface: an upstream change to it silently changes our

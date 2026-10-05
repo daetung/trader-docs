@@ -42,6 +42,15 @@ confirmation that it still reads correctly.
    rather than a design blocker, so it is not sequenced against the items
    above either. It is listed because a new item left out of this list is the
    carry-forward defect this file exists to prevent, inverted.
+6. **Deferred DECIMAL type conversion** is unblocked and not sequenced
+   against the items above.
+7. **Fractional-balance sell path** is blocked on (6).
+8. **Carried partially filled exit — engine divergence** is unblocked and not
+   sequenced against the items above.
+9. **No path from a trained model's `run_id` to the live model** is unblocked
+   and not sequenced against the items above.
+10. **Finding 6 divergence — resampling unit and threshold** is not sequenced
+    against the items above.
 
 ---
 
@@ -173,15 +182,17 @@ has enough history; revisit then, not before.
 ## `api_contract_checklist.md` — verify before Pilot
 
 Not a new design problem — a pointer, so it isn't lost among the items
-above. `docs/ops/api_contract_checklist.md` holds **23 rows, of which 18 are
-still unverified** assumptions, two of those graded **A** (T-1: REST/WS tick
-granularity; T-7: fill-event stream ID stability). The numbers reconcile as
-23 = 18 unverified + 1 measured (T-6) + 4 retired (T-3, T-14, T-15, T-16),
-and the row count does not fall as questions are settled because that
+above. `docs/ops/api_contract_checklist.md` holds **37 rows, of which 30 are
+still unverified** assumptions, three of those graded **A** (T-1: REST/WS tick
+granularity; T-21: each execution reported under exactly one order number;
+T-25: `AstkExecBaseQty` reflecting same-day executions immediately). The
+numbers reconcile as 37 = 30 unverified + 1 measured (T-6) + 6 retired (T-3,
+T-7, T-8, T-14, T-15, T-16), and the row count does not fall as questions are
+settled because that
 file's Role and Constraints forbid deleting rows — a broker change would
 make a settled question live again, and a deleted row would have to be
-rediscovered. T-1 and T-7 are the only A-graded rows, and both must be
-verified, or their fallback paths confirmed sufficient, before Stage 2
+rediscovered. T-1, T-21 and T-25 are the only A-graded rows, and each must be
+verified, or its fallback path confirmed sufficient, before Stage 2
 (Pilot) — see that file's own "When to use it" section. Not duplicated here;
 consult that file directly rather than letting a second copy of its contents
 drift out of sync.
@@ -263,3 +274,77 @@ parameter already coexist, which is itself the argument for settling it once.
 
 **`01_entry_detection.md`'s `max_sideways_ratio` is the sharpest instance**:
 its own inline comment reads `# from config` beside the hardcoded default.
+
+---
+
+## Deferred DECIMAL type conversion
+
+**Problem.** Ledger quantities, per-share prices and cash amounts are to be
+DECIMAL, and the rules are already decided — `utils.md`'s Ledger Numeric
+Rules and the float boundary rules (V1 and V6 in `trading_api.md`'s Response
+Normalization, V2–V5 in `utils.md`). What remains is applying them to the surface
+that still carries INTEGER or DOUBLE:
+
+- the existing columns of `live_order_requests`, `live_fills`, `live_orders`
+  and `live_positions` (`db_schema.md`); `live_fills.cum_after_qty` is part of
+  its primary key
+- `trade_log`'s price and `predicted_*` columns
+- `live_session_state.session_start_cash`
+- `live_ticker_terms`' `mgnrt` and `order_cost`
+- `experiment_log`'s amount totals
+- `execution_common.md`'s floor computations: position sizing,
+  `check_funds_available()`, the exposure limits, the fill simulator
+- the exit ladder's limit pricing and tick rounding
+- `09_backtest_engine.md`'s Case A cash arithmetic
+
+Retired with it: V3's exception for writes to existing DOUBLE price columns,
+V6's 'number' format, and `trading_api.md`'s integrality assertion for
+INTEGER ledger columns.
+
+Undecided: whether market data and feature tables are included.
+
+---
+
+## Fractional-balance sell path
+
+**Problem.** A split or reverse split can leave a fractional balance the
+broker holds rather than settles in cash. Selling it needs fractional
+`requested_qty` / `qty` / `exec_qty` columns, so it waits for the type
+conversion above.
+
+Meanwhile `live_mode_runner.md` records `event_settlement_stalled`
+`kind='fraction_held'` at each Broker Reconcile call and the fraction is
+handled manually.
+
+Needs: `api_contract_checklist.md` T-29 (whether the order API sells a
+fractional balance), and whether IS2 carries fractional quantities.
+
+---
+
+## Carried partially filled exit — engine divergence
+
+**Problem.** When an exit fills only partly before session end, live and
+shadow sell the remainder in a later session, while BacktestEngine ends the
+row at D with `dead_position_penalty_pct` on the remainder. The two engines'
+pnl for such a row therefore differ structurally.
+
+Scope: backtest modelling. Not decided.
+
+---
+
+## No path from a trained model's `run_id` to the live model
+
+**Problem.** The live model is the `run_id` set in config by hand
+(`inferencer.md`). `shadow_retraining.md` declares the retraining scope
+without containing a step that moves a newly trained `run_id` into that
+config. The regime holdout gate (`pipeline_optimizer.md`) only checks the
+configured `run_id` at session start; it does not choose one.
+
+---
+
+## Finding 6 divergence — resampling unit and threshold
+
+**Problem.** `health_report.md`'s finding 6 and `shadow_retraining.md`'s
+divergence trigger compare live winning rate against a backtest CI. The CI is
+computed by `utils.bootstrap_ci()`, but the trigger's resampling unit and
+its threshold are undecided.

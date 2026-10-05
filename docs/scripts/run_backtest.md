@@ -98,6 +98,7 @@ class Backtester:
         outer_fold_idx:  int = -1,
         fold_test_start: str | None = None,
         fold_test_end:   str | None = None,
+        fold_test_days:  int | None = None,
         eval_type:       str | None = None,
         execution_variant: str | None = None,
     ) -> dict:
@@ -120,6 +121,9 @@ class Backtester:
                              None for standalone (derived from test_df date range)
             fold_test_end:   last date of test window ('YYYYMMDD');
                              None for standalone (derived from test_df date range)
+            fold_test_days:  trading days the test split holds;
+                             None for standalone (derived from test_df: the
+                             count of its distinct dates)
             eval_type:       None               → standard backtest (standalone or non-nested)
                              "outer_validation" → nested validation outer fold evaluation
                              "regime_holdout"   → regime holdout robustness check
@@ -174,6 +178,7 @@ experiment_log_row = {
     "execution_variant":    execution_variant,   # None = baseline pass
     "fold_test_start":      fold_test_start,     # None → derived from test_df.date.min()
     "fold_test_end":        fold_test_end,       # None → derived from test_df.date.max()
+    "fold_test_days":       fold_test_days,      # None → derived from test_df.date.nunique()
     "winning_rate":         summary["winning_rate"],
     "total_trades":         summary["total_trades"],
     "winning_trades":       summary["winning_trades"],
@@ -197,9 +202,11 @@ experiment_log_row = {
 }
 ```
 
-`fold_test_start` and `fold_test_end` are sourced from fold_meta when called by
-PipelineOptimizer: `fold_meta["fold_test_start"]`, `fold_meta["fold_test_end"]`.
-In standalone mode, these are derived from `test_df["date"].min()` and `.max()`.
+`fold_test_start`, `fold_test_end` and `fold_test_days` are sourced from fold_meta
+when called by PipelineOptimizer with a fold: `fold_meta["fold_test_start"]`,
+`fold_meta["fold_test_end"]`, `fold_meta["fold_test_days"]`. Otherwise — standalone
+mode, and the regime holdout check, which passes none of them — they are derived
+from `test_df["date"].min()`, `.max()` and `.nunique()`.
 
 ---
 
@@ -281,7 +288,8 @@ Elapsed: 45.2s
 - `fold_idx` default -1 for standalone CLI runs; 0-based for rolling inner folds
 - `outer_fold_idx` default -1 for non-nested runs; 0-based for nested outer folds
 - `eval_type` default None for standalone; set explicitly by PipelineOptimizer
-- In standalone mode, `fold_test_start`/`fold_test_end` derived from test_df date range
+- In standalone mode, `fold_test_start`/`fold_test_end`/`fold_test_days` derived from
+  test_df — its date range and its count of distinct dates
 - `execution_variant` is an IDENTIFIER column, alongside `run_id`,
   `fold_idx`, `outer_fold_idx` and `eval_type` — it sits OUTSIDE the 1:1
   rule below, which binds `summary_dict` keys to METRIC columns only.

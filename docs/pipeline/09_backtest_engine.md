@@ -186,11 +186,14 @@ WHERE ticker = ? AND date = ?
 
 ### Corporate events (for dead position Case A/D dividend/split adjustment)
 ```sql
-SELECT event_type, value FROM corporate_events
+SELECT event_type, event_date, value, source, basis_date FROM corporate_events
 WHERE ticker = ? AND event_date > ? AND event_date <= ?
 ```
 Queried only when Case A/D resolution is reached — not on every trade.
 Same window and rationale as Labeler's equivalent lookup (see `05_labeler.md`).
+The split factor is `utils.md`'s single rule, applied through
+`cum_split_ratio()` over (D, D+1]; a 'dividend' row's amount is read only
+through `utils.md`'s dividend amount function, never from `value` directly.
 
 **Iteration order is DATE-major, not ticker-major.** The concurrency caps
 (`execution.max_tickers` / `execution.max_positions_per_ticker`) and the
@@ -348,7 +351,7 @@ Procedure:
             p_entry=p_entry,
             # ohlcv_entry dropped and the index argument replaced by a TIME:
             # backtest COMPUTES this instant while live OBSERVES it as
-            # live_positions.submitted_at, and the two must never be composed
+            # the entry 'new' request's sent_at, and the two must never be composed
             # (execution_common.md). fill_idx is still computed above for the
             # `fill_bundle is not None` guard; the simulator derives its own.
             buy_rate=config["execution"]["buy_rate"],
@@ -727,16 +730,27 @@ Case A — next trading day has_data=True AND ticker exists in ticker_data_cover
     if exit_price cannot be resolved from either source (NaN/unavailable):
         → Case D (below)
     exit_price *= (1 - dead_position_penalty_pct)
-    adjusted_p_entry = (p_entry - dividend_amount) / cum_split_ratio
-        where cum_split_ratio = product of split/reverse_split 'value' in
-            corporate_events WHERE ticker=? AND event_date IN (D, D+1]
-        dividend_amount = 'dividend' value in corporate_events with
-            event_date IN (D, D+1] (0.0 if none) — same overnight window and
-            rationale as Labeler's Case A (see 05_labeler.md); US splits and
-            ex-dividend adjustments always take effect before market open
+    r = cum_split_ratio() over (D, D+1]   (utils.md's split factor; 1.0 if none)
+    dividend_term = Σ over 'dividend' rows with event_date IN (D, D+1] of
+        the net amount (utils.md's dividend amount function: the gross
+        amount in its event_date basis × (1 − corporate_events.
+        dividend_withholding_rate)) × the split factor over (D, that
+        event_date]   (0.0 if none) — per share entered; same overnight
+        window and rationale as Labeler's Case A (see 05_labeler.md); US
+        splits and ex-dividend adjustments always take effect before
+        market open
+    revive amount = quantity × (r × exit_price + dividend_term)
+        — quantity in D's basis
+    pnl = (revive amount − quantity × fill_price) / (quantity × fill_price)
     exit_reason = "dead_position"
     is_dead_position = True
-    pnl = (exit_price - adjusted_p_entry) / adjusted_p_entry
+    trade_log row, in the basis as of its exit:
+        fill_price = the simulated fill ÷ r
+        exit_price = as resolved above
+        quantity, requested_quantity = × r, rounded per utils.md's Ledger
+            Numeric Rules (the product converted per trading_api.md's V1)
+        slippage_pct = (simulated fill − p_entry) / p_entry, taken before
+            the normalisation
     exit_bar / exit_date = the timestamp of whichever source actually
         resolved exit_price (pre-market first tick, or the first bar open
         on fallback) — NOT a fixed hour. This is the only Case whose
@@ -795,8 +809,12 @@ longer counts toward `execution.max_tickers` /
 committed amount is written off at that moment. Cash comes back only as a
 scheduled revive credit, under one rule with no per-Case special casing:
 
-    revive amount = quantity * exit_price
+    revive amount = quantity * (r * exit_price + dividend_term)
+                    — quantity in D's basis; r = 1 and dividend_term = 0
+                    outside Case A, which reduces it to quantity * exit_price
     revive moment = that row's own exit_date / exit_bar
+    The cash ledger's arithmetic type is deferred with the DECIMAL type
+    conversion (open_items.md).
 
 which resolves per Case without further rules: A revives at its D+1
 resolution timestamp; C revives immediately at D's close, since its
@@ -809,7 +827,7 @@ recording pnl = -1.0 (B/D) or -0.5 (C) would break that identity.
 Only the credit is deferred across the date boundary, never the position:
 the trade row is written complete at D's close (BacktestEngine already
 reads D+1 data to resolve Case A), and the queue carries just
-`(exit_date, exit_bar, quantity * exit_price)`. No slot is held and no exit
+`(exit_date, exit_bar, revive amount)`. No slot is held and no exit
 evaluation is pending, so the per-date decomposition of the Chronological
 Simulation holds.
 
@@ -910,14 +928,14 @@ backtest:
 -- Added columns (in addition to existing schema):
 weighted_avg_exit_price  DOUBLE,    -- volume-weighted average fill price across partial fills
 partial_fills_count      INTEGER,   -- number of tick bundles used for exit fills
-unfilled_quantity        INTEGER,   -- shares remaining after ticks exhausted (0 = fully closed)
+unfilled_quantity        DECIMAL(18,6), -- shares remaining after ticks exhausted (0 = fully closed)
 is_ambiguous             BOOLEAN,   -- True if simultaneous bundle-level tp/sl breach
 exit_date                VARCHAR,   -- 'YYYYMMDD'; equals `date` for every exit resolved
-                                    -- on the entry date. Differs only for dead position
-                                    -- Case A (D+1) and live's overnight_exit — see
-                                    -- db_schema.md. NOT NULL: an always-populated column
+                                    -- on the entry date. Differs for dead position
+                                    -- Case A (D+1) and for live rows closed in a later
+                                    -- session — the list is db_schema.md's. NOT NULL: an always-populated column
                                     -- keeps every date-scoped query free of COALESCE.
-requested_quantity       INTEGER,   -- quantity actually SUBMITTED, i.e. after
+requested_quantity       DECIMAL(18,6), -- quantity actually SUBMITTED, i.e. after
                                     -- check_funds_available() sized it down. The fill-rate
                                     -- denominator (quantity / requested_quantity) therefore
                                     -- measures market participation only; a funds-driven
@@ -958,7 +976,8 @@ requested_quantity       INTEGER,   -- quantity actually SUBMITTED, i.e. after
 - After-market data used only as fallback when exit_deadline(date) bar is halt/no_data
 - Dead position: session_end fallback fails only (exit_deadline(date) halt + no after-market data)
 - Dead position lookup uses `has_data = TRUE` filter (not `is_trading_day`) — consistent with Labeler
-- Dead position Case A pnl uses dividend/split-adjusted p_entry (see Dead Position section) —
+- Dead position Case A pnl uses the split-normalised exit and the net dividend term
+  (see Dead Position section) — `p_entry` is never adjusted;
   `corporate_events` rows for (ticker, event_date IN (D, D+1]) are loaded alongside
   `trading_calendar`/`ticker_data_coverage` for this lookup; same query pattern as Labeler
 - Dead position Case D (`exit_reason = "dead_position_extended_halt"`) triggers only when

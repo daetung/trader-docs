@@ -39,10 +39,13 @@ tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]  # (train_balanced, val, test)
 Iterator[tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]]
 # yields (train_balanced, val, test, fold_meta) per fold
 # fold_meta = {
-#   "fold_idx":        int,    # 0-based fold index
-#   "fold_train_end":  str,    # 'YYYYMMDD' — last date of train window
-#   "fold_test_start": str,    # 'YYYYMMDD' — first date of test window
-#   "fold_test_end":   str,    # 'YYYYMMDD' — last date of test window
+#   "fold_idx":         int,   # 0-based fold index
+#   "fold_train_start": str,   # 'YYYYMMDD' — first date of train window
+#   "fold_train_end":   str,   # 'YYYYMMDD' — last date of train window
+#   "fold_train_days":  int,   # trading days the train split holds (step 6)
+#   "fold_test_start":  str,   # 'YYYYMMDD' — first date of test window
+#   "fold_test_end":    str,   # 'YYYYMMDD' — last date of test window
+#   "fold_test_days":   int,   # trading days the test split holds (step 6)
 # }
 # Folds are always yielded in ascending fold_idx order (0, 1, 2, ...).
 # fold_run_ids[-1] in PipelineOptimizer is guaranteed to correspond to
@@ -192,10 +195,13 @@ Per fold:
     7. Yield (train_balanced, val, test, fold_meta)
 
 fold_meta contents:
-    fold_idx:        0-based integer index of this fold
-    fold_train_end:  last date of train window ('YYYYMMDD')
-    fold_test_start: first date of test window ('YYYYMMDD')
-    fold_test_end:   last date of test window ('YYYYMMDD')
+    fold_idx:         0-based integer index of this fold
+    fold_train_start: first date of train window ('YYYYMMDD')
+    fold_train_end:   last date of train window ('YYYYMMDD')
+    fold_train_days:  trading days the train split holds (step 6)
+    fold_test_start:  first date of test window ('YYYYMMDD')
+    fold_test_end:    last date of test window ('YYYYMMDD')
+    fold_test_days:   trading days the test split holds (step 6)
 
 Yield order:
     Folds are always yielded in ascending fold_idx order (0, 1, 2, ...).
@@ -309,10 +315,13 @@ class ClassBalancer:
         without ClassBalancer needing to distinguish between them.
 
         fold_meta dict keys:
-            fold_idx        (int)  : 0-based fold index
-            fold_train_end  (str)  : 'YYYYMMDD' last date of train window
-            fold_test_start (str)  : 'YYYYMMDD' first date of test window
-            fold_test_end   (str)  : 'YYYYMMDD' last date of test window
+            fold_idx         (int)  : 0-based fold index
+            fold_train_start (str)  : 'YYYYMMDD' first date of train window
+            fold_train_end   (str)  : 'YYYYMMDD' last date of train window
+            fold_train_days  (int)  : trading days the train split holds
+            fold_test_start  (str)  : 'YYYYMMDD' first date of test window
+            fold_test_end    (str)  : 'YYYYMMDD' last date of test window
+            fold_test_days   (int)  : trading days the test split holds
 
         Order of operations per fold:
           1. session_mode filter on full df (skipped if session_mode is None)

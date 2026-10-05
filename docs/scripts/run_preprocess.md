@@ -134,8 +134,9 @@ pd.DataFrame  # full labeled feature matrix, unsplit
        )
        (includes is_dead_position, dead_position_case, is_ambiguous)
        (corp_events_df: full table passed through, same pattern as calendar_df/
-        coverage_df — Labeler filters internally to the overnight window it needs
-        for dead position Case A/D dividend/split adjustment)
+        coverage_df — Labeler selects dead position Case A's event rows by the
+        overnight window and passes the whole frame to utils.md's frame forms,
+        since a restated dividend's split factor can need rows after D+1)
 
 5. Save labeled_samples to DuckDB labeled_samples table (INSERT OR IGNORE)
 
@@ -315,7 +316,10 @@ misc.lookback_bars
   Labeler.label() (Case A/D adjustment) — FeatureExtractor's corporate-event bars
   adjustment and gap_percentile dividend_amount lookup query `corporate_events`
   independently inside `extract_batch()` (see `04_feature_extractor.md`), not via
-  a value passed in from this script
+  a value passed in from this script. In both, a 'dividend' row's amount is read
+  through utils.md's dividend amount function — `dividend_gross_amount()` in
+  FeatureExtractor, its frame form `dividend_gross_from_events()` in the
+  Labeler — never from `value` directly
 - `ticker_meta` (Step 6) is date-keyed, not a flat per-ticker dict — `stock_meta`'s
   schema is `(ticker, date)`-keyed (see V-1 fix); per-field fallback to
   `utils.estimate_historical_meta()` when a field is missing for a given date;

@@ -97,7 +97,9 @@ for train, val, test, fold_meta in balancer.generate_folds(
         run_id=run_id,
         fold_idx=fold_idx,
         outer_fold_idx=-1,
+        fold_train_start=fold_meta["fold_train_start"],
         fold_train_end=fold_meta["fold_train_end"],
+        fold_train_days=fold_meta["fold_train_days"],
         run_reducer=True,
         phase="selection",
         trial_idx=0,
@@ -156,12 +158,22 @@ selected_features = load_json(config["optimizer"]["selected_features_path"])
 # eval_type='outer_validation' score is not an estimate over the whole
 # distribution (db_schema.md's experiment_log).
 holdout_cfg   = config["optimizer"]["regime_holdout"]
-holdout_dates = utils.compute_vol_regime_holdout(
+holdout_vol   = utils.compute_vol_regime_holdout(
     db_conn,
     vol_percentile=holdout_cfg["vol_holdout_percentile"],
     window_days=holdout_cfg["vol_window_days"],
     vol_metric=holdout_cfg["vol_metric"],
-) if holdout_cfg["enabled"] else set()
+) if holdout_cfg["enabled"] else {}
+holdout_dates = set(holdout_vol)
+
+# The holdout set is recomputed per run and shifts as data accumulates, so it
+# is recorded once here: every row of this optimizer_run_id that excludes or
+# tests on it reads the same set back from regime_holdout_dates (db_schema.md).
+if holdout_vol:
+    db_conn.executemany(
+        "INSERT INTO regime_holdout_dates (optimizer_run_id, date, rolling_vol) VALUES (?, ?, ?)",
+        [(optimizer_run_id, d, v) for d, v in sorted(holdout_vol.items())],
+    )
 
 remaining_df = full_labeled_df[~full_labeled_df["date"].isin(holdout_dates)]
 holdout_df   = full_labeled_df[full_labeled_df["date"].isin(holdout_dates)]
@@ -307,6 +319,10 @@ for outer_train_df, _, outer_test_df, outer_fold_meta in balancer.generate_folds
         val_fraction=0.15,
         embargo_days=outer_cfg["embargo_days"],
     )
+    # train_log's fold_train_* describe the dates actually trained on — the
+    # train split, not outer_fold_meta's window, which also holds the val
+    # split and its embargo.
+    outer_train_dates = outer_train_split["date"]
 
     outer_run_id    = f"{optimizer_run_id}_o{outer_fold_idx}_eval"
     config_override = utils.apply_overrides(config, best_config)
@@ -318,7 +334,9 @@ for outer_train_df, _, outer_test_df, outer_fold_meta in balancer.generate_folds
         run_id=outer_run_id,
         fold_idx=-1,
         outer_fold_idx=outer_fold_idx,
-        fold_train_end=outer_fold_meta["fold_train_end"],
+        fold_train_start=outer_train_dates.min(),
+        fold_train_end=outer_train_dates.max(),
+        fold_train_days=outer_train_dates.nunique(),
         feature_config=best_config,
         feature_names=selected_features,
         run_reducer=False,
@@ -335,6 +353,7 @@ for outer_train_df, _, outer_test_df, outer_fold_meta in balancer.generate_folds
         outer_fold_idx=outer_fold_idx,
         fold_test_start=outer_fold_meta["fold_test_start"],
         fold_test_end=outer_fold_meta["fold_test_end"],
+        fold_test_days=outer_fold_meta["fold_test_days"],
         eval_type="outer_validation",
     )
 
@@ -374,6 +393,7 @@ for outer_train_df, _, outer_test_df, outer_fold_meta in balancer.generate_folds
                 outer_fold_idx=outer_fold_idx,
                 fold_test_start=outer_fold_meta["fold_test_start"],
                 fold_test_end=outer_fold_meta["fold_test_end"],
+                fold_test_days=outer_fold_meta["fold_test_days"],
                 eval_type="outer_validation",
                 execution_variant=json.dumps(variant),
             )
@@ -396,6 +416,7 @@ final_train_split, final_val_split = utils.temporal_split_simple(
     embargo_days=outer_cfg["embargo_days"],
 )
 final_run_id = utils.generate_run_id()
+final_train_dates = final_train_split["date"]   # as outer_train_dates above
 final_trainer = Trainer(final_config_override, db_conn, optimizer_run_id=optimizer_run_id)
 
 # test_df: holdout_df (completely unseen, preferred) when holdout is enabled and non-empty;
@@ -412,6 +433,9 @@ final_trainer.run(
     run_id=final_run_id,
     fold_idx=-1,
     outer_fold_idx=-1,
+    fold_train_start=final_train_dates.min(),
+    fold_train_end=final_train_dates.max(),
+    fold_train_days=final_train_dates.nunique(),
     feature_config=consensus_config,
     feature_names=selected_features,
     run_reducer=False,
@@ -425,6 +449,9 @@ if holdout_cfg["enabled"] and len(holdout_df) > 0:
     regime_backtester = Backtester(
         final_config_override, db_conn, optimizer_run_id=optimizer_run_id
     )
+    # No fold_test_* argument: run_backtest derives them from holdout_df. The
+    # date pair is then the ends of a non-contiguous set, whose members are in
+    # regime_holdout_dates.
     regime_backtester.run(
         holdout_df,
         run_id=final_run_id,
@@ -432,7 +459,44 @@ if holdout_cfg["enabled"] and len(holdout_df) > 0:
         outer_fold_idx=-1,
         eval_type="regime_holdout",
     )
+
+    # Report and verdict — see "Regime Holdout Report and Verdict" below.
+    # Always computed; whether the verdict blocks anything is decided at
+    # session start, before Inferencer init (live_mode_runner.md), not here.
 ```
+
+#### Regime Holdout Report and Verdict
+
+Computed at the end of every exploitation run that writes a 'regime_holdout'
+`experiment_log` row. It writes one `regime_holdout_verdict` row (db_schema.md)
+and prints the report.
+
+- **Report items:**
+  - from the 'regime_holdout' `experiment_log` row: `total_trades`,
+    `fold_test_days`, `winning_rate`, `avg_pnl_pct`
+  - from the final model's `train_log` row (test = `holdout_df`): `auc_mean`
+  - each beside the mean, min and max of the same item over this
+    `optimizer_run_id`'s 'outer_validation' `experiment_log` rows with
+    `execution_variant` NULL — for `auc_mean`, over the outer eval `train_log`
+    rows
+- **Bootstrap CI (report only):**
+  - population: the `trade_log` rows of those 'outer_validation' runs, entered
+    trades only, resampled per trade by `utils.bootstrap_ci()`; sample size =
+    the regime `total_trades`; `optimizer.bootstrap` sets resamples,
+    confidence and seed
+  - `winning_rate` (share of `pnl_pct > 0`) and `avg_pnl_pct` (mean
+    `pnl_pct`) each get `ci_low`, `ci_high`, `in_ci` (the regime value lies in
+    [`ci_low`, `ci_high`]) and `ci_position` ('below' | 'inside' | 'above')
+  - no gate check reads them; `auc_mean` gets no CI
+- **Gate checks:**
+  - regime `winning_rate` ≥ the outer folds' min `winning_rate`
+  - final model `auc_mean` ≥ the outer eval rows' min `auc_mean`
+- **Verdict:** 'pass' when every check passes, 'fail' otherwise. When the
+  regime `total_trades` < `optimizer.regime_holdout.gate.min_trades`, the
+  checks are not evaluated and the verdict is
+  `optimizer.regime_holdout.gate.insufficient_sample`'s value.
+- **Row:** `optimizer_run_id`, `final_run_id`, `detail` (JSON of the report
+  items, the CI fields and each check's result), `verdict`, `evaluated_at`.
 
 ---
 
@@ -470,7 +534,9 @@ for train, val, test, fold_meta in balancer.generate_folds(
         run_id=run_id,
         fold_idx=fold_idx,
         outer_fold_idx=-1,
+        fold_train_start=fold_meta["fold_train_start"],
         fold_train_end=fold_meta["fold_train_end"],
+        fold_train_days=fold_meta["fold_train_days"],
         run_reducer=False,
         phase="full",
         trial_idx=0,
@@ -558,7 +624,9 @@ def run_trial_round(
         run_id=run_id,
         fold_idx=inner_fold_idx,
         outer_fold_idx=outer_fold_idx,
+        fold_train_start=fold_meta["fold_train_start"],
         fold_train_end=fold_meta["fold_train_end"],
+        fold_train_days=fold_meta["fold_train_days"],
         feature_config=hyperparams,
         feature_names=selected_features,
         run_reducer=False,
@@ -664,7 +732,8 @@ class PipelineOptimizer:
           - "exploitation": nested validation with Successive Halving,
                             outer fold evaluation, consensus config, regime holdout
                             returns experiment_log rows (outer_validation + regime_holdout
-                            if holdout enabled)
+                            if holdout enabled); also writes regime_holdout_dates and,
+                            with a regime_holdout row, one regime_holdout_verdict row
           - "full":         one fold pass, no reducer, backtest
                             returns experiment_log rows
           - "refresh":      routine retraining entry point — the two-depth
@@ -816,6 +885,17 @@ optimizer:
     vol_holdout_percentile: 0.80   # top 20% most volatile dates excluded
     vol_window_days: 30
     vol_metric: "avg_intraday_range"
+    gate:                          # read at session start (live_mode_runner.md)
+      enabled: false               # false = report only
+      min_trades: 30               # below it the gate checks are not evaluated
+      insufficient_sample: "pass_with_warning"   # "pass_with_warning" | "fail"
+      missing_result: "pass_with_warning"        # "pass_with_warning" | "fail";
+                                                 # no verdict row for the run_id
+
+  bootstrap:                       # utils.bootstrap_ci(); also the divergence
+    n_resamples: 1000              # trigger (shadow_retraining.md)
+    confidence: 0.95
+    seed: 0
 
 class_balancer:
   outer_fold:
@@ -871,6 +951,15 @@ class_balancer:
   holdout_df used for both final model test_df (train_log AUC) and regime_holdout backtest
 - final model test_df: holdout_df (primary, completely unseen) when holdout enabled and
   non-empty; final_val_split (fallback) when holdout disabled
+- The holdout date set is written to `regime_holdout_dates` once per exploitation run,
+  with each date's rolling_vol; the regime_holdout backtest passes no fold_test_* argument
+- `fold_train_start` / `fold_train_end` / `fold_train_days`: from fold_meta at the inner
+  fold call sites; from the temporal_split_simple() train split for the outer eval and
+  the final model — never outer_fold_meta's train window
+- `fold_test_days` passed from fold_meta wherever fold_test_start / fold_test_end are
+- Regime holdout report and verdict are computed whenever a regime_holdout row is
+  written; the gate is enforced only at session start, before Inferencer init
+  (live_mode_runner.md)
 - `compute_vol_regime_holdout()` uses ohlcv_1min regular session bars only
 - `compute_consensus_config()` aggregates outer fold best_configs;
   continuous params → median → nearest grid value; categorical → mode

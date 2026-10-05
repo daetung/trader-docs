@@ -154,18 +154,29 @@ def session_start_compute(
     """
 ```
 
-### `on_regular_session_open(bars_with_930)`
+### `on_regular_session_open(bars_with_930, dividend_amount)`
 
 Called once when 09:30 bar is confirmed closed (09:31 bar arrives).
 
 ```python
-def on_regular_session_open(self, bars_with_930: pd.DataFrame) -> None:
+def on_regular_session_open(
+    self,
+    bars_with_930: pd.DataFrame,
+    dividend_amount: float,
+) -> None:
     """
     Computes gap_percentile (requires 093000 open price).
     session_stats must be available (set via set_session_stats() before this call).
+    dividend_amount: the ticker's ex-dividend gross amount for today, 0.0 if
+        none — supplied by LiveModeRunner from its today-dividend map
+        (live_mode_runner.md), the live counterpart of the scalar
+        FeatureExtractor's Strategy D passes in training. No default: an
+        omitted value would silently drop the correction. This class never
+        looks it up.
     """
     self._fixed["gap_pct"] = self.gap_percentile(
-        bars_with_930, self._today_date, self._n_sessions, self._session_stats
+        bars_with_930, self._today_date, self._n_sessions, self._session_stats,
+        dividend_amount,
     )
 ```
 
@@ -400,6 +411,7 @@ def scoped_recompute(
     historical_bars: pd.DataFrame,
     tick_bar_history: pd.DataFrame | None,
     bars_today: pd.DataFrame,
+    dividend_amount: float,
 ) -> None:
     """
     One-shot correction for a single ticker whose indicators were seeded
@@ -416,6 +428,13 @@ def scoped_recompute(
          Append and Feed Outage Recovery already rely on (on_bar_close()
          is O(1) per bar, so replaying N bars is O(N) — fine for one
          ticker).
+      3. If bars_today includes the 093000 bar, run
+         on_regular_session_open(<bars through 093000>, dividend_amount)
+         after the replay — the replay is on_bar_close() only, so without
+         this a recompute finishing after the 09:30 bar has closed would
+         leave gap_pct as seeded before the event. dividend_amount is the
+         ticker's today-dividend map entry, which LiveModeRunner re-reads
+         before this call (live_mode_runner.md).
 
     After this returns, LiveModeRunner clears the ticker's
     quarantine_reason if it was set (the distortion is corrected; no
@@ -438,6 +457,7 @@ def scoped_recompute(
   tradable universe (pool size = all tickers from trading API at session_start)
 - `session_start_compute()` must be called before any `get_for_entry()` call
 - `set_session_stats()` must be called before `on_regular_session_open()` or any REFERENCE_SESSION indicator call
+- `on_regular_session_open()` and `scoped_recompute()` take `dividend_amount` from LiveModeRunner's today-dividend map — this class never looks it up
 - `on_bar_close()` must be called in bar-close order (chronological) — no random access
 - `sr_levels` is always recomputed fresh in `get_for_entry()` — never stored in Layer 2 cache
 - `gap_pct` is stored as a scalar in Layer 1 after `on_regular_session_open()` — never in Layer 2

@@ -185,7 +185,12 @@ mutating the source table):
 Scalar corrections (neither raw-only nor bar-adjusted — a single value
 derived from corporate_events applied at one specific comparison point):
     gap_percentile()'s dividend_amount        — ex-dividend cash-drop correction
-    Dead position Case A/D's adjusted_p_entry — overnight split+dividend correction
+                                                 (gross amount, read through
+                                                 utils.dividend_gross_amount())
+    Dead position Case A's exit split factor  — overnight split+dividend correction:
+      and net dividend term                     the exit is multiplied by the split
+                                                 factor and the net dividend added;
+                                                 p_entry is never adjusted
                                                  (05_labeler.md, 09_backtest_engine.md)
     EntryPointDetector filter E's shares_outstanding — point-in-time share count
                                                         (utils.estimate_historical_meta())
@@ -401,8 +406,9 @@ Before submitting any module, verify:
        `adjust_tick_derived_series_for_corporate_events()` output
 - [ ] FeatureExtractor/IndicatorCalculator and `populate_precomputed_session_stats()`
        always operate on corporate-event-adjusted bars/tick-derived series, never raw
-- [ ] gap_percentile's `dividend_amount`, dead position's `adjusted_p_entry`,
-       and filter E's `shares_outstanding` are scalar corrections applied at
+- [ ] gap_percentile's `dividend_amount`, dead position Case A's split factor
+       and dividend term, and filter E's `shares_outstanding` are scalar
+       corrections applied at
        their one specific comparison point — not a substitute for, and not
        satisfied by, bar-level or tick-derived-series adjustment elsewhere
        in the same module

@@ -43,9 +43,15 @@ ticker_data_coverage: pd.DataFrame
     # Case B: ticker not found in coverage for next day with has_data=True (possible delisting)
 
 corporate_events: pd.DataFrame
-    columns: [ticker, event_date, event_type, value]
-    # used only for dead position Case A/D overnight dividend/split adjustment
-    # (see Step 4) — filtered internally per entry point to event_date IN (D, D+1]
+    columns: [ticker, event_date, event_type, value, source, basis_date]
+    # used only for dead position Case A/D overnight dividend/split adjustment;
+    # a 'dividend' row's amount is read only through utils.md's
+    # dividend_gross_from_events(), never from value directly
+    # (see Step 4). The frame is passed WHOLE to utils.md's frame forms
+    # (split_ratio_from_events(), dividend_gross_from_events()); the
+    # per-entry-point window event_date IN (D, D+1] selects only Case A's
+    # event rows — a restated dividend's factor reads split rows up to its
+    # basis_date, which may lie well after D+1
 ```
 
 
@@ -231,18 +237,20 @@ In this case:
         if exit_price cannot be resolved from either source (NaN/unavailable):
             → proceed to Case D (below); do not assign a label here
         exit_price *= (1 - dead_position_penalty_pct)
-        adjusted_P_entry = (P_entry - dividend_amount) / cum_split_ratio
-            where cum_split_ratio = product of split/reverse_split 'value' in
-                corporate_events WHERE ticker=? AND event_date IN (D, D+1]
-            dividend_amount = 'dividend' value in corporate_events with
-                event_date IN (D, D+1] (0.0 if none; same overnight window as
-                cum_split_ratio — a split or ex-dividend date effective D+1
-                is what would otherwise corrupt this comparison, since US
-                splits/ex-dividend adjustments always take effect before
-                market open)
+        r = split_ratio_from_events() over (D, D+1], from the
+            corporate_events frame   (utils.md's split factor; 1.0 if none)
+        dividend_term = Σ over 'dividend' rows with event_date IN (D, D+1] of
+            the net amount (utils.md's dividend_gross_from_events(), from
+            the same frame: the gross amount in its event_date basis ×
+            (1 − corporate_events.dividend_withholding_rate)) × the split
+            factor over (D, that event_date] (split_ratio_from_events())
+            (0.0 if none; same overnight window as r — a
+            split or ex-dividend date effective D+1 is what would otherwise
+            corrupt this comparison, since US splits/ex-dividend adjustments
+            always take effect before market open)
         is_dead_position = True
         dead_position_case = "A"
-        pnl = (exit_price - adjusted_P_entry) / adjusted_P_entry
+        pnl = (r × exit_price + dividend_term - P_entry) / P_entry
         apply label by pnl threshold (same rules as Step 3)
 
     Case B — has_data=True AND ticker NOT in ticker_data_coverage:
@@ -335,8 +343,9 @@ Note: `build_effective_bar_sequence()` is an internal delegation to
 - `exit_interpolation` passed through to `track_label_breach()` — read from config
 - `ticker_data_coverage` must be pre-loaded and passed explicitly;
   used for dead position Case A vs Case B determination only
-- Dead position Case A: pnl computed from next-day exit_price, dividend/split
-  adjusted (see Step 4) via `corporate_events`; label assigned by threshold;
+- Dead position Case A: pnl computed against raw `P_entry` from the next-day
+  exit_price normalised by the split factor plus the net dividend term (see
+  Step 4) via `corporate_events`; label assigned by threshold;
   if exit_price cannot be resolved, falls through to Case D instead
 - Dead position Case B: pnl = -1.0 fixed; label assigned by threshold
   (resolves to label_dn5) — not label_sw
@@ -347,8 +356,10 @@ Note: `build_effective_bar_sequence()` is an internal delegation to
   Case A's exit_price cannot be resolved after fallback
 - Case A/D overnight dividend/split lookup uses `corporate_events` rows passed
   in by the caller (see Input section) — consistent with how `trading_calendar`
-  and `ticker_data_coverage` are already supplied; Labeler does not query
-  DuckDB directly anywhere in this module
+  and `ticker_data_coverage` are already supplied — read through `utils.md`'s
+  frame forms `split_ratio_from_events()` / `dividend_gross_from_events()`,
+  passed the whole frame; Labeler does not query DuckDB directly anywhere in
+  this module
 
 ---
 
@@ -408,10 +419,10 @@ labeler:
 | Ambiguous bundle (both ±3pp in same bundle), priority="up" | label_up3/up5, is_ambiguous=True |
 | +3pp and +5pp in the SAME bundle | label_up3 — Stage 2 starts at exit_hour_1 with the Stage 1 breach bundle excluded, so the +5pp print in it is never scanned |
 | +3pp, +5pp and -3pp in the SAME bundle, priority="up" | label_up3, is_ambiguous=True — priority resolves direction, then the same bundle exclusion applies |
-| Dead position Case A (ticker in coverage, has_data=True next day) | is_dead_position=True, case="A", label by pnl threshold (dividend/split adjusted) |
+| Dead position Case A (ticker in coverage, has_data=True next day) | is_dead_position=True, case="A", label by pnl threshold (split-normalised exit plus net dividend) |
 | Dead position Case B (ticker missing, has_data=True next day) | is_dead_position=True, case="B", pnl=-1.0, label_dn5 |
 | Dead position Case C (no next day with has_data=True) | is_dead_position=True, case="C", label_sw |
 | Dead position Case D (Case A entered, exit_price unresolvable — extended halt) | is_dead_position=True, case="D", pnl=-1.0, label_dn5 |
-| Dead position Case A with split effective D+1 | pnl computed against split-adjusted P_entry, not raw P_entry |
+| Dead position Case A with split effective D+1 | pnl computed against raw P_entry with the exit multiplied by the split factor |
 | Halt bar skipped in valid count | label assigned after halt |
 | Time-limit exit: execution.max_hold_bars valid bars collected, last_bar(date) not yet reached | exit at last valid bar close, no dead position |

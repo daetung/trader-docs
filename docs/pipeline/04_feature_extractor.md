@@ -222,7 +222,9 @@ Strategy D — date당 1회 스칼라 (gap_percentile only):
     Computed once per date (same value for all entry points of the same date).
     session_stats dict provides the baseline.
     dividend_amount looked up once per date from corporate_events
-    (event_type='dividend', event_date=today; 0.0 if none) and passed to
+    (event_type='dividend', event_date=today; 0.0 if none) — the row's gross
+    amount through utils.dividend_gross_amount(), never its raw value, and
+    no withholding applied — and passed to
     IndicatorCalculator.gap_percentile() — corporate_events is queried here,
     not inside IndicatorCalculator (which remains DB-unaware).
     NaN for t="093000" or pre-market entries.
@@ -658,7 +660,8 @@ They are used by ClassBalancer for pre-balance filtering.
   global `stock_meta` snapshot; `sector` is the sole exception (no fallback,
   always most-recent snapshot)
 - `gap_percentile()`'s `dividend_amount` is looked up from `corporate_events`
-  by FeatureExtractor (Strategy D) and passed as a scalar — IndicatorCalculator
+  by FeatureExtractor (Strategy D), read through `utils.dividend_gross_amount()`
+  (gross, no withholding), and passed as a scalar — IndicatorCalculator
   itself never queries `corporate_events`
 - `extract_batch()`'s `meta` parameter is date-keyed (`{date: {field: value}}`),
   not a flat per-ticker dict — required because `stock_meta` is `(ticker, date)`-keyed;

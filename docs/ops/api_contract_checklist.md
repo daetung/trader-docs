@@ -69,8 +69,8 @@ outranks a shaky one that degrades gracefully.
 | T-4 | Whether `AstkOrdAbleAmt` includes UNSETTLED SELL PROCEEDS — the settled-funds axis, the part of the original cash/buying-power/settled question still open | `session_start_cash` → `compute_position_size()` | **B** | `inquiry/deposit-detail` (CAZCQ01400, TPS 2, no input) returns a D+0..D+4 ladder — `DpsBaseDt0..4` against `AstkDps*`, `AstkUnsttSellAmt*`, `AstkUnsttBuyAmt*`. `AstkUnsttSellAmt0` is the discriminator: when it is nonzero, whether `AstkOrdAbleAmt` tracks `AstkDps0` or `AstkDps0` minus it settles the question from two vendor responses | — (no key; what remains is a FIELD CHOICE, not a value) | |
 | T-5 | `Mgnrt0` from `inquiry/able-orderqty` IS the effective requirement, needing no combination — `Mgnrt` is the instrument rate and `OtptItemNm1` a label string, so there is no second RATE to reconcile against | Position sizing — `live_mode_runner.md`'s Per-Ticker Trading Terms | **B** | Call it for a ticker with and without an open position and confirm `Mgnrt0` is what the broker actually applies; the account-level override shows as `Mgnrt0 == 100` rather than as a separate figure | — (key deleted with `margin_ratio_url`) | |
 | T-6 | WS connection limits: tickers per connection, connections per account, subscription types per connection, connections per IP per port | Exit Architecture; WS connections | **B** | Subscribe and connect past each limit and observe the failure | `execution.ws_ticker_limit` | **Measured** — 50 tickers per connection; 2 connections per account; ONE subscription type per connection (an account registration sent on a quote connection converts it and silently stops quote delivery); 30 connections per IP per port. Confirmed against production AND demo accounts |
-| T-7 | Account-wide fill event stream: whether individual fills carry a stable, unique ID; schema; heartbeat; reconnect; whether events missed while disconnected are replayed | In-flight order tracking (fill accounting invariant) | **A** | See the fill-accounting sub-items below the table | — | |
-| T-8 | A REST order-status endpoint suitable as the exit-fill backstop, and whether it returns a given order's COMPLETE fill history or a paginated/windowed slice (shared checkpoint with T-7 — see below) | In-flight order tracking (exits are REST-only) | **C** | Endpoint documentation; poll a known order; check for pagination on an order with many fills | — | |
+| T-7 | ~~Account-wide fill event stream: whether individual fills carry a stable, unique ID; schema; heartbeat; reconnect; whether events missed while disconnected are replayed~~ | ~~In-flight order tracking (fill accounting invariant)~~ | **RETIRED** | Nothing to verify — see below | — | **Retired** — superseded by the order and fill ledger; residual question in T-21 |
+| T-8 | ~~A REST order-status endpoint suitable as the exit-fill backstop, and whether it returns a given order's COMPLETE fill history or a paginated/windowed slice~~ | ~~In-flight order tracking (exits are REST-only)~~ | **RETIRED** | Nothing to verify — see below | — | **Retired** — superseded by fill folding's completeness condition |
 | T-9 | Subscribe acknowledgement latency | Exit Architecture's post-subscribe REST gap-fill window | **C** | Time the round trip under load | — (no key; the gap-fill covers the window rather than a configured value sizing it) | |
 | T-10 | The broker's rejection reason vocabulary | `trade_log.reject_reason`; any future normalisation | **C** | Self-measuring — `health_report.md`'s unrecognised-reason finding accumulates it | — (stored verbatim; no enum until this is known) | |
 | T-11 | Whether a server-clock endpoint exists | `clock_check.source: "vendor_api"` | **C** | Endpoint documentation | `live_mode.clock_check.source` | |
@@ -81,7 +81,21 @@ outranks a shaky one that degrades gracefully.
 | T-16 | ~~REST round-trip latency range~~ | ~~Prefix-scan slot allocation~~ | **RETIRED** | Nothing to verify — measured, then transcribed | — | **Retired** — 400-600ms recorded in `live_mode_runner.md`'s `scan:` keys; ongoing drift is `health_report.md`'s finding 32, not a checklist question |
 | T-17 | The watchdog list fires for every ticker that crosses conditions A-G, so a ticker becoming eligible always rises to the head | `live_mode_runner.md` prefix scan — the soundness of stopping where bar delta stops | **B** | Self-measuring — the `evening_detection_gap` stage runs `detect()` over the day's ingested bars and compares against `inference_log` | — (no key; the rotation cursor and the promotion path bound the gap rather than a value sizing it) | |
 | T-18 | `Mgnrt0` is INTRADAY-INVARIANT, so a rate acquired at watchdog first listing stands for the session | `live_mode_runner.md`'s Per-Ticker Trading Terms — acquisition once per ticker, and the rate pinned onto each `live_positions` row | **B** | Self-measuring at zero cost — the post-dispatch entry observation already calls `able-orderqty` and its response carries `Mgnrt0` beside `AstkOrdAbleQty`, so comparing it against the PERSISTED `live_ticker_terms` row needs no extra call. A mismatch raises the same warning. Comparing against the persisted row rather than an in-memory cache is what lets the measurement survive a crash and a warm restart, which is exactly when a rate change would be least visible | — (no key; a rate that moves needs a re-acquisition rule, not a value) | |
-| T-19 | Whether a resting order survives the session-close / after-hours boundary and stays live overnight, or is canceled by the venue at that boundary | `live_mode_runner.md`'s Session Shutdown cancellation, the in-flight exit loop's amend reasoning, and the vanished-order rule's venue-cancellation cause | **B** | Self-measuring — whether Broker Reconcile's Orders branch meets a prior-session exit order at the next session start answers it directly; a session that crashed without reaching Session Shutdown is the observation | — (no key; the answer settles which statements may assert, not a value) | |
+| T-19 | Whether a resting order survives the session-close / after-hours boundary and stays live overnight, or is canceled by the venue at that boundary | `live_mode_runner.md`'s Session Shutdown cancellation, the in-flight exit loop's amend reasoning, and the vanished-order rule's venue-cancellation cause | **B** | Self-measuring — the startup procedure classifies each 'open' logical order carried from a prior day, recording `live_orders.terminal_cause`: `carried_live_canceled` (still live at the broker) against `expired_at_boundary` (gone). A session that ended without Session Shutdown's cancels is the observation | — (no key; the answer settles which statements may assert, not a value) | |
+| T-20 | Which order number is live after an amend is confirmed — the original or the amend's | `live_mode_runner.md`'s IS2 routing (`current_request_id`) and the exit ladder's amends | **C** | Amend a resting order; compare the OUTSTANDING list's order numbers before and after | — | |
+| T-21 | Each execution is reported under exactly one order number, and the uniqueness scope of `ExecNo` | `live_fills`' primary key and fill folding (`live_mode_runner.md`) | **A** | Amend a partly filled order and fill it further; compare the REST itemised fills of both order numbers and their `ExecNo` values | — | |
+| T-22 | The `AstkOrdStatCode` code set | `live_order_requests.broker_status` (stored raw) | **C** | Record the codes observed across new, amend, cancel, fill and rejection | — (no key; classification uses quantities and IS2 event types, not the code) | |
+| T-23 | Whether a prior-day order can be cancelled with `OrgOrdNo` alone | `live_mode_runner.md`'s startup procedure — `carried_live_canceled` | **B** | Cancel an order carried from a prior day | — | |
+| T-24 | Whether an IS2 event can precede the order API response | `live_mode_runner.md`'s IS2 routing (unresolved new-order events) | **C** | Compare IS2 receipt times with order-response receipt times | — | |
+| T-25 | Whether `AstkExecBaseQty` reflects same-day executions immediately | `live_mode_runner.md`'s Positions branch comparison | **A** | Query `inquiry/balance-margin` immediately after a fill and compare with `live_fills` | — | |
+| T-26 | When the broker reflects a split or reverse split in `AstkExecBaseQty` and `AstkAvrPchsPrc` relative to the effective date, and whether a sell is refused meanwhile | `live_mode_runner.md`'s event-day exit gate and Positions branch | **B** | Observe a holding across a split's effective date | `live_mode.unrecorded_event_detectors` | |
+| T-27 | How the broker disposes of a split's or reverse split's fractional share — cash in lieu, rounding up, or a fractional balance — the `SmryNm` of its cash and movement rows, whether its cash row carries `AstkIsuNo`, whether it also appears as a sell in `inquiry/trading-history` or `inquiry/transaction-history`, its lag from `event_date`, and whether `QryTpCode` '1' and '2' exclude trade rows | `live_mode_runner.md`'s Positions branch event settlement, fill folding's settlement exclusion, broker measurement and summary vocabulary | **C** | Self-measuring — `health_report.md`'s `summary_vocabulary_candidate` finding | `live_mode.summary_match_mode`, `live_mode.cash_in_lieu_summary_names`, `live_mode.split_movement_summary_names`, `live_mode.cash_in_lieu_sources`, `live_mode.trade_summary_words`, `live_mode.summary_direction_words`, `live_mode.trade_history_query_mode` | **Partial** — `inquiry/trade-history` accepts an empty `AstkIsuNo` and returns the whole account; every deposit/withdrawal and in/out-transfer `SmryNm` contains '입금', '출금', '입고' or '출고'; trade rows carry '매수' or '매도' (e.g. '주식매수대금출금(외화)', '주식매도출고(외화)') |
+| T-28 | Under `DpntBalTpCode='0'`, whether `inquiry/balance-margin` returns one row per ticker or one per balance type, and whether `AstkExecBaseQty` includes the fractional balance | `live_mode_runner.md`'s broker measurement | **C** | Query an account holding both a whole and a fractional balance under each `DpntBalTpCode`; fallback: the 'split' default | `live_mode.balance_query_mode` | |
+| T-29 | Whether the order API sells a fractional balance with a fractional `AstkOrdQty` | `live_mode_runner.md`'s settlement pending — `event_settlement_stalled` `kind='fraction_held'` | **C** | Submit a sell for a fractional balance | — | **Partial** — the account holds fractional-share buy records ('소수점주식매수입고(외화)') |
+| T-30 | Whether each `corporate_events` source restates a dividend `value` by later splits, and how a re-crawl that returns a restated amount is upserted | `utils.md`'s dividend amount function; `metadata_crawler.md`'s upsert | **C** | Compare a dividend across a later split in each source; fallback: the key's default | `corporate_events.dividend_restated_sources` | |
+| T-31 | Whether any non-integer vendor numeric field arrives as a JSON number rather than a string | `trading_api.md`'s Response Normalization; `live_mode_runner.md`'s broker measurement | **C** | Inspect raw responses; fallback: a float is converted through `repr` | — | |
+| T-32 | Whether the order API accepts `AstkOrdQty` and `AstkOrdPrc` as JSON numbers carrying up to 6 decimal places, and as strings | `trading_api.md`'s order request numeric format | **C** | Submit orders in each format; fallback: the 'number' default | `trading.order_numeric_format` | |
+| T-33 | The dividend withholding rate applied to this account, and the `SmryNm` of dividend cash and tax rows | `utils.md`'s dividend amount function; `live_mode_runner.md`'s dividend withholding check | **C** | Self-measuring — `health_report.md`'s `dividend_withholding_mismatch` and `summary_vocabulary_candidate` findings | `corporate_events.dividend_withholding_rate`, `corporate_events.dividend_cash_summary_names`, `corporate_events.dividend_tax_summary_names` | **Partial** — `inquiry/trade-history` shows '배당금입금(외화)' and '배당세출금(외화)' |
 
 **T-3 is RETIRED, not verified.** Its premise was that a real-world
 throughput ceiling had to be measured because none was published. `api_doc/`
@@ -200,54 +214,34 @@ and its stated reason (the reference price is set high, shrinking orderable
 quantity) is buy-specific. Recorded so the question is not re-raised as a
 gap.
 
-**T-7 and T-8 have a partial documentary answer.** The vendor's fill
-inquiry exposes an itemised mode alongside a summarised one, so per-fill
-rows ARE retrievable — which is what decides whether `seen_fills`' fill-ID
-primary mechanism is available at all. This is an input, not a closure: the
-ID's stability across reconnects, and whether the WS stream and the REST
-endpoint share one ID scheme, are still open and are sub-items 1 and 3
-below. The same inquiry is account-wide rather than per-order, which is why
+**T-7 and T-8 are RETIRED.** The order and fill ledger (`db_schema.md`'s
+`live_fills`; `live_mode_runner.md`'s fill folding) removed the mechanism
+they backed. T-7's sub-items:
+- 1 (a stable per-fill ID) — superseded by `live_fills`' `cum_after_qty` key
+  and the REST itemised view's `ExecNo`
+- 2 (an order's complete fill history) — retired with T-8
+- 3 (one ID scheme across WS and REST) — answered from vendor documentation:
+  WS IS2 carries no fill ID
+- 4 (replay after reconnect) — covered by the REST backstop
+- 5 (cumulative fields for a fallback) — moot, no fallback remains
+
+Its residual question is T-21. T-8 is superseded by fill folding's
+completeness condition: a REST itemised result replaces an order number's
+rows only when its Σ `exec_qty` equals the broker cumulative for that order
+number. The fill inquiry is account-wide rather than per-order, which is why
 `live_mode_runner.md`'s exit backstop is one pair of scoped calls per cycle
 rather than one call per outstanding order.
 
-**T-1 and T-7 are the grade A rows.** Both back a stated correctness
+**T-1, T-21 and T-25 are the grade A rows.** Each backs a stated correctness
 guarantee rather than a tunable value — a wrong answer means the design
-itself is wrong, not just a config default. They are also the only two:
-T-14 and T-15 were graded A while open, but both retired within the session
-that raised them, so no other row currently carries the grade.
+itself is wrong, not just a config default. T-14 and T-15 were graded A while
+open, but both retired within the session that raised them.
 
 **T-1**: Exit Architecture states that WS and REST share one parser and one
 2-print guard, and therefore that the two exit paths have no filter
 asymmetry. If the granularities differ, that claim is false as written — a
 normalisation layer is needed and the guard has to be re-derived for each
 path. Verify this first.
-
-**T-7's sub-items**, in the order they should be checked (see
-live_mode_runner.md's fill accounting invariant for why each matters):
-1. Does each individual fill carry a stable, unique ID that survives
-   reconnects and REST re-queries? This decides whether the PRIMARY
-   fill-tracking mechanism (fill-ID set union) is available at all — without
-   it, tracking falls back to cumulative-field assignment, a materially
-   weaker guarantee.
-2. Does T-8's REST endpoint return an order's COMPLETE fill history, or can
-   it be paginated/windowed? (Shared with T-8 above — this is what
-   determines whether a Warm Restart can rebuild `seen_fills` from one REST
-   query.)
-3. Do the WS stream and the REST endpoint use the SAME fill-ID scheme?
-   Two different ID spaces for the same underlying fills would make
-   deduplication silently fail across channels while appearing to work
-   within each one.
-4. On reconnect, are fills missed while disconnected replayed, or lost?
-5. (Needed only if item 1 is No) Does the API expose a cumulative filled
-   quantity and cumulative average price per order, usable by the fallback
-   mechanism?
-
-A wrong answer to 1 or 3 does not fail loudly — it produces occasional
-double-counted fills, which live_mode_runner.md's monotonic-non-decrease
-guard catches only sometimes (it rejects a DECREASE, not every
-over-count). This is why T-7 is graded on the same tier as T-1 rather than
-on the strength of its own fallback: the fallback exists so a No to item 1
-degrades to a still-correct mechanism, not so item 1 can go unverified.
 
 **T-4 and T-5 WERE one question in two parts, and are no longer.** They were
 one only while the balance figure's meaning was unknown: full deployment being
@@ -302,7 +296,8 @@ since a halt-feed mismatch says nothing about forward-check row matching.
 - Where a row names a config key, the measured value belongs in
   `pipeline_config.yaml` under that key — recording it only in this table
   leaves the code running on its default
-- The self-measuring rows (T-2, T-10, T-12, T-13, T-17, T-18, I-2) are
+- The self-measuring rows (T-2, T-10, T-12, T-13, T-17, T-18, T-19, T-27, T-33, I-2,
+  I-3) are
   filled in during ordinary operation and do not need a separate measurement
   exercise. Most accumulate through `health_report.md` findings; T-17
   accumulates in `live_scan_daily` instead, by way of the evening

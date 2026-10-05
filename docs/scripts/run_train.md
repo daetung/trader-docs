@@ -35,7 +35,9 @@ class Trainer:
         run_id:         str | None = None,
         fold_idx:       int = -1,
         outer_fold_idx: int = -1,
+        fold_train_start: str | None = None,
         fold_train_end: str | None = None,
+        fold_train_days: int | None = None,
         feature_config: dict | None = None,
         feature_names:  list[str] | None = None,
         run_reducer:    bool = False,
@@ -59,9 +61,15 @@ class Trainer:
             outer_fold_idx:
                 Outer fold index for nested validation (0-based). Default -1 for
                 non-nested runs (standalone, selection, full, non-nested exploitation).
-            fold_train_end:
-                Last date of train window ('YYYYMMDD'). None for standalone.
-                Sourced from fold_meta["fold_train_end"] — not computed independently.
+            fold_train_start, fold_train_end:
+                First and last date of the date range the model is actually
+                trained on ('YYYYMMDD'). None for standalone.
+            fold_train_days:
+                Trading days that range holds. None for standalone.
+                All three are passed by the caller — from fold_meta at the
+                inner fold call sites, from the temporal_split_simple() train
+                split for the outer eval and the final model. Trainer does not
+                compute them.
             feature_config:
                 Active hyperparameter config dict for this trial.
                 None in standalone mode — full config snapshot used instead.
@@ -122,7 +130,8 @@ Options:
 CLI always runs with:
 ```
 optimizer_run_id=None, fold_idx=-1, outer_fold_idx=-1,
-fold_train_end=None, trial_idx=0, dry_run=False
+fold_train_start=None, fold_train_end=None, fold_train_days=None,
+trial_idx=0, dry_run=False
 ```
 
 ---
@@ -143,7 +152,9 @@ train_log_row = {
                                                     # inner trials
     "fold_idx":            fold_idx,                # -1 for standalone/outer eval
     "outer_fold_idx":      outer_fold_idx,          # -1 for non-nested runs
+    "fold_train_start":    fold_train_start,        # None for standalone
     "fold_train_end":      fold_train_end,          # None for standalone
+    "fold_train_days":     fold_train_days,         # None for standalone
     "feature_config":      json.dumps(feature_config)
                            if feature_config is not None
                            else json.dumps(config),
@@ -204,7 +215,8 @@ trainer:
   0-based for exploitation inner trials; also 0 for the exploitation final
   model (outer_fold_idx=-1) — same "single implicit trial" semantics as
   standalone/selection/full, just reached via a different phase
-- `fold_train_end` sourced from fold_meta["fold_train_end"] — Trainer does not compute it
+- `fold_train_start`, `fold_train_end`, `fold_train_days` are passed by the caller —
+  Trainer does not compute them
 - Sample weight column (`__sample_weight__`) generated inside Trainer when
   `use_ambiguous_sample_weight=True`; must not appear in feature_names
 - `categorical_cols` derived from `FeatureExtractor.get_feature_schema()` — no heuristic matching
