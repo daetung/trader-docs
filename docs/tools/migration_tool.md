@@ -93,7 +93,8 @@ python tools/migrate_json_to_duckdb.py \
 3. For each (ticker, date, resolution):
      a. Check DuckDB: if (ticker, date) already exists in target table → SKIP
      b. Load JSON → pd.DataFrame
-     c. Cast all fields to correct types (strings → DOUBLE / BIGINT)
+     c. Parse all fields to their column types (strings → DECIMAL(18,6)
+        prices / BIGINT volumes; db_schema.md's Ingestion Rules)
      d. Filter to valid trading hours: hour >= '040000' AND hour <= '200000'
         (pre-market, regular session, after-market; overnight excluded)
      e. For tick data: assign seq_id within each (ticker, date, hour) group

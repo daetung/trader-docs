@@ -244,6 +244,9 @@ max_up(i)   = ( max(High of bars t..t+i) - P_entry ) / P_entry
 max_down(i) = ( P_entry - min(Low of bars t..t+i)  ) / P_entry
 ```
 
+A comparison of `max_up` / `max_down` against a threshold is a grid-value
+decision (utils.md's Numeric Rules).
+
 ---
 
 ## Label vs. Backtest Reference Price

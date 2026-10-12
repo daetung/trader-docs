@@ -186,14 +186,14 @@ WHERE ticker = ? AND date = ?
 
 ### Corporate events (for dead position Case A/D dividend/split adjustment)
 ```sql
-SELECT event_type, event_date, value, source, basis_date FROM corporate_events
+SELECT event_type, event_date, ratio, amount, source, basis_date FROM corporate_events
 WHERE ticker = ? AND event_date > ? AND event_date <= ?
 ```
 Queried only when Case A/D resolution is reached — not on every trade.
 Same window and rationale as Labeler's equivalent lookup (see `05_labeler.md`).
 The split factor is `utils.md`'s single rule, applied through
 `cum_split_ratio()` over (D, D+1]; a 'dividend' row's amount is read only
-through `utils.md`'s dividend amount function, never from `value` directly.
+through `utils.md`'s dividend amount function, never from `amount` directly.
 
 **Iteration order is DATE-major, not ticker-major.** The concurrency caps
 (`execution.max_tickers` / `execution.max_positions_per_ticker`) and the
@@ -240,8 +240,8 @@ direction, exit_price, exit_hour, is_ambiguous = utils.track_price_breach(
     fill_price=fill_price,
     fill_second=fill_second,
     threshold_up=tp_pct,
-    threshold_dn=config["backtest"]["stop_loss_pct"],
-    exit_interpolation=config["backtest"]["exit_interpolation"],
+    threshold_dn=config["execution"]["stop_loss_pct"],
+    exit_interpolation=config["execution"]["exit_interpolation"],
 )
 ```
 
@@ -343,15 +343,18 @@ Procedure:
         else (p_entry * (1 + config["execution"]["entry_gap_value"])
               if config["execution"]["entry_gap_type"] == "percentage"
               else p_entry + config["execution"]["entry_gap_value"])
+    # a limit price is rounded DOWN to execution_common.md's tick(price) grid
+    # — the less aggressive direction for a buy, the function live uses too
 
     if fill_bundle is not None:
         fill_price, total_filled, unfilled_qty, status = execution_common.simulate_entry_fill(
             ticks_entry=ticks_t, quantity=quantity,
-            entry_anchor_second=entry_hour + config["execution"]["entry_fill_delay_seconds"],
+            entry_anchor_second=fill_second,   # utils.hour_add_seconds(entry_hour,
+                                               #   entry_fill_delay_seconds), above
             p_entry=p_entry,
             # ohlcv_entry dropped and the index argument replaced by a TIME:
-            # backtest COMPUTES this instant while live OBSERVES it as
-            # the entry 'new' request's sent_at, and the two must never be composed
+            # backtest COMPUTES this instant while live OBSERVES it as the
+            # time part of the entry 'new' request's sent_at, and the two must never be composed
             # (execution_common.md). fill_idx is still computed above for the
             # `fill_bundle is not None` guard; the simulator derives its own.
             buy_rate=config["execution"]["buy_rate"],
@@ -644,8 +647,8 @@ itself). New small utility; belongs in `utils.py` alongside the other hour
 utilities (not execution_common.md — it's a pure time-arithmetic function
 with no execution-decision content, same category as `hour_add_seconds()`).
 
-**`trade_log.exit_bar`**: the EXIT ANCHOR INSTANT, for all four exit
-reasons. On the tp/sl path that is `effective_second` above rather than the
+**`trade_log.exit_bar`**: the EXIT ANCHOR INSTANT, for every exit
+reason. On the tp/sl path that is `effective_second` above rather than the
 raw `exit_hour`. On the `time_limit` / `session_end` paths it is the instant
 the trigger fired — previously undefined here, those two reasons having had
 no `effective_second` to populate it from, which the generalised anchor
@@ -747,8 +750,8 @@ Case A — next trading day has_data=True AND ticker exists in ticker_data_cover
     trade_log row, in the basis as of its exit:
         fill_price = the simulated fill ÷ r
         exit_price = as resolved above
-        quantity, requested_quantity = × r, rounded per utils.md's Ledger
-            Numeric Rules (the product converted per trading_api.md's V1)
+        quantity, requested_quantity = × r, rounded per utils.md's Numeric
+            Rules (the product converted per trading_api.md's V1)
         slippage_pct = (simulated fill − p_entry) / p_entry, taken before
             the normalisation
     exit_bar / exit_date = the timestamp of whichever source actually
@@ -813,8 +816,8 @@ scheduled revive credit, under one rule with no per-Case special casing:
                     — quantity in D's basis; r = 1 and dividend_term = 0
                     outside Case A, which reduces it to quantity * exit_price
     revive moment = that row's own exit_date / exit_bar
-    The cash ledger's arithmetic type is deferred with the DECIMAL type
-    conversion (open_items.md).
+    The cash ledger's arithmetic runs in float — Case A's amounts are
+    computed values (utils.md's Numeric Rules).
 
 which resolves per Case without further rules: A revives at its D+1
 resolution timestamp; C revives immediately at D's close, since its
@@ -952,6 +955,16 @@ requested_quantity       DECIMAL(18,6), -- quantity actually SUBMITTED, i.e. aft
   BacktestEngine computes the same three metrics live does but never gates
   an entry on them (see Chronological Simulation's Circuit Breaker note)
 - BacktestEngine accesses DuckDB directly — callers do not pass ohlcv/ticks as arguments
+- Numeric decisions follow utils.md's Numeric Rules:
+  - `track_price_breach()`'s breach tests are grid-value decisions;
+  - `compute_position_size()` / `check_funds_available()` floors and
+    comparisons are grid-value decisions;
+  - BacktestEngine's `DOUBLE` inputs enter them by V1;
+  - the fill simulators' output prices pass V1 before any sign decision, pnl
+    or write
+- The fill simulators take the sealed bundle series in both engines — `tick_10`
+  here, live's vendor or derived bundles (live_mode_runner.md's Per-Ticker
+  Tick Buffer) — so `per_tick_vol = bundle.volume / 10` holds in both
 - `db_conn` injected via constructor for testability (mock DB in tests)
 - OHLCV loaded once per ticker for all its entry dates
 - Tick data loaded once per ticker/date (full day); filtered in memory by range

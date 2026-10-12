@@ -71,7 +71,7 @@ outranks a shaky one that degrades gracefully.
 | T-6 | WS connection limits: tickers per connection, connections per account, subscription types per connection, connections per IP per port | Exit Architecture; WS connections | **B** | Subscribe and connect past each limit and observe the failure | `execution.ws_ticker_limit` | **Measured** — 50 tickers per connection; 2 connections per account; ONE subscription type per connection (an account registration sent on a quote connection converts it and silently stops quote delivery); 30 connections per IP per port. Confirmed against production AND demo accounts |
 | T-7 | ~~Account-wide fill event stream: whether individual fills carry a stable, unique ID; schema; heartbeat; reconnect; whether events missed while disconnected are replayed~~ | ~~In-flight order tracking (fill accounting invariant)~~ | **RETIRED** | Nothing to verify — see below | — | **Retired** — superseded by the order and fill ledger; residual question in T-21 |
 | T-8 | ~~A REST order-status endpoint suitable as the exit-fill backstop, and whether it returns a given order's COMPLETE fill history or a paginated/windowed slice~~ | ~~In-flight order tracking (exits are REST-only)~~ | **RETIRED** | Nothing to verify — see below | — | **Retired** — superseded by fill folding's completeness condition |
-| T-9 | Subscribe acknowledgement latency | Exit Architecture's post-subscribe REST gap-fill window | **C** | Time the round trip under load | — (no key; the gap-fill covers the window rather than a configured value sizing it) | |
+| T-9 | Subscribe acknowledgement latency | The held interval's first 1-tick fetch covering the subscribe-to-active window (`live_mode_runner.md`'s Per-Ticker Tick Buffer) | **C** | Time the round trip under load | — (no key; the first fetch covers the window rather than a configured value sizing it) | |
 | T-10 | The broker's rejection reason vocabulary | `trade_log.reject_reason`; any future normalisation | **C** | Self-measuring — `health_report.md`'s unrecognised-reason finding accumulates it | — (stored verbatim; no enum until this is known) | |
 | T-11 | Whether a server-clock endpoint exists | `clock_check.source: "vendor_api"` | **C** | Endpoint documentation | `live_mode.clock_check.source` | |
 | T-12 | Whether a resting order survives a trading halt on its ticker, is auto-canceled by the halt, or executes at the halt-resumption cross/auction | `live_mode_runner.md` Position Manager Loop — halt-clear handling for an in-flight exit order | **C** | Self-measuring — `health_report.md` finding 25 records every case where an in-flight exit order was found gone at halt-clear | — (no key; the design branches at halt-clear regardless of the answer — see below) | |
@@ -91,8 +91,8 @@ outranks a shaky one that degrades gracefully.
 | T-26 | When the broker reflects a split or reverse split in `AstkExecBaseQty` and `AstkAvrPchsPrc` relative to the effective date, and whether a sell is refused meanwhile | `live_mode_runner.md`'s event-day exit gate and Positions branch | **B** | Observe a holding across a split's effective date | `live_mode.unrecorded_event_detectors` | |
 | T-27 | How the broker disposes of a split's or reverse split's fractional share — cash in lieu, rounding up, or a fractional balance — the `SmryNm` of its cash and movement rows, whether its cash row carries `AstkIsuNo`, whether it also appears as a sell in `inquiry/trading-history` or `inquiry/transaction-history`, its lag from `event_date`, and whether `QryTpCode` '1' and '2' exclude trade rows | `live_mode_runner.md`'s Positions branch event settlement, fill folding's settlement exclusion, broker measurement and summary vocabulary | **C** | Self-measuring — `health_report.md`'s `summary_vocabulary_candidate` finding | `live_mode.summary_match_mode`, `live_mode.cash_in_lieu_summary_names`, `live_mode.split_movement_summary_names`, `live_mode.cash_in_lieu_sources`, `live_mode.trade_summary_words`, `live_mode.summary_direction_words`, `live_mode.trade_history_query_mode` | **Partial** — `inquiry/trade-history` accepts an empty `AstkIsuNo` and returns the whole account; every deposit/withdrawal and in/out-transfer `SmryNm` contains '입금', '출금', '입고' or '출고'; trade rows carry '매수' or '매도' (e.g. '주식매수대금출금(외화)', '주식매도출고(외화)') |
 | T-28 | Under `DpntBalTpCode='0'`, whether `inquiry/balance-margin` returns one row per ticker or one per balance type, and whether `AstkExecBaseQty` includes the fractional balance | `live_mode_runner.md`'s broker measurement | **C** | Query an account holding both a whole and a fractional balance under each `DpntBalTpCode`; fallback: the 'split' default | `live_mode.balance_query_mode` | |
-| T-29 | Whether the order API sells a fractional balance with a fractional `AstkOrdQty` | `live_mode_runner.md`'s settlement pending — `event_settlement_stalled` `kind='fraction_held'` | **C** | Submit a sell for a fractional balance | — | **Partial** — the account holds fractional-share buy records ('소수점주식매수입고(외화)') |
-| T-30 | Whether each `corporate_events` source restates a dividend `value` by later splits, and how a re-crawl that returns a restated amount is upserted | `utils.md`'s dividend amount function; `metadata_crawler.md`'s upsert | **C** | Compare a dividend across a later split in each source; fallback: the key's default | `corporate_events.dividend_restated_sources` | |
+| T-29 | ~~Whether the order API sells a fractional balance with a fractional `AstkOrdQty`~~ | ~~`live_mode_runner.md`'s settlement pending — `event_settlement_stalled` `kind='fraction_held'`~~ | **RETIRED** | Nothing to verify — no order path sends a fractional quantity | — | **Retired** — no fractional order path; partial observation kept: the account holds fractional-share buy records ('소수점주식매수입고(외화)') |
+| T-30 | Whether each `corporate_events` source restates a dividend `amount` by later splits, and how a re-crawl that returns a restated amount is upserted | `utils.md`'s dividend amount function; `metadata_crawler.md`'s upsert | **C** | Compare a dividend across a later split in each source; fallback: the key's default | `corporate_events.dividend_restated_sources` | |
 | T-31 | Whether any non-integer vendor numeric field arrives as a JSON number rather than a string | `trading_api.md`'s Response Normalization; `live_mode_runner.md`'s broker measurement | **C** | Inspect raw responses; fallback: a float is converted through `repr` | — | |
 | T-32 | Whether the order API accepts `AstkOrdQty` and `AstkOrdPrc` as JSON numbers carrying up to 6 decimal places, and as strings | `trading_api.md`'s order request numeric format | **C** | Submit orders in each format; fallback: the 'number' default | `trading.order_numeric_format` | |
 | T-33 | The dividend withholding rate applied to this account, and the `SmryNm` of dividend cash and tax rows | `utils.md`'s dividend amount function; `live_mode_runner.md`'s dividend withholding check | **C** | Self-measuring — `health_report.md`'s `dividend_withholding_mismatch` and `summary_vocabulary_candidate` findings | `corporate_events.dividend_withholding_rate`, `corporate_events.dividend_cash_summary_names`, `corporate_events.dividend_tax_summary_names` | **Partial** — `inquiry/trade-history` shows '배당금입금(외화)' and '배당세출금(외화)' |
@@ -202,9 +202,10 @@ which is what the design actually rests on.
 
 **T-9 lost its config key rather than its purpose.** It originally sized
 `fill_stream_linger_seconds`, a key deleted with the lease. Subscribe
-acknowledgement latency still has a live consumer — Exit Architecture
-REST-gap-fills the window between the subscribe call and the subscription
-going active — so the row stays, re-anchored, with the key column cleared.
+acknowledgement latency still has a live consumer — the held interval's
+first 1-tick fetch covers the window between the subscribe call and the
+subscription going active (`live_mode_runner.md`'s Per-Ticker Tick Buffer)
+— so the row stays, re-anchored, with the key column cleared.
 
 **No row exists for market-sell conversion, deliberately.** The vendor
 converts a market BUY into an unfavourably-priced limit; whether it does the
@@ -262,6 +263,7 @@ reading the other's result.
 | # | Assumption | Consumed by | Grade | How to verify | Config key | Measured |
 |---|---|---|---|---|---|---|
 | Y-1 | Split, reverse-split and dividend history is complete and timely enough for same-day corporate-event detection | `metadata_crawler.md`; `cum_split_ratio()` | **C** | Cross-check against investing.com — this is what the second vendor is for | — | |
+| Y-2 | A dividend restated by a later split arrives rounded after the division, so `dividend_gross_amount()` recovers the gross only to within the vendor's last digit × the split ratio; that error stays inside the agreement tolerance | `utils.md`'s dividend amount functions; `metadata_crawler.md`'s `upsert_corporate_event()` agreement test | **C** | Compare a restated dividend × the split ratio against the original amount (investing.com or the issuer), for dividends across a split | `quarantine.corporate_event_value_tolerance` | |
 
 ---
 
@@ -301,8 +303,9 @@ since a halt-feed mismatch says nothing about forward-check row matching.
   filled in during ordinary operation and do not need a separate measurement
   exercise. Most accumulate through `health_report.md` findings; T-17
   accumulates in `live_scan_daily` instead, by way of the evening
-  detection-gap stage, which `health_report.md` then reads. T-13 remains
-  the only one of these that names a config key while graded above C —
+  detection-gap stage, which `health_report.md` then reads. T-2 and T-13 are
+  the ones of these that name a config key while graded above C — T-2's key
+  a fallback only —
   self-measuring describes how the value is obtained, not what its being
   wrong costs, so it does not lower a grade
 - A grade-A row that cannot be verified before Pilot is a reason not to enter

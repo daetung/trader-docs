@@ -334,7 +334,9 @@ the current market regime.
 ## Operational Notes
 
 **Timezone / DST Discipline.** All schedule times in this system (03:00 ET
-`--token-refresh` — see metadata_crawler.md's "Overnight Token Refresh" —
+`--token-refresh` — see metadata_crawler.md's "Overnight Token Refresh"; it
+writes no `batch_runs` row, its failure surfacing through the
+`token_refresh_failed` alert —
 04:00 ET `--premarket-open`, 09:20 ET `--premarket-recheck` — R-1: the
 09:20 pass is now a LiveModeRunner in-process task, not a cron entry — see
 metadata_crawler.md's "Dual Schedule", N-1/N-3 — 09:30 regular session
@@ -380,15 +382,14 @@ comparison described above — an entry whose authority is a config key is compa
 against that key; an entry whose authority is `trading_calendar` is compared
 against the column.
 
-**DuckDB Backup/Recovery.** `data/market.duckdb` is backed up via a
-nightly file-level copy, scheduled in the quiescent window after the
-evening batch completes and before the next premarket batch begins —
-concretely, after `batch_runs` shows `stage='evening_session_stats',
-status='success'` for the day (see db_schema.md's DB File Ownership
-Windows, the single site of that design). Retention follows the posture the
-table purge registry takes: nightly copies and the weekly snapshot are kept
-without limit until an operator sets a window against observed disk growth,
-so nothing is deleted by default and the growth is the operator's to watch.
-Recovery
-is a plain file-copy restore of the single `.duckdb` file — no
-WAL/point-in-time replay involved.
+**DuckDB Backup/Recovery.** For `data/market.duckdb`:
+- Backup: the evening run's final stage, `evening_backup`
+  (metadata_crawler.md's Nightly Backup), its window per db_schema.md's DB
+  File Ownership Windows, the single site of that design.
+- Retention: follows the posture the table purge registry takes — nightly
+  copies are kept without limit until an operator sets a window against
+  observed disk growth, so nothing is deleted by default and the growth is
+  the operator's to watch.
+- Recovery: a plain file-copy restore of the single `.duckdb` file — any
+  existing `market.duckdb.wal` is removed before the copy is placed; no
+  WAL/point-in-time replay involved.

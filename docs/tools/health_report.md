@@ -31,7 +31,7 @@ overnight/premarket batches feeding into Health Gate 1/2 — see
 live_mode_runner.md), once at session end (reports on the session's own
 inference/trade activity).
 
-EVENT-DRIVEN invocations fire outside that schedule. Five triggers exist:
+EVENT-DRIVEN invocations fire outside that schedule. These triggers exist:
 - A circuit-breaker trip (R-4) — entries are frozen for the rest of the
   session at that point, worth knowing immediately rather than at session
   end.
@@ -44,17 +44,23 @@ EVENT-DRIVEN invocations fire outside that schedule. Five triggers exist:
   Authority rests on has been contradicted, so waiting for session end
   would mean a full day of judgements made on a broken assumption.
 - The evening job finding LiveModeRunner's session-end marker missing
-  (finding 11), and
-- The evening job aborting at its lock-probe deadline (finding 28).
-  Both of these run in the evening batch process (metadata_crawler.md),
-  outside any session — so no in-memory aggregate exists for them, and the
-  second cannot reach the DB at all.
+  (finding 11);
+- A batch — the evening job or the premarket batch — aborting at its
+  lock-probe deadline (finding 28);
+- A failed overnight token refresh (finding 46).
 
-The first two send the WHOLE report; the last three are TARGETED, scoped to
-the finding that triggered them. A breaker trip is worth its full context,
-whereas a finding that can fire many times a minute must not drag the entire
-report along each time. This distinction is what `findings_subset` exists
-for — see Invocation Contract.
+Findings 11, 28 and 46 run in batch processes (metadata_crawler.md), outside
+any session:
+- no in-memory aggregate exists for them;
+- the findings 28 and 46 paths do not reach the DB at all.
+
+Report scope:
+- the breaker trip and the `clock_check` abort send the WHOLE report;
+- the others are TARGETED, scoped to the finding that triggered them.
+
+A breaker trip is worth its full context, whereas a finding that can fire
+many times a minute must not drag the entire report along each time. This
+distinction is what `findings_subset` exists for — see Invocation Contract.
 
 None of this needs new delivery infrastructure — the Discord and email
 channels below already existed and were simply never wired to a mid-session,
@@ -550,19 +556,26 @@ def gather_findings(db_conn, today_date, log_dir,
         indicator state that absorbed a partial bar. That is a knowingly
         accepted exposure, recorded here rather than in a session doc so it
         stays attached to the signal that detects it.
-    28. Evening job deadline abort (`evening_job_deadline_abort`) — the
-        evening batch gave up waiting for the DuckDB write lock at
-        `evening_wait_hard_deadline` and aborted (metadata_crawler.md's
-        evening job start gate). Severity 'abort'. Needs neither the DB nor
-        any in-memory aggregate, which is the point: it fires precisely
-        because the DB could not be opened.
+    28. Batch lock-probe deadline abort (`batch_lock_deadline_abort`) — a
+        batch gave up waiting for the DuckDB write lock at its lock-probe
+        deadline and aborted. Detail `job` ∈ 'evening' | 'premarket':
+        - 'evening' — the evening batch, at `evening_wait_hard_deadline`
+          (metadata_crawler.md's evening job start gate);
+        - 'premarket' — `--premarket-open`, at Session Start Gating's
+          `wait_deadline` (metadata_crawler.md's premarket start gate).
+        Severity 'abort'. Needs neither the DB nor any in-memory aggregate,
+        which is the point: it fires precisely because the DB could not be
+        opened.
         Named for the observed event, not a presumed cause — whether the
         holder is a live runner still working or a hung process is exactly
         what is unknown at this moment, and is what the manual intervention
         it requests has to determine.
-        Consequence worth stating: tomorrow's Health Gate 1a will abort
-        tomorrow's session on missing session stats. That is the intended
-        fail-safe, reached loudly.
+        Consequence worth stating:
+        - `job='evening'`: tomorrow's Health Gate 1a will abort tomorrow's
+          session on missing session stats — the intended fail-safe, reached
+          loudly;
+        - `job='premarket'`: the session takes its degraded start
+          (live_mode_runner.md's Session Start Gating).
 
     29. Watchdog working set empty during the regular session
         (`watchdog_empty_working_set`) — `watchdog.get_candidates()`
@@ -748,6 +761,20 @@ def gather_findings(db_conn, today_date, log_dir,
         finding_name='regime_holdout_verdict'; detail
         `{run_id, verdict, report}`. Level: ok — a report, never an alert on
         its own.
+    45. Tick alignment failed (`tick_alignment_failed`) — a held interval's
+        derived-bundle alignment failed and the ticker's bundle source
+        degraded to vendor 10-tick (live_mode_runner.md's Per-Ticker Tick
+        Buffer). Source: health_events where
+        finding_name='tick_alignment_failed', recorded once per failed held
+        interval; detail `{ticker, held_since, reason}`, `reason` ∈
+        'no_overlap' | 'no_unique_offset' | 'later_mismatch'. Level: warn —
+        entries are not blocked.
+    46. Token refresh failed (`token_refresh_failed`) — the overnight token
+        refresh failed for an account (metadata_crawler.md's Overnight Token
+        Refresh). Delivered DB-less: the refresh opens no DB connection.
+        Detail `{account, attempts, last_error}`. Level: warn — a batch's
+        own automatic reissue can still leave a token covering the session,
+        and live_mode_runner.md's Token coverage gate is the session's test.
 
     Returns: dict of {finding_name: {severity: 'ok'|'warn'|'abort', detail: ...}}
     """
@@ -883,10 +910,19 @@ def run_health_report(db_conn, today_date, log_dir, config,
 
 `enqueue()` returns once the `alert_log` row is written (db_schema.md) with
 `dispatched_at` set and `outcome` NULL, or immediately with
-`outcome='suppressed'`. **Delivery itself is asynchronous** — a background
-worker per channel performs the actual send and fills in `completed_at` /
-`outcome`. `run_health_report()` therefore returns as soon as logging is
-done and never blocks its caller on a socket.
+`outcome='suppressed'`.
+
+On a path whose DB axis is "no" — `batch_lock_deadline_abort`,
+`token_refresh_failed`:
+- no `alert_log` row is written — `enqueue()` skips the row;
+- the send outcome is written to the `log_dir` log;
+- the process drains delivery (up to `alerting.drain_timeout_seconds`)
+  before it exits.
+
+**Delivery itself is asynchronous** — a background worker per channel
+performs the actual send and fills in `completed_at` / `outcome`.
+`run_health_report()` therefore returns as soon as logging is done and
+never blocks its caller on a socket.
 
 Recording `completed_at` on SUCCESS, not only on failure, is deliberate: the
 pair with `dispatched_at` gives every send its own duration, per channel, and
@@ -1083,15 +1119,19 @@ across three files and drifted.
 | `clock_check` abort (R-8) | `clock_check_abort` | None | False | yes | yes | — |
 | Negative bar-latency sample | `bar_close_premise_violation` | finding 27 | True | yes | yes | — |
 | Evening liveness probe | `evening_liveness_probe` | DB-only findings | False | yes | yes | — |
-| Evening deadline abort | `evening_deadline_abort` | finding 28 | False | **no** | yes | — |
+| Batch lock-probe deadline abort | `batch_lock_deadline_abort` | finding 28 | False | **no** | yes | — |
+| Token refresh failure | `token_refresh_failed` | finding 46 | False | **no** | yes | — |
 
-`log_write_failed` is an eighth `alert_key` but not a path — it is injected
-into whichever delivery is in flight (see Log Writing) and is never
-suppressed. `db_health_observation` (R-9) is a ninth: it is a delivery
-stream, not a findings-gathering path, so it appears in `alert_log` and in
-the suppression key space but has no row above — it passes no
-`findings_subset` because it collects no findings at all (see DB Health
-Observation).
+- A path whose DB column reads **no** writes no `alert_log` row (see the
+  delivery rules below).
+- `log_write_failed` is also an `alert_key` but not a path — it is injected
+  into whichever delivery is in flight (see Log Writing) and is never
+  suppressed.
+- `db_health_observation` (R-9) is another: it is a delivery stream, not a
+  findings-gathering path, so it appears in `alert_log` and in the
+  suppression key space but has no row above — it passes no
+  `findings_subset` because it collects no findings at all (see DB Health
+  Observation).
 
 **Requirement axes — three, not two.** Beyond the DB and `live_aggregates`,
 `gather_findings()` also reads the crawler log FILES under `log_dir`, which
@@ -1109,13 +1149,14 @@ present.
   former `partial` described exactly the case R-9 removed — an abort before
   Gate 2 now leaves its probe measurements in the DB rather than in memory.
 - **`log_dir` files**: findings 4, 10, and the missing-`SUMMARY` finding.
-  Readable without the DB, which is why path (7) can produce anything at all.
+  Readable without the DB, which is why the DB-less paths can produce
+  anything at all.
 - **DB**: findings 1, 2, 3, 5, 8, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
-  22, 23, 24, 25, 26, 27, 29, 30, 31, 32, 33, 34, 35, 36-44. Of those, 30-33 and 35
+  22, 23, 24, 25, 26, 27, 29, 30, 31, 32, 33, 34, 35, 36-45. Of those, 30-33 and 35
   read `live_scan_daily`; 33 alone reads a row written by the evening batch
   rather than by the session being reported, so on a session-end call it
   describes the PREVIOUS day.
-- **Neither**: findings 6, 7 (placeholders) and 28.
+- **Neither**: findings 6, 7 (placeholders), 28 and 46.
 - Finding 11 is produced BY the evening liveness probe rather than gathered
   during it — it is that path's own conclusion, not a query result.
 

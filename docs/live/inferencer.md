@@ -167,6 +167,8 @@ step 0: bars = self._prepare_bars(bars, entry)
 4. Insert entry point to DuckDB:
        write_fn("INSERT OR IGNORE INTO entry_points (ticker, date, hour,
                  p_entry) ...", params)
+       # p_entry bound as Decimal through V1 into its DECIMAL(18,6) column
+       # (utils.md's Numeric Rules, V4)
 
 5. Obtain halts_df from the injected accessor — no DB query here:
        halts_df = halt_accessor(entry["ticker"], entry["date"])

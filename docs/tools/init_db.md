@@ -59,9 +59,42 @@ Statements are already written `CREATE TABLE IF NOT EXISTS` (and the one view
 this tool decides or adds.
 
 **When `db_schema.md` changes, `SCHEMA_STATEMENTS` is re-transcribed from it.**
-Re-transcription has now been required NINE times. The most recent occasion is
-the order and fill ledger and its follow-throughs, one DDL set decided
-together, moving the table count 34 -> 40:
+Re-transcription has now been required TEN times. The most recent occasion is
+the numeric type conversion (utils.md's Numeric Rules), one DDL set decided
+together, adding no table:
+- `ohlcv_1min`, `tick_10` (class 2): open, high, low and close become
+  `DECIMAL(18,6)` by `ALTER COLUMN ... SET DATA TYPE`.
+- `bid_ask_snapshots` (class 2): prices, sizes, size totals and cumulative
+  volumes become `DECIMAL(18,6)`.
+- `stock_meta` (class 2): `market_cap` `DECIMAL(28,6)`, `price_52h` and
+  `price_52l` `DECIMAL(18,6)`, `avg_volume` `BIGINT`.
+- `fundamentals_quarterly` (class 2): `value` becomes `DECIMAL(28,6)`.
+- `corporate_events` (REBUILD): `value` is replaced by `ratio DOUBLE`
+  (split, reverse_split) and `amount DECIMAL(18,8)` (dividend), with table
+  CHECK constraints tying each to `event_type`; each row's `value` moves to
+  the column its `event_type` names. An amount beyond the stored scale logs a
+  warning during the rebuild.
+- `corporate_event_conflicts` (REBUILD): `kept_value` and `other_value` split
+  the same way, into `kept_ratio` / `kept_amount` and `other_ratio` /
+  `other_amount`.
+- `live_fills` (REBUILD): `cum_after_qty` is a primary-key column; it,
+  `exec_qty` and `exec_price` become `DECIMAL(18,6)`.
+- `live_positions` (REBUILD): `entry_mgnrt` is referenced by a table CHECK,
+  which DuckDB 1.5.6 refuses to `ALTER TYPE`; `requested_quantity` and
+  `entry_mgnrt` become `DECIMAL(18,6)` in that rebuild.
+- Class 2, `ALTER COLUMN ... SET DATA TYPE`: `live_order_requests` `qty`,
+  `reported_cum_qty`, `remaining_qty` and `price`; `live_orders`
+  `requested_qty`; `trade_log` `fill_price`, `exit_price` and
+  `weighted_avg_exit_price` — `DECIMAL(18,6)`; `live_session_state`
+  `session_start_cash` `DECIMAL(28,6)`; `live_ticker_terms` `mgnrt`
+  `DECIMAL(18,6)` and `order_cost` `DECIMAL(28,6)`; `entry_points` and
+  `labeled_samples` `p_entry` `DECIMAL(18,6)`.
+- The view `live_position_state` is dropped and recreated: it reads
+  `corporate_events.ratio`, and `CREATE VIEW IF NOT EXISTS` leaves an
+  existing view unchanged.
+
+The occasion before it was the order and fill ledger and its follow-throughs,
+one DDL set decided together, moving the table count 34 -> 40:
 - New tables (class 1): `live_orders`, `live_order_requests`, `live_fills`,
   `live_position_adjustments`, `regime_holdout_dates`,
   `regime_holdout_verdict`. The DB VIEW `live_position_state` is created in

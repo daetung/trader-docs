@@ -68,10 +68,14 @@ mutates a dict and the flush serialises at most `flush_seconds` ×
 provided instead by loop A's thread catching at its top level, stopping only
 itself, and recording one health event per session (live_mode_runner.md).
 
-**"Itself" is not this component alone.** Loop A also carries the watchdog
-scan's demo REST quote leg (live_mode_runner.md), so that thread stopping
-also costs the scan that leg — the scan continues on production's leg alone,
-at the doubled pacing interval trading_api.md quantifies. That cost does not
+**"Itself" is not this component alone.** Loop A also carries the demo REST
+quote leg (live_mode_runner.md; trading_api.md's Leg assignment) of:
+- the watchdog scan;
+- the `chart/tick` consumers.
+
+That thread stopping also costs them that leg — they continue on
+production's leg alone, at the doubled pacing interval trading_api.md
+quantifies. That cost does not
 change the conclusion here: a separate process would not avoid it, because
 the demo REST quote leg has to live wherever the demo account's client
 lives, and moving it out means a second client on that account or a third
@@ -211,8 +215,9 @@ No cron entry: loop A starts with LiveModeRunner and stops at shutdown
 stage 2. The former `0 4 * * 1-5` entry existed to have the client
 initialised, its token held and its WS session established before the first
 entry — not to collect anything, since the subscription set derives from
-open positions and is empty until the first fill. Starting with the runner
-leaves that preparation more than four hours before 09:30.
+`live_positions WHERE lifecycle='live'` and is empty until the first entry
+submission. Starting with the runner leaves that preparation more than four
+hours before 09:30.
 
 ---
 

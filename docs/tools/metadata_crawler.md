@@ -86,8 +86,9 @@ def crawl_corporate_events(ticker: str, db_conn) -> int:
     of which vendor wrote first; without this, a write ordered before an
     investing.com write for the same event would bypass conflict detection
     entirely via a bare INSERT OR IGNORE). Determines event_type from split
-    ratio: >1.0 → 'split', <1.0 → 'reverse_split'. Dividends stored
-    separately with event_type='dividend' and value=per-share cash amount.
+    ratio: >1.0 → 'split', <1.0 → 'reverse_split'. A split ratio is stored in
+    `ratio`; dividends are stored separately with event_type='dividend' and
+    the per-share cash amount in `amount`.
     Returns: number of rows newly inserted or updated (a no-op agreement
     with an existing row is not counted — see upsert_corporate_event()).
     """
@@ -175,12 +176,13 @@ def crawl_corporate_events_investing(dividends_filter: str, db_conn) -> int:
           company cell, and extracting it is this crawler's job — it runs
           ahead of normalize_vendor_symbol(), whose scope stays
           case/separator/class-suffix folding.
-        - splits: the ratio string parses as a:b into
-          corporate_events.value = a / b, which puts 2:1 at 2.0 and 1:20 at
+        - splits: the ratio string parses as a:b, a and b each an integer
+          or a decimal (e.g. "1.5:1", "1.05:1"), into
+          corporate_events.ratio = a / b, which puts 2:1 at 2.0 and 1:20 at
           0.05, matching that column's share-multiplier convention.
           event_type comes from the same parse — 'split' where a > b,
           'reverse_split' where b > a.
-        - dividends: Ex-Dividend Date is event_date; Dividend is value, the
+        - dividends: Ex-Dividend Date is event_date; Dividend is amount, the
           per-share cash amount, which every reader takes through utils.md's
           dividend_gross_amount() or its frame form
           dividend_gross_from_events(). Payment Date, Yield and Type are not
@@ -246,6 +248,14 @@ def upsert_corporate_event(
     Vendor-agnostic write path for corporate_events. basis_date is the date
     the value was fetched (today); it is written with the value, so a row's
     basis_date always belongs to its stored value.
+
+    The column follows event_type:
+    - 'split' / 'reverse_split': `value` is written to `ratio` (DOUBLE);
+    - 'dividend': `value` is written to `amount` (DECIMAL(18,8)); an amount
+      carrying more than 8 decimals is rounded to that scale and logs a
+      warning.
+    corporate_event_conflicts records both values the same way — kept_ratio /
+    kept_amount, other_ratio / other_amount.
 
         no existing row for (ticker, event_date, event_type)
             -> INSERT this row (source and basis_date recorded).
@@ -331,23 +341,25 @@ only, cannot open the DB read-write during a live session):
                                                              #   no chunk size
                                                              #   (utils.md)
        # sequential — same function, same reasoning as above
-    2. crawl_corporate_events_investing("this_week", db_conn)  # item N: yes, this
+    2. check_corporate_event_anomaly(db_conn, config, quotes, halt_status)
+                                                             # writes batch_runs
+                                                             #   stage='premarket_quarantine_recheck'
+       # full-universe fresh re-evaluation, NOT a delta; at 09:20 it runs
+       # before the investing refresh (the 04:00 order is unchanged)
+    3. crawl_corporate_events_investing("this_week", db_conn)  # item N: yes, this
                                                              # pass DOES refresh
                                                              # corporate_events now
                                                              # (contrast the old
                                                              # design, which never
                                                              # re-crawled at 09:20)
-    3. check_corporate_event_anomaly(db_conn, config, quotes, halt_status)
-                                                             # writes batch_runs
-                                                             #   stage='premarket_quarantine_recheck'
-       # full-universe fresh re-evaluation, NOT a delta;
-       # ordered after the investing refresh, as at 04:00, so the
-       # re-evaluation reads that pass's own corporate_events
     4. yfinance narrow crawl (crawl_corporate_events(ticker, db_conn)) for
        any ticker newly quarantined in step 2                      # item N
-    5. scoped-recompute trigger for any ticker that gained a new same-day
-       corporate_events row in steps 3-4 and already has a calculator
-       (caching_calculator.md's scoped_recompute())                # item N
+    5. per ticker that gained a new same-day corporate_events row in
+       steps 3-4:                                                  # item N
+       - calculator exists → scoped recompute (caching_calculator.md's
+         scoped_recompute()), swap, then clear quarantine_reason if set
+       - no calculator (Step 4b late-start path) → clear quarantine_reason
+         if set at once; Eager Pool computes on the fresh rows
        # writes through db_write() — this process's own writer, no
        # inter-process coordination (see live_mode_runner.md)
 ```
@@ -774,15 +786,17 @@ neither.
 
 **Placed after the NYSE halt crawl and before Retention Purge.** It reads
 `trading_halts`, so the crawl that fills it for the date has to have run;
-both tables it reads are purge-registry members, so running after the purge
-would leave it counting rows already gone for the retention edge. Nothing
+`live_halt_episodes`, the other table it reads, is a purge-registry member
+(`trading_halts` is structurally excluded), so running after the purge would
+leave it counting rows already gone for the retention edge. Nothing
 downstream reads its output, so a failure here blocks nothing.
 
 ---
 
-## Retention Purge (R-9) — final evening stage
+## Retention Purge (R-9) — last evening data stage
 
-The last stage of the evening run, after every other stage has completed.
+The last data stage of the evening run, after every other data stage has
+completed; only `evening_backup` (Nightly Backup, below) follows it.
 Driven by an explicit registry — a table absent from it is UNREACHABLE by
 this code, which is the whole point: structural exclusion rather than an
 infinite default means no misconfiguration can delete the training corpus or
@@ -848,9 +862,40 @@ stage writes one (see Output / Logging and Constraints), and omitting it
 here would make health_report.md's finding 4 report an abnormal termination
 every evening for a stage that ran perfectly.
 
-Placed last because it is the only destructive stage: everything that reads
-this evening's data has already run, and a failure here cannot cost the run's
-actual work.
+Placed last among the data stages because it is the only destructive one:
+everything that reads this evening's data has already run, and a failure here
+cannot cost the run's actual work. `evening_backup` follows it and copies the
+finished file.
+
+---
+
+## Nightly Backup (`stage='evening_backup'`) — final evening stage
+
+The evening run's final stage, after `evening_retention_purge`, inside the
+evening run's writer connection, run whatever the earlier stages' status:
+1. `CHECKPOINT`;
+2. confirm no `market.duckdb.wal` file exists;
+3. copy the file to `backup_dir/market_YYYYMMDD.duckdb.partial`;
+4. open the copy read-only and query it;
+5. rename it to `market_YYYYMMDD.duckdb`, replacing a same-date file;
+6. `status='success'`.
+
+Any step failing → `status='failed'`, the `.partial` file deleted, and the
+evening run ending normally.
+
+- `YYYYMMDD` and the `batch_runs` date are the evening run's date basis.
+- Writes its own `batch_runs` row (`'running'` at start, then
+  `'success'`/`'failed'`) and its own `SUMMARY` line.
+- Not a Health Gate condition.
+- Runs in the full evening run, with or without its `--skip-*` flags, and
+  under `--backup-only`; no other partial-run flag runs it.
+- `--backup-only` is the manual re-run:
+  - it runs this stage alone, with one read-write open;
+  - on failure it exits with an error, with no lock-probe wait;
+  - the copy and its `batch_runs` row take the latest date carrying an
+    `evening_*` `batch_runs` row; with none, it exits with an error.
+- Its window is db_schema.md's DB File Ownership Windows: the evening
+  window's exit condition is this stage's completion.
 
 ---
 
@@ -1084,9 +1129,11 @@ def collect_fundamentals_incremental(db_conn) -> int:
 ## Overnight Token Refresh
 
 **Not a crawl. It shares this tool's process and scheduler, nothing else** —
-placed here because a scheduled entry point already exists, and a bare cron
-job would have no `batch_runs` marker and so no way to be noticed when it
-fails.
+placed here because a scheduled entry point already exists.
+- It opens no DB connection: its token lives in the SDK's token cache file
+  (sdk_dependency.md).
+- A failure is noticed through the DB-less `token_refresh_failed` alert
+  (health_report.md finding 46).
 
 The trading API's access token lives 24 hours from issuance, and a reissue
 inside that window returns the SAME token with the SAME expiry — the only
@@ -1098,25 +1145,26 @@ following day, and never inside a session.
 
 ```bash
 # Overnight token refresh — config token_refresh_time (this file's Config
-# Keys), default "03:00" America/New_York. ONE STAGE PER ACCOUNT: the same
-# structure duplicated, not one stage extended.
+# Keys), default "03:00" America/New_York. The scheduled (bare) form
+# processes the production and demo accounts in one process, each with its
+# own skip and its own retry budget.
 python tools/collect_daily.py \
     --db-path data/market.duckdb \
-    --token-refresh --account production
+    --token-refresh
+# Manual re-run for one account
 python tools/collect_daily.py \
     --db-path data/market.duckdb \
-    --token-refresh --account demo
+    --token-refresh --account production    # or: --account demo
 ```
 
 The one-per-minute issuance limit is PER ACCOUNT (measured), so the two do
-not interfere and no ordering between them is fixed here. Separate stages
-also give each its own idempotency skip and its own retry budget, which is
-why no partial-failure rule is needed.
+not interfere and no ordering between them is fixed here. Each account keeps
+its own skip and its own retry budget, which is why no partial-failure rule
+is needed.
 
 **Why after midnight, and why that early.** After midnight because the
-previous evening run can overrun past its own deadline, and because
-`batch_runs.date` must then be the trading day the stage targets rather
-than the previous one. That early because refresh cadence and token
+previous evening run can overrun past its own deadline. That early because
+refresh cadence and token
 lifetime are both 24 hours, so the outgoing token expires at the very
 moment the new one is requested — there is no previous token to fall back
 on, and a failed refresh blocks the entire day. The only remedy is retry
@@ -1124,26 +1172,31 @@ against a one-per-minute issuance limit, which makes lead time the sole
 recovery capacity; the dead window between the evening batch and the
 premarket batch is where the most of it is available.
 
-**Idempotency.** Each account's stage writes its own marker —
-`stage='overnight_token_refresh_production'` or
-`'overnight_token_refresh_demo'`, `'running'` at
-its start, then `'success'` or `'failed'` — and is SKIPPED when today's row
-for THAT stage already exists. A duplicate revoke-and-reissue would spend
-the issuance budget and can leave no usable token at all.
+**Idempotency.** Per account:
+- the refresh is SKIPPED when that account's SDK token cache holds
+  `expires_at` ≥ today's `token_refresh_time` + 24h — a refresh already done
+  today;
+- a duplicate revoke-and-reissue would spend the issuance budget and can
+  leave no usable token at all;
+- the test is on EXPIRY, as `live_mode_runner.md`'s Token coverage gate's
+  is: a revoke that failed silently leaves the old expiry, so that refresh
+  is retried, not skipped.
 
-**Not a gate.** The marker is for observability and the skip above, not for
-blocking. A failed refresh followed by a batch's own automatic reissue
-leaves a token that genuinely covers the session, and
-`live_mode_runner.md`'s session-start gate tests that requirement directly
-rather than inferring it from this stage's status. The failure still
-surfaces through finding 1.
+**Not a gate.** A failed refresh raises the `token_refresh_failed` alert and
+blocks nothing:
+- a batch's own automatic reissue can still leave a token that genuinely
+  covers the session;
+- `live_mode_runner.md`'s Token coverage gate tests that requirement
+  directly.
 
-**Blast radius is bounded by P-5, not by luck.** Revocation is
-account-wide, but the premarket batch, the live session and the evening
-batch are already strictly serialised by their completion markers, so no
-other API consumer exists at 03:00. Batch entry points keep the SDK's
-automatic reissue enabled, having no WebSocket connection to disturb; the
-live session does not (see `live_mode_runner.md`).
+**Blast radius is bounded, not by luck.** Revocation is account-wide, but no
+other trading-API consumer exists at 03:00:
+- the evening batch makes no trading-API call;
+- the premarket batch starts later.
+
+Batch entry points keep the SDK's automatic reissue enabled, having no
+WebSocket connection to disturb; the live session does not (see
+`live_mode_runner.md`).
 
 ---
 
@@ -1275,6 +1328,10 @@ python tools/collect_daily.py \
     --date today \
     --skip-session-stats
 
+# Nightly backup only — manual re-run of the evening_backup stage (see
+# "Nightly Backup"); one read-write open, no lock-probe wait
+python tools/collect_daily.py --db-path data/market.duckdb --backup-only
+
 # Skip tick bar aggregates / fundamentals collection independently
 python tools/collect_daily.py --db-path data/market.duckdb --date today --skip-tick-bar-aggregates
 python tools/collect_daily.py --db-path data/market.duckdb --date today --skip-fundamentals
@@ -1332,10 +1389,14 @@ python tools/collect_daily.py \
 # entry below). Unlike its neighbours in this section, which are manual,
 # debug or partial-run flags, this one's primary use is the scheduled
 # entry — it is listed here for completeness, not because it is normally
-# invoked by hand.
+# invoked by hand. The bare form processes both accounts; --account
+# production|demo restricts a manual re-run to one.
 python tools/collect_daily.py \
     --db-path data/market.duckdb \
     --token-refresh
+python tools/collect_daily.py \
+    --db-path data/market.duckdb \
+    --token-refresh --account production
 ```
 
 ---
@@ -1463,7 +1524,9 @@ loop:   # the evening half of db_schema.md's DB file ownership windows
         if open FAILS (lock held):
             → runner still alive (or hung). Sleep and retry, BUT: if now >
               evening_wait_hard_deadline (config, default 23:30 ET): alert
-              + abort this evening run (manual intervention). A hung-past-
+              (health_report.md finding 28, `batch_lock_deadline_abort`,
+              job='evening') + abort this evening run (manual
+              intervention). A hung-past-
               deadline run aborts loudly tonight; tomorrow's Health Gate 1a
               then correctly aborts tomorrow on missing session stats — the
               right fail-safe, now reached noisily instead of silently.
@@ -1475,6 +1538,16 @@ Start Gating). The original reasoning ("don't write while the runner
 might still be writing") is preserved exactly — the loop still only
 proceeds once the lock is free, either via the clean-shutdown marker or
 via the lock-probe fallback above.
+
+**Premarket start gate (lock probe).** `--premarket-open` runs the same lock
+probe before its first DB access:
+1. a read-write open, sleeping and retrying while it fails;
+2. deadline: live_mode_runner.md's Session Start Gating `wait_deadline`;
+3. past it, the run alerts (health_report.md finding 28, `job='premarket'`)
+   and aborts, and the runner's degraded start follows.
+
+This is the premarket half of db_schema.md's DB File Ownership Windows — its
+04:00 ET row's entry condition is cron, then a read-write open succeeding.
 
 ```bash
 # Run after the day's JSON dump completes (weekdays only), 21:00 ET — NOT
@@ -1538,11 +1611,14 @@ fmp_api_key: "your_key_here"
 # aborts on missing session stats), so a transient lock must not reach it.
 evening_wait_hard_deadline: "23:30"   # ET
 
+# Nightly Backup's destination directory (see "Nightly Backup"). It may be on
+# another mount; off-host replication is the operator's.
+backup_dir: "data/backups/"
+
 # Wall-clock time of the overnight token refresh (see "Overnight Token
 # Refresh"). America/New_York, like every other time in this system.
 # AFTER MIDNIGHT deliberately: the evening run can overrun past its own
-# deadline above, and batch_runs.date must be the trading day the stage
-# targets rather than the previous one. Early rather than close to the
+# deadline above. Early rather than close to the
 # session because refresh cadence and token lifetime are both 24h, so a
 # failed refresh has no previous token to fall back on and its only remedy
 # is retry against a one-per-minute issuance limit — lead time IS recovery
@@ -1604,17 +1680,21 @@ quarantine:
   single evening run must not change; the premarket refresh is intentionally
   a separate, later, supplementary crawl that session_stats does NOT re-read
 - `populate_trading_calendar()`, `populate_ticker_coverage()`, and `populate_precomputed_session_stats()` sourced from `utils.py`
-- The evening run writes one `batch_runs` row per stage as it progresses —
-  `stage='evening_ingestion'` (around Steps 3-4 above), `stage='evening_tick_bar_aggregates'`
-  (Tick Bar Aggregates Update), `stage='evening_session_stats'` (Session Stats
-  Update), `stage='evening_investing_forward_check'` (Evening
-  Forward-Looking Corporate-Events Check, item N),
-  `stage='evening_feed_coverage'` (Feed Coverage Analysis),
-  `stage='evening_detection_gap'` (Detection-Gap Analysis),
-  `stage='evening_halt_comparison'` (Halt Comparison), and finally
-  `stage='evening_retention_purge'` (Retention Purge, R-9 — last, after
-  every other stage, being the only destructive one) — each
-  `status='running'` at its own start, `'success'`/`'failed'`
+- The evening run writes one `batch_runs` row per stage as it progresses:
+  - `stage='evening_ingestion'` (around Steps 3-4 above);
+  - `stage='evening_tick_bar_aggregates'` (Tick Bar Aggregates Update);
+  - `stage='evening_session_stats'` (Session Stats Update);
+  - `stage='evening_investing_forward_check'` (Evening Forward-Looking
+    Corporate-Events Check, item N);
+  - `stage='evening_feed_coverage'` (Feed Coverage Analysis);
+  - `stage='evening_detection_gap'` (Detection-Gap Analysis);
+  - `stage='evening_halt_comparison'` (Halt Comparison);
+  - `stage='evening_retention_purge'` (Retention Purge, R-9 — the last data
+    stage, being the only destructive one);
+  - finally `stage='evening_backup'` (Nightly Backup, run whatever the
+    earlier stages' status).
+
+  Each row is `status='running'` at its own start, `'success'`/`'failed'`
   at its own completion, independent of the others. Each also writes its own
   `SUMMARY` line to the run log (see Output / Logging), since
   `health_report.md` treats a missing `SUMMARY` for a stage that has a
@@ -1641,6 +1721,10 @@ quarantine:
   `--ticker-rename-only` and `--corporate-events-only` remain available as
   lower-level flags for manual re-run/debugging of one piece in isolation
   — only the automated cron schedule moves to `--premarket-open`.
+- `--backup-only` is a manual re-run flag beside them (see Nightly Backup):
+  - the `evening_backup` stage alone;
+  - one read-write open, an error exit on failure with no lock-probe wait;
+  - dated by the latest date carrying an `evening_*` `batch_runs` row
 - The 09:20 ET recheck (R-1: now a LiveModeRunner in-process task — see
   live_mode_runner.md's "In-Process Premarket Recheck"; `--premarket-recheck`
   itself survives only as a manual/debug flag, not the automated path) runs

@@ -33,7 +33,7 @@ halts_df: pd.DataFrame
     # trading_halts table rows for this ticker-date
 
 trading_calendar: pd.DataFrame
-    columns: [date, is_trading_day, has_data]
+    columns: [date, is_trading_day, session_close, after_hours_end, has_data]
     # used for dead position next-day lookup
 
 ticker_data_coverage: pd.DataFrame
@@ -43,10 +43,10 @@ ticker_data_coverage: pd.DataFrame
     # Case B: ticker not found in coverage for next day with has_data=True (possible delisting)
 
 corporate_events: pd.DataFrame
-    columns: [ticker, event_date, event_type, value, source, basis_date]
+    columns: [ticker, event_date, event_type, ratio, amount, source, basis_date]
     # used only for dead position Case A/D overnight dividend/split adjustment;
     # a 'dividend' row's amount is read only through utils.md's
-    # dividend_gross_from_events(), never from value directly
+    # dividend_gross_from_events(), never from amount directly
     # (see Step 4). The frame is passed WHOLE to utils.md's frame forms
     # (split_ratio_from_events(), dividend_gross_from_events()); the
     # per-entry-point window event_date IN (D, D+1] selects only Case A's
@@ -145,7 +145,8 @@ now resolve to the same label.
 ## Core Logic
 
 ```
-P_entry      = t bar open price (from entry_points.p_entry)
+P_entry      = t bar open price (from entry_points.p_entry — stored
+               DECIMAL(18,6), a float in the frame passed here)
 fill_second  = utils.hour_add_seconds(t_hour, 5)
 ticks_from_t = ticks_df filtered to hour >= t_hour, sorted by (hour, seq_id)
 
@@ -322,6 +323,8 @@ Note: `build_effective_bar_sequence()` is an internal delegation to
 ## Constraints
 
 - t bar high/low/close/volume must NOT be used — only t bar open (P_entry) is permitted as reference
+- `is_ambiguous`'s two threshold tests and the pnl label boundaries are
+  grid-value decisions (utils.md's Numeric Rules)
 - Halt bars are excluded from the valid count — search extends to compensate
 - Time-limit exit (Step 3 Case A): triggered when execution.max_hold_bars valid bars collected before last_bar(date);
   exit_price = last valid bar close; no after-market fallback; no dead position

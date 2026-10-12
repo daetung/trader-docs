@@ -756,9 +756,12 @@ def get_execution_param(param_name: str, db_conn, config) -> float:
            buy_rate, sell_rate_tp, sell_rate_sl, sell_rate_neutral: valid
                range is (0, 1].
                Derived directly from simulate_entry_fill()/
-               simulate_exit_fill()'s floor(per_tick_vol * rate) — 0 is
-               permanent zero-fill degeneracy, anything above 1.0 asserts
-               participation exceeding a bundle's own volume.
+               simulate_exit_fill()'s floor(per_tick_vol * rate), with
+               per_tick_vol = bundle.volume / 10:
+               - 0 is permanent zero-fill degeneracy;
+               - at rate 1 a bundle supplies at most per_tick_vol, one
+                 average tick's volume per ten ticks traded;
+               - anything above 1.0 asserts more.
            cancel_after_seconds: valid range is > 0. <= 0 is a degenerate
                "canceled before submission" value.
        value outside its range → log + fall back to
@@ -782,7 +785,7 @@ def get_execution_param(param_name: str, db_conn, config) -> float:
 def simulate_exit_fill(
     ticks_exit: pd.DataFrame,
     position_size: int,
-    exit_anchor_second: int,
+    exit_anchor_second: str,
     reference_price: float,
     sell_rate: float,
     halts_df: pd.DataFrame,
@@ -795,15 +798,21 @@ def simulate_exit_fill(
     ANCHOR, generalised from the former (breach_bundle_idx, breach_price):
     every exit has a (trigger instant, reference price at that instant), and
     a breach is merely how tp/sl produces one.
-        exit_anchor_second: HHMMSS of the trigger. A TIME, not an index —
-            live recomputes statelessly from the anchor each pass and rebuilds
-            its buffer doing so, which leaves an iloc unstable between passes
-            while a time is stable. The index derivation the caller used to do
-            (bundle_idx_at()) happens HERE, so both engines pass the same kind
-            of thing: backtest the instant its exit fired, live
-            live_position_state.exiting_since.
-        reference_price: the last print strictly BEFORE that instant, for all
-            four exit reasons. Backtest's former "close of the last valid bar"
+        ticks_exit: the sealed bundle series — tick_10 in backtest, the
+            ticker's vendor or derived bundles in live (live_mode_runner.md's
+            Per-Ticker Tick Buffer) — from the bundle holding the anchor.
+        exit_anchor_second: HHMMSS string of the trigger, on the anchor's
+            session date — the form of the tick `hour` column. A TIME, not an
+            index — live recomputes statelessly from the anchor each pass and
+            rebuilds its buffer doing so, which leaves an iloc unstable
+            between passes while a time is stable. The index derivation the
+            caller used to do (bundle_idx_at()) happens HERE, so both engines
+            pass the same kind of thing:
+            - backtest: effective_second, the instant its exit fired;
+            - live: the time part of the exit logical order's reference_at
+              ('YYYYMMDD_HHMMSS'), not live_position_state.exiting_since.
+        reference_price: the last print strictly BEFORE that instant, for
+            every exit reason. Backtest's former "close of the last valid bar"
             / "last bar close" is not the general form — a 1-minute bar's
             close IS that minute's last print, so the two agree exactly when
             the trigger falls on a bar boundary (session_end) and differ only
@@ -866,7 +875,7 @@ def simulate_exit_fill(
 def simulate_entry_fill(
     ticks_entry: pd.DataFrame,
     quantity: int,
-    entry_anchor_second: int,
+    entry_anchor_second: str,
     p_entry: float,
     buy_rate: float,
     halts_df: pd.DataFrame,
@@ -879,12 +888,21 @@ def simulate_entry_fill(
     participation-rate structure, applied to a buy instead of a sell, and the
     same time-valued anchor with index derivation inside.
 
-    entry_anchor_second is the ONE anchor that does not collapse to a single
-    column across the two engines: backtest COMPUTES it as
-    entry_hour + execution.entry_fill_delay_seconds, live OBSERVES it as
-    the entry 'new' request's sent_at (live_order_requests). They are two
-    expressions of one moment and must never be composed — adding the delay
-    to sent_at double-counts a wait live has already lived through.
+    ticks_entry: the sealed bundle series — tick_10 in backtest, the
+    ticker's vendor or derived bundles in live (live_mode_runner.md's
+    Per-Ticker Tick Buffer) — from the bundle holding the anchor.
+
+    entry_anchor_second is an HHMMSS string on the anchor's session date —
+    the form of the tick `hour` column — and the ONE anchor that does not
+    collapse to a single column across the two engines:
+    - backtest COMPUTES it as fill_second = utils.hour_add_seconds(entry_hour,
+      execution.entry_fill_delay_seconds);
+    - live OBSERVES it as the time part of the entry 'new' request's sent_at
+      (live_order_requests).
+    They are two expressions of one moment and must never be composed —
+    adding the delay to sent_at double-counts a wait live has already lived
+    through. Time arithmetic on the anchor — the cancel_after_seconds window
+    below — goes through utils.hour_add_seconds().
 
     ohlcv_entry is GONE, for the same reason as ohlcv_exit. p_entry STAYS:
     its zero-fill fallback role is inert here (a zero-fill entry is
@@ -894,7 +912,8 @@ def simulate_entry_fill(
     limit_price: None for entry_order_type="market" (no price gate — every
     bundle is eligible regardless of price, matching current behavior
     exactly). A float for entry_order_type="limit" (see caller — computed
-    from p_entry, execution.entry_gap_type, execution.entry_gap_value).
+    from p_entry, execution.entry_gap_type, execution.entry_gap_value, and
+    rounded down to the tick(price) grid).
 
     cancel_after_seconds: for a counterfactual run of a live entry that
     ended early (shadow_retraining.md), the caller passes the whole seconds
@@ -1004,6 +1023,24 @@ documentation rather than assumed:
   final-backstop guarantee holds wherever a market order is permitted at
   all.
 
+### Tick Size
+
+```python
+def tick(price: Decimal) -> Decimal:
+    """
+    The order-price grid step: 0.0001 below $1.00, 0.01 at or above. The
+    $1.00 boundary test is a grid-value decision (utils.md's Numeric Rules).
+
+    Order prices are rounded to this grid in the less aggressive direction,
+    all through this function:
+    - a buy down — the entry limit: BacktestEngine's limit_price and
+      LiveModeRunner's entry limit;
+    - a sell up — LiveModeRunner's exit ladder price.
+    """
+```
+
+---
+
 ### Exit Limit Pricing
 
 A limit exit rests at a SPREAD POSITION, anchored at the ask:
@@ -1011,6 +1048,9 @@ A limit exit rests at a SPREAD POSITION, anchored at the ask:
 ```
 price = ask1 - k * (ask1 - bid1)
 ```
+
+The price is rounded UP to the `tick(price)` grid — the less aggressive
+direction for a sell (Tick Size, above).
 
 | k | price | |
 |---|---|---|
@@ -1040,6 +1080,19 @@ bid/ask model to mirror them. If backtest is later extended to replay
 ## Constraints
 
 - All functions are stateless — no module-level state or caching
+- Numeric decisions follow utils.md's Numeric Rules:
+  - `compute_position_size()` and `check_funds_available()` floors and
+    comparisons are grid-value decisions, BacktestEngine's `DOUBLE` inputs
+    entering by V1;
+  - the fill simulators' arithmetic is float; their
+    `floor(per_tick_vol × rate)` and limit-price gate are grid-value
+    decisions, and their output prices pass V1 before any sign decision,
+    pnl or write;
+  - the `tick(price)` $1.00 boundary test is a grid-value decision
+- Order prices round to `tick(price)` in the less aggressive direction — a
+  buy down, a sell up — in both engines
+- The fill simulators' anchors are HHMMSS strings on the anchor's session
+  date; anchor time arithmetic goes through `utils.hour_add_seconds()`
 - `resolve_signal()` is the single source of truth for entry signal thresholding
   — BacktestEngine and Inferencer both import from here
 - `resolve_signal()` suppression check always precedes entry signal check

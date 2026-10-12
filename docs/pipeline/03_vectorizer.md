@@ -143,6 +143,20 @@ NaN padding rule: if fewer than n_levels extrema found, pad missing levels with 
 
 ---
 
+## NaN Entries in a Window
+
+Every method computes over the window's non-NaN entries:
+- `statistical_summary`'s statistics over the non-NaN values;
+- `linear_trend`'s OLS over the non-NaN points at their bar positions;
+- `window_comparison`'s half means over each half's non-NaN values;
+- `rate_of_change` over consecutive non-NaN pairs;
+- `shape_features` over the sequence with NaN entries removed.
+
+`{name}_last` is the last value as it stands, NaN included. An output is NaN
+when the non-NaN count falls below what its statistic requires.
+
+---
+
 ## Indicator → Method Mapping (default)
 
 Configured in `pipeline_config.yaml`. Default mapping:
@@ -207,6 +221,11 @@ slice — training accumulates from the ticker's full history, live from the
 after slicing: it would break Strategy A's once-per-ticker computation and
 the calculator's O(1) incremental discipline for no gain.
 
+The origin-invariance rests on `02_indicator_calculator.md`'s Incremental
+Computation Rule, I3: the window is rebased by exact subtraction to its first
+value before conversion to float, so the two paths' differing origins never
+reach a float value.
+
 ---
 
 ## Interface
@@ -252,6 +271,8 @@ class Vectorizer:
 - All method parameters (window splits, prominence settings) from `pipeline_config.yaml`
 - Feature names must be deterministic and stable across runs (used as LightGBM column names)
 - NaN values are allowed in output — LightGBM handles them natively
+- Every method computes over a window's non-NaN entries; `{name}_last` keeps
+  NaN as it stands — see "NaN Entries in a Window"
 - `transform()` must raise `ValueError` if method="sr_distance" is passed
 - `sr_distance()` is always called directly by FeatureExtractor, never via `transform()`
 - `level_distance()` is dispatched via `transform()` with `reference_price` as kwarg

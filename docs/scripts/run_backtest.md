@@ -70,7 +70,8 @@ model_dir: Path | None  # directory containing trained model artifacts (optional
 8. Compute dead position case distribution from test_df:
        dead_case_dist = test_df[test_df["is_dead_position"]]["dead_position_case"].value_counts()
 9. Print results to stdout
-10. Write trade_log to DuckDB trade_log table
+10. Write trade_log to DuckDB trade_log table — simulated prices pass V1
+        into its DECIMAL price columns (utils.md's Numeric Rules)
 11. Write experiment_log row to DuckDB — full field list in
         "experiment_log Write" below (kept 1:1 with summary_dict; see
         Constraints)
@@ -176,6 +177,9 @@ experiment_log_row = {
     "eval_type":            eval_type,           # None | "outer_validation" |
                                                  # "regime_holdout"
     "execution_variant":    execution_variant,   # None = baseline pass
+    "entry_fill_rate_disabled": config["backtest"]["entry_fill_rate_disabled"],
+    "exit_fill_rate_disabled":  config["backtest"]["exit_fill_rate_disabled"],
+                                                 # run-state, outside the 1:1 rule
     "fold_test_start":      fold_test_start,     # None → derived from test_df.date.min()
     "fold_test_end":        fold_test_end,       # None → derived from test_df.date.max()
     "fold_test_days":       fold_test_days,      # None → derived from test_df.date.nunique()
@@ -290,6 +294,10 @@ Elapsed: 45.2s
 - `eval_type` default None for standalone; set explicitly by PipelineOptimizer
 - In standalone mode, `fold_test_start`/`fold_test_end`/`fold_test_days` derived from
   test_df — its date range and its count of distinct dates
+- `entry_fill_rate_disabled` and `exit_fill_rate_disabled` are RUN-STATE
+  columns, written from the Backtester's `config["backtest"]` keys of the
+  same names. Like `execution_variant`, they sit outside the `summary_dict`
+  1:1 metric rule below
 - `execution_variant` is an IDENTIFIER column, alongside `run_id`,
   `fold_idx`, `outer_fold_idx` and `eval_type` — it sits OUTSIDE the 1:1
   rule below, which binds `summary_dict` keys to METRIC columns only.

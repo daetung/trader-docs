@@ -198,7 +198,7 @@ has no counterpart spec.
   contradicted the per-APP premise stated in its own first clause and was
   wrong. The consequence was measured under `api_contract_checklist.md` T-15,
   since retired: the demo
-  account returns identical `chart/min` and `inquiry/orderbook` data on an
+  account returns identical `chart/min`, `chart/tick` and `inquiry/orderbook` data on an
   independent budget at both tiers. The combined two-account budget this
   yields is a large part of what closed the call-budget open item, and
   `trading_api.md`'s Call-Point Inventory carries the resulting figures

@@ -118,10 +118,10 @@ CREATE TABLE IF NOT EXISTS ohlcv_1min (
     ticker   VARCHAR      NOT NULL,
     date     VARCHAR      NOT NULL,  -- 'YYYYMMDD'
     hour     VARCHAR      NOT NULL,  -- 'HHMMSS', bar open time
-    open     DOUBLE       NOT NULL,
-    high     DOUBLE       NOT NULL,
-    low      DOUBLE       NOT NULL,
-    close    DOUBLE       NOT NULL,
+    open     DECIMAL(18,6) NOT NULL,
+    high     DECIMAL(18,6) NOT NULL,
+    low      DECIMAL(18,6) NOT NULL,
+    close    DECIMAL(18,6) NOT NULL,
     volume   BIGINT       NOT NULL,
     PRIMARY KEY (ticker, date, hour)
 );
@@ -136,10 +136,10 @@ CREATE TABLE IF NOT EXISTS tick_10 (
     date     VARCHAR      NOT NULL,
     hour     VARCHAR      NOT NULL,  -- 'HHMMSS', last tick of bundle (second precision)
     seq_id   INTEGER      NOT NULL,  -- sequential index within same (ticker, date, hour)
-    open     DOUBLE       NOT NULL,  -- Oprc (first tick of bundle)
-    high     DOUBLE       NOT NULL,  -- Hprc
-    low      DOUBLE       NOT NULL,  -- Lprc
-    close    DOUBLE       NOT NULL,  -- Prpr (last tick of bundle)
+    open     DECIMAL(18,6) NOT NULL,  -- Oprc (first tick of bundle)
+    high     DECIMAL(18,6) NOT NULL,  -- Hprc
+    low      DECIMAL(18,6) NOT NULL,  -- Lprc
+    close    DECIMAL(18,6) NOT NULL,  -- Prpr (last tick of bundle)
     volume   BIGINT       NOT NULL,  -- CntgVol
     PRIMARY KEY (ticker, date, hour, seq_id)
 );
@@ -216,17 +216,17 @@ CREATE TABLE IF NOT EXISTS bid_ask_snapshots (
     source          VARCHAR NOT NULL,   -- 'signal_time_rest' | 'ws_tick_piggyback'
 
     -- 'signal_time_rest' only — 5-level book; NULL on 'ws_tick_piggyback' rows
-    bid_price_1 DOUBLE, bid_price_2 DOUBLE, bid_price_3 DOUBLE, bid_price_4 DOUBLE, bid_price_5 DOUBLE,
-    ask_price_1 DOUBLE, ask_price_2 DOUBLE, ask_price_3 DOUBLE, ask_price_4 DOUBLE, ask_price_5 DOUBLE,
-    bid_size_1  DOUBLE, bid_size_2  DOUBLE, bid_size_3  DOUBLE, bid_size_4  DOUBLE, bid_size_5  DOUBLE,
-    ask_size_1  DOUBLE, ask_size_2  DOUBLE, ask_size_3  DOUBLE, ask_size_4  DOUBLE, ask_size_5  DOUBLE,
+    bid_price_1 DECIMAL(18,6), bid_price_2 DECIMAL(18,6), bid_price_3 DECIMAL(18,6), bid_price_4 DECIMAL(18,6), bid_price_5 DECIMAL(18,6),
+    ask_price_1 DECIMAL(18,6), ask_price_2 DECIMAL(18,6), ask_price_3 DECIMAL(18,6), ask_price_4 DECIMAL(18,6), ask_price_5 DECIMAL(18,6),
+    bid_size_1  DECIMAL(18,6), bid_size_2  DECIMAL(18,6), bid_size_3  DECIMAL(18,6), bid_size_4  DECIMAL(18,6), bid_size_5  DECIMAL(18,6),
+    ask_size_1  DECIMAL(18,6), ask_size_2  DECIMAL(18,6), ask_size_3  DECIMAL(18,6), ask_size_4  DECIMAL(18,6), ask_size_5  DECIMAL(18,6),
 
     -- 'ws_tick_piggyback' only; NULL on 'signal_time_rest' rows (there,
     -- level-1 price is bid_price_1/ask_price_1 above — not duplicated here)
-    bid_size_total DOUBLE,   -- side-total resting size, not tied to one level
-    ask_size_total DOUBLE,
-    cum_bid_volume DOUBLE,   -- session-cumulative, buy-side filled volume
-    cum_ask_volume DOUBLE,   -- session-cumulative, sell-side filled volume
+    bid_size_total DECIMAL(18,6),   -- side-total resting size, not tied to one level
+    ask_size_total DECIMAL(18,6),
+    cum_bid_volume DECIMAL(18,6),   -- session-cumulative, buy-side filled volume
+    cum_ask_volume DECIMAL(18,6),   -- session-cumulative, sell-side filled volume
 
     PRIMARY KEY (ticker, date, hour, seq_id, source)
 );
@@ -250,11 +250,11 @@ CREATE TABLE IF NOT EXISTS stock_meta (
     ticker             VARCHAR   NOT NULL,
     date               VARCHAR   NOT NULL,   -- 'YYYYMMDD', date actually crawled
     sector             VARCHAR,
-    market_cap         DOUBLE,
+    market_cap         DECIMAL(28,6),
     shares_outstanding BIGINT,
-    price_52h          DOUBLE,
-    price_52l          DOUBLE,
-    avg_volume         DOUBLE,
+    price_52h          DECIMAL(18,6),
+    price_52l          DECIMAL(18,6),
+    avg_volume         BIGINT,
     updated_at         VARCHAR,
     PRIMARY KEY (ticker, date)
 );
@@ -334,7 +334,7 @@ CREATE TABLE IF NOT EXISTS fundamentals_quarterly (
                                           -- 3 = quarterly duration; 12 = annual duration
                                           -- (Q4-only duration values are derived at
                                           -- read time as FY - (Q1+Q2+Q3), never stored)
-    value             DOUBLE  NOT NULL,
+    value             DECIMAL(28,6) NOT NULL,
     PRIMARY KEY (ticker, fiscal_period_end, metric, filed_date)
 );
 
@@ -471,9 +471,9 @@ CREATE TABLE IF NOT EXISTS batch_runs (
                                       -- 'evening_investing_forward_check' |
                                       -- 'evening_feed_coverage' |
                                       -- 'evening_detection_gap' |
+                                      -- 'evening_halt_comparison' |
                                       -- 'evening_retention_purge' |
-                                      -- 'overnight_token_refresh_production' |
-                                      -- 'overnight_token_refresh_demo' |
+                                      -- 'evening_backup' |
                                       -- 'live_session_start' | 'live_session_end'
     date         VARCHAR   NOT NULL,  -- 'YYYYMMDD' — the trading day this batch targets
     status       VARCHAR   NOT NULL,  -- 'running' | 'success' | 'failed'
@@ -481,17 +481,8 @@ CREATE TABLE IF NOT EXISTS batch_runs (
     finished_at  TIMESTAMP,           -- NULL while status='running'
     PRIMARY KEY (stage, date)
 );
--- 'overnight_token_refresh_production' / '_demo': one stage per account,
--- the same structure duplicated rather than one stage extended, so each
--- carries its own idempotency skip and its own retry budget against the
--- per-account one-per-minute issuance limit. Written by
--- metadata_crawler.md's third
--- schedule entry, after midnight, so their `date` is the trading day they
--- cover. Observability and same-day idempotency only — NOT a Health Gate
--- blocking condition: a failed refresh followed by a batch's own automatic
--- reissue can still leave a token that covers the session, and
--- live_mode_runner.md's token coverage gate tests that requirement
--- directly.
+-- The overnight token refresh writes no row here: it opens no DB connection
+-- (metadata_crawler.md's Overnight Token Refresh).
 -- 'live_session_start' (R-2): written 'running' at Session Lifecycle Step
 -- 1c, flipped to 'success' at clean Session Shutdown alongside
 -- 'live_session_end'. A today row still 'running' with no
@@ -545,11 +536,11 @@ CREATE TABLE IF NOT EXISTS corporate_events (
     ticker      VARCHAR NOT NULL,
     event_date  VARCHAR NOT NULL,   -- 'YYYYMMDD' (effective date, before market open)
     event_type  VARCHAR NOT NULL,   -- 'split' | 'reverse_split' | 'dividend'
-    value       DOUBLE  NOT NULL,   -- stays DOUBLE, outside the deferred type
-                                    -- conversion (utils.md's split-ratio rule)
-                                    -- split/reverse_split: ratio (>1.0 or <1.0)
-                                    -- dividend: per-share cash amount (USD, >0),
-                                    -- read ONLY through utils.md's
+    ratio       DOUBLE,             -- split/reverse_split only: the ratio (>1.0
+                                    -- or <1.0); DOUBLE per utils.md's Numeric
+                                    -- Rules (split ratio)
+    amount      DECIMAL(18,8),      -- dividend only: per-share cash amount
+                                    -- (USD, >0), read ONLY through utils.md's
                                     -- dividend_gross_amount() or its frame
                                     -- form dividend_gross_from_events(),
                                     -- never directly
@@ -557,13 +548,16 @@ CREATE TABLE IF NOT EXISTS corporate_events (
                                     -- which vendor supplied the value now
                                     -- stored. NOT part of the primary key —
                                     -- see the invariant below.
-    basis_date  VARCHAR NOT NULL,   -- 'YYYYMMDD', the date `value` was fetched;
-                                    -- written with it by the crawlers. A
-                                    -- source that restates past dividends by
-                                    -- later splits (corporate_events.
+    basis_date  VARCHAR NOT NULL,   -- 'YYYYMMDD', the date the stored ratio or
+                                    -- amount was fetched; written with it by
+                                    -- the crawlers. A source that restates
+                                    -- past dividends by later splits
+                                    -- (corporate_events.
                                     -- dividend_restated_sources) expresses
-                                    -- `value` in this date's basis
-    PRIMARY KEY (ticker, event_date, event_type)
+                                    -- `amount` in this date's basis
+    PRIMARY KEY (ticker, event_date, event_type),
+    CHECK ((ratio IS NOT NULL) = (event_type IN ('split', 'reverse_split'))),
+    CHECK ((amount IS NOT NULL) = (event_type = 'dividend'))
 );
 -- item N INVARIANT: exactly ONE row per (ticker, event_date, event_type),
 -- always. This is load-bearing, not incidental: the split factor rule
@@ -615,11 +609,17 @@ CREATE TABLE IF NOT EXISTS corporate_event_conflicts (
     event_date    VARCHAR   NOT NULL,   -- 'YYYYMMDD'
     event_type    VARCHAR   NOT NULL,   -- 'split' | 'reverse_split' | 'dividend'
     kept_source   VARCHAR   NOT NULL,   -- vendor whose value is in corporate_events
-    kept_value    DOUBLE    NOT NULL,
+    kept_ratio    DOUBLE,               -- split/reverse_split only
+    kept_amount   DECIMAL(18,8),        -- dividend only
     other_source  VARCHAR   NOT NULL,   -- vendor whose value was NOT kept
-    other_value   DOUBLE    NOT NULL,
+    other_ratio   DOUBLE,               -- split/reverse_split only
+    other_amount  DECIMAL(18,8),        -- dividend only
     observed_at   TIMESTAMP NOT NULL,
-    PRIMARY KEY (ticker, event_date, event_type, other_source)
+    PRIMARY KEY (ticker, event_date, event_type, other_source),
+    CHECK ((kept_ratio IS NOT NULL) = (event_type IN ('split', 'reverse_split'))
+       AND (other_ratio IS NOT NULL) = (event_type IN ('split', 'reverse_split'))),
+    CHECK ((kept_amount IS NOT NULL) = (event_type = 'dividend')
+       AND (other_amount IS NOT NULL) = (event_type = 'dividend'))
 );
 
 -- Entry points (output of EntryPointDetector)
@@ -630,7 +630,7 @@ CREATE TABLE IF NOT EXISTS entry_points (
     ticker      VARCHAR      NOT NULL,
     date        VARCHAR      NOT NULL,
     hour        VARCHAR      NOT NULL,  -- t bar open time
-    p_entry     DOUBLE       NOT NULL,  -- t bar open price
+    p_entry     DECIMAL(18,6) NOT NULL, -- t bar open price
     PRIMARY KEY (ticker, date, hour)
 );
 
@@ -652,7 +652,7 @@ CREATE TABLE IF NOT EXISTS labeled_samples (
     ticker              VARCHAR      NOT NULL,
     date                VARCHAR      NOT NULL,
     hour                VARCHAR      NOT NULL,
-    p_entry             DOUBLE       NOT NULL,
+    p_entry             DECIMAL(18,6) NOT NULL,
     label_up5           INTEGER      NOT NULL,  -- 1 or 0
     label_up3           INTEGER      NOT NULL,
     label_sw            INTEGER      NOT NULL,
@@ -956,8 +956,8 @@ CREATE TABLE IF NOT EXISTS trade_log (
                                         -- `date`.
     signal                  VARCHAR,     -- "up5" | "up3"; NULL exactly on a live
                                         -- adopted row (entry_bar = -1)
-    fill_price              DOUBLE       NOT NULL,
-    exit_price              DOUBLE,      -- live: the reference_price of the root of
+    fill_price              DECIMAL(18,6) NOT NULL,
+    exit_price              DECIMAL(18,6), -- live: the reference_price of the root of
                                         -- the chain ending at the position's latest
                                         -- exit logical order (followed back through
                                         -- replaces_logical_order_id), ÷ the split
@@ -966,7 +966,7 @@ CREATE TABLE IF NOT EXISTS trade_log (
                                         -- position never had an exit logical order
                                         -- or a shortfall adjustment completes its
                                         -- close
-    weighted_avg_exit_price DOUBLE,
+    weighted_avg_exit_price DECIMAL(18,6),
     pnl_pct                 DOUBLE,
     exit_reason             VARCHAR,     -- TWO families below sit outside ordinary
                                         -- strategy PnL attribution, for DIFFERENT
@@ -1432,12 +1432,12 @@ CREATE TABLE IF NOT EXISTS live_positions (
                                            --   judged at runtime by
                                            --   live_mode_runner.md's last_halt_state
                                            --   and recorded in live_halt_episodes.
-    requested_quantity INTEGER,            -- shares the entry submitted; fixed at
+    requested_quantity DECIMAL(18,6),      -- shares the entry submitted; fixed at
                                            --   submission. trade_log's own
                                            --   requested_quantity is written from it,
                                            --   in the basis as of the close. NULL on an
                                            --   adopted row.
-    entry_mgnrt        DOUBLE,             -- the margin rate (vendor Mgnrt0, PERCENT)
+    entry_mgnrt        DECIMAL(18,6),      -- the margin rate (vendor Mgnrt0, PERCENT)
                                            --   in force when the entry was sized, and
                                            --   NEVER revised. NULL exactly on an
                                            --   adopted row, which is never sized;
@@ -1519,7 +1519,7 @@ CREATE TABLE IF NOT EXISTS live_orders (
                                                    --   executes; inherited along
                                                    --   replaces_logical_order_id
     replaces_logical_order_id  VARCHAR,            -- the logical order this one continues
-    requested_qty              INTEGER NOT NULL,
+    requested_qty              DECIMAL(18,6) NOT NULL,
     current_request_id         VARCHAR,            -- the request whose broker order
                                                    --   number is live
     status                     VARCHAR NOT NULL,   -- 'open' | 'filled' | 'canceled' |
@@ -1540,7 +1540,8 @@ CREATE TABLE IF NOT EXISTS live_orders (
                                                    --   tp/sl order, otherwise the last
                                                    --   print strictly before creation. NULL
                                                    --   on entry orders.
-    reference_at               VARCHAR,            -- exit side: that price's time. NULL on
+    reference_at               VARCHAR,            -- exit side: that price's time,
+                                                   --   'YYYYMMDD_HHMMSS'. NULL on
                                                    --   entry orders.
     created_at                 VARCHAR NOT NULL,   -- 'YYYYMMDD_HHMMSS'
     terminal_at                VARCHAR,
@@ -1562,15 +1563,15 @@ CREATE TABLE IF NOT EXISTS live_order_requests (
     bns_code         VARCHAR NOT NULL,   -- AstkBnsTpCode: '1' sell | '2' buy
     price_type_code  VARCHAR NOT NULL,   -- AstkOrdprcPtnCode
     cond_code        VARCHAR NOT NULL,   -- AstkOrdCndiTpCode
-    qty              INTEGER NOT NULL,   -- AstkOrdQty
-    price            DOUBLE,             -- AstkOrdPrc; NULL = market (sent as 0)
+    qty              DECIMAL(18,6) NOT NULL, -- AstkOrdQty
+    price            DECIMAL(18,6),      -- AstkOrdPrc; NULL = market (sent as 0)
     org_order_no     BIGINT,             -- OrgOrdNo (amend / cancel)
     broker_order_no  BIGINT,             -- OrdNo returned
     status           VARCHAR NOT NULL,   -- 'intent' | 'sent' | 'confirmed' | 'rejected' | 'unsent'
     broker_status    VARCHAR,            -- raw AstkOrdStatCode / Sastkordstatnm, last seen
-    reported_cum_qty INTEGER,            -- broker cumulative for this order number;
+    reported_cum_qty DECIMAL(18,6),      -- broker cumulative for this order number;
                                          --   cross-check only
-    remaining_qty    INTEGER,            -- AstkOrdRmqty / Sastkunercqty, last seen
+    remaining_qty    DECIMAL(18,6),      -- AstkOrdRmqty / Sastkunercqty, last seen
     reject_code      VARCHAR,
     reject_reason    VARCHAR,
     intent_at        VARCHAR NOT NULL,   -- 'YYYYMMDD_HHMMSS'
@@ -1592,12 +1593,12 @@ CREATE TABLE IF NOT EXISTS live_fills (
     order_date      VARCHAR NOT NULL,   -- OrdDt
     broker_order_no BIGINT  NOT NULL,   -- the order number it executed on; shadow:
                                         --   negative synthetic
-    cum_after_qty   INTEGER NOT NULL,   -- that order number's cumulative after this
+    cum_after_qty   DECIMAL(18,6) NOT NULL, -- that order number's cumulative after this
                                         --   execution
     exec_no         BIGINT,             -- ExecNo (REST itemised view); NULL on WS-only rows
     request_id      VARCHAR,            -- → live_order_requests; NULL while unattributed
-    exec_qty        INTEGER NOT NULL,   -- Sastkexecqty / AstkExecQty
-    exec_price      DOUBLE  NOT NULL,   -- Sastkexecprc / AstkExecPrc
+    exec_qty        DECIMAL(18,6) NOT NULL, -- Sastkexecqty / AstkExecQty
+    exec_price      DECIMAL(18,6) NOT NULL, -- Sastkexecprc / AstkExecPrc
     exec_at         VARCHAR NOT NULL,   -- 'YYYYMMDD_HHMMSS', US-local:
                                         --   Sastklclexecdttm / AstkLclExecDttm
     source          VARCHAR NOT NULL,   -- 'ws' (provisional) | 'rest' (authoritative) |
@@ -1611,7 +1612,7 @@ CREATE TABLE IF NOT EXISTS live_fills (
 -- that Broker Reconcile makes (live_mode_runner.md's Positions branch and
 -- settlement pending). Corrections never enter live_fills, live_orders or
 -- live_order_requests, which hold broker and shadow records only. Numeric
--- columns follow utils.md's Ledger Numeric Rules.
+-- columns follow utils.md's Numeric Rules.
 -- Retention: purge-registry member — date_column `date`, retention_days: inf
 --   (see metadata_crawler.md's evening purge stage).
 CREATE TABLE IF NOT EXISTS live_position_adjustments (
@@ -1650,7 +1651,7 @@ CREATE TABLE IF NOT EXISTS live_position_adjustments (
 -- (today's share count). Sums, counts, times and flags only: it carries NO
 -- average price. weighted_avg_entry_price and weighted_avg_exit_price are
 -- computed in Python from its sums (live_mode_runner.md), because division
--- is never done in DuckDB (utils.md's Ledger Numeric Rules).
+-- is never done in DuckDB (utils.md's Numeric Rules).
 -- Basis factor of a fill or an adjustment: utils.md's single split-factor
 --   rule (split_ratio_from_events(), which cum_split_ratio() delegates to)
 --   over the window after its US-local trading date
@@ -1667,7 +1668,7 @@ today AS (
     SELECT strftime(timezone('America/New_York', now()), '%Y%m%d') AS d
 ),
 splits AS (
-    SELECT ce.ticker, ce.event_date, ce.value
+    SELECT ce.ticker, ce.event_date, ce.ratio
     FROM corporate_events ce, today
     WHERE ce.event_type IN ('split', 'reverse_split')
       AND ce.event_date <= today.d
@@ -1690,7 +1691,7 @@ first_exit AS (
 fills AS (
     SELECT x.*,
            CAST(CAST(x.exec_qty AS DOUBLE) * COALESCE((
-               SELECT product(s.value) FROM splits s
+               SELECT product(s.ratio) FROM splits s
                WHERE s.ticker = x.ticker
                  AND s.event_date > substr(x.exec_at, 1, 8)
            ), 1.0) AS DECIMAL(18,6)) AS norm_qty,
@@ -1716,7 +1717,7 @@ fill_agg AS (
 adjustments AS (
     SELECT a.*,
            CAST(CAST(a.qty AS DOUBLE) * COALESCE((
-               SELECT product(s.value) FROM splits s
+               SELECT product(s.ratio) FROM splits s
                WHERE s.ticker = a.ticker
                  AND s.event_date > substr(a.observed_at, 1, 8)
            ), 1.0) AS DECIMAL(18,6)) AS norm_qty
@@ -1832,7 +1833,7 @@ FROM pending;
 CREATE TABLE IF NOT EXISTS live_session_state (
     date               VARCHAR NOT NULL,
     run_id             VARCHAR NOT NULL,
-    session_start_cash DOUBLE  NOT NULL,
+    session_start_cash DECIMAL(28,6) NOT NULL,
     started_at         VARCHAR NOT NULL,
     stage              VARCHAR NOT NULL,  -- 'shadow' | 'pilot' | 'scale'
                                           -- (shadow_retraining.md's own
@@ -2361,12 +2362,12 @@ CREATE TABLE IF NOT EXISTS live_halt_episodes (
 CREATE TABLE IF NOT EXISTS live_ticker_terms (
     ticker      VARCHAR   NOT NULL,
     date        VARCHAR   NOT NULL,   -- 'YYYYMMDD', session date
-    mgnrt       DOUBLE    NOT NULL,   -- vendor Mgnrt0 (적용증거금률), PERCENT.
+    mgnrt       DECIMAL(18,6) NOT NULL, -- vendor Mgnrt0 (적용증거금률), PERCENT.
                                       --   100 = no leverage. Taken AS-IS: there
                                       --   is no account-level rate to combine
                                       --   it with (OtptItemNm1 is a label
                                       --   string, not a number).
-    order_cost  DOUBLE    NOT NULL,   -- the @cost term above. NOT NULL because
+    order_cost  DECIMAL(28,6) NOT NULL, -- the @cost term above. NOT NULL because
                                       --   a row exists only when the response
                                       --   was whole, and a whole response
                                       --   carries both values.
@@ -2467,7 +2468,8 @@ CREATE TABLE IF NOT EXISTS exit_trigger_agreement_daily (
 -- and finding 29 does too, as do fill_ledger_mismatch, intent_match_ambiguous,
 -- exit_rejection_streak, reconcile_deferred, event_settlement_stalled,
 -- summary_vocabulary_candidate, dividend_withholding_mismatch,
--- regime_holdout_gate_failed and regime_holdout_verdict.
+-- regime_holdout_gate_failed, regime_holdout_verdict and
+-- tick_alignment_failed.
 -- Findings 13 and 15 deliberately do NOT: each already writes its own
 -- trade_log row (finding 13: exit_reason='restart_gap_exit'; finding 15:
 -- rows with exit_date > date OR exit_reason='overnight_exit', and
@@ -2536,7 +2538,6 @@ CREATE TABLE IF NOT EXISTS alert_log (
                                          --   'breaker_trip' | 'clock_check_abort' |
                                          --   'bar_close_premise_violation' |
                                          --   'evening_liveness_probe' |
-                                         --   'evening_deadline_abort' |
                                          --   'log_write_failed' |
                                          --   'db_health_observation'.
                                          --   The last two are NOT paths:
@@ -2551,7 +2552,13 @@ CREATE TABLE IF NOT EXISTS alert_log (
                                          --   because an event-driven invocation
                                          --   delivers a REPORT, not one finding —
                                          --   so suppression is keyed on
-                                         --   (alert_key, channel) as well
+                                         --   (alert_key, channel) as well.
+                                         --   The DB-less paths —
+                                         --   'batch_lock_deadline_abort' and
+                                         --   'token_refresh_failed' — write no
+                                         --   row here: their send outcome goes
+                                         --   to the log_dir log
+                                         --   (health_report.md)
     channel          VARCHAR NOT NULL,   -- 'discord' | 'email'
     severity         VARCHAR NOT NULL,   -- 'ok' | 'warn' | 'abort' — the MAXIMUM
                                          --   severity across the findings this
@@ -2599,18 +2606,20 @@ restating it.
 
 | Window | Owning process | Entry condition | Exit condition |
 |---|---|---|---|
-| 03:00 ET | metadata_crawler `--token-refresh` | cron | `batch_runs stage IN ('overnight_token_refresh_production','overnight_token_refresh_demo')` complete |
-| 04:00 ET– | metadata_crawler `--premarket-open` | cron | `stage IN ('premarket_rename','premarket_corporate_events')` status='success' |
+| 04:00 ET– | metadata_crawler `--premarket-open` | cron, then a read-write open succeeding (lock probe, deadline `wait_deadline`) | `stage IN ('premarket_rename','premarket_corporate_events')` status='success' |
 | Session | LiveModeRunner | both markers success, or 05:00 ET wait_deadline reached (degraded start) | RELEASE of the DB connection at shutdown stage 1, which PRECEDES process exit |
-| 21:00 ET– | metadata_crawler evening batch | `stage='live_session_end'` status='success', or a read-write open succeeding (the runner-absent verdict) | `stage='evening_retention_purge'` complete |
-| Nightly backup | file copy, not a connection | `stage='evening_session_stats'` status='success' | before the next premarket start |
+| 21:00 ET– | metadata_crawler evening batch | `stage='live_session_end'` status='success', or a read-write open succeeding (the runner-absent verdict) | `stage='evening_backup'` complete |
 
 While the runner holds the DB connection no separate process may open
 `market.duckdb`, read-only included. That window ends at shutdown stage 1,
 not at process exit, so the runner's stage-2 tail is outside it. Forbidden
-to run independently inside the window: `detection_benchmark.py`,
-`run_preprocess.py`, `run_train.py`, `run_backtest.py`, and
-`pipeline_optimizer`'s workers and coordinator.
+to run independently inside the window:
+- `detection_benchmark.py`
+- `run_preprocess.py`
+- `run_train.py`
+- `run_backtest.py`
+- `pipeline_optimizer`'s workers and coordinator
+- `collect_daily.py --backup-only`
 
 Referencing this section: `live_mode_runner.md`'s DB Connection Management
 (P-5) and Session Start Gating, `metadata_crawler.md`'s evening job start
@@ -2692,9 +2701,9 @@ session_stats_all = con.execute("""
 # Check for corporate events (splits, reverse splits, dividends) for a ticker.
 # Inspection only: a 'dividend' row's amount for any computation is read
 # through utils.md's dividend_gross_amount() or dividend_gross_from_events(),
-# never from `value`.
+# never from `amount`.
 events = con.execute("""
-    SELECT ticker, event_date, event_type, value
+    SELECT ticker, event_date, event_type, ratio, amount
     FROM corporate_events
     WHERE ticker = ?
       AND event_date >= ? AND event_date <= ?
@@ -2821,7 +2830,9 @@ exp_results = con.execute("""
 
 ## Ingestion Rules
 
-- All numeric fields from JSON are stored as strings → cast to DOUBLE/BIGINT on insert
+- All numeric fields from JSON are stored as strings → parsed to the column's
+  type on insert: prices `DECIMAL(18,6)`, volumes `BIGINT` (utils.md's
+  Numeric Rules)
 - **No session filtering** — all sessions (pre-market, regular, after-market;
   `hour` 040000~200000) are stored; overnight is excluded by the ingestion
   time-range filter — see `migrate_json_to_duckdb.py` / `metadata_crawler.md`

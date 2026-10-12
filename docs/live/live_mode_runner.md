@@ -39,8 +39,9 @@ LiveModeRunner
     │                                 reception and production REST
     └── loop A  (thread)              auxiliary_stream.md's component:
                                       the demo account's client — delayed
-                                      stream subscriptions and the
+                                      stream subscriptions, the
                                       watchdog scan's demo REST quote leg
+                                      and the chart/tick consumers' demo leg
 ```
 
 **The two lists above are different KINDS.** A caller loop is a unit of
@@ -66,15 +67,21 @@ rate-limit waits, and the delay would not surface anywhere because loop P
 itself stays busy. The same reasoning that separates the two loops'
 executors applies one level down inside loop P.
 
-Its consumers here are BOTH shadow fill simulations' tick scans — the entry
-side in the Watchdog Polling Loop's submission path and the exit side in
-Position Manager Loop Step 3, each running its scan once per position
-lifetime — and the halt-status poller below. The pool is bounded by the
-shadow positions resolving in one cycle PLUS that poller's single task, its
-concurrency being one by construction: the poll interval carries a
-60-second floor. The SDK's is bounded by the rate controller's concurrent
-in-flight ceiling. Loop A is not split — the
-auxiliary stream is its only consumer.
+Its consumers here:
+- BOTH shadow fill simulations' tick scans — the entry side in the Watchdog
+  Polling Loop's submission path and the exit side in Position Manager Loop
+  Step 3, each running its scan once per position lifetime;
+- the derived-bundle offset search (Per-Ticker Tick Buffer);
+- the halt-status poller below.
+
+The pool is bounded by:
+- the shadow positions resolving in one cycle;
+- the held intervals aligning in one cycle;
+- that poller's single task, its concurrency being one by construction: the
+  poll interval carries a 60-second floor.
+
+The SDK's is bounded by the rate controller's concurrent in-flight ceiling.
+Loop A is not split — the auxiliary stream is its only consumer.
 
 **Where each caller loop runs, and why it matters.**
 
@@ -212,7 +219,9 @@ concern evaluated afterward, once the session has already started):
 
 ```
 wait_deadline = 05:00:00 ET   # up to 1 hour from the premarket batch's
-                               # 04:00:00 ET start (see metadata_crawler.md)
+                               # 04:00:00 ET start (see metadata_crawler.md);
+                               # also the deadline of --premarket-open's own
+                               # lock probe, past which it aborts
 poll batch_runs every N seconds (polling interval unspecified — cheap,
     low-stakes choice) for stage IN ('premarket_rename',
     'premarket_corporate_events') AND date = today_date, status='success'
@@ -470,9 +479,9 @@ LiveModeRunner.start_session(today_date):
       Insufficient coverage on EITHER ABORTS the session; nothing here
       refreshes either token. The demo account is treated symmetrically
       with production rather than degraded-through: its refresh has its own
-      scheduled stage and its own batch_runs marker, so a failed refresh is
-      already surfaced there and by finding 1, and the session does not
-      absorb it. Refresh happens only in its own scheduled stage
+      scheduled run, and a failed refresh is already surfaced by the DB-less
+      `token_refresh_failed` alert (metadata_crawler.md), so the session does
+      not absorb it. Refresh happens only in its own scheduled run
       (metadata_crawler.md) — refreshing at session start would spend the
       one-per-minute issuance budget with the session waiting on it, and
       would turn a loud batch failure into a quiet one.
@@ -895,9 +904,10 @@ watchdog and 5s position loops are not stalled):
    Polling Loop cycle boundary — it has absorbed bars through the
    snapshot's last bar, and the Watchdog Polling Loop's Step 3 multi-bar
    replay covers the bars after it — then clear its quarantine_reason if
-   set. NOT run on Step 4b's late-start path — there, Eager Pool hasn't
-   executed yet, so Step 0 picks up the fresh corporate_events rows
-   naturally and no scoped recompute applies.
+   set. On Step 4b's late-start path no calculator exists yet: the
+   ticker's quarantine_reason is cleared at once if set, and Eager Pool
+   computes on the fresh rows — Step 0 picks them up naturally, so no
+   scoped recompute applies.
 ```
 
 All writes in steps 2-5 go through `db_write()`; no lock-handoff or
@@ -1214,9 +1224,18 @@ loop every poll_interval_seconds:
         query, not just the latest bar). InputDivXtick=1 and a dataCnt
         sized by the deficit rule for head/rotation slots; minute
         resolution for a backfill
-     b. Fetch current ticks from trading API (10-tick up to now).
-        Indicator input only — NOT a detection input; the tick channel is
-        unchanged by the scan design
+     b. Fetch current ticks from trading API — `chart/tick` with
+        `InputDivXtick=10`:
+        - range: from the last held bundle to now, the terminal bundle
+          discarded per utils.md's unsealed-bundle discard rule;
+        - only when the ticker has a completed bar not yet absorbed, judged
+          by wall clock (bar close <= now) before the slot is issued, so the
+          fetch still fires alongside a; a later visit within the same bar
+          carries no tick fetch;
+        - not for a ticker in the `lifecycle='live'` set (Per-Ticker Tick
+          Buffer);
+        - indicator input only — NOT a detection input; the tick channel is
+          unchanged by the scan design
      c. Update intraday state in memory / DuckDB
 
      Slots: N head (prefix scan, stop where this ticker's own bar data has
@@ -1227,6 +1246,8 @@ loop every poll_interval_seconds:
   3. If one or more new 1min bars completed for ticker since last check:
          for each newly-arrived bar, in chronological order:
              calculators[ticker].on_bar_close(bar, ticks_for_bar)
+             # ticks_for_bar: the ticker's sealed bundles selected by
+             # bundle hour (Per-Ticker Tick Buffer)
              if 093000 bar just closed:
                  calculators[ticker].on_regular_session_open(
                      bars_including_930,
@@ -1414,6 +1435,8 @@ loop every poll_interval_seconds:
                  else (entry["p_entry"] * (1 + config["execution"]["entry_gap_value"])
                        if config["execution"]["entry_gap_type"] == "percentage"
                        else entry["p_entry"] + config["execution"]["entry_gap_value"])
+             # a limit price is rounded DOWN to execution_common.md's
+             # tick(price) grid — the less aggressive direction for a buy
              # Both branches open the position the same way (Position Manager
              # Loop's Order and fill ledger): ONE transaction under
              # write_lock — the guard check (no 'open' entry logical order
@@ -1452,7 +1475,7 @@ loop every poll_interval_seconds:
                      on simulate_entry_fill() resolving synchronously,
                      which it cannot; a branch disappears here rather than
                      a simplification being lost.
-                 anchor = the request's sent_at
+                 anchor = the time part (HHMMSS) of the request's sent_at
                      # Live OBSERVES this instant; backtest COMPUTES its
                      # equivalent as entry_hour +
                      # execution.entry_fill_delay_seconds. Two expressions
@@ -1460,7 +1483,8 @@ loop every poll_interval_seconds:
                      # sent_at double-counts a wait live has already
                      # lived through (execution_common.md).
                  The RESOLUTION-CONDITION test — has the 1-tick buffer
-                 reached anchor + cancel_after_seconds — is a comparison of
+                 reached utils.hour_add_seconds(anchor,
+                 cancel_after_seconds) — is a comparison of
                  two times and stays INLINE on loop P. The scan runs ONCE
                  per position lifetime, on the pass that test first passes,
                  and is offloaded to loop P's CALLER EXECUTOR (Architecture's
@@ -1470,7 +1494,8 @@ loop every poll_interval_seconds:
                  the anchor:
                  weighted_avg_fill_price, filled, unfilled, status =
                      execution_common.simulate_entry_fill(
-                         ticks_entry=<1-tick buffer, anchor forward>,
+                         ticks_entry=<the ticker's sealed bundle series, from
+                                      the bundle holding the anchor>,
                          quantity=quantity,
                          entry_anchor_second=anchor, p_entry=entry["p_entry"],
                          buy_rate=config["execution"]["buy_rate"],
@@ -1487,7 +1512,8 @@ loop every poll_interval_seconds:
                  then settle exactly as the real branch does: filled > 0
                  writes ONE live_fills row (source='shadow', the request's
                  synthetic broker_order_no, exec_qty=filled,
-                 exec_price=weighted_avg_fill_price, exec_at=anchor,
+                 exec_price=weighted_avg_fill_price converted per V1,
+                 exec_at=anchor,
                  cum_after_qty=filled); the entry logical order ends
                  'filled' when filled == quantity, otherwise 'canceled'
                  with terminal_cause='timeout'; filled == 0 also sets
@@ -2051,7 +2077,7 @@ session.
 **Realised loss is counted per exit fill.** The session's realised loss is the
 Σ, over non-shadow exit fills whose US-local `exec_at` date is today, of
 `exec_qty` × (`exec_price` − `weighted_avg_entry_price`), each fill in its own
-basis, computed in `Decimal` (utils.md's Ledger Numeric Rules), and recomputed
+basis, computed in `Decimal` (utils.md's Numeric Rules), and recomputed
 from `live_fills` whenever an exit fill folds. Fills of exit logical orders
 whose `exit_reason` is PnL-excluded are left out. An 'event_settlement' exit
 adjustment counts, as `amount` − `qty` × `weighted_avg_entry_price`, on the date
@@ -2095,7 +2121,7 @@ event.
 
 ## Broker Reconcile (shared procedure) — R-3
 
-One implementation, three call sites: (a) every Session Lifecycle start,
+One implementation, these call sites: (a) every Session Lifecycle start,
 cold start included (Session Lifecycle Step 1d), (b) Feed Outage Recovery
 step 4, (c) Warm Restart step 1 (R-2, below). It brings the ledger
 (db_schema.md's `live_orders`, `live_order_requests`, `live_fills` and
@@ -2235,7 +2261,10 @@ is set.
     `kind='cash_unobserved'` is recorded.
 - On reaching it when the broker still holds the fraction, the position
   stays pending and records `kind='fraction_held'` at each Broker Reconcile
-  call.
+  call. No order is placed for a fractional balance:
+  - the operator sells it through the broker's app while no session runs;
+  - the sale closes the position through event settlement and the
+    'trading_history_sale' cash-in-lieu source.
 - `kind='cash_ambiguous'` is recorded per Broker measurement's attribution
   rule.
 - `event_settlement_stalled` is a `health_report.md` finding at severity
@@ -2420,9 +2449,16 @@ so a re-crash during recovery re-enters warm restart on the same signature.
    submission rather than first fill, not just the fully-open pair this
    step originally covered:
      a. WS re-subscribe FIRST (see Exit Architecture), THEN
-     b. REST gap-fill for the crash gap, deduped against the WS buffer by
-        the global tick-dedup rule (see utils.md's stitch_ticks()). Doing
-        (a) before (b) guarantees no realtime tick is lost in the seam.
+     b. The held interval's 1-tick first fetch (Per-Ticker Tick Buffer's
+        Warm Restart rule):
+        - at the maximum dataCnt and paging back to the earlier of the
+          oldest unresolved anchor and the crash gap's start;
+        - deduped against the WS buffer by the global tick-dedup rule (see
+          utils.md's stitch_ticks());
+        - it replaces the crash-gap gap-fill for every ticker in the set,
+          and (b2) and (c) run over the whole crash gap from it.
+        Doing (a) before (b) guarantees no realtime tick is lost in the
+        seam.
      b2. Resolve any live_halt_episodes row left OPEN by the crash
         (halt_end IS NULL) by REPLAYING the tick-rate heuristic over (b)'s
         gap-fill ticks: no ticks, or tick_rate_per_min below
@@ -2508,7 +2544,7 @@ so a re-crash during recovery re-enters warm restart on the same signature.
    capacity needs no rebuild: it is live_position_state.reserved, read from
    the ledger like everything else.
 
-7. Circuit breaker restore (R-4): recompute all three counters,
+7. Circuit breaker restore (R-4): recompute the counters,
    `is_shadow = FALSE` only (a shadow evaluation's counters, if this
    process also ran shadow, are recomputed the same way but restricted to
    `is_shadow = TRUE` and kept separate — see Circuit Breaker): realised
@@ -2734,6 +2770,111 @@ CachingCalculator.get_for_entry(indicator, bars_up_to_t1):
 
 ---
 
+## Per-Ticker Tick Buffer
+
+Each ticker's ticks are held in one buffer for the session. Its source
+depends on whether the ticker is in the `lifecycle='live'` set — the set
+Exit Architecture's subscription derives from.
+
+**Acquisition.**
+- Outside the set: Watchdog Step 2b's vendor 10-tick fetch (`chart/tick`,
+  `InputDivXtick=10`), until `exit_deadline`. Each response's terminal
+  bundle is discarded per utils.md's unsealed-bundle discard rule
+  (`stitch_ticks()`).
+- Inside the set, a HELD INTERVAL: REST `chart/tick` with `InputDivXtick=1`,
+  fetched as a `cont_key` delta on the Position Manager cycle under the
+  polling rule below. The interval's first fetch:
+  - takes the maximum `dataCnt`;
+  - covers the window between the subscribe request and the subscription
+    going active (Exit Architecture).
+- On leaving the set: the ticker returns to Step 2b, its window starting at
+  the leave time.
+- The buffer is held at every stage.
+
+**Derived bundles.**
+- Formed from the REST 1-tick rows only, WS `V60` rows excluded, with prints
+  grouped per the vendor's `InputDivXtick=10` bundle conventions (`hour` is
+  the bundle's last print's second).
+- The phase is the one offset d in [0, 10) whose derived bundles equal every
+  overlapping vendor bundle in `hour`, open, high, low, close and volume,
+  compared as grid values (utils.md's Numeric Rules):
+  - the overlap is that of the held interval's first 1-tick fetch with the
+    vendor bundles already held;
+  - a vendor bundle later obtained for the held interval is checked against
+    the same d.
+- Alignment state does not cross held intervals.
+- When alignment fails:
+  - the ticker's bundle source degrades to vendor 10-tick in Step 2b form,
+    for the indicator path and the fill simulators alike;
+  - the ticker keeps its held 1-tick poll, and the 1-tick consumers below
+    keep that source;
+  - the vendor fetch runs on the Position Manager cycle while held, only when
+    the ticker has a completed bar not yet absorbed (Watchdog Step 2b's
+    test);
+  - entries are not blocked;
+  - the `tick_alignment_failed` finding (health_report.md, severity `warn`,
+    source `health_events`) is recorded once per failed held interval,
+    detail `{ticker, held_since, reason}`, `reason` one of:
+    - 'no_overlap' — no overlapping vendor bundle;
+    - 'no_unique_offset' — not exactly one d matches;
+    - 'later_mismatch' — a vendor bundle obtained after alignment disagrees.
+
+**Consumers.**
+- The sealed bundle series — vendor bundles outside the set, derived
+  bundles inside it — feeds `on_bar_close()`'s `ticks_for_bar`, selected by
+  bundle `hour` (Watchdog Step 3), and the shadow and pilot fill simulators,
+  from the bundle holding the anchor.
+- The 1-tick rows feed the resolution-condition tests,
+  `exit_trigger_agreement_daily`'s M and R computations, and the WS/backstop
+  tp/sl path (Exit Architecture).
+- `halt_tick_counts` is unchanged.
+- 1-tick is the source for live tracking except the fill simulators.
+
+**Retention.**
+- The bundle series is kept for the session.
+- Raw 1-tick rows are kept from the oldest unresolved consumer's anchor
+  forward, released at the shadow exit pass (Position Manager Loop Step 3).
+
+**Where it runs.**
+- The incremental 1-tick fetch is issued, and the append-derivation of
+  bundles runs, on loop P inside the Position Manager cycle; the fetch is
+  dispatched to either leg (trading_api.md's Leg assignment).
+- The offset search runs on loop P's caller executor.
+
+**Polling rule.**
+- Held tickers whose WS stream is down are polled every Position Manager
+  cycle, outside the cap. For such a ticker the REST tick backstop's poll
+  (Exit Architecture) is this fetch, the same call and `cont_key`:
+  - while the WS stream is down, the fetched rows go to the tp/sl path and to
+    `halt_tick_counts` as the backstop's rows do;
+  - while it is up, they go only to the other consumers above and do not
+    increment `halt_tick_counts`.
+- The remaining held tickers' polling is capped per second by
+  `live_mode.position_tick_poll_slots`: `chart/tick` pacing slots per
+  second, a cap and not a reservation, inside `chart/tick`'s combined 8,
+  ordered by trading_api.md's dispatch-priority deadlines.
+  - Held tickers polled per Position Manager cycle = min(remaining held
+    tickers, the key × `position_check_interval_seconds`), served
+    round-robin, held tickers in the bar-close superset first.
+  - A ticker skipped in a cycle resumes from its `cont_key`.
+- A ticker degraded to vendor 10-tick keeps its 1-tick poll; its vendor fetch
+  (Derived bundles, above) takes a slot inside the cap.
+- Deadlines (trading_api.md): the backstop poll, immediate; the held-ticker
+  poll — a held interval's first fetch included — the next Position Manager
+  cycle; a degraded ticker's vendor fetch, Watchdog Step 2b's.
+
+**Warm Restart.** Every ticker in the set opens a new held interval:
+- the 1-tick first fetch, at the maximum `dataCnt` and paging back to the
+  earlier of the oldest unresolved anchor and the crash gap's start, replaces
+  step 3b's crash-gap gap-fill for those tickers, and steps 3b2 and 3c run
+  over the whole crash gap from it (Session Restart (Warm Start));
+- a Step 2b-form vendor fetch per ticker supplies the alignment overlap;
+- pre-restart `ticks_for_bar` beyond the 1-tick reach comes from vendor
+  10-tick;
+- these fetches complete before the caller loops start.
+
+---
+
 ## Exit Architecture (WS-primary / REST-backstop) — R-2
 
 tp/sl detection for OPEN POSITIONS ONLY (entry-side watchdog over the full
@@ -2753,14 +2894,15 @@ not per position, so several positions on one ticker share one
 subscription. Price tracking owns the quote connection for the whole
 session; see "WS connections" under Position Manager Loop for the
 two-connection topology and why nothing is leased or shared.
-Immediately after the subscribe call, REST gap-fill the short window
-between the subscribe request and the subscription actually going active —
-pure network/handshake latency now, not the fill-to-subscribe gap this
-covered before subscription moved earlier — deduped by the global
-tick-dedup rule (see utils.md's `stitch_ticks()`). Each inbound tick:
+The window between the subscribe request and the subscription actually
+going active is covered by the held interval's first 1-tick fetch
+(Per-Ticker Tick Buffer), deduped by the global tick-dedup rule (see
+utils.md's `stitch_ticks()`); no separate gap-fill follows the subscribe
+call. Each inbound tick:
 ```
 breach_up = price >= weighted_avg_entry_price * (1 + tp_pct)
 breach_dn = price <= weighted_avg_entry_price * (1 - stop_loss_pct)
+# both are grid-value decisions (utils.md's Numeric Rules)
 ```
 `weighted_avg_entry_price` is computed in Python from `live_position_state`'s
 sums (Position close, Position Manager Loop), refreshed as entry fills fold.
@@ -2843,7 +2985,10 @@ there is NO accuracy/filter asymmetry between them — only latency differs
 (push-immediate vs. up-to-one-poll delay). A poll may return several
 buffered ticks at once; they are evaluated in sequence, so detection
 accuracy matches WS — only detection TIME lags. `utils.track_price_breach()`
-is NOT used on this path; it is backtest-only as of this patch.
+is NOT used on this path; it is backtest-only as of this patch. The poll is
+the Per-Ticker Tick Buffer's held-ticker 1-tick fetch — the same call and
+`cont_key` — polled every Position Manager cycle, outside the polling cap,
+while the ticker's WS stream is down.
 
 **`halt_tick_counts` — what the halt heuristic counts.** Both paths above
 also increment a per-ticker count of DEDUP-PASSING ticks keyed by second.
@@ -3082,7 +3227,8 @@ counter adds another unmeasured threshold).
 placed order is tracked and never reads as a ghost. This is an OPERATOR
 CONVENTION and is unenforceable — the system cannot prevent an operator using
 the broker's own app, and the convention is likeliest to break during exactly
-the incident `health_report.md`'s finding 28 asks for manual intervention in.
+the incident `health_report.md`'s finding 28 (`batch_lock_deadline_abort`)
+asks for manual intervention in.
 At a 60-second threshold there is effectively no human-in-the-loop grace,
 which is what makes the convention load-bearing. A CLI route for it is an open
 item.
@@ -3236,7 +3382,7 @@ unfilled remainder stays tracked either way.
   that a later match identifies as such is deleted and recorded in that
   `evidence`.
 - Vendor numbers are converted per V1 (trading_api.md's Response
-  Normalization); ledger arithmetic follows utils.md's Ledger Numeric Rules.
+  Normalization); ledger arithmetic follows utils.md's Numeric Rules.
 
 Over-counting is impossible by construction rather than merely unlikely: an
 execution is keyed by `(order_date, broker_order_no, cum_after_qty)`, so a
@@ -3306,7 +3452,7 @@ loop every position_check_interval_seconds (config, default: 5s):
     purpose='vanished_replacement' and replaces_logical_order_id, at the
     current phase's permitted type and the current k.
     # Vanished-order rule — applies every cycle, not only at a halt
-    # clear. One mechanism, four causes: cancellation during a halt
+    # clear. One mechanism, these causes: cancellation during a halt
     # (api_contract_checklist.md T-12), cancellation by the venue at a
     # session-phase boundary (T-19), a cancel whose follow-up failed, and
     # arbitrary broker cancellation.
@@ -3390,7 +3536,9 @@ loop every position_check_interval_seconds (config, default: 5s):
         # a wait. That is intended — the exposure is a day old.
         bid, ask = REST orderbook query, this ticker's current level-1
             (one call; both sides come back from it)
-        target = ask - k * (ask - bid)     # execution_common.md
+        target = ask - k * (ask - bid)     # execution_common.md; rounded UP
+                                           # to the tick(price) grid — the
+                                           # less aggressive direction for a sell
         if target != the current request's price:
             send an amend request (request_type='amend') — re-quotes stay
                 amends, not cancel-and-resubmit; IS2 routing's
@@ -3776,7 +3924,7 @@ loop every position_check_interval_seconds (config, default: 5s):
          breach, the observed price and time of the confirming (2nd)
          breach tick — a real observation, not a bundle interpolation; for
          any other exit logical order, the last print strictly before its
-         creation, defined for all four exit reasons (execution_common.md).
+         creation, defined for every exit reason (execution_common.md).
          Vendor prices are converted per V1. This is the "reference price
          still logged" for the realized-vs-simulated comparison, and
          trade_log's live exit_price derives from it (Position close).
@@ -3800,7 +3948,8 @@ loop every position_check_interval_seconds (config, default: 5s):
            # session_end must NOT fall through to _sl — doing so was
            # contaminating the population _sl is fitted on
            # (execution_common.md).
-           anchor    = the exit logical order's reference_at   # a TIME
+           anchor    = the time part (HHMMSS) of the exit logical order's
+                       reference_at ('YYYYMMDD_HHMMSS')       # a TIME
            reference = its reference_price
            The RESOLUTION-CONDITION test runs INLINE on loop P each cycle:
            session end reached, or `sell_rate` times the buffer's volume at
@@ -3825,7 +3974,8 @@ loop every position_check_interval_seconds (config, default: 5s):
            pass safe to repeat after a restart, and nothing in it asks for
            the answer to be recomputed on cycles that cannot change it:
            weighted_avg_exit_price, filled, unfilled, _ = execution_common.simulate_exit_fill(
-               ticks_exit=<1-tick buffer, anchor forward>,
+               ticks_exit=<the ticker's sealed bundle series, from the
+                           bundle holding the anchor>,
                position_size=requested_qty,
                exit_anchor_second=anchor, reference_price=reference,
                sell_rate=sell_rate,
@@ -3840,7 +3990,8 @@ loop every position_check_interval_seconds (config, default: 5s):
            On settlement, in one pass over that same buffer:
              - filled > 0 writes ONE live_fills row (source='shadow', the
                request's synthetic broker_order_no, exec_qty=filled,
-               exec_price=weighted_avg_exit_price, exec_at=anchor,
+               exec_price=weighted_avg_exit_price converted per V1,
+               exec_at=anchor,
                cum_after_qty=filled); the logical order ends 'filled' when
                filled == requested_qty, and the position closes per
                Position close when its condition holds — the trade_log row
@@ -3852,7 +4003,8 @@ loop every position_check_interval_seconds (config, default: 5s):
                full-tape buffer to obtain M and R against this exit's
                observed L (db_schema.md)
              - raw 1-tick rows ahead of the oldest remaining unresolved
-               anchor are released
+               anchor are released; the bundle series is kept for the
+               session (Per-Ticker Tick Buffer)
        else:
            if config["execution"]["exit_order_type"] == "market":
                submit the 'new' request via trading API: quantity =
@@ -3863,7 +4015,8 @@ loop every position_check_interval_seconds (config, default: 5s):
                k = config["live_mode"]["exit_ladder_seed"]
                submit the 'new' request via trading API: quantity =
                    requested_qty, order_type="limit",
-                   limit_price=`ask - k * (ask - bid)` (execution_common.md)
+                   limit_price=`ask - k * (ask - bid)` rounded up to the
+                   tick(price) grid (execution_common.md)
            on response the request records broker_order_no and becomes
                'sent'; on structural refusal the exit logical order ends
                'rejected' (Order and fill ledger's rejected-exit rule)
@@ -3888,7 +4041,7 @@ excepted, whose 'none' fallback closes with `amount` NULL). Then
 `lifecycle='closed'` and the `trade_log` row is written, in the basis as of
 the close:
 - Average prices are computed in Python from `live_position_state`'s sums,
-  divided in `Decimal` (utils.md's Ledger Numeric Rules):
+  divided in `Decimal` (utils.md's Numeric Rules):
   `weighted_avg_entry_price` = `entry_fill_amount` ÷ `entry_filled_qty`, or
   `adopted_entry_amount` ÷ `entry_qty` for a position with no entry fill;
   `weighted_avg_exit_price` = `exit_fill_amount` ÷ `exit_filled_qty`, NULL
@@ -3929,8 +4082,9 @@ the close:
   `utils.dividend_gross_amount()` × (1 − `corporate_events.dividend_withholding_rate`),
   converted per V1, × the shares held at the start of that `event_date`, in
   that date's basis.
-- Writes to `trade_log`'s DOUBLE price columns convert the rounded `Decimal`
-  at the write (V3's exception, until the deferred type conversion).
+- Writes to `trade_log`:
+  - its DECIMAL price columns bind the rounded `Decimal` (V4);
+  - `predicted_*` stay DOUBLE.
 
 ---
 
@@ -3940,6 +4094,12 @@ the close:
 live_mode:
   poll_interval_seconds:          1
   position_check_interval_seconds: 5    # shared timing grid — see Position Manager Loop
+  position_tick_poll_slots:       6      # chart/tick pacing slots PER SECOND
+                                         # for held-ticker 1-tick polling — a
+                                         # CAP inside chart/tick's combined 8,
+                                         # not a reservation; WS-dead held
+                                         # tickers sit outside it (Per-Ticker
+                                         # Tick Buffer)
   scan:
     head_slots:                   3      # N — prefix-scan calls per cycle from
                                          # the head of the watchdog list
@@ -4417,7 +4577,7 @@ trading:
   within a single table rather than by row-existence.
 - session_start_compute() parallelized across workers; thread-safety per-ticker guaranteed
   (no shared state between CachingCalculator instances)
-- Eager Pool bars loading (Step 3) uses `utils.load_ohlcv_with_history()`, not a raw
+- Eager Pool bars loading (Step 5) uses `utils.load_ohlcv_with_history()`, not a raw
   `ohlcv_1min` query — stitches predecessor-ticker bars when a rename occurred
   within the lookback window; no-op fast path for the vast majority of tickers
 - Corporate-event split adjustment of loaded bars happens inside
@@ -4426,7 +4586,7 @@ trading:
 - `gap_percentile()`'s `dividend_amount` in live comes from `today_dividends`
   (Session Lifecycle Step 4c), passed to `on_regular_session_open()` and
   `scoped_recompute()` — the calculator never looks it up
-- `meta_bulk` (Step 3b) is (ticker, date)-keyed at the source (`stock_meta`)
+- `meta_bulk` (Step 3) is (ticker, date)-keyed at the source (`stock_meta`)
   but resolved to a flat per-ticker dict for today's date only, since live mode
   has exactly one date in play per session — unlike training's `extract_batch()`,
   which must stay date-keyed across a ticker's multiple historical entry dates

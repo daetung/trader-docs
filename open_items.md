@@ -42,15 +42,12 @@ confirmation that it still reads correctly.
    rather than a design blocker, so it is not sequenced against the items
    above either. It is listed because a new item left out of this list is the
    carry-forward defect this file exists to prevent, inverted.
-6. **Deferred DECIMAL type conversion** is unblocked and not sequenced
-   against the items above.
-7. **Fractional-balance sell path** is blocked on (6).
-8. **Carried partially filled exit — engine divergence** is unblocked and not
+6. **Carried partially filled exit — engine divergence** is unblocked and not
    sequenced against the items above.
-9. **No path from a trained model's `run_id` to the live model** is unblocked
+7. **No path from a trained model's `run_id` to the live model** is unblocked
    and not sequenced against the items above.
-10. **Finding 6 divergence — resampling unit and threshold** is not sequenced
-    against the items above.
+8. **Finding 6 divergence — resampling unit and threshold** is not sequenced
+   against the items above.
 
 ---
 
@@ -142,6 +139,11 @@ restricting it to "only when the runner is dead" answers the third by
 construction, so the concurrency question should be settled before the
 interface is drawn.
 
+A further design target: on launch, the CLI pre-fills a sell order for each
+position awaiting manual liquidation — `fraction_held` positions among them
+(`live_mode_runner.md`'s settlement pending) — for the operator to submit
+directly.
+
 ---
 
 ## Real-time bid/ask spread — model-feature / entry-gate paths
@@ -182,14 +184,14 @@ has enough history; revisit then, not before.
 ## `api_contract_checklist.md` — verify before Pilot
 
 Not a new design problem — a pointer, so it isn't lost among the items
-above. `docs/ops/api_contract_checklist.md` holds the broker-behaviour
+above. `docs/ops/api_contract_checklist.md` holds the vendor-contract
 assumptions the specs rest on, among them:
 
 - unverified and graded **A**: T-1 (REST/WS tick granularity), T-21 (each
   execution reported under exactly one order number), T-25
   (`AstkExecBaseQty` reflecting same-day executions immediately)
 - measured: T-6
-- retired: T-3, T-7, T-8, T-14, T-15, T-16
+- retired: T-3, T-7, T-8, T-14, T-15, T-16, T-29
 
 Rows are not removed as questions are settled, because that file's Role
 and Constraints forbid deleting rows — a broker change would
@@ -276,81 +278,6 @@ parameter already coexist, which is itself the argument for settling it once.
 
 **`01_entry_detection.md`'s `max_sideways_ratio` is the sharpest instance**:
 its own inline comment reads `# from config` beside the hardcoded default.
-
----
-
-## Deferred DECIMAL type conversion
-
-**Problem.** Ledger quantities, per-share prices and cash amounts are to be
-DECIMAL, and the rules are already decided — `utils.md`'s Ledger Numeric
-Rules and the float boundary rules (V1 and V6 in `trading_api.md`'s Response
-Normalization, V2–V5 in `utils.md`). What remains is applying them to the surface
-that still carries INTEGER or DOUBLE:
-
-- the existing columns of `live_order_requests`, `live_fills`, `live_orders`
-  and `live_positions` (`db_schema.md`); `live_fills.cum_after_qty` is part of
-  its primary key
-- `trade_log`'s price and `predicted_*` columns
-- `live_session_state.session_start_cash`
-- `live_ticker_terms`' `mgnrt` and `order_cost`
-- `experiment_log`'s amount totals
-- `execution_common.md`'s floor computations: position sizing,
-  `check_funds_available()`, the exposure limits, the fill simulator
-- the exit ladder's limit pricing and tick rounding
-- `09_backtest_engine.md`'s Case A cash arithmetic
-
-Retired with it: V3's exception for writes to existing DOUBLE price columns,
-V6's 'number' format, and `trading_api.md`'s integrality assertion for
-INTEGER ledger columns.
-
-Excluded: `corporate_events.value` stays DOUBLE (`utils.md`'s split-ratio
-rule). A ratio such as 1:3 has no exact DECIMAL form, and the rule already
-takes value × ratio and value ÷ ratio in DOUBLE and rounds the result.
-
-Undecided: whether market data and feature tables are included.
-
-**Findings for the next session** (undecided; raised this session):
-
-- Principle raised: DECIMAL applies only where the source value is a decimal
-  value from the broker API; a value whose source is a ratio such as 1:x
-  stays DOUBLE.
-- Under it, these stay on the surface: the existing ledger table columns
-  (`live_positions.entry_mgnrt` included), `session_start_cash`,
-  `live_ticker_terms`' `mgnrt` and `order_cost`, position sizing,
-  `check_funds_available()`, the exposure limits, the exit ladder's limit
-  pricing and tick rounding, and `trade_log`'s `fill_price`, `exit_price`
-  and `weighted_avg_exit_price`.
-- Under it, these leave the surface and stay DOUBLE: `trade_log`'s and
-  `live_orders`' `predicted_*`, the fill simulator's floor computation,
-  `experiment_log`'s amount totals, and `09_backtest_engine.md`'s Case A
-  cash arithmetic, whose deferral would close as DOUBLE.
-- Market data and feature tables, though fetched from the broker's quote
-  endpoints, are proposed to stay DOUBLE — which would settle the Undecided
-  line above. A market value copied into the ledger (`reference_price`) is
-  already converted per V1.
-- Values whose source is a ratio already stay DOUBLE and are not on the
-  surface: split ratios and the factors derived from them, and configured
-  or fitted rates.
-- A restated dividend arrives rounded by its vendor after division, so
-  `utils.dividend_gross_amount()` cannot recover the exact gross. The error
-  lies within the upsert agreement test's tolerance, and no type choice
-  removes it.
-
----
-
-## Fractional-balance sell path
-
-**Problem.** A split or reverse split can leave a fractional balance the
-broker holds rather than settles in cash. Selling it needs fractional
-`requested_qty` / `qty` / `exec_qty` columns, so it waits for the type
-conversion above.
-
-Meanwhile `live_mode_runner.md` records `event_settlement_stalled`
-`kind='fraction_held'` at each Broker Reconcile call and the fraction is
-handled manually.
-
-Needs: `api_contract_checklist.md` T-29 (whether the order API sells a
-fractional balance), and whether IS2 carries fractional quantities.
 
 ---
 

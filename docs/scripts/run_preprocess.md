@@ -105,7 +105,8 @@ pd.DataFrame  # full labeled feature matrix, unsplit
    # keyed on bars_for_ticker["date"].unique() — ALL dates present in this
    # ticker's bars, since entry dates aren't known until scan() runs
    # (narrower than this would be circular). Deliberately separate from
-   # Step 6's ticker_meta (4 fields, keyed on entry dates only, a smaller
+   # Step 6's ticker_meta (market_cap, shares_outstanding, price_52h,
+   # price_52l and sector, keyed on entry dates only, a smaller
    # and cheaper set once entry_points exists) — not unified into one dict.
    scan_meta = {
        date: {
@@ -122,7 +123,9 @@ pd.DataFrame  # full labeled feature matrix, unsplit
    }
    detector.scan(bars_for_ticker, ticker, meta=scan_meta, closes=closes)
 
-3. Save entry_points to DuckDB entry_points table (INSERT OR IGNORE)
+3. Save entry_points to DuckDB entry_points table (INSERT OR IGNORE) —
+   p_entry bound as `Decimal` through V1 into its DECIMAL(18,6) column (V4,
+   utils.md's Numeric Rules)
 
 4. Labeler.label() for all entry points → labeled_samples
        Per ticker/date:
@@ -139,7 +142,8 @@ pd.DataFrame  # full labeled feature matrix, unsplit
         overnight window and passes the whole frame to utils.md's frame forms,
         since a restated dividend's split factor can need rows after D+1)
 
-5. Save labeled_samples to DuckDB labeled_samples table (INSERT OR IGNORE)
+5. Save labeled_samples to DuckDB labeled_samples table (INSERT OR IGNORE) —
+   p_entry bound as `Decimal` through V1, as in step 3
 
 6. FeatureExtractor.extract_batch() for each ticker:
        bars_td   = ohlcv_df filtered to (ticker)
@@ -320,7 +324,7 @@ misc.lookback_bars
   a value passed in from this script. In both, a 'dividend' row's amount is read
   through utils.md's dividend amount function — `dividend_gross_amount()` in
   FeatureExtractor, its frame form `dividend_gross_from_events()` in the
-  Labeler — never from `value` directly
+  Labeler — never from `amount` directly
 - `ticker_meta` (Step 6) is date-keyed, not a flat per-ticker dict — `stock_meta`'s
   schema is `(ticker, date)`-keyed (see V-1 fix); per-field fallback to
   `utils.estimate_historical_meta()` when a field is missing for a given date;
@@ -328,7 +332,8 @@ misc.lookback_bars
 - `scan_meta` (Step 2) is a separate, smaller date-keyed dict (shares_outstanding
   only) built BEFORE entry_points exists, keyed on all dates in the ticker's
   bars — not the same object as `ticker_meta`, which is keyed on entry dates
-  only and includes 3 additional fields; the two are deliberately not unified
+  only and holds market_cap, shares_outstanding, price_52h, price_52l and
+  sector; the two are deliberately not unified
   since entry dates aren't known until after `scan()` returns
 - Ticker rename stitching (Step 6): `get_ticker_history()` returns `None` for the
   vast majority of tickers (no query cost beyond the small `ticker_history` lookup);

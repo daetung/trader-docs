@@ -107,7 +107,7 @@ split_ratio AS (
     SELECT
         d.ticker, d.date,
         COALESCE(
-            EXP(SUM(LN(c.value)) FILTER (
+            EXP(SUM(LN(c.ratio)) FILTER (
                 WHERE c.event_type IN ('split', 'reverse_split')
                   AND c.event_date > d.date AND c.event_date <= s.latest_date
             )),

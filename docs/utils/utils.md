@@ -189,6 +189,7 @@ def track_price_breach(
         entry_anchor_second and derives the index internally —
         execution_common.md.)
         For each bundle: check if high >= tp_target or low <= sl_target.
+        Each breach test is a grid-value decision (Numeric Rules, below).
         Ambiguity: if both thresholds satisfied within the same bundle,
             use ambiguity_priority to break the tie.
         On breach: interpolate price at breach_second; record direction.
@@ -297,7 +298,10 @@ def hour_to_minutes(hour: str) -> int:
 def hour_add_seconds(hour: str, seconds: int) -> str:
     """
     Add seconds to an HHMMSS string. Returns HHMMSS string.
-    Used for t+5s target computation in entry slippage.
+    Used for:
+    - t+5s target computation in entry slippage;
+    - every time computation on a fill-simulation anchor — the entry delay
+      and the cancel_after_seconds window (execution_common.md).
     Example: hour_add_seconds("093000", 5) → "093005"
     Does not handle day rollover (not needed within trading day).
     """
@@ -656,7 +660,8 @@ def populate_trading_calendar(
     What that closes: on reaching the last populated date the daily collection
     raises at get_next_trading_day(), tomorrow's precomputed_session_stats is
     never written, and Health Gate 1a aborts tomorrow's session — the ending
-    health_report.md finding 28 describes. The raise rule on a missing
+    health_report.md finding 28 describes for an evening-job abort
+    (`job='evening'`). The raise rule on a missing
     session_close (below) makes the dependency heavier still.
     A forward row carries is_trading_day, is_holiday, session_close and
     after_hours_end, and has_data=FALSE. That FALSE is correct, not a gap.
@@ -828,7 +833,7 @@ def cum_split_ratio(
     db_conn: duckdb.DuckDBPyConnection,
 ) -> float:
     """
-    Cumulative product of split/reverse_split 'value' in corporate_events for
+    Cumulative product of split/reverse_split 'ratio' in corporate_events for
     this ticker with event_date IN (from_date, to_date]. Returns 1.0 if none
     (the common case — no query cost beyond a small corporate_events lookup,
     since the table itself is small regardless of match).
@@ -854,7 +859,7 @@ def cum_split_ratio(
           fit_execution_params() (shadow_retraining.md)
 
     Query:
-        SELECT ticker, event_date, event_type, value FROM corporate_events
+        SELECT ticker, event_date, event_type, ratio FROM corporate_events
         WHERE ticker = ? AND event_type IN ('split', 'reverse_split')
           AND event_date > ? AND event_date <= ?
         -- the rows split_ratio_from_events() reads; it returns their
@@ -875,7 +880,7 @@ def split_ratio_from_events(
     run_preprocess.md SELECTs it at Step 1 and passes it on to
     05_labeler.md, which never queries DuckDB.
 
-    SOLE OWNER OF THE SPLIT FACTOR RULE: the product of 'value' over this
+    SOLE OWNER OF THE SPLIT FACTOR RULE: the product of 'ratio' over this
     ticker's rows with event_type IN ('split', 'reverse_split') and
     event_date IN (from_date, to_date]; 1.0 if none. cum_split_ratio()
     above delegates here.
@@ -904,8 +909,10 @@ def dividend_gross_amount(
     delegates to dividend_gross_from_events() below, which solely owns the
     rule, so the two entry points cannot diverge.
 
-    EVERY reader of a 'dividend' value reads it through this function or
-    dividend_gross_from_events() — no caller reads corporate_events.value
+    value: the row's `amount` (DECIMAL(18,8)), taken as float at entry.
+
+    EVERY reader of a 'dividend' amount reads it through this function or
+    dividend_gross_from_events() — no caller reads corporate_events.amount
     for a dividend directly.
 
     Gross, before withholding. A cash-flow reader applies
@@ -939,7 +946,8 @@ def dividend_gross_from_events(
 ) -> float:
     """
     The same gross amount from an already-loaded corporate_events frame, for
-    05_labeler.md (see split_ratio_from_events() above). SOLE OWNER OF THE
+    05_labeler.md (see split_ratio_from_events() above). value is the row's
+    `amount`, taken as float at entry. SOLE OWNER OF THE
     RULE:
         value × split_ratio_from_events(ticker, event_date, basis_date, events_df)
             when source is in config corporate_events.dividend_restated_sources
@@ -1391,7 +1399,7 @@ def populate_precomputed_session_stats(
 
         For ticker T, as_of_date D, prior session D-k:
             cum_ratio(D-k) = cum_split_ratio(T, D-k, D, db_conn)
-                             (product of split/reverse_split 'value' with
+                             (product of split/reverse_split 'ratio' with
                              event_date IN (D-k, D]; 1.0 if none — the common
                              case, no additional cost beyond the small
                              corporate_events lookup)
@@ -1412,7 +1420,7 @@ def populate_precomputed_session_stats(
                 gap_pct_mean/std:
                     adjusted_prev_close(D-k) =
                         (raw_prev_close(D-k) - dividend_at(D-k)) / split_at(D-k)
-                        where split_at(D-k) = 'split'/'reverse_split' value
+                        where split_at(D-k) = 'split'/'reverse_split' ratio
                             with event_date=D-k (1.0 if none)
                         dividend_at(D-k) = dividend_gross_amount() of the
                             'dividend' row with event_date=D-k (0.0 if none)
@@ -1736,49 +1744,104 @@ def query_halt_status(
 
 ---
 
-### Ledger Numeric Rules
+### Numeric Rules
 
-Binding on every ledger value — quantities, per-share prices, cash amounts —
-in `live_order_requests`, `live_fills`, `live_orders`, `live_positions`,
-`live_position_adjustments`, the view `live_position_state` and `trade_log`
-(db_schema.md).
+Binding on every numeric value the system stores, computes or decides on.
 
-- **Types:** quantities and per-share prices `DECIMAL(18,6)`; cash amounts
-  and Σ quantity × price `DECIMAL(28,6)`. Ratios and statistics (`pnl_pct`,
-  `slippage_pct`) stay `DOUBLE`.
+- **Ledger values:** quantities, per-share prices and cash amounts in
+  `live_order_requests`, `live_fills`, `live_orders`, `live_positions`,
+  `live_position_adjustments`, the view `live_position_state` and
+  `trade_log` (db_schema.md).
+- **Kinds:**
+  - GRID VALUES — prices, amounts, quantities, broker-reported rates, config
+    values and fitted parameters after V1, and values formed from these by
+    +, −, ×, ÷ (returns, thresholds, totals, quantity × rate);
+  - ESTIMATES — indicator outputs, series statistics, smoothing,
+    interpolation, model outputs.
+- **Types, by source:**
+  - stored `DECIMAL` — values from the broker API (its responses, the JSON
+    dump loading `ohlcv_1min` and `tick_10`, and `bid_ask_snapshots`), and
+    amounts, prices and quantities from yfinance, SEC companyfacts and
+    investing.com;
+  - stored `DOUBLE` — `a:b` split ratios and the factors derived from them;
+  - computed values follow these rules, so `predicted_*`, `pnl_pct`,
+    `slippage_pct`, `experiment_log` totals, `precomputed_session_stats`,
+    `tick_bar_aggregates` and `indicator_cache` stay `DOUBLE`.
+- **Widths** (db_schema.md):
+  - quantities, per-share prices and broker rates `DECIMAL(18,6)`;
+  - cash amounts and Σ quantity × price `DECIMAL(28,6)`;
+  - dividend amounts `DECIMAL(18,8)`.
 - **Rounding:** to 6 decimal places, ties away from zero — DuckDB `CAST` and
   `round`; Python `ROUND_HALF_UP`, never the `Decimal` default.
-- **Multiplication in DuckDB:** one operand is widened to `DECIMAL(38,6)`
-  first — `DECIMAL(18,6) × DECIMAL(18,6)` is `DECIMAL(18,12)` and overflows
-  above six integer digits.
-- **Division:** in Python `Decimal`, then rounded (a split ratio excepted —
-  below); no ledger value is divided in DuckDB, where `DECIMAL ÷ DECIMAL`
-  returns `DOUBLE`.
-- **Split ratio:** `corporate_events.value` stays `DOUBLE`; value × ratio and
-  value ÷ ratio are taken in `DOUBLE` and the result rounded; the ratio
-  itself is not rounded and never enters `Decimal` arithmetic on its own.
-- **Scope:** until the deferred type conversion (open_items.md), the existing
-  columns of `live_order_requests`, `live_fills`, `live_orders` and
-  `live_positions` keep their current types.
+- **Arithmetic:**
+  - ledger values in Python `Decimal`, division in Python `Decimal` then
+    rounded;
+  - elsewhere either kind may be computed in float.
+- **DuckDB `DECIMAL`:**
+  - one multiplication operand is widened to `DECIMAL(38,6)` first —
+    `DECIMAL(18,6) × DECIMAL(18,6)` is `DECIMAL(18,12)` and overflows above
+    six integer digits;
+  - no `DECIMAL` division in DuckDB, where `DECIMAL ÷ DECIMAL` returns
+    `DOUBLE`.
+- **Split ratio:**
+  - `corporate_events.ratio` is `DOUBLE`;
+  - value × ratio and value ÷ ratio are taken in `DOUBLE` and the result
+    rounded;
+  - the ratio itself is not rounded and never enters `Decimal` arithmetic on
+    its own.
+- **Decisions:**
+  - comparison, equality and dedup, floor/ceil/int, and sign on grid values
+    return what `Decimal` evaluation returns, live and offline, float
+    operands entering by V1;
+  - admitted equivalent: grid values compared in float against a threshold
+    computed in `Decimal` and rounded to the 6-decimal grid — up for ≥ and <,
+    down for ≤ and >;
+  - decisions involving an estimate run in float through one implementation
+    shared by live and offline.
+- **Grid-value decision sites** (execution_common.md, 05_labeler.md,
+  09_backtest_engine.md, live_mode_runner.md):
+  - tp/sl breach tests (`track_price_breach()`, live breach_up/breach_dn);
+  - `is_ambiguous`;
+  - the Labeler's pnl label boundaries and data_boundary.md's
+    max_up/max_down thresholds;
+  - `compute_position_size()` and `check_funds_available()` floors and
+    comparisons, BacktestEngine's `DOUBLE` inputs entering by V1;
+  - the fill simulator's `floor(per_tick_vol × rate)` and limit-price gate,
+    its arithmetic float and its output prices passing V1 before any sign
+    decision, pnl or write;
+  - `stitch_ticks()`'s dedup.
+- **Not a grid-value decision site:** the late-entry residual-edge
+  comparison (execution_common.md) involves an estimate and follows the
+  estimate rule above.
 
-**Float boundary rules.** V1 (numbers in) and V6 (order requests out) are
-stated in trading_api.md's Response Normalization; V1 governs every float
-entering `Decimal` arithmetic, a vendor value or not. The rest:
+**Crossings — the float boundary rules.**
+- V1 (numbers in) and V6 (order requests out) are stated in trading_api.md's
+  Response Normalization.
+- V1 governs every float entering `Decimal` arithmetic, a vendor value or
+  not.
+- An estimate or float value entering storage, the ledger or a grid-value
+  decision passes V1.
+
+The rest:
 
 - **V2 — no mixing:** `Decimal` and float are neither combined nor compared;
   a float config value or threshold is converted by V1 first.
-- **V3 — out:** only ratios and statistics leave as float, computed in
-  `Decimal` and converted once. Exceptions: until the deferred type
-  conversion, a write to an existing `DOUBLE` price column (`trade_log`'s
-  price and `predicted_*` columns) converts the rounded `Decimal` at the
-  write; V6's 'number' format.
+- **V3 — out:**
+  - ratios and statistics leave as float, computed in `Decimal` and
+    converted once;
+  - a grid value entering an estimate computation is converted to float
+    once;
+  - exception: V6's 'number' format, whose fate follows
+    api_contract_checklist.md T-32.
 - **V4 — DB write:** `DECIMAL` columns are bound with `Decimal`; a float bind
   is allowed only for the split-ratio results above (value × ratio and
   value ÷ ratio).
-- **V5 — DB read:** a path reading ledger or accounting values is admissible
-  only when a contract test asserts that `DECIMAL` columns arrive as
-  `Decimal`; `fetchall()` is such a path; `.df()` serves analysis and report
-  paths only.
+- **V5 — DB read:**
+  - a path reading ledger or accounting values is admissible only when a
+    contract test asserts that `DECIMAL` columns arrive as `Decimal`;
+    `fetchall()` is such a path;
+  - an analysis read of a `DECIMAL` column takes float through `.df()` or
+    `CAST(... AS DOUBLE)`; `.df()` serves analysis and report paths only.
 
 ---
 
@@ -1886,15 +1949,21 @@ def record_health_event(
 def stitch_ticks(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame:
     """
     Single source of truth for concatenating REST-fetched ticks onto an
-    existing tick buffer/history. Used EVERYWHERE ticks are stitched: WS
-    gap-fill, the WS-dead REST backstop, and warm-restart gap-fill catch-up
-    (see live_mode_runner.md).
+    existing tick buffer/history. Used EVERYWHERE ticks are stitched
+    (live_mode_runner.md's Per-Ticker Tick Buffer):
+    - vendor 10-tick fetches — Watchdog Step 2b's, and a held ticker's in
+      Step 2b form;
+    - the held-ticker 1-tick fetch — a held interval's first fetch, Warm
+      Restart's included, and the poll that serves the WS-dead REST
+      backstop.
 
     TICK IDENTITY RULE (global): two ticks are the SAME only when `hour`
     AND ALL OHLCV fields match. `hour` alone is NOT a key — multiple ticks
     can share one wall-clock second (sub-second events collapse to the same
     `hour`), so deduping on `hour` alone would wrongly drop distinct ticks.
-    Dedup on the full (hour, open, high, low, close, volume) tuple.
+    Dedup on the full (hour, open, high, low, close, volume) tuple, compared
+    in `Decimal` (Numeric Rules, above) — before live broker market data is
+    converted to float for the indicator and feature path.
 
     Known limitation: two genuinely distinct fills that happen to coincide
     on `hour` + OHLCV merge into one. Negligible given 10-tick bundling in
@@ -1911,12 +1980,16 @@ def stitch_ticks(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame
     encodes as groupby(ticker, date, hour).cumcount(). The `if present`
     branch below is therefore PRESENT on the live 1-tick path, and the
     ordinal is a true key there rather than a sort aid.
-    Live buffers hold SEALED bundles and 1-tick rows only. A vendor 10-tick
-    response's terminal bundle is unsealed and its `hour` and OHLCV update
-    with every arriving print, so the same bundle fetched twice does not
-    compare equal under the rule above and both copies survive as a
-    phantom; it is discarded at the source rather than handled here
-    (live_mode_runner.md).
+    UNSEALED-BUNDLE DISCARD RULE — owned here, referenced by every fetching
+    site (live_mode_runner.md):
+    - live buffers hold SEALED bundles and 1-tick rows only;
+    - a vendor 10-tick response's terminal bundle is unsealed: its `hour`
+      and OHLCV update with every arriving print, so the same bundle fetched
+      twice does not compare equal under the rule above and both copies
+      survive as a phantom;
+    - every vendor 10-tick response therefore has its terminal bundle
+      discarded on receipt, before the response is stitched; this function
+      never receives it.
 
     Returns: existing with incoming appended, deduped per the rule above,
     re-sorted by (hour, seq_id) if present.
@@ -2002,7 +2075,7 @@ def stitch_ticks(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame
   term) since dividends don't create the continuous bar-level
   price discontinuity that motivates a full-series bar adjustment
 - `dividend_gross_amount()` and its frame form `dividend_gross_from_events()`
-  are the only readers of a 'dividend' row's `value`; the frame form owns the
+  are the only readers of a 'dividend' row's `amount`; the frame form owns the
   rule, it returns the gross amount in the `event_date` basis, and only
   cash-flow readers apply `corporate_events.dividend_withholding_rate`
 - The split factor is a single rule, with its window as a parameter, owned by
@@ -2012,16 +2085,16 @@ def stitch_ticks(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame
   records it in `regime_holdout_dates`
 - `bootstrap_ci()` is shared by the regime holdout report and the divergence
   trigger; its seed is fixed by config so a rerun reproduces the interval
-- Ledger numeric values follow the Ledger Numeric Rules section above; V1–V5
-  are binding on every path that reads, computes or writes them
+- Numeric values follow the Numeric Rules section above; V1–V5 are binding
+  on every path that reads, computes, decides on or writes them
 - `estimate_historical_meta()` must never be called with `field="sector"` —
   sector has no derivation path; callers use the most recent stock_meta
   snapshot for sector regardless of date
 - `estimate_historical_meta()`'s `shares_outstanding` derivation does not
   capture buyback/issuance activity between quarters — only split-driven
   share-count changes are reversible from `ohlcv_1min` + `corporate_events`;
-  this is a known, accepted limitation (see Open Items: fundamentals history
-  collection) distinct from the corporate-event scale-correction problem this
+  this is a known, accepted limitation, distinct from the corporate-event
+  scale-correction problem this
   session's other changes solve exactly
 - `populate_precomputed_session_stats()`'s corporate-event adjustment (D.) is
   applied to individual per-session raw values BEFORE aggregation into
@@ -2042,6 +2115,7 @@ def stitch_ticks(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame
   per-indicator methods (avg_vol_per_tick(), tpm(), etc.) rather than
   reimplementing their formulas — this is what guarantees a cached
   tick_bar_aggregates value and a freshly-computed one can never diverge
+- `compute_tick_bar_aggregates()` is the sole IndicatorCalculator wrapper
 - `load_tick_bar_aggregates_with_history()`'s Tier 2 (on-the-fly compute)
   result is never written back to `tick_bar_aggregates` — only
   collect_daily.py's offline batch writes that table; Tier 2 existing at all
@@ -2064,9 +2138,7 @@ def stitch_ticks(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame
   live_mode_runner.md's Halt-Status Poller is the sole FETCH owner of that
   source — one side reads a snapshot, the other holds the feed that fills
   it, and no third site does either, for the same single-source-of-truth
-  reason
-  `compute_tick_bar_aggregates()` is the sole IndicatorCalculator wrapper.
-  It is NOT a trading-API endpoint: the dbsec catalogue has none, so this
+  reason. It is NOT a trading-API endpoint: the dbsec catalogue has none, so this
   function sits outside trading_api.md's boundary entirely. The scope is
   LIVE status, not halts as such: metadata_crawler.md's
   `crawl_nyse_halts()` does query a halt source directly, the NYSE page

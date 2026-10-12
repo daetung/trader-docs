@@ -403,7 +403,9 @@ pd.DataFrame(columns=[
     "ticker",    # str
     "date",      # 'YYYYMMDD'
     "hour",      # 'HHMMSS' — t bar open time (NOT t-1 bar)
-    "p_entry",   # float — t bar open price (bars[i+1]["open"] in training)
+    "p_entry",   # float — t bar open price (bars[i+1]["open"] in training);
+                 # stored as entry_points.p_entry DECIMAL(18,6), bound as
+                 # Decimal through V1 (utils.md's Numeric Rules, V4)
 ])
 ```
 

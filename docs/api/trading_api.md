@@ -100,18 +100,23 @@ each loop its own default executor, so `asyncio.to_thread` is separated and
 the demo leg's rate-limit waits cannot starve production's pool — with no SDK
 modification.
 
-**Loop P's executors are partitioned; loop A's are not.** Loop P's DEFAULT
-executor serves the SDK's production REST dispatch, whose threads are held
-for the whole of a rate-limit wait or a retry backoff; it is bounded by the
-rate controller's concurrent in-flight ceiling. A separate CALLER EXECUTOR
-serves caller offload, reached through `run_in_executor(caller_pool, ...)`
-rather than `asyncio.to_thread`, which would land on the default pool; it is
-bounded by the shadow positions resolving in one cycle PLUS the halt-status
-poller's single task. Its consumers are both shadow fill simulations' tick
-scans, entry side and exit side, and that poller, whose concurrency is one
-by construction — its poll interval carries a 60-second floor
-(`live_mode_runner.md`). Loop A is not partitioned — the auxiliary stream is
-its only consumer.
+**Loop P's executors are partitioned; loop A's are not.**
+- Loop P's DEFAULT executor serves the SDK's production REST dispatch, whose
+  threads are held for the whole of a rate-limit wait or a retry backoff; it
+  is bounded by the rate controller's concurrent in-flight ceiling.
+- A separate CALLER EXECUTOR serves caller offload, reached through
+  `run_in_executor(caller_pool, ...)` rather than `asyncio.to_thread`, which
+  would land on the default pool. It is bounded by:
+  - the shadow positions resolving in one cycle;
+  - the held intervals aligning in one cycle;
+  - the halt-status poller's single task.
+
+  Its consumers:
+  - both shadow fill simulations' tick scans, entry side and exit side;
+  - the derived-bundle offset search;
+  - that poller, whose concurrency is one by construction — its poll
+    interval carries a 60-second floor (`live_mode_runner.md`).
+- Loop A is not partitioned — the auxiliary stream is its only consumer.
 
 **How a caller reaches a method here.** This module's methods are coroutines,
 each scheduled on its own leg's loop. A caller that is a coroutine on loop P
@@ -187,7 +192,9 @@ endpoints plus 9 trading endpoints for overseas equities). TPS is the vendor's
 published per-endpoint rate FOR ONE APP — see the sixth note below for what
 two apps make of it. Every consumer is now bounded against these numbers and
 the call-budget open item is closed, so the column is a standing reference for
-future call sites rather than an input to an unresolved allocation.
+future call sites rather than an input to an unresolved allocation. Held-ticker
+1-tick polling is among them, capped per second by
+`live_mode.position_tick_poll_slots` (live_mode_runner.md).
 
 | Need | Call site | Endpoint | TPS |
 |---|---|---|---|
@@ -195,7 +202,7 @@ future call sites rather than an input to an unresolved allocation.
 | Balance and deposit | Step 1b; the funds gate; Broker Reconcile (the query `live_mode.balance_query_mode` selects) | `trading/…/inquiry/balance-margin` | 3 |
 | Per-ticker margin rate and order cost | watchdog first listing, once per ticker per session; and the post-dispatch entry observation | `trading/…/inquiry/able-orderqty` | 2 |
 | Bars, minute OR second resolution | Watchdog Step 2a (prefix scan, rotation window, backfill) | `quote/…/chart/min` | 4 |
-| Ticks | Watchdog Step 2b; Exit Architecture's REST tick backstop (WS-dead only) | `quote/…/chart/tick` | 4 |
+| Ticks | Watchdog Step 2b; held-ticker 1-tick polling (Position Manager Loop); Exit Architecture's REST tick backstop (WS-dead only), served by that polling | `quote/…/chart/tick` | 4 |
 | Bulk price snapshot | `bulk_fetch_today_first_price()` | `quote/…/inquiry/multiprice` | 2 |
 | Level-1 orderbook | the exit ladder; `signal_time_rest` | `quote/…/inquiry/orderbook` | 2 |
 | Order submit, amend, cancel | Step 5c; Position Manager; Shutdown; Broker Reconcile | `trading/…/order` | 10 |
@@ -235,8 +242,8 @@ Six things the table settles that prose had left ambiguous:
   `client.apis.ws_common.ws_session_disconnect()`, so this project does not
   build the call. Its scope is every session for the token's account, so
   recovering one connection resets the other.
-- **The TPS column is per APP, and TWO apps are in use.** `chart/min` and
-  `inquiry/orderbook` return identical data on the demo and production
+- **The TPS column is per APP, and TWO apps are in use.** `chart/min`,
+  `chart/tick` and `inquiry/orderbook` return identical data on the demo and production
   accounts, and each account carries its own allowance at both the app and the
   endpoint tier (measured; that check is retired as
   `api_contract_checklist.md` T-15 — this entry and `sdk_dependency.md`'s
@@ -256,15 +263,21 @@ Six things the table settles that prose had left ambiguous:
 ```
 
   The watchdog scan's slot allocation is written against the doubled
-  `chart/min` figure. Note the buckets with contending consumers: the exit
-  ladder re-quotes round-robin inside `orderbook`'s 4, and `signal_time_rest`
-  preempts it at bar close; inside `chart/min`'s non-reserved half, carryover
-  and promotion share the cap with the bar-close superset-K fetch, which
-  preempts both. Position Manager Loop is no longer among the `chart/min`
-  consumers — its per-position bar fetch went with `bars_since_entry`
-  (live_mode_runner.md). It does draw `chart/tick`: the WS-dead exit backstop,
-  and, at stage `shadow`, the ticker-scoped 1-tick buffer the fill
-  simulations run over.
+  `chart/min` figure. The buckets with contending consumers:
+  - `orderbook`'s 4: the exit ladder re-quotes round-robin inside it, and
+    `signal_time_rest` preempts it at bar close;
+  - `chart/min`'s non-reserved half: carryover and promotion share the cap
+    with the bar-close superset-K fetch, which preempts both;
+  - `chart/tick`'s 8: held-ticker 1-tick polling is capped per second by
+    `live_mode.position_tick_poll_slots`, WS-dead held tickers outside the
+    cap, and Watchdog Step 2b's tick fetch shares the rest, all ordered by
+    the dispatch-priority deadlines below.
+
+  Position Manager Loop is no longer among the `chart/min` consumers — its
+  per-position bar fetch went with `bars_since_entry` (live_mode_runner.md).
+  It does draw `chart/tick`: the ticker-scoped 1-tick buffer of every held
+  ticker, at every stage, whose poll is also the WS-dead exit backstop's and
+  from which the sealed bundles the fill simulators take are derived.
 
 **Leg assignment, and the one rule that decides it.** A `trading/` call is
 scoped to the account that owns the positions and the cash, so it has no
@@ -277,7 +290,14 @@ production leg    all trading/ calls  +  the scan's reserved half
 demo leg          everything else quote/
 ```
 
-Two `quote/` consumers are exceptions and stay on BOTH legs:
+These `quote/` consumers are exceptions and stay on BOTH legs:
+
+- **The `chart/tick` consumers:**
+  - Watchdog Step 2b's tick fetch;
+  - held-ticker 1-tick polling.
+
+  Their budget is the combined 8, the figure
+  `live_mode.position_tick_poll_slots` is sized inside (live_mode_runner.md).
 
 - **The watchdog scan.** Its ~850ms figure is a DERIVED slack target — the
   reserved slot at t=250 plus T-16's measured 400-600ms round trip — and not
@@ -304,6 +324,13 @@ falls out of that:
 | Entry submission | t bar open + `execution.entry_fill_delay_seconds` |
 | Ghost / stuck-order cancel | 60s |
 | Ladder amend | next re-quote |
+| REST tick backstop poll (WS-dead held ticker) | immediate |
+| Held-ticker 1-tick poll, a held interval's first fetch included | the next Position Manager cycle |
+| Watchdog Step 2b tick fetch or a degraded held ticker's vendor 10-tick fetch, bar-close superset member | bar close + `execution.entry_fill_delay_seconds` |
+| Watchdog Step 2b tick fetch or a degraded held ticker's vendor 10-tick fetch, any other ticker | that ticker's next bar close |
+
+Warm Restart's tick fetches complete before the caller loops start, so they
+carry no row.
 
 Slack is `deadline - now - expected RTT`; a request with slack yields to one
 without. This is what lets an entry burst and the scan share the order and
@@ -447,7 +474,7 @@ A blanket "convert what looks numeric" is not available: it would turn
 
 - **CONVERT** — declared with a target type. Prices, amounts and quantities
   become `Decimal` (V1 below), rounded to 6 decimal places per `utils.md`'s
-  Ledger Numeric Rules; order identifiers become strings, this system's canonical
+  Numeric Rules; order identifiers become strings, this system's canonical
   form for an opaque handle; temporal fields are converted per format (below).
 - **PRESERVE** — declared, passed through unchanged: `rsp_cd`, `rsp_msg`,
   `AstkRjtCode`, `AstkRjtRsnCnts`, symbols.
@@ -466,34 +493,40 @@ and parses to its declared target.
 **An empty string maps to `None`, never to `0`.** Per-field semantics for
 `""` are not knowable, `None` propagates as a visible absence while `0.0`
 propagates as a plausible wrong number, and the schema already accepts it
-(`exit_price DOUBLE`; `live_order_requests.price` NULL for a market order). The
+(`trade_log.exit_price`, a nullable `DECIMAL(18,6)`; `live_order_requests.price` NULL for a market order). The
 vendor's own use of `0` as a REAL value settles it: `AstkOrdPrc` is
 documented as `0` for a market order, so conflating `""` with `0` would make
 a market order indistinguishable from an unknown price.
 
-**V1 — numbers in.** A string becomes `Decimal(str)`; a float — a value that
-arrived as a JSON number, or any other float such as a config value or
-threshold — becomes `Decimal(repr(x))`; either is then rounded per
-`utils.md`'s Ledger Numeric Rules. V1 governs every float entering `Decimal`
-arithmetic, not only vendor values. `Decimal(x)` on a float is never used — it carries
-the float's binary error into the ledger. A split ratio is excepted:
-it never enters `Decimal` arithmetic on its own — value × ratio and value ÷
-ratio are taken in `DOUBLE` and the result rounded (`utils.md`'s Ledger
-Numeric Rules); a `DOUBLE` result that then enters `Decimal` arithmetic is
-converted here.
+**V1 — numbers in.**
+- A string becomes `Decimal(str)`; a float — a value that arrived as a JSON
+  number, or any other float such as a config value or threshold — becomes
+  `Decimal(repr(x))`; either is then rounded per `utils.md`'s Numeric Rules.
+- V1 governs every float entering `Decimal` arithmetic, not only vendor
+  values — a simulated fill price written to `live_fills.exec_price` or
+  `trade_log` included.
+- `Decimal(x)` on a float is never used — it carries the float's binary
+  error into the ledger.
+- A split ratio is excepted: it never enters `Decimal` arithmetic on its own
+  — value × ratio and value ÷ ratio are taken in `DOUBLE` and the result
+  rounded (`utils.md`'s Numeric Rules); a `DOUBLE` result that then enters
+  `Decimal` arithmetic is converted here.
 
-**Integrality is asserted only where a quantity is written to an INTEGER
-ledger column** — `live_order_requests` and `live_fills` (`db_schema.md`),
-until the deferred type conversion. A non-integral value there is an ERROR —
-a wrong field mapped, a vendor change, or a parse fault. Balance and
-trade-history quantities (`AstkExecBaseQty`, `AstkTrdQty`, `AstkCrbalQty`)
-accept fractions.
+**Integrality, by where a quantity goes:**
+- written to `live_order_requests` or `live_fills` (`db_schema.md`):
+  integrality is asserted — no order path sends a fractional quantity (V6),
+  so a non-integral value there is an ERROR:
+  - a wrong field mapped;
+  - a vendor change;
+  - a parse fault;
+- balance and trade-history quantities (`AstkExecBaseQty`, `AstkTrdQty`,
+  `AstkCrbalQty`): fractions accepted.
 
 **V6 — order requests out.** A quantity is sent as `int()` of its floor. A
 price is sent per config key `trading.order_numeric_format`, 'number' |
 'string', default 'number': 'number' sends `float()` of the rounded `Decimal`,
 'string' sends its `str()`. The remaining float boundary rules (V2–V5) are
-`utils.md`'s.
+`utils.md`'s Numeric Rules.
 
 **Temporal fields are per-format, and none is an identity conversion.** Four
 vendor forms exist against four schema forms that match none of them
@@ -567,7 +600,9 @@ Applying it:
   layer, whatever re-attempt budget a caller passes
 - Order identity is `(order_date, OrdNo)`, never `OrdNo` alone
 - CONVERT targets for prices, amounts and quantities are `Decimal` (V1); a
-  quantity's integrality is asserted only for an INTEGER ledger column
+  quantity's integrality is asserted where it is written to
+  `live_order_requests` or `live_fills`, no order path sending a fractional
+  quantity
 - Order request quantities are sent as `int()` of their floor; prices per
   `trading.order_numeric_format` (V6)
 - `execution.ws_ticker_limit` must not exceed `DBSecWebSocket._MAX_SUBSCRIPTIONS`

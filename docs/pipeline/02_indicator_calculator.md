@@ -81,6 +81,8 @@ roc(bars, n)
 
 stochastic(bars, n, m)
     → %K = (close - lowest_low_n) / (highest_high_n - lowest_low_n) * 100
+    → %K is NaN where highest_high_n == lowest_low_n (a flat window — see
+      Incremental Computation Rule, I5)
     → %D = SMA(%K, m)
     → default: n=14, m=3
 
@@ -88,6 +90,7 @@ cci(bars, n)
     → Commodity Channel Index
     → CCI = (typical_price - SMA(typical_price, n)) / (0.015 * mean_deviation)
     → typical_price = (high + low + close) / 3
+    → CCI is NaN where mean_deviation == 0 (see Incremental Computation Rule, I5)
     → default: n=20
 
 mfi(bars, n)
@@ -101,6 +104,8 @@ mfi(bars, n)
 bollinger_bands(bars, n, k)
     → upper_band, middle_band (SMA), lower_band
     → pct_b = (close - lower) / (upper - lower)
+    → pct_b is NaN where upper == lower (zero variance — see Incremental
+      Computation Rule, I5)
     → bandwidth = (upper - lower) / middle
     → default: n=20, k=2
 
@@ -133,6 +138,9 @@ ad(bars)
     → Accumulation/Distribution Indicator
     → money_flow_multiplier = ((close - low) - (high - close)) / (high - low)
     → ad = cumsum(money_flow_multiplier * volume)
+    → a flat bar (high == low) or a NaN input (a halt bar included)
+      contributes 0, and ad carries its prior value at that bar (see
+      Incremental Computation Rule, I5)
 
 vwap(bars, reset_mode, regular_start)
     → Volume-Weighted Average Price
@@ -450,6 +458,49 @@ relative_avg_vol_per_tick(bars, ticks, date, n_sessions, delta_minutes,
       volume is normal — e.g. detecting an unusually large-block trade
       pattern even when cumulative volume looks unremarkable.
 ```
+
+---
+
+## Incremental Computation Rule
+
+Applies to:
+- every indicator here that CachingIndicatorCalculator maintains
+  incrementally (`caching_calculator.md`);
+- the batch form of the same indicator.
+
+- **I1 — one defined value.** An incrementally maintained indicator has one
+  defined value: its update step `(state, bar) → state` applied over the
+  series in order, or, for an exact accumulator, the I2 sums.
+  - IndicatorCalculator owns that definition. The update step is a pure
+    function — the state is passed in and returned, never held by this class.
+  - A batch implementation and an incremental implementation, selected by an
+    input parameter, may differ in code. A contract test asserts their outputs
+    are bitwise equal.
+- **I2 — exact accumulators.** Sums, sums of squares and counts over a window
+  or a cumulative range, window add and remove included, are exact:
+  - each term is rounded to the 6-decimal grid by V1 (`trading_api.md`'s
+    Response Normalization; `utils.md`'s Numeric Rules) and summed in
+    `Decimal` or arbitrary-precision integers;
+  - a term already exact — a grid value, a volume, (h+l+c) × v — is not
+    rounded;
+  - a statistic (mean, variance, VWAP) is formed from the exact sums and
+    converted to float once;
+  - a vectorized int64 batch path carries an overflow guard that falls back
+    to arbitrary precision.
+- **I3 — rebased cumulative series.** An unbounded cumulative series (`obv`,
+  `ad`) is rebased by exact subtraction to the first value of the window
+  being vectorized, before conversion to float.
+- **I4 — recursive filters.** A recursive filter on estimates (`ema`, Wilder
+  smoothing, `parabolic_sar`) keeps batch-incremental parity through I1. The
+  difference between training's origin (full history) and live's origin (the
+  `lookback_days` seed) stays bounded by `lookback_days`.
+- **I5 — zero-range denominators and NaN inputs.**
+  - A ratio output whose denominator is a zero range — a flat bar, a flat
+    window, zero variance, zero mean deviation — is NaN: `stochastic`'s %K,
+    `bollinger_bands`' `pct_b`, `cci`.
+  - An accumulator term with a zero-range denominator or a NaN input, a halt
+    bar included, contributes 0, and the accumulator emits its carried value
+    at that bar, in batch and incremental alike.
 
 ---
 
@@ -781,6 +832,14 @@ indicators:
 - No feature extraction or vectorization logic in this file — computation only
 - All window sizes and parameters must be accepted as arguments (not hardcoded)
 - NaN handling: return NaN for warm-up period rows; do not forward-fill silently
+- Incrementally maintained indicators follow the Incremental Computation Rule
+  (I1–I5):
+  - one defined value per indicator;
+  - exact accumulators;
+  - rebased cumulative series;
+  - NaN for a zero-range ratio;
+  - batch and incremental implementations bitwise equal under a contract
+    test
 - `dmi()` must not duplicate the calculation logic of `adx()` — call or delegate internally
 - VWAP reset behavior is controlled by `reset_mode` argument — caller (FeatureExtractor) reads from config and passes explicitly
 - `fibonacci_retracement()` and `pivot_points()` output level values as absolute prices, not distances — distance features are derived in Vectorizer via `level_distance()`
