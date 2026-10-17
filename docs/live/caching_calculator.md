@@ -17,7 +17,8 @@ adds state only via inheritance — the base class interface is preserved.
 **Same inputs, same values.** Caching changes what is recomputed, never what
 is computed: for one bar and one ticker this class returns what
 IndicatorCalculator returns, bitwise, under 02_indicator_calculator.md's
-Incremental Computation Rule (I1–I5). The one admitted divergence is the multi-day
+Incremental Computation Rule (I1–I5b).
+The one admitted divergence is the multi-day
 component of a tick-derived indicator declared `"session-only"`, whose live
 window is today's ticks by declaration — see 02_indicator_calculator.md's
 Live-mode windowing item, which owns that declaration and is the only place a
@@ -207,7 +208,9 @@ def on_bar_close(
         Exact arithmetic (02_indicator_calculator.md's Incremental
         Computation Rule):
         - the running sums and sums of squares are I2 exact accumulators;
-        - a zero-range or NaN-input term follows I5.
+        - a zero-range term follows I5a;
+        - a halt bar and any NaN term follow I5b, NaN-term handling and
+          W2.
 
     For fibonacci (monotonic deque):
         deque.add(new_bar["close"])
@@ -296,10 +299,19 @@ def set_session_stats(self, session_stats: dict) -> None:
 ### `persist_to_db(db_conn, session_date, ticker)`
 
 Serialize and store Layer 1 and Layer 2 to the `indicator_cache` table.
-Called in both `indicator_cache_mode` settings, by each Eager Pool worker as
-soon as it finishes its ticker:
+The table holds, per ticker, the seed computed on the current
+`corporate_events` — the `session_start_compute()` body's result, before
+any of today's bars are replayed.
+Called in both `indicator_cache_mode` settings:
+- by each Eager Pool worker as soon as it finishes its ticker;
+- by a Scoped Mid-Session Recompute's new instance, for its step-1 seed
+  (below);
+- by the In-Process Premarket Recheck for a ticker with no calculator,
+  after re-seeding it (live_mode_runner.md).
+
+The stored rows serve:
 - in either mode, as the R-2 crash-recovery backup;
-- in "db" mode, the table is also the primary runtime store
+- in "db" mode, also as the primary runtime store
   (live_mode_runner.md; db_schema.md's `indicator_cache`).
 
 ```python
@@ -319,7 +331,8 @@ def persist_to_db(
     - "db" mode: the instance may be released from RAM;
     - "memory" mode: it stays the authoritative copy for the running
       session, and the stored rows are read only by a warm restart.
-    Purges prior session_date entries for this ticker before inserting.
+    Purges prior session_date entries for this ticker before inserting, and
+    replaces the ticker's existing rows for the same session_date.
     """
 ```
 
@@ -328,7 +341,9 @@ def persist_to_db(
 Restore Layer 1 and Layer 2 from the `indicator_cache` table.
 Called:
 - in "db" mode, on a ticker's first appearance in the watchdog working set;
-- in either mode, at Warm Restart (live_mode_runner.md's Session Restart
+- in either mode, at Warm Restart, for a ticker whose rows for today are
+  present — a ticker without them is recomputed by
+  `session_start_compute()` alone (live_mode_runner.md's Session Restart
   (Warm Start)).
 
 ```python
@@ -352,8 +367,9 @@ def load_from_db(
         calc.set_session_stats(stats)
         # then replay today's intraday bars via on_bar_close()
 
-    A warm restart restores each ticker through this method in either
-    indicator_cache_mode (live_mode_runner.md).
+    A warm restart restores a ticker through this method in either
+    indicator_cache_mode when today's rows for it are present
+    (live_mode_runner.md).
     """
 ```
 
@@ -448,7 +464,9 @@ def scoped_recompute(
          1 / Layer 2 seeding — exactly as at session start. This is a
          single-ticker full recompute, NOT an on_bar_close() call, so the
          O(1) per-call rule for on_bar_close() (see Constraints) is
-         untouched.
+         untouched. LiveModeRunner persists this step-1 seed through
+         persist_to_db(), replacing the ticker's rows for today's
+         session_date, before step 2.
       2. Replay today's bars so far via on_bar_close() from session start
          to the snapshot's last bar. Reuses the same cheap replay path Watchlist
          Append and Feed Outage Recovery already rely on (on_bar_close()
@@ -488,7 +506,11 @@ def scoped_recompute(
 - Incrementally maintained values follow 02_indicator_calculator.md's
   Incremental Computation Rule:
   - running sums are I2 exact accumulators;
-  - zero-range and NaN-input terms follow I5;
+  - zero-range terms follow I5a;
+  - halt bars and NaN terms follow:
+    - I5b;
+    - NaN-term handling;
+    - W2;
   - the result is bitwise equal to IndicatorCalculator's
 - `sr_levels` is always recomputed fresh in `get_for_entry()` — never stored in Layer 2 cache
 - `gap_pct` is stored as a scalar in Layer 1 after `on_regular_session_open()` — never in Layer 2
@@ -512,9 +534,12 @@ def scoped_recompute(
   is safe as instances share no state; scoped_recompute() runs on a new instance swapped in
   afterwards for the same reason
 - `persist_to_db()` is called in both `indicator_cache_mode` settings, after
-  each Eager Pool worker, as the R-2 crash-recovery backup
+  each Eager Pool worker, as the R-2 crash-recovery backup, and for a
+  recheck re-seed (a Scoped Mid-Session Recompute's step-1 seed, or a
+  ticker with no calculator)
 - `load_from_db()` is called on a ticker's first appearance in "db" mode and
-  at Warm Restart in either mode
+  at Warm Restart in either mode, for a ticker whose rows for today are
+  present
 - `persist_to_db()` does not persist `_session_stats`;
   `load_from_db()` does not restore `_session_stats`
 - After `persist_to_db()`:

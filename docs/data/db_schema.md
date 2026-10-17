@@ -178,13 +178,16 @@ CREATE TABLE IF NOT EXISTS tick_bar_aggregates (
 );
 
 -- Bid/ask auxiliary signal collection (Real-time bid/ask spread open item).
--- Two sources, deliberately not normalized to a common shape — each stores
+-- Sources, deliberately not normalized to a common shape — each stores
 -- only what it actually provides; a source's columns it does not supply
 -- are NULL on its own rows, not zero-filled or derived:
 --   'signal_time_rest'  : fired async, fire-and-forget, at entry-signal
 --                         detection (Watchdog Polling Loop step 5c, before
 --                         gate evaluation — every signal, gated or not,
 --                         real or shadow). Full 5-level book.
+--   'exit_ladder_rest'  : one row per orderbook query of a shadow limit
+--                         exit's ladder (live_mode_runner.md), in the
+--                         'signal_time_rest' column layout.
 --   'ws_tick_piggyback'  : extracted from the same inbound tick handler
 --                         Exit Architecture already processes (2-print
 --                         guard) for a position's live tick subscription —
@@ -213,16 +216,19 @@ CREATE TABLE IF NOT EXISTS bid_ask_snapshots (
                                         -- signal_time_rest capture point's
                                         -- own timestamp source) need no cast
     seq_id          INTEGER NOT NULL,   -- same convention as tick_10
-    source          VARCHAR NOT NULL,   -- 'signal_time_rest' | 'ws_tick_piggyback'
+    source          VARCHAR NOT NULL,   -- 'signal_time_rest' | 'exit_ladder_rest' |
+                                        -- 'ws_tick_piggyback'
 
-    -- 'signal_time_rest' only — 5-level book; NULL on 'ws_tick_piggyback' rows
+    -- 'signal_time_rest' and 'exit_ladder_rest' only — 5-level book; NULL on
+    -- 'ws_tick_piggyback' rows
     bid_price_1 DECIMAL(18,6), bid_price_2 DECIMAL(18,6), bid_price_3 DECIMAL(18,6), bid_price_4 DECIMAL(18,6), bid_price_5 DECIMAL(18,6),
     ask_price_1 DECIMAL(18,6), ask_price_2 DECIMAL(18,6), ask_price_3 DECIMAL(18,6), ask_price_4 DECIMAL(18,6), ask_price_5 DECIMAL(18,6),
     bid_size_1  DECIMAL(18,6), bid_size_2  DECIMAL(18,6), bid_size_3  DECIMAL(18,6), bid_size_4  DECIMAL(18,6), bid_size_5  DECIMAL(18,6),
     ask_size_1  DECIMAL(18,6), ask_size_2  DECIMAL(18,6), ask_size_3  DECIMAL(18,6), ask_size_4  DECIMAL(18,6), ask_size_5  DECIMAL(18,6),
 
-    -- 'ws_tick_piggyback' only; NULL on 'signal_time_rest' rows (there,
-    -- level-1 price is bid_price_1/ask_price_1 above — not duplicated here)
+    -- 'ws_tick_piggyback' only; NULL on 'signal_time_rest' and
+    -- 'exit_ladder_rest' rows (there, level-1 price is bid_price_1/ask_price_1
+    -- above — not duplicated here)
     bid_size_total DECIMAL(18,6),   -- side-total resting size, not tied to one level
     ask_size_total DECIMAL(18,6),
     cum_bid_volume DECIMAL(18,6),   -- session-cumulative, buy-side filled volume
@@ -455,7 +461,8 @@ CREATE TABLE IF NOT EXISTS ticker_data_coverage (
 -- (1) LiveModeRunner's Health Gate 1/2 (live_mode_runner.md) reads this to
 --     detect a stale/failed/still-running upstream batch before trading
 --     starts; (2) DuckDB access-ownership sequencing (P-5): the premarket
---     stage's completion marker gates LiveModeRunner's session start, and
+--     run's rows gate LiveModeRunner's session start (Session Start Gating's
+--     proceed rule; DB File Ownership Windows below), and
 --     LiveModeRunner's own 'live_session_end' row gates the evening stage's
 --     start — see live_mode_runner.md and metadata_crawler.md.
 -- Retention: purge-registry member — date_column `date`, retention_days: inf
@@ -466,14 +473,17 @@ CREATE TABLE IF NOT EXISTS batch_runs (
                                       -- 'premarket_corporate_events' |
                                       -- 'premarket_quarantine_check' |
                                       -- 'premarket_quarantine_recheck' |
+                                      -- 'premarket_recheck_bundle' |
                                       -- 'evening_ingestion' | 'evening_tick_bar_aggregates' |
                                       -- 'evening_session_stats' |
                                       -- 'evening_investing_forward_check' |
                                       -- 'evening_feed_coverage' |
                                       -- 'evening_detection_gap' |
                                       -- 'evening_halt_comparison' |
+                                      -- 'evening_execution_param_fit' |
                                       -- 'evening_retention_purge' |
                                       -- 'evening_backup' |
+                                      -- 'evening_health_report' |
                                       -- 'live_session_start' | 'live_session_end'
     date         VARCHAR   NOT NULL,  -- 'YYYYMMDD' — the trading day this batch targets
     status       VARCHAR   NOT NULL,  -- 'running' | 'success' | 'failed'
@@ -488,21 +498,32 @@ CREATE TABLE IF NOT EXISTS batch_runs (
 -- 'live_session_end'. A today row still 'running' with no
 -- 'live_session_end' row is the crash signature warm-restart detection
 -- keys on — see live_mode_runner.md.
+-- 'premarket_recheck_bundle': written by the In-Process Premarket Recheck's
+-- bundle itself — 'running' at start, 'failed' when its fetches fail,
+-- 'success' once its per-ticker work is complete. Absent or 'running' means
+-- not done; 'success' or 'failed' means done (live_mode_runner.md).
+-- 'evening_execution_param_fit' (the evening run's fit stage) and
+-- 'evening_health_report' (its final step, evening_end) — see
+-- metadata_crawler.md and health_report.md.
 
--- Fitted execution-simulation parameters (buy_rate, sell_rate_tp, sell_rate_sl,
--- sell_rate_neutral, cancel_after_seconds), refit periodically from
--- pilot-stage predicted-vs-actual
--- fill comparisons (see trade_log.predicted_* columns and
+-- Fitted fill rates (buy_rate, sell_rate_tp, sell_rate_sl, sell_rate_neutral),
+-- one per order type, refit periodically from pilot-stage real fills
+-- against eligible tick volume (trade_log's *_eligible_volume columns,
 -- shadow_retraining.md's fit_execution_params()). The `execution:` config
--- block values (execution_common.md) are seed defaults only, used until the
--- first row lands here for a given param_name; BacktestEngine and
--- LiveModeRunner both read the latest row per param_name at session start
--- in preference to the config seed — this table is never written by hand.
+-- block values (execution_common.md) are seed defaults only — one scalar per
+-- rate, shared by every order type — used until the first row lands here for
+-- a (param_name, order_type) pair. get_execution_param() resolves the latest
+-- row per pair once per top-level run — LiveModeRunner's session start,
+-- run_backtest.py's start, pipeline_optimizer's coordinator — in preference to
+-- the config seed, overlaying the in-memory config (execution_common.md);
+-- this table is never written by hand.
 -- Retention: NEVER purged — structurally excluded from the purge registry
 --   (fitted-parameter history).
 CREATE TABLE IF NOT EXISTS execution_params (
     param_name   VARCHAR   NOT NULL,  -- 'buy_rate' | 'sell_rate_tp' | 'sell_rate_sl' |
-                                      -- 'sell_rate_neutral' | 'cancel_after_seconds'
+                                      -- 'sell_rate_neutral'
+    order_type   VARCHAR   NOT NULL,  -- 'market' | 'limit' — the trade's first
+                                      -- request's actual order type
     value        DOUBLE    NOT NULL,
     fitted_at    TIMESTAMP NOT NULL,
     sample_size  INTEGER   NOT NULL,  -- cumulative pilot-stage trade count used —
@@ -512,7 +533,7 @@ CREATE TABLE IF NOT EXISTS execution_params (
     week_start   VARCHAR   NOT NULL,  -- 'YYYYMMDD' — calendar-week this fit run
                                       -- was triggered on (the run cadence, not
                                       -- the data window — see above)
-    PRIMARY KEY (param_name, fitted_at)
+    PRIMARY KEY (param_name, order_type, fitted_at)
 );
 
 -- Corporate events (splits, reverse splits, dividends)
@@ -846,8 +867,10 @@ CREATE TABLE IF NOT EXISTS experiment_log (
     -- NO early-close column here, and the absence is DELIBERATE — recorded so
     -- it is not proposed again. The pair above exists because those switches
     -- vary per RUN and cannot be reconstructed afterwards. Early-close handling
-    -- does not vary per run: live_mode.trade_early_close_days gates LIVE entry
-    -- submission only, and BacktestEngine always replays early-close dates, so
+    -- does not vary per run: live_mode.trade_early_close_days gates the day's
+    -- entry pipeline in live, carried positions being managed by the reduced
+    -- session (live_mode_runner.md), and BacktestEngine always replays
+    -- early-close dates, so
     -- every run treats them identically and there is no variable to record.
     -- Which dates in a run's window were early closes is recoverable at any
     -- time by joining fold_test_start/fold_test_end against trading_calendar,
@@ -860,11 +883,12 @@ CREATE TABLE IF NOT EXISTS experiment_log (
     -- The two backtest: participation-rate switches, recorded per RUN
     -- (09_backtest_engine.md). Recorded as switch state rather than as the
     -- resolved rate values, for three reasons: a rate would place the
-    -- switch back inside get_execution_param()'s resolution chain, which
-    -- the switch exists to bypass; it would scatter one fact across
-    -- buy_rate plus three sell_rate_* slots now that a neutral rate
-    -- exists; and it would be indistinguishable from all four having
-    -- genuinely fitted to 1.0. A run with either set is not comparable to
+    -- switch back among the rates run_backtest.py's get_execution_param()
+    -- resolution overlays on the config (execution_common.md's Rate
+    -- Overlay), which the switch — applied after selection — exists to
+    -- bypass; it would scatter one fact across buy_rate and the sell_rate_*
+    -- rates, per order type; and it would be indistinguishable from every
+    -- rate having genuinely fitted to 1.0. A run with either set is not comparable to
     -- one without, so these columns are what keeps a ranking from being
     -- read outside the state it was produced in
     -- (pipeline_optimizer.md's execution_eval fixes them per run).
@@ -919,7 +943,8 @@ CREATE TABLE IF NOT EXISTS regime_holdout_verdict (
 -- also written by LiveModeRunner at stage 'shadow' — see is_shadow below and
 -- live_mode_runner.md's Position Manager / Watchdog Loop
 -- `stage == "shadow"` branches. Written COMPLETE in a single INSERT: the
--- predicted_* columns are populated at exit completion alongside the real
+-- predicted_* and *_eligible_volume columns are populated at the position's
+-- close transition (live_mode_runner.md's close pending) alongside the real
 -- values, not appended by a session-end update pass)
 -- Retention: NEVER purged — structurally excluded from the purge registry
 --   (the P&L record).
@@ -989,10 +1014,7 @@ CREATE TABLE IF NOT EXISTS trade_log (
                                         --     observation, not omitted from the table.
                                         --     fit_execution_params() reads every row
                                         --     for buy_rate — an entry that ended early
-                                        --     read on the window it actually had — and,
-                                        --     for cancel_after_seconds, only the rows
-                                        --     whose entry logical order ended
-                                        --     terminal_cause='timeout'
+                                        --     read on the window it actually had
                                         --     (shadow_retraining.md).
                                         --   'entry_rejected' (R-7, LIVE-ONLY) — the
                                         --     broker or the account refused the
@@ -1081,12 +1103,12 @@ CREATE TABLE IF NOT EXISTS trade_log (
     requested_quantity      DECIMAL(18,6), -- quantity actually SUBMITTED — i.e. after
                                         -- check_funds_available() sized the order down
                                         -- to fit available cash. Deliberately NOT the
-                                        -- pre-gate sizing output: quantity /
-                                        -- requested_quantity is the fill-rate
-                                        -- denominator fit_execution_params() reads
-                                        -- (shadow_retraining.md), and a funds-driven
-                                        -- reduction must never enter it — only
-                                        -- market-driven shortfall. With full capital
+                                        -- pre-gate sizing output: it decides whether an
+                                        -- order filled in full, which ends
+                                        -- fit_execution_params()'s eligible-volume
+                                        -- window (shadow_retraining.md), and a
+                                        -- funds-driven reduction must never enter that
+                                        -- decision — only market-driven shortfall. With full capital
                                         -- deployment as the intended operating point,
                                         -- the funds gate truncates routinely late in a
                                         -- session, so conflating the two would bias
@@ -1101,24 +1123,31 @@ CREATE TABLE IF NOT EXISTS trade_log (
                                         -- which shadow session (not a real backtest run_id)
     predicted_fill_price              DOUBLE,  -- pilot-stage only: simulate_entry_fill()
                                         -- run counterfactually against the same tick
-                                        -- data as the real fill above, AT EXIT
-                                        -- COMPLETION rather than at session end
-                                        -- (see shadow_retraining.md Stage 2); an entry
+                                        -- data as the real fill above, computed ONCE,
+                                        -- at the position's close transition rather
+                                        -- than at session end, by the batch form over
+                                        -- the REST tape in spans split at the real
+                                        -- request path's changes (live_mode_runner.md;
+                                        -- shadow_retraining.md Stage 2); an entry
                                         -- that ended early is simulated on the window
                                         -- it actually had (shadow_retraining.md). NULL for
                                         -- backtest/shadow rows (no "real" counterpart
                                         -- to predict against) and for scale-stage rows.
                                         -- The former session-end timing existed because
                                         -- the simulator needed tick data that did not
-                                        -- exist yet mid-session; the real-path-parallel
-                                        -- incremental form resolves exactly that, so
-                                        -- settlement IS the moment no further data is
-                                        -- owed. Consequence for writers: a trade_log row
+                                        -- exist yet mid-session; the close transition
+                                        -- waits until the ticker's tape covers the
+                                        -- trade's last second, so no further data is
+                                        -- owed then. Consequence for writers: a trade_log row
                                         -- is written COMPLETE in a single INSERT, not
                                         -- inserted and then updated at session end, and
                                         -- a crash mid-session no longer loses the whole
                                         -- day's predicted_* values.
-    predicted_weighted_avg_exit_price DOUBLE,  -- same, exit side
+    predicted_weighted_avg_exit_price DOUBLE,  -- same, exit side. The exit side is
+                                        -- NULL for an exit_reason other than
+                                        -- take_profit, stop_loss, time_limit and
+                                        -- session_end, for a close completed by an
+                                        -- adjustment, and on an 'entry_canceled' row
     predicted_partial_fills_count     INTEGER, -- same, exit side — diagnostic
                                         -- counterpart to partial_fills_count above.
                                         -- A position carried with an exit logical
@@ -1127,6 +1156,30 @@ CREATE TABLE IF NOT EXISTS trade_log (
                                         -- Session Shutdown, ÷ the split factor from
                                         -- its first request's order_date to the
                                         -- close for the two prices
+    predicted_entry_filled_qty        DECIMAL(18,6), -- the entry and exit
+    predicted_exit_filled_qty         DECIMAL(18,6), --   counterfactuals' simulated
+                                        -- filled quantities, bound with Decimal per
+                                        -- V4. Populated and NULL under the same rules
+                                        -- as their side's predicted price column. A
+                                        -- carried position takes them from its
+                                        -- live_orders values × the split factor from
+                                        -- that order's first request's order_date to
+                                        -- the close.
+    entry_eligible_volume             BIGINT,  -- pilot only: the tick volume after
+    exit_eligible_volume              BIGINT,  --   the anchor on which the real
+                                        -- order could fill, along the real request
+                                        -- path (fit_execution_params()'s Σ Vᵢ,
+                                        -- shadow_retraining.md). Populated and NULL
+                                        -- under the same rules as their side's
+                                        -- predicted price column, computed at the
+                                        -- close transition (at Session Shutdown stage
+                                        -- 1 for a carried position) before the tape's
+                                        -- release, over the same span split as
+                                        -- predicted_*. A carried position takes the
+                                        -- live_orders values × the split factor from
+                                        -- that order's first request's order_date to
+                                        -- the close; the fit reads the live_orders raw
+                                        -- values for a carried position.
     PRIMARY KEY (run_id, ticker, date, entry_bar),
     CHECK ((signal IS NULL) = (entry_bar = -1))
 );
@@ -1382,10 +1435,16 @@ CREATE TABLE IF NOT EXISTS precomputed_session_stats (
 -- restore via load_from_db() instead of recomputing historical_bars; in
 -- "memory" mode the RAM copy stays authoritative for the running session
 -- and this backup is read only on a warm restart.
--- Populated by CachingIndicatorCalculator.persist_to_db() at session_start.
+-- Holds, per ticker, the seed computed on the current corporate_events —
+-- session_start_compute()'s result, before any of today's bars are replayed.
+-- Populated by CachingIndicatorCalculator.persist_to_db(): per Eager-Pool
+-- worker at session_start, and for an In-Process Premarket Recheck re-seed
+-- (caching_calculator.md); persist_to_db() replaces the ticker's rows for the
+-- same session_date.
 -- Loaded per-ticker on its first appearance in the watchdog working set via
 -- load_from_db() ("db" mode), or by a warm restart (any mode — R-2, see
--- live_mode_runner.md).
+-- live_mode_runner.md) for a ticker whose rows for today are present; a
+-- ticker without them is recomputed by session_start_compute() alone.
 -- session_stats are NOT stored here — sourced from precomputed_session_stats separately.
 -- Retention: session-scoped, its own mechanism — NOT in the purge registry.
 -- Current session_date only, purged per ticker inside persist_to_db() at COLD
@@ -1532,9 +1591,12 @@ CREATE TABLE IF NOT EXISTS live_orders (
     predicted_fill_price              DOUBLE,      -- pilot stage, a position carried with
     predicted_weighted_avg_exit_price DOUBLE,      --   this exit order: computed at Session
     predicted_partial_fills_count     INTEGER,     --   Shutdown stage 1 when it cancels the
-                                                   --   order, unless its purpose is
-                                                   --   'overnight_liquidation'. NULL
-                                                   --   elsewhere.
+    predicted_entry_filled_qty        DECIMAL(18,6), -- order, unless its purpose is
+    predicted_exit_filled_qty         DECIMAL(18,6), -- 'overnight_liquidation', exit steps
+    entry_eligible_volume             BIGINT,      --   ending at that cancel instant.
+    exit_eligible_volume              BIGINT,      --   NULL elsewhere. Columns as on
+                                                   --   trade_log, in this order's raw
+                                                   --   basis.
     reference_price            DECIMAL(18,6),      -- exit side: recorded at creation — the
                                                    --   confirming breach tick's price for a
                                                    --   tp/sl order, otherwise the last
@@ -2383,24 +2445,28 @@ CREATE TABLE IF NOT EXISTS live_ticker_terms (
 -- versus the WS entitlement's roughly half of prints) and the algorithm
 -- (utils.track_price_breach() versus the 2-print guard). Nothing measured
 -- either before this table, and the consequence is not benign — Pilot's
--- fit_execution_params() anchors its counterfactual on whatever the LIVE
+-- predicted_* (finding 7) anchor their counterfactual on whatever the LIVE
 -- path detected while backtest anchors on the full tape, so a detection
--- difference is absorbed as a fill-rate difference and mislabelled silently.
--- Three computations over the ONE 1-tick buffer already held at exit
--- completion, so no extra fetch, no extra retention and no new stage:
---   L = what live's exit trigger path actually consumed, 2-print guard.
---       An OBSERVATION, never recomputed. Not WS-scoped: the REST backstop
---       takes over while WS is dead and runs the same guard over the full
---       tape, and those stretches belong to L.
+-- difference is absorbed as a fill difference and mislabelled silently.
+-- The terms below are taken per position, at its close transition, so no
+-- extra fetch, no extra retention and no new stage:
+--   L = the live exit-trigger path's RECORDED firing — a tp/sl exit logical
+--       order's reference_at and reference_price, or the absence of such an
+--       order — not a computation over the tick buffer. Not WS-scoped: the
+--       REST backstop takes over while WS is dead and runs the same guard
+--       over the full tape, and those firings belong to L.
 --   M = complete 1-tick, 2-print guard   -> tape swapped
 --   R = complete 1-tick, track_price_breach() -> backtest equivalent
+--   M and R are computed over the REST portion of the held-ticker tape
+--   (live_mode_runner.md).
 -- L vs M isolates the TAPE term, M vs R the ALGORITHM term, L vs R the
 -- total. M is the only term that makes the split possible.
 -- Cannot be deferred to the evening batch, unlike its entry-side counterpart
 -- evening_detection_gap: L is an observation, and which prints live happened
 -- to receive is not reconstructable from tick_10.
--- Written by LiveModeRunner per settled exit, and for each exit logical order
--- Session Shutdown cancels, from that session's buffer — in both cases except
+-- Written by LiveModeRunner at each position's close transition, and for each
+-- exit logical order Session Shutdown cancels, from that session's tape — in
+-- both cases except
 -- an exit logical order whose purpose is 'overnight_liquidation', which writes
 -- no contribution — deliberately NOT
 -- merged into feed_coverage_daily despite the identical grain and the shared
@@ -2468,8 +2534,9 @@ CREATE TABLE IF NOT EXISTS exit_trigger_agreement_daily (
 -- and finding 29 does too, as do fill_ledger_mismatch, intent_match_ambiguous,
 -- exit_rejection_streak, reconcile_deferred, event_settlement_stalled,
 -- summary_vocabulary_candidate, dividend_withholding_mismatch,
--- regime_holdout_gate_failed, regime_holdout_verdict and
--- tick_alignment_failed.
+-- regime_holdout_gate_failed, regime_holdout_verdict,
+-- tick_alignment_failed, and finding 9's execution_param_fit_rejected and
+-- execution_param_bound_fallback.
 -- Findings 13 and 15 deliberately do NOT: each already writes its own
 -- trade_log row (finding 13: exit_reason='restart_gap_exit'; finding 15:
 -- rows with exit_date > date OR exit_reason='overnight_exit', and
@@ -2538,6 +2605,7 @@ CREATE TABLE IF NOT EXISTS alert_log (
                                          --   'breaker_trip' | 'clock_check_abort' |
                                          --   'bar_close_premise_violation' |
                                          --   'evening_liveness_probe' |
+                                         --   'evening_end' |
                                          --   'log_write_failed' |
                                          --   'db_health_observation'.
                                          --   The last two are NOT paths:
@@ -2606,9 +2674,9 @@ restating it.
 
 | Window | Owning process | Entry condition | Exit condition |
 |---|---|---|---|
-| 04:00 ET– | metadata_crawler `--premarket-open` | cron, then a read-write open succeeding (lock probe, deadline `wait_deadline`) | `stage IN ('premarket_rename','premarket_corporate_events')` status='success' |
-| Session | LiveModeRunner | both markers success, or 05:00 ET wait_deadline reached (degraded start) | RELEASE of the DB connection at shutdown stage 1, which PRECEDES process exit |
-| 21:00 ET– | metadata_crawler evening batch | `stage='live_session_end'` status='success', or a read-write open succeeding (the runner-absent verdict) | `stage='evening_backup'` complete |
+| 04:00 ET– | metadata_crawler `--premarket-open` | cron, then a read-write open succeeding (lock probe, deadline `premarket_wait_deadline`) | `--premarket-open` releasing its connection at process exit |
+| Session | LiveModeRunner | Session Start Gating's proceed rule (live_mode_runner.md): a read-write open succeeding with today's premarket batch_runs rows present, or at or after `premarket_wait_deadline` (degraded start) | RELEASE of the DB connection at shutdown stage 1, which PRECEDES process exit — the Early-Close gate's non-participation exit included |
+| 21:00 ET– | metadata_crawler evening batch | `stage='live_session_end'` status='success', or a read-write open succeeding (the runner-absent verdict) | `stage='evening_health_report'` complete |
 
 While the runner holds the DB connection no separate process may open
 `market.duckdb`, read-only included. That window ends at shutdown stage 1,
@@ -2648,13 +2716,14 @@ ticks = con.execute("""
     ORDER BY hour, seq_id
 """, ["AAPL", "20250714", "093000"]).df()
 
-# Load 10-tick data for entry slippage (100s window, not limited to t bar)
+# Load 10-tick data for the entry tick range: anchor (t bar open +
+# entry_fill_delay_seconds) to anchor + cancel_after_seconds (09_backtest_engine.md)
 ticks_entry = con.execute("""
     SELECT * FROM tick_10
     WHERE ticker = ? AND date = ?
-      AND hour >= ? AND hour < ?
+      AND hour >= ? AND hour <= ?
     ORDER BY hour, seq_id
-""", ["AAPL", "20250714", "093000", "093140"]).df()  -- entry_hour + 100s
+""", ["AAPL", "20250714", "093005", "093035"]).df()  -- anchor + cancel_after_seconds (30)
 
 # Load full-day tick data for exit tracking and partial fill simulation
 ticks_full = con.execute("""
@@ -2785,7 +2854,7 @@ unfilled_rate = con.execute("""
     SELECT
         COUNT(*) FILTER (WHERE unfilled_quantity > 0) AS unfilled_count,
         COUNT(*)                                       AS total_trades,
-        AVG(partial_fills_count)                       AS avg_bundles_to_exit
+        AVG(partial_fills_count)                       AS avg_exit_fill_seconds
     FROM trade_log
     WHERE run_id = ?
 """, ["20250715_143022"]).df()

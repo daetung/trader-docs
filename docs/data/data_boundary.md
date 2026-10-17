@@ -25,7 +25,8 @@ Entry execution: always at t bar open + 5s (next bar after detection fires).
 Rationale:
   - Identical detection logic in training and inference → no train-serve skew
   - t bar real-time values cannot be reproduced from historical 1-min data
-  - Slippage is bounded to t bar open vs t+5s fill price difference only
+  - Slippage is bounded to the difference between t bar open and the
+    weighted-average entry fill price, fills accruing from t+5s
   - Do not change this convention without updating all dependent modules.
 ```
 
@@ -44,7 +45,7 @@ P_entry = open price of the t bar
 | Feature input | NO | t bar is not a fully closed OHLCV bar |
 | Label reference price | YES | Starting point for ±pp threshold calculation |
 | Label search range start | YES | t bar open marks the entry moment |
-| Backtest fill price reference | YES | Compared against t+5s estimated fill |
+| Backtest fill price reference | YES | Compared against the weighted-average entry fill price |
 | Parquet identifier column | YES | Stored alongside ticker/date/hour for BacktestEngine use |
 
 P_entry is stored in parquet files as an identifier column alongside `ticker`, `date`, `hour`.
@@ -141,7 +142,8 @@ adjusted (via a copy) by others; neither utility ever mutates the source table.
 Raw (adjustment forbidden for these consumers — must reflect actual traded values):
     EntryPointDetector (filters operate on actual traded price/volume that day)
     Labeler's same-day breach tracking (track_label_breach, build_effective_bar_sequence)
-    BacktestEngine's fill/exit simulation (find_fill_bundle, simulate_exit_fill)
+    BacktestEngine's fill/exit simulation (simulate_entry_fill, simulate_exit_fill,
+        over synthetic ticks expanded from raw tick_10)
     P_entry — always the literal t bar open price, never adjusted
 
 Note: this is a consumer-level guarantee, not a table-level one. The
@@ -255,7 +257,9 @@ decision (utils.md's Numeric Rules).
 Labeler:        threshold computed relative to P_entry (t bar open price)
                 → measures signal quality independent of execution
 
-BacktestEngine: threshold computed relative to fill_price (P_entry ± slippage)
+BacktestEngine: threshold computed relative to the weighted-average entry fill
+                price (P_entry ± slippage) — running during the entry window,
+                fixed after it
                 → measures realized P&L including execution friction
 
 Consequence:
@@ -399,8 +403,11 @@ Before submitting any module, verify:
 - [ ] 10-tick data used in features is strictly filtered to before t bar open
 - [ ] Labeler uses track_label_breach() with fill_second = t bar open + 5s;
        tracking starts strictly after fill_bundle (fill_bundle excluded)
-- [ ] Backtest entry slippage uses 10-tick data with search window = entry_hour to entry_hour + 100s
-- [ ] Backtest exit slippage uses simulate_exit_fill() from breach bundle onward (full day ticks)
+- [ ] Backtest entry fills use synthetic ticks from 10-tick data over the entry tick range =
+       the anchor to anchor + cancel_after_seconds; no tick in the range → entry_canceled
+- [ ] Backtest exit fills use simulate_exit_fill() over synthetic ticks after the exit anchor
+       (full day ticks): cumulative filled = min(order quantity, floor(rate × cumulative
+       tick volume after the anchor))
 - [ ] REFERENCE_SESSION baselines sourced from precomputed_session_stats — not from bars input
 - [ ] gap_percentile returns NaN for t="093000" or pre-market entries (not an error)
 - [ ] Dead position lookup uses has_data=TRUE filter (not is_trading_day)

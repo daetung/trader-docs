@@ -13,8 +13,13 @@ window it opens no DB and reads the most recent `scope="whole"` record from
 `log_dir/health_report_{today_date}.log`, reporting it with its `ts`.
 Outside it, including the runner's shutdown stage-2 tail, it opens the DB and
 gathers normally. Both modes yield the same findings set.
-**Seven call paths** — two scheduled per session, five event-driven, two of
-the five from outside any session. See Invocation Contract below.
+**Call paths** are the Invocation Contract's rows (below):
+- scheduled:
+  - session start;
+  - session end;
+  - evening end;
+- event-driven — every other row;
+- from outside any session — the rows whose caller is a batch process.
 
 ---
 
@@ -26,10 +31,15 @@ in logs and tables: `batch_runs` status, `ticker_cik_map` suspended count,
 per-run log files. No new infrastructure — everything read here already
 exists for another purpose (see db_schema.md, metadata_crawler.md).
 
-Two scheduled invocations per session: once at session start (reports on the
-overnight/premarket batches feeding into Health Gate 1/2 — see
-live_mode_runner.md), once at session end (reports on the session's own
-inference/trade activity).
+Scheduled invocations:
+- session start — reports on the overnight/premarket batches feeding into
+  Health Gate 1/2 (see live_mode_runner.md);
+- session end — reports on the session's own inference/trade activity;
+- evening end — the evening run's final step, after `evening_backup`,
+  whatever the earlier stages' status:
+  - findings 1 and 4 over that run's stages;
+  - finding 9 when that run's `evening_execution_param_fit` stage executed
+    the fit.
 
 EVENT-DRIVEN invocations fire outside that schedule. These triggers exist:
 - A circuit-breaker trip (R-4) — entries are frozen for the rest of the
@@ -48,6 +58,8 @@ EVENT-DRIVEN invocations fire outside that schedule. These triggers exist:
 - A batch — the evening job or the premarket batch — aborting at its
   lock-probe deadline (finding 28);
 - A failed overnight token refresh (finding 46).
+- LiveModeRunner's Session Start Gating still unable to open the DB at
+  `premarket_wait_deadline` (finding 47).
 
 Findings 11, 28 and 46 run in batch processes (metadata_crawler.md), outside
 any session:
@@ -87,9 +99,25 @@ def gather_findings(db_conn, today_date, log_dir,
     Invocation Contract for which findings need it, and for what happens when
     a subset asks for one of them without it).
 
-    1. batch_runs — status of every stage for today_date; a stage with no
-       row at all (not even 'running') is reported distinctly from a
-       'failed' row.
+    1. batch_runs — status of each stage in the expected set, on that
+       stage's own date. The expected set, by invocation path:
+       - session start: today's --premarket-open stages and the previous
+         trading day's evening_health_report stage; the previous trading
+         day's evening_* stages join only when that evening_health_report
+         row is not 'success' (absent, 'running' or 'failed') — the
+         evening end report's crash test;
+       - session end, breaker trip, clock_check abort: the session-start
+         set plus the runner-written work stages
+         (premarket_quarantine_recheck, premarket_recheck_bundle) whose
+         scheduled instant (live_mode_runner.md) has passed — none on a
+         reduced-session day;
+       - evening liveness probe: today's premarket stages and today's
+         runner-written work stages (none on a reduced-session day), its
+         own run's evening stages excluded;
+       - evening end: that evening run's own stages;
+       - a non-trading day per trading_calendar: empty.
+       A stage of the expected set with no row at all (not even 'running')
+       is reported distinctly from a 'failed' row.
     2. ticker_cik_map — entry-blocked ticker count and detail (rewritten:
        the original `status`/`suspend_reason` columns this finding named
        were removed by N-2's restructure into two independent columns,
@@ -117,11 +145,17 @@ def gather_findings(db_conn, today_date, log_dir,
        Alert threshold: TBD — not yet set (same deferral status as findings
        6 and 7's thresholds below; the rate itself is always computed and
        loggable, only the warn/abort cutoff is undecided).
-    4. metadata_crawler structured logs — parse logs/metadata_crawler_{today_date}.log
-       for SUMMARY lines only (see metadata_crawler.md's Output / Logging).
-       A stage with a batch_runs 'success'/'failed' row but no matching
-       SUMMARY line is flagged as a logging-mismatch finding on its own —
-       distinct from the batch's own status.
+    4. Structured logs — the SUMMARY lines of the work stages carrying a
+       SUMMARY obligation (premarket_*, evening_*, premarket_recheck_bundle;
+       live_session_start and live_session_end are outside this domain).
+       For each such stage of finding 1's expected set, the SUMMARY lines of
+       that stage's own date are collected from
+       logs/metadata_crawler_{date}.log and logs/live_mode_runner_{date}.log
+       and matched to batch_runs rows by stage name (see
+       metadata_crawler.md's Output / Logging). A stage with a batch_runs
+       'success'/'failed' row but no matching SUMMARY line is flagged as a
+       logging-mismatch finding on its own — distinct from the batch's own
+       status.
     5. tick_bar_aggregates Tier-2/3 fallback rate — LiveModeRunner's Health
        Gate 2 result for the current session, not recomputed here (see
        live_mode_runner.md). Read (R-9) from
@@ -175,15 +209,25 @@ def gather_findings(db_conn, today_date, log_dir,
        findings 6/7. Threshold TBD (same deferral status as the rate
        itself always being computed and loggable, only the warn cutoff
        undecided).
-    9. Execution-parameter fit rejections (N-7, pilot stage onward) — count
-       of this week's fit_execution_params() run, per parameter, where a
-       value cleared its sample-size gate but was rejected by the
-       relative-bound check (landed outside
-       [current/fit_rejection_multiplier, current*fit_rejection_multiplier]
-       — see shadow_retraining.md and execution_common.md's
-       fit_rejection_multiplier config). Also includes get_execution_param()
-       hard-bound fallbacks (a stored value outside its mathematically
-       valid range — see execution_common.md), though those should never
+    9. Execution-parameter fit rejections (N-7, pilot stage onward) —
+       counted per (parameter, order type) from health_events:
+       - execution_param_fit_rejected — written by the
+         evening_execution_param_fit stage when a value cleared its
+         sample-size gate but was rejected by the relative-bound check
+         (landed outside
+         [current/fit_rejection_multiplier, current*fit_rejection_multiplier]
+         — see shadow_retraining.md and execution_common.md's
+         fit_rejection_multiplier config); detail {param, order_type,
+         fitted, current};
+       - execution_param_bound_fallback — get_execution_param()'s
+         hard-bound fallback (a stored value outside its mathematically
+         valid range — see execution_common.md), recorded by every
+         resolver holding a read-write DB connection: LiveModeRunner's
+         session-start resolution and the evening_execution_param_fit
+         stage's reads of the current value; detail {param, order_type,
+         stored, seed}. Backtest and optimizer resolutions log a fallback
+         only.
+       Fallbacks should never
        occur under normal operation since the relative-bound check is what
        prevents a bad value from being written in the first place; a
        nonzero count here specifically would point at manual corruption or
@@ -214,6 +258,11 @@ def gather_findings(db_conn, today_date, log_dir,
         guarantee zero residual mismatches. Pooling the sources would hide
         which one drifted, which is the only actionable part. Threshold
         TBD, same deferral status as finding 8's warn cutoff.
+        Source: RESIDUE lines (fields source, items, unmatched) in the
+        file-log format — the halt-status poller writes one per poll to the
+        runner log; crawl_corporate_events_investing() writes one per call
+        to its hosting process's log. Finding 10 sums items and unmatched
+        per source over today_date.
     11. Session end marker missing (R-2) — set when the evening job's
         DuckDB-lock liveness probe (see metadata_crawler.md's "Evening job
         start gate") finds LiveModeRunner dead with no clean shutdown
@@ -308,13 +357,12 @@ def gather_findings(db_conn, today_date, log_dir,
         different reasons and mean different things: the operational ones
         held a real position that was closed for a non-strategy reason,
         while these never opened at all (see db_schema.md's two exclusion
-        families). A rising timeout entry_canceled count points at
-        buy_rate / cancel_after_seconds being too tight and is calibration
-        evidence (fit_execution_params() consumes it); the other count is
-        not a sign of either being too tight — those entries were cut short
-        before cancel_after_seconds could decide them, and
-        fit_execution_params() reads them for buy_rate only, on the window
-        they actually had; a rising entry_rejected count
+        families). A rising timeout entry_canceled count is a
+        cancel_after_seconds policy signal and buy_rate fit evidence
+        (fit_execution_params() consumes it); the other count is neither —
+        those entries were cut short before cancel_after_seconds could
+        decide them, and fit_execution_params() reads them for buy_rate on
+        the window they actually had; a rising entry_rejected count
         points at the account or the broker and is not — it is excluded
         from that calibration (see shadow_retraining.md). The
         entry_rejected tally is broken out by trade_log.reject_reason
@@ -325,7 +373,7 @@ def gather_findings(db_conn, today_date, log_dir,
         that rises with exposure is normal — without the reason there is
         nothing to separate that from a real fault.
     18. Exit order still in flight (R-7) — exit orders whose age exceeds
-        live_mode.exit_order_stuck_minutes without completing, with the
+        execution.exit_order_stuck_minutes without completing, with the
         (ticker, order_date, order_id, age, exit_filled_qty / entry_qty)
         detail. The age is the POSITION's exit-attempt age, measured from
         live_position_state.exiting_since — the earliest created_at among its
@@ -561,8 +609,8 @@ def gather_findings(db_conn, today_date, log_dir,
         deadline and aborted. Detail `job` ∈ 'evening' | 'premarket':
         - 'evening' — the evening batch, at `evening_wait_hard_deadline`
           (metadata_crawler.md's evening job start gate);
-        - 'premarket' — `--premarket-open`, at Session Start Gating's
-          `wait_deadline` (metadata_crawler.md's premarket start gate).
+        - 'premarket' — `--premarket-open`, at `premarket_wait_deadline`
+          (metadata_crawler.md's premarket start gate).
         Severity 'abort'. Needs neither the DB nor any in-memory aggregate,
         which is the point: it fires precisely because the DB could not be
         opened.
@@ -574,8 +622,9 @@ def gather_findings(db_conn, today_date, log_dir,
         - `job='evening'`: tomorrow's Health Gate 1a will abort tomorrow's
           session on missing session stats — the intended fail-safe, reached
           loudly;
-        - `job='premarket'`: the session takes its degraded start
-          (live_mode_runner.md's Session Start Gating).
+        - `job='premarket'`: the runner's start follows Session Start
+          Gating's proceed rule (live_mode_runner.md), Health Gate 1c
+          judging the premarket markers.
 
     29. Watchdog working set empty during the regular session
         (`watchdog_empty_working_set`) — `watchdog.get_candidates()`
@@ -767,14 +816,26 @@ def gather_findings(db_conn, today_date, log_dir,
         Buffer). Source: health_events where
         finding_name='tick_alignment_failed', recorded once per failed held
         interval; detail `{ticker, held_since, reason}`, `reason` ∈
-        'no_overlap' | 'no_unique_offset' | 'later_mismatch'. Level: warn —
-        entries are not blocked.
+        'insufficient_data' | 'no_unique_offset' | 'later_mismatch':
+        - 'insufficient_data' — paging exhausted with the alignment window
+          short of its conditions;
+        - 'no_unique_offset' — recorded after the alignment's retries;
+        - 'later_mismatch' — unchanged.
+        Level: warn — entries are not blocked.
     46. Token refresh failed (`token_refresh_failed`) — the overnight token
         refresh failed for an account (metadata_crawler.md's Overnight Token
         Refresh). Delivered DB-less: the refresh opens no DB connection.
         Detail `{account, attempts, last_error}`. Level: warn — a batch's
         own automatic reissue can still leave a token covering the session,
         and live_mode_runner.md's Token coverage gate is the session's test.
+    47. Session lock wait exceeded (`session_lock_wait_exceeded`) —
+        LiveModeRunner's Session Start Gating open still failing at
+        `premarket_wait_deadline` (live_mode_runner.md), sent once. The
+        runner keeps retrying: its first successful open proceeds per
+        Session Start Gating's proceed rule, and an open still failing at
+        the process hard cap ends the runner without a session. Level:
+        abort — manual intervention requested. Delivered DB-less: no
+        `alert_log` row, the send outcome written to the runner log.
 
     Returns: dict of {finding_name: {severity: 'ok'|'warn'|'abort', detail: ...}}
     """
@@ -879,7 +940,7 @@ def run_health_report(db_conn, today_date, log_dir, config,
                       suppressible: bool = False,
                       alert_key: str | None = None,
                       live_aggregates: dict | None = None) -> None:
-    """See Invocation Contract below for the seven call paths and the
+    """See Invocation Contract below for the call paths — its rows — and the
     argument each one passes. `alert_key` is required when suppressible."""
     findings = gather_findings(db_conn, today_date, log_dir,
                                subset=findings_subset,
@@ -912,12 +973,16 @@ def run_health_report(db_conn, today_date, log_dir, config,
 `dispatched_at` set and `outcome` NULL, or immediately with
 `outcome='suppressed'`.
 
-On a path whose DB axis is "no" — `batch_lock_deadline_abort`,
-`token_refresh_failed`:
+Paths whose DB axis is "no":
+- `batch_lock_deadline_abort`;
+- `token_refresh_failed`;
+- `session_lock_wait_exceeded`.
+
+On such a path:
 - no `alert_log` row is written — `enqueue()` skips the row;
 - the send outcome is written to the `log_dir` log;
-- the process drains delivery (up to `alerting.drain_timeout_seconds`)
-  before it exits.
+- the process drains delivery, up to the path's drain timeout (Shutdown
+  Order and Drain, below), before it exits.
 
 **Delivery itself is asynchronous** — a background worker per channel
 performs the actual send and fills in `completed_at` / `outcome`.
@@ -1010,8 +1075,9 @@ released.
                                           observed a resumption — and a warm
                                           restart resolves it by replay
                                           instead. exit_trigger_agreement_daily
-                                          needs no step here: it is written per
-                                          settled exit, not at shutdown)
+                                          needs no step here: it is written at
+                                          each position's close transition, not
+                                          at shutdown)
 2. gather_findings + write_to_log
 3. dispatch delivery                     (background)
 4. drain, up to alerting.drain_timeout_seconds
@@ -1053,9 +1119,15 @@ Steps 2-4 failing does NOT stop 5-6. Holding the DB open on an alerting
 failure would make the evening batch wait to its own deadline and abort,
 costing two days of operation over an undelivered message.
 
-Path (6)'s drain uses `abort_drain_timeout_seconds` instead: it has already
-asked for manual intervention, so a process lingering an hour afterwards is
-an operational trap.
+Drain timeout, by path:
+- `abort_drain_timeout_seconds` — the paths whose finding requests manual
+  intervention; such a path has already asked for manual intervention, so a
+  process lingering an hour afterwards is an operational trap:
+  - `batch_lock_deadline_abort`, job 'evening' and 'premarket' alike;
+  - `session_lock_wait_exceeded`, whose drain takes place at the runner's
+    give-up exit;
+- `drain_timeout_seconds` — every other path, `token_refresh_failed` and
+  `evening_end` included.
 
 ### Discord
 
@@ -1119,8 +1191,10 @@ across three files and drifted.
 | `clock_check` abort (R-8) | `clock_check_abort` | None | False | yes | yes | — |
 | Negative bar-latency sample | `bar_close_premise_violation` | finding 27 | True | yes | yes | — |
 | Evening liveness probe | `evening_liveness_probe` | DB-only findings | False | yes | yes | — |
+| Scheduled, evening end | `evening_end` | findings 1 and 4 over that evening run's stages; finding 9 when that run's `evening_execution_param_fit` SUMMARY line reports the fit executed | False | yes | yes | — |
 | Batch lock-probe deadline abort | `batch_lock_deadline_abort` | finding 28 | False | **no** | yes | — |
 | Token refresh failure | `token_refresh_failed` | finding 46 | False | **no** | yes | — |
+| Session lock wait exceeded | `session_lock_wait_exceeded` | finding 47 | False | **no** | yes | — |
 
 - A path whose DB column reads **no** writes no `alert_log` row (see the
   delivery rules below).
@@ -1132,6 +1206,25 @@ across three files and drifted.
   suppression key space but has no row above — it passes no
   `findings_subset` because it collects no findings at all (see DB Health
   Observation).
+
+**Evening end** (`evening_end`) is the evening run's final step, after
+`evening_backup`, whatever the earlier stages' status:
+- order: gather → write_to_log → dispatch → drain, up to
+  `alerting.drain_timeout_seconds`;
+- it writes, under `stage='evening_health_report'`, in this order:
+  - its own `batch_runs` row as 'running', at start;
+  - its `SUMMARY` line;
+  - the row as 'success', after the drain;
+- a session start finding the previous trading day's
+  `evening_health_report` row not 'success' also reports that day's
+  evening_* stages; otherwise session start does not read them:
+  - the row counts as not 'success' when it is:
+    - absent;
+    - 'running';
+    - 'failed';
+  - the stages are reported through:
+    - finding 1's rows;
+    - finding 4's `SUMMARY` lines from `metadata_crawler_{that date}.log`.
 
 **Requirement axes — three, not two.** Beyond the DB and `live_aggregates`,
 `gather_findings()` also reads the crawler log FILES under `log_dir`, which
@@ -1148,7 +1241,11 @@ present.
   Every path's entry is `—` for now, including `clock_check_abort`, whose
   former `partial` described exactly the case R-9 removed — an abort before
   Gate 2 now leaves its probe measurements in the DB rather than in memory.
-- **`log_dir` files**: findings 4, 10, and the missing-`SUMMARY` finding.
+- **`log_dir` files** — `logs/metadata_crawler_{date}.log` and
+  `logs/live_mode_runner_{date}.log`:
+  - finding 4;
+  - finding 10;
+  - the missing-`SUMMARY` finding.
   Readable without the DB, which is why the DB-less paths can produce
   anything at all.
 - **DB**: findings 1, 2, 3, 5, 8, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
@@ -1156,11 +1253,17 @@ present.
   read `live_scan_daily`; 33 alone reads a row written by the evening batch
   rather than by the session being reported, so on a session-end call it
   describes the PREVIOUS day.
-- **Neither**: findings 6, 7 (placeholders), 28 and 46.
+- **Neither**:
+  - finding 6 (placeholder);
+  - finding 7 (placeholder);
+  - finding 28;
+  - finding 46;
+  - finding 47.
 - Finding 11 is produced BY the evening liveness probe rather than gathered
   during it — it is that path's own conclusion, not a query result.
 
-**Path (6)'s subset is deliberately wider than finding 11.** That path exists
+**`evening_liveness_probe`'s subset is deliberately wider than finding 11.**
+That path exists
 because the session crashed, which means its scheduled session-end call never
 happened and its findings were never alerted anywhere — and the next
 session-start call reads a different date. Sweeping every DB-computable
@@ -1220,8 +1323,10 @@ alerting:
   drain_timeout_seconds: 600               # normal shutdown: wait for pending
                                            # deliveries. Bounded by the ~50min
                                            # gap to the 21:00 evening batch
-  abort_drain_timeout_seconds: 600         # abort shutdown (evening job
-                                           # deadline abort) — manual
+  abort_drain_timeout_seconds: 600         # paths whose finding requests
+                                           # manual intervention —
+                                           # batch_lock_deadline_abort and
+                                           # session_lock_wait_exceeded —
                                            # intervention is already pending,
                                            # so do not linger
   discord:
@@ -1261,12 +1366,12 @@ alerting:
   added later must declare its own; no fallback is defined, deliberately, so
   that the decision is forced rather than silently inheriting a value sized
   for a different transport. No further channels are planned
-- Suppression applies ONLY to event-driven, single-report deliveries.
-  Scheduled invocations send every finding in one batched message, which
-  suppression's per-`alert_key` model does not address, and at two calls a
-  session they could not reach a rate limit anyway. This is a consequence of
-  the DELIVERY UNIT, not of severity — which is why the `warn`/`ok` entries
-  in `event_alert_suppression` are inert today rather than wrong
+- Suppression applies ONLY to event-driven, single-report deliveries. Scheduled
+  invocations send every finding in one batched message, which suppression's
+  per-`alert_key` model does not address, and at one call per scheduled point
+  they could not reach a rate limit anyway. This is a consequence of the
+  DELIVERY UNIT, not of severity — which is why the `warn`/`ok` entries in
+  `event_alert_suppression` are inert today rather than wrong
 - `write_to_log()` always runs before any delivery attempt; delivery success
   or failure never affects whether findings are logged
 - Delivery is best-effort per channel — a failure on one configured channel
@@ -1308,6 +1413,6 @@ alerting:
 - Finding 9 (execution-parameter fit rejections) has nothing to report
   before Pilot stage produces its first fit_execution_params() run, but
   unlike findings 6/7 has no further threshold to defer once Pilot begins
-  — rejection is a boolean per parameter per week against
+  — rejection is a boolean per (parameter, order type) per week against
   `fit_rejection_multiplier` (already a concrete config value, not TBD),
   not a magnitude needing a warn cutoff decided later.

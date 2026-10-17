@@ -59,9 +59,30 @@ Statements are already written `CREATE TABLE IF NOT EXISTS` (and the one view
 this tool decides or adds.
 
 **When `db_schema.md` changes, `SCHEMA_STATEMENTS` is re-transcribed from it.**
-Re-transcription has now been required TEN times. The most recent occasion is
-the numeric type conversion (utils.md's Numeric Rules), one DDL set decided
-together, adding no table:
+Re-transcription has now been required ELEVEN times. The most recent occasion
+is the fill-simulation record and the per-order-type rates, one DDL set
+decided together, adding no table:
+- `trade_log` (class 2, `ADD COLUMN`): nullable columns, added by
+  `ADD COLUMN` alone:
+  - `predicted_entry_filled_qty` (`DECIMAL(18,6)`);
+  - `predicted_exit_filled_qty` (`DECIMAL(18,6)`);
+  - `entry_eligible_volume` (`BIGINT`);
+  - `exit_eligible_volume` (`BIGINT`).
+- `live_orders` (class 2, `ADD COLUMN`): the same columns.
+- `execution_params` (REBUILD): `order_type` is added and the primary key
+  becomes `(param_name, order_type, fitted_at)` — a primary-key change
+  forces a rebuild. Existing rows:
+  - each rate row — the one value every order type used before the
+    split — is copied into a `'market'` row and a `'limit'` row, keeping:
+    - its `fitted_at`;
+    - its `sample_size`;
+    - its `week_start`;
+  - `'cancel_after_seconds'` rows are not carried over (no longer a
+    `param_name`);
+  - each row not carried over logs a warning.
+
+The occasion before it was the numeric type conversion (utils.md's Numeric
+Rules), one DDL set decided together, adding no table:
 - `ohlcv_1min`, `tick_10` (class 2): open, high, low and close become
   `DECIMAL(18,6)` by `ALTER COLUMN ... SET DATA TYPE`.
 - `bid_ask_snapshots` (class 2): prices, sizes, size totals and cumulative
@@ -72,11 +93,13 @@ together, adding no table:
 - `corporate_events` (REBUILD): `value` is replaced by `ratio DOUBLE`
   (split, reverse_split) and `amount DECIMAL(18,8)` (dividend), with table
   CHECK constraints tying each to `event_type`; each row's `value` moves to
-  the column its `event_type` names. An amount beyond the stored scale logs a
-  warning during the rebuild.
+  the column its `event_type` names. An amount beyond the stored scale is
+  rounded to it per utils.md's Numeric Rules — 8 decimal places for a
+  per-share dividend amount, ties away from zero — and logs a warning during
+  the rebuild.
 - `corporate_event_conflicts` (REBUILD): `kept_value` and `other_value` split
   the same way, into `kept_ratio` / `kept_amount` and `other_ratio` /
-  `other_amount`.
+  `other_amount`, an amount rounded to the stored scale by the same rule.
 - `live_fills` (REBUILD): `cum_after_qty` is a primary-key column; it,
   `exec_qty` and `exec_price` become `DECIMAL(18,6)`.
 - `live_positions` (REBUILD): `entry_mgnrt` is referenced by a table CHECK,

@@ -196,7 +196,9 @@ def crawl_corporate_events_investing(dividends_filter: str, db_conn) -> int:
     this design pass; no longer a naive exact match). Normalization is
     best-effort, not a
     guarantee — health_report.md finding 10 keeps tracking the residual
-    mismatch rate — then writes each row through the shared
+    mismatch rate, from the RESIDUE line this function writes once per call
+    to its hosting process's structured log (Output / Logging) — then
+    writes each row through the shared
     upsert_corporate_event() helper below with source='investing'.
     Does NOT write corporate_events directly: the one-row-per-event
     invariant (see db_schema.md) and the vendor-disagreement handling both
@@ -252,8 +254,9 @@ def upsert_corporate_event(
     The column follows event_type:
     - 'split' / 'reverse_split': `value` is written to `ratio` (DOUBLE);
     - 'dividend': `value` is written to `amount` (DECIMAL(18,8)); an amount
-      carrying more than 8 decimals is rounded to that scale and logs a
-      warning.
+      carrying more than 8 decimals is rounded to that scale per utils.md's
+      Numeric Rules (8 decimal places for a per-share dividend amount, ties
+      away from zero) and logs a warning.
     corporate_event_conflicts records both values the same way — kept_ratio /
     kept_amount, other_ratio / other_amount.
 
@@ -325,9 +328,11 @@ Schedule" below for why they differ:
                                                              # writes batch_runs
                                                              #   stage='premarket_corporate_events'
     3b. crawl_corporate_events_investing("this_week", db_conn) # item N: investing.com
-                                                             # bulk (own db_conn — no
-                                                             # LiveModeRunner running
-                                                             # yet, no write-serialization
+                                                             # bulk (own db_conn —
+                                                             # LiveModeRunner holds no
+                                                             # DB connection before its
+                                                             # ownership window, no
+                                                             # write-serialization
                                                              # concern at this hour)
     4. check_corporate_event_anomaly(db_conn, config, quotes, halt_status)
                                                              # writes batch_runs
@@ -356,12 +361,29 @@ only, cannot open the DB read-write during a live session):
        any ticker newly quarantined in step 2                      # item N
     5. per ticker that gained a new same-day corporate_events row in
        steps 3-4:                                                  # item N
-       - calculator exists → scoped recompute (caching_calculator.md's
-         scoped_recompute()), swap, then clear quarantine_reason if set
-       - no calculator (Step 4b late-start path) → clear quarantine_reason
-         if set at once; Eager Pool computes on the fresh rows
+       once Eager Pool has run — each ticker's write its own transaction
+       under one write_lock hold, issued as that ticker's seed is ready,
+       no batching across tickers:
+       - calculator exists (either indicator_cache_mode) → scoped
+         recompute (caching_calculator.md's scoped_recompute()), its new
+         instance persisting its step-1 seed (replacing that ticker's
+         rows for today's session_date), then the swap at a Watchdog
+         Polling Loop cycle boundary, then clear quarantine_reason if set
+       - no calculator ("db" mode, ticker not yet restored) → the seed is
+         recomputed and persisted, quarantine_reason cleared in the same
+         transaction
+       before Eager Pool has run (Step 4b late-start path) → clear
+       quarantine_reason if set at once; Eager Pool computes on the fresh
+       rows
        # writes through db_write() — this process's own writer, no
        # inter-process coordination (see live_mode_runner.md)
+    The pass is run_premarket_recheck_bundle(), which writes its own
+    batch_runs row, stage='premarket_recheck_bundle': 'running' at start;
+    'failed' when step 1's fetches fail; 'success' once step 5's per-ticker
+    work is complete. check_corporate_event_anomaly() alone writes
+    'premarket_quarantine_recheck', for its own run. A same-day re-run
+    overwrites the existing (stage, date) rows of 'premarket_recheck_bundle'
+    and 'premarket_quarantine_recheck'.
 ```
 
 Both quotes/halt fetches are sequential (not parallel) within themselves.
@@ -793,10 +815,24 @@ downstream reads its output, so a failure here blocks nothing.
 
 ---
 
+## Execution-Parameter Fit (`stage='evening_execution_param_fit'`)
+
+`fit_execution_params()` (shadow_retraining.md) runs as this evening data
+stage, placed before `evening_retention_purge`:
+- evaluated on every evening run, it executes on the calendar week's last
+  trading day, under the Monday-start, >=3-trading-day convention;
+- it writes its `batch_runs` row and its `SUMMARY` line on every evening
+  run — 'success' on a day it does not execute, once that decision is made;
+- the `SUMMARY` line carries an `executed` field, which the evening end
+  report reads to include finding 9 (health_report.md).
+
+---
+
 ## Retention Purge (R-9) — last evening data stage
 
 The last data stage of the evening run, after every other data stage has
-completed; only `evening_backup` (Nightly Backup, below) follows it.
+completed; only `evening_backup` (Nightly Backup, below) and the evening end
+report follow it.
 Driven by an explicit registry — a table absent from it is UNREACHABLE by
 this code, which is the whole point: structural exclusion rather than an
 infinite default means no misconfiguration can delete the training corpus or
@@ -869,10 +905,11 @@ finished file.
 
 ---
 
-## Nightly Backup (`stage='evening_backup'`) — final evening stage
+## Nightly Backup (`stage='evening_backup'`) — last stage before the evening end report
 
-The evening run's final stage, after `evening_retention_purge`, inside the
-evening run's writer connection, run whatever the earlier stages' status:
+The evening run's last stage before the evening end report, after
+`evening_retention_purge`, inside the evening run's writer connection, run
+whatever the earlier stages' status:
 1. `CHECKPOINT`;
 2. confirm no `market.duckdb.wal` file exists;
 3. copy the file to `backup_dir/market_YYYYMMDD.duckdb.partial`;
@@ -895,7 +932,26 @@ evening run ending normally.
   - the copy and its `batch_runs` row take the latest date carrying an
     `evening_*` `batch_runs` row; with none, it exits with an error.
 - Its window is db_schema.md's DB File Ownership Windows: the evening
-  window's exit condition is this stage's completion.
+  window's exit condition is the evening end report's completion (below).
+
+---
+
+## Evening End Report (`stage='evening_health_report'`)
+
+The evening run's final step, after `evening_backup`, run whatever the
+earlier stages' status: health_report.md's `evening_end` path.
+- Covers:
+  - findings 1 and 4 over this run's stages;
+  - finding 9 when this run's `evening_execution_param_fit` stage executed
+    the fit.
+- Order: gather → write_to_log → dispatch → drain, up to
+  `alerting.drain_timeout_seconds`.
+- Writes, in this order:
+  - its own `batch_runs` row as 'running', at start;
+  - its `SUMMARY` line;
+  - the row as 'success', after the drain.
+- A session start finding the previous trading day's row not 'success'
+  also reports that day's evening_* stages (health_report.md's finding 1).
 
 ---
 
@@ -1487,8 +1543,28 @@ text:
 A `SUMMARY` line is written at the end of each stage. Its absence (rather
 than a `failed` count) is `health_report.md`'s signal for an abnormal
 termination, distinct from a high-but-nonzero failure count. Per-ticker
-`INFO`/`WARN` lines are for human debugging; only `SUMMARY` lines are
-parsed by `health_report.md`.
+`INFO`/`WARN` lines are for human debugging; `health_report.md` parses only
+`SUMMARY` and `RESIDUE` lines.
+
+A `RESIDUE` line records one symbol-matching pass's residue for
+`health_report.md`'s finding 10:
+- its fields:
+  - `source`;
+  - `items`;
+  - `unmatched`;
+- `crawl_corporate_events_investing()` writes one per call;
+- LiveModeRunner's halt-status poller writes one per poll, to the runner
+  log.
+
+The structured log is per hosting process:
+- LiveModeRunner owns `logs/live_mode_runner_{date}.log` ({date} = the
+  US-local session date), in this file-log line format; a warm restart
+  appends to that date's file;
+- a function logs into the structured log of the process hosting it, each
+  entry point configuring that log, with no function signature change —
+  in-process, `check_corporate_event_anomaly()`'s and the recheck bundle's
+  `SUMMARY` lines go to the runner log;
+- `tools/*_candidates.log` files stay shared review queues.
 
 ---
 
@@ -1532,8 +1608,8 @@ loop:   # the evening half of db_schema.md's DB file ownership windows
               right fail-safe, now reached noisily instead of silently.
 ```
 This is the DuckDB-ownership-handoff half of P-5's temporal ownership
-design (the other half — LiveModeRunner waiting on the premarket marker
-before opening its own connection — is in live_mode_runner.md's Session
+design (the other half — LiveModeRunner's read-write open attempts,
+proceeding per its proceed rule — is in live_mode_runner.md's Session
 Start Gating). The original reasoning ("don't write while the runner
 might still be writing") is preserved exactly — the loop still only
 proceeds once the lock is free, either via the clean-shutdown marker or
@@ -1542,12 +1618,17 @@ via the lock-probe fallback above.
 **Premarket start gate (lock probe).** `--premarket-open` runs the same lock
 probe before its first DB access:
 1. a read-write open, sleeping and retrying while it fails;
-2. deadline: live_mode_runner.md's Session Start Gating `wait_deadline`;
+2. deadline: `premarket_wait_deadline` (Config Keys, below), the same key
+   Session Start Gating reads;
 3. past it, the run alerts (health_report.md finding 28, `job='premarket'`)
-   and aborts, and the runner's degraded start follows.
+   and aborts, and the runner's start follows Session Start Gating
+   (live_mode_runner.md).
 
-This is the premarket half of db_schema.md's DB File Ownership Windows — its
-04:00 ET row's entry condition is cron, then a read-write open succeeding.
+On success, `--premarket-open` holds that one connection until its process
+exit. This is the premarket half of db_schema.md's DB File Ownership
+Windows, its 04:00 ET row's conditions being:
+- entry: cron, then a read-write open succeeding;
+- exit: that connection's release at process exit.
 
 ```bash
 # Run after the day's JSON dump completes (weekdays only), 21:00 ET — NOT
@@ -1610,6 +1691,14 @@ fmp_api_key: "your_key_here"
 # days of operation (this run aborts, and tomorrow's Health Gate 1a then
 # aborts on missing session stats), so a transient lock must not reach it.
 evening_wait_hard_deadline: "23:30"   # ET
+
+# Premarket lock-probe deadline: --premarket-open's lock probe gives up at
+# it (finding 28, job='premarket'), and LiveModeRunner's Session Start
+# Gating reads it — before it, a successful open with no premarket
+# batch_runs row is closed and retried; at or after it, the session proceeds
+# as a degraded start, and a runner whose open still fails sends finding 47
+# once (live_mode_runner.md).
+premarket_wait_deadline: "05:00"      # ET
 
 # Nightly Backup's destination directory (see "Nightly Backup"). It may be on
 # another mount; off-host replication is the operator's.
@@ -1689,10 +1778,13 @@ quarantine:
   - `stage='evening_feed_coverage'` (Feed Coverage Analysis);
   - `stage='evening_detection_gap'` (Detection-Gap Analysis);
   - `stage='evening_halt_comparison'` (Halt Comparison);
+  - `stage='evening_execution_param_fit'` (Execution-Parameter Fit);
   - `stage='evening_retention_purge'` (Retention Purge, R-9 — the last data
     stage, being the only destructive one);
-  - finally `stage='evening_backup'` (Nightly Backup, run whatever the
-    earlier stages' status).
+  - `stage='evening_backup'` (Nightly Backup, run whatever the earlier
+    stages' status);
+  - finally `stage='evening_health_report'` (Evening End Report, run
+    whatever the earlier stages' status).
 
   Each row is `status='running'` at its own start, `'success'`/`'failed'`
   at its own completion, independent of the others. Each also writes its own
@@ -1733,16 +1825,20 @@ quarantine:
   `crawl_corporate_events_investing()` (item N bulk vendor) → a yfinance
   narrow crawl for any newly-quarantined ticker (item N) → a scoped-recompute
   trigger for tickers that gained a new same-day corporate_events row (item
-  N, caching_calculator.md). Before doing any of its own work, the task
-  checks `batch_runs` for `stage='premarket_corporate_events', date=today`;
-  if `status='running'` (the 04:00 `--premarket-open` process is still
-  mid-crawl), it defers rather than contend — the recheck-vs-04:00 guard is
-  retained unchanged. The recheck-vs-LiveModeRunner-writer contention that
+  N, caching_calculator.md). It cannot run concurrently with a still-running
+  `--premarket-open`:
+  - that process holds the DB's one writer connection until its process
+    exit;
+  - LiveModeRunner holds no connection before its ownership window.
+
+  The recheck-vs-LiveModeRunner-writer contention that
   motivated moving this in-process in the first place is not merely guarded
   against but dissolved outright: all writes go through this process's own
   `db_write()` funnel (see live_mode_runner.md), so there is no second
-  writer to collide with. Writes its own `batch_runs` row:
-  `stage='premarket_quarantine_recheck'`.
+  writer to collide with. `batch_runs` rows:
+  - the bundle's `stage='premarket_recheck_bundle'`;
+  - `check_corporate_event_anomaly()`'s own
+    `stage='premarket_quarantine_recheck'` (09:20 call pattern above).
 - Must be safe to run multiple times on the same date (idempotent) —
   `--premarket-open`'s four internal steps are each independently
   idempotent (`crawl_corporate_events()`'s `upsert_corporate_event()`
@@ -1750,9 +1846,9 @@ quarantine:
   `bulk_fetch_today_first_price()`/`query_halt_status()` are stateless
   reads; `check_corporate_event_anomaly()`'s UPDATE reflects only that
   run's fresh inputs, not an accumulating count) — re-running the whole
-  flag is therefore also safe, though the collision guard above means
-  `--premarket-recheck` specifically does not attempt this concurrently
-  with a still-running `--premarket-open`.
+  flag is therefore also safe, though `--premarket-recheck` cannot run
+  concurrently with a still-running `--premarket-open`, which holds the
+  DB's one writer connection until its process exit (lock exclusivity).
 - Log files (`tools/rename_candidates.log`, `tools/quarantine_candidates.log`,
   `tools/metadata_missing.log`) have no rotation/retention policy specified
   — grow unbounded. Low-cost operational gap, not a correctness one; a

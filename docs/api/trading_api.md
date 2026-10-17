@@ -107,12 +107,10 @@ modification.
 - A separate CALLER EXECUTOR serves caller offload, reached through
   `run_in_executor(caller_pool, ...)` rather than `asyncio.to_thread`, which
   would land on the default pool. It is bounded by:
-  - the shadow positions resolving in one cycle;
   - the held intervals aligning in one cycle;
   - the halt-status poller's single task.
 
   Its consumers:
-  - both shadow fill simulations' tick scans, entry side and exit side;
   - the derived-bundle offset search;
   - that poller, whose concurrency is one by construction — its poll
     interval carries a 60-second floor (`live_mode_runner.md`).
@@ -326,11 +324,14 @@ falls out of that:
 | Ladder amend | next re-quote |
 | REST tick backstop poll (WS-dead held ticker) | immediate |
 | Held-ticker 1-tick poll, a held interval's first fetch included | the next Position Manager cycle |
+| Held ticker's derived-bundle alignment fetch — a 1-tick paging page or a vendor 10-tick fetch, inside `live_mode.position_tick_poll_slots` | the next Position Manager cycle |
+| Close-pending ticker's 1-tick poll, every Position Manager cycle, outside `live_mode.position_tick_poll_slots` | the next Position Manager cycle |
+| Held ticker in the bar-close superset: its 1-tick poll at the first slot after bar close | bar close + `execution.entry_fill_delay_seconds` |
+| Held ticker whose coverage is still incomplete at bar close + `execution.entry_fill_delay_seconds`: one Step 2b-form vendor 10-tick fetch | immediate |
+| Warm Restart recovery fetch of a held ticker — its first fetch, and its alignment fetches while in recovery | immediate |
+| Session Shutdown stage 1 1-tick poll of a ticker with a close-pending position or a carried pilot exit logical order | immediate |
 | Watchdog Step 2b tick fetch or a degraded held ticker's vendor 10-tick fetch, bar-close superset member | bar close + `execution.entry_fill_delay_seconds` |
 | Watchdog Step 2b tick fetch or a degraded held ticker's vendor 10-tick fetch, any other ticker | that ticker's next bar close |
-
-Warm Restart's tick fetches complete before the caller loops start, so they
-carry no row.
 
 Slack is `deadline - now - expected RTT`; a request with slack yields to one
 without. This is what lets an entry burst and the scan share the order and
@@ -396,11 +397,29 @@ that each call site interprets `None` per its own context.
 Returning one page plus a continuation handle would put `cont_key` in a
 caller's hands, and `cont_key` is one of the four things the test names. So
 this module pages until a caller-supplied bound is covered and returns a
-completed set. Bounds are timestamps, upper and lower, so one method serves
-the exit backstop's "newer than last seen", the startup procedure's "from the
-earliest open order's date", and any bounded window; they map onto the
-vendor's own `QrySrtDt`/`QryEndDt`, which are date-only, so sub-day filtering
-is client-side. This is robust to the
+completed set. Bounds are timestamps, upper and lower, so one method serves:
+- the exit backstop's "newer than last seen";
+- the startup procedure's "from the earliest open order's date";
+- any bounded window.
+
+The SDK pages from a start continuation key until the first of the
+following — it has no bound-based stop:
+- the server signals the end;
+- `max_pages`;
+- its own safety cap.
+
+This module therefore implements bounded paging itself:
+- the upper bound is passed as a start continuation key built from (date,
+  HHMMSS, within-second ordinal);
+- pages are requested one at a time (`max_pages=1`), the returned
+  continuation key passed on;
+- paging stops once a page's oldest row reaches the lower bound;
+- page size (`dataCnt`) is a caller argument;
+- `fetch_all()`'s run-to-end form is not used for bounded reads.
+
+For the fill inquiry, the bounds map onto the vendor's own
+`QrySrtDt`/`QryEndDt`, which are date-only, so sub-day filtering there is
+client-side. This is robust to the
 varying page size that was the fill-inquiry open item's central worry — an
 item now closed, its distribution accumulating in `live_scan_daily`'s
 `fill_page_rows_p50`/`_p95` during ordinary operation rather than through a
@@ -449,20 +468,25 @@ before alerting, and the startup procedure resolves every remaining 'intent'
 row at the next start.
 
 **Session-phase order types stay in `execution_common.md`.** Concealment was
-never available: `check_funds_available()` and `simulate_entry_fill()` both
-size against the market-BUY-to-limit conversion, and the latter is
-BacktestEngine's, which never reaches this layer. The two do not size
-IDENTICALLY — `simulate_entry_fill()` cannot read
-`live_mode.market_buy_price_margin` and approximates the conversion from bar
-data, an asymmetry `execution_common.md` states outright and `open_items.md`
-carries — but that sharpens this point rather than weakening it: the backtest
+never available:
+- the session-phase table, implemented by `permitted_order_type()`, decides
+  the order type in every engine;
+- BacktestEngine never reaches this layer.
+
+A market entry fills at tick prices in every engine
+(`execution_common.md`'s Fill Simulation Model); the
+remaining asymmetry is the funds check price — live checks a market entry
+at `ask1 × live_mode.market_buy_price_margin`, backtest at `p_entry`, having
+no book — which `execution_common.md` states outright and `open_items.md`
+carries. That sharpens this point rather than weakening it: the backtest
 side needs these semantics and has no way to obtain them from this layer. The
 boundary test forbids
 leaking vendor REPRESENTATIONS; it does not license hiding vendor SEMANTICS
 with an economic consequence. What this module owns is validation — refusing
-an order type the current session phase does not permit, before it reaches
-the vendor, because letting it through returns an `rsp_cd` the caller would
-have to decode.
+an order type the current session phase does not permit, checked against the
+same session-phase table `permitted_order_type()` implements, before it
+reaches the vendor, because letting it through returns an `rsp_cd` the
+caller would have to decode.
 
 ---
 

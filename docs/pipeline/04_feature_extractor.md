@@ -75,6 +75,7 @@ bars (t-N ... t-1)
     ├─► MissingBarClassifier          (pre-processing step)
     │       classify gaps as halt / no_trade (using halts_df)
     │       forward-fill no_trade bars; keep halt bars as NaN
+    │       (handled per 02_indicator_calculator.md's I5b)
     │       covers all time periods (pre/regular/after-market)
     │       output: cleaned bars + market_structure_features dict
     │
@@ -227,7 +228,8 @@ Strategy D — date당 1회 스칼라 (gap_percentile only):
     no withholding applied — and passed to
     IndicatorCalculator.gap_percentile() — corporate_events is queried here,
     not inside IndicatorCalculator (which remains DB-unaware).
-    NaN for t="093000" or pre-market entries.
+    NaN for t="093000" or pre-market entries, or when the 093000 bar is a
+    halt bar (02_indicator_calculator.md).
     Inserted directly into feature vector as "gap_pct" (no Vectorizer step).
 
 Strategy E — session_stats lookup (REFERENCE_SESSION baselines):
@@ -241,6 +243,8 @@ Strategy E — session_stats lookup (REFERENCE_SESSION baselines):
     tick_bar_aggregates (see db_schema.md, utils.md
     populate_precomputed_session_stats()), not computed from raw ticks at
     this layer.
+    The price_return today series takes prev_close from the latest valid
+    bar (02_indicator_calculator.md's NaN-term handling).
 ```
 
 ---
@@ -623,7 +627,12 @@ They are used by ClassBalancer for pre-balance filtering.
 - `p_entry` must never appear as a feature column
 - `is_monday` and `is_friday` binary columns must NOT be generated
 - Missing bar classification must run before IndicatorCalculator receives bars
-- Halt bars (NaN) propagate naturally into indicator NaN — do not suppress
+- Halt bars (NaN OHLC) follow 02_indicator_calculator.md's Incremental
+  Computation Rule — a halt bar's own indicator output is NaN and is never
+  forward-filled:
+  - I5b;
+  - NaN-term handling;
+  - W2
 - Temporal features use `entry.hour` (t bar open time) as reference — not data leakage
 - Encoding maps (`sector_map`, `day_of_week_map`, `halt_reason_code_map`) loaded via
   `utils.load_encoding_map()` internally — Inferencer does not load or inject maps

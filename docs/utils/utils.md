@@ -97,30 +97,22 @@ for the full spec.
 ### Tick and Price Utilities
 
 ```python
-def find_fill_bundle(
-    ticks: pd.DataFrame,
-    fill_second: str,
-) -> tuple[int, pd.Series | None, pd.Series | None]:
-    """
-    Find the tick bundle containing fill_second.
-    Returns (fill_idx, prev_bundle, fill_bundle).
-
-    fill_bundle: first bundle with hour >= fill_second.
-    prev_bundle: bundle immediately before fill_bundle (None if fill_bundle is first).
-    fill_idx:    iloc index of fill_bundle in ticks DataFrame.
-
-    If no bundle satisfies hour >= fill_second, returns (-1, None, None).
-    """
-    ...
-
-
 def interpolate_bundle_price(
     prev_bundle: pd.Series | None,
     curr_bundle: pd.Series,
-    target_second: str,
+    t_prev: float | None,
+    t_curr: float,
+    t_target: float,
 ) -> float:
     """
-    Estimate the price at target_second within curr_bundle using linear interpolation.
+    Estimate the price at t_target within curr_bundle using linear interpolation.
+
+    Times are continuous — seconds since midnight, float:
+    - expand_synthetic_ticks() (below) passes each bundle's effective end
+      time and the synthetic tick's time;
+    - a caller holding an HHMMSS second s passes s's seconds since midnight
+      (HH × 3600 + MM × 60 + SS) — track_price_breach() does so for bundle
+      hours and breach_second.
 
     Anchors:
         t_prev → prev_bundle.close          (last tick of prev bundle)
@@ -130,16 +122,13 @@ def interpolate_bundle_price(
 
     Formula:
         p_mid  = (curr_bundle.high + curr_bundle.low + curr_bundle.close) / 3
-        t_tgt  = hour_to_int(target_second)
-        t_prev = hour_to_int(prev_bundle.hour)
-        t_curr = hour_to_int(curr_bundle.hour)
         t_mid  = (t_prev + t_curr) / 2
 
-        if t_tgt <= t_mid:
-            ratio = (t_tgt - t_prev) / (t_mid - t_prev)
+        if t_target <= t_mid:
+            ratio = (t_target - t_prev) / (t_mid - t_prev)
             est   = prev_bundle.close + ratio * (p_mid - prev_bundle.close)
         else:
-            ratio = (t_tgt - t_mid) / (t_curr - t_mid)
+            ratio = (t_target - t_mid) / (t_curr - t_mid)
             est   = p_mid + ratio * (curr_bundle.close - p_mid)
 
         est = clamp(est, curr_bundle.low, curr_bundle.high)
@@ -152,12 +141,57 @@ def interpolate_bundle_price(
         est = curr_bundle.close
 
     Args:
-        prev_bundle:   pd.Series of the bundle before curr_bundle; None if not available
-        curr_bundle:   pd.Series of the bundle containing target_second
-        target_second: HHMMSS; must satisfy prev_bundle.hour < target_second <= curr_bundle.hour
+        prev_bundle: pd.Series of the bundle before curr_bundle; None if not available
+        curr_bundle: pd.Series of the bundle containing t_target
+        t_prev:      prev_bundle's time; None when prev_bundle is None
+        t_curr:      curr_bundle's time
+        t_target:    must satisfy t_prev < t_target <= t_curr
 
     Returns:
         Estimated price (float), clamped to [curr_bundle.low, curr_bundle.high]
+    """
+    ...
+
+
+def expand_synthetic_ticks(
+    ticks: pd.DataFrame,
+    halts_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """
+    Expand one (ticker, date)'s tick_10 bundles into synthetic ticks — the
+    tick sequence BacktestEngine's fill simulation and in-window breach
+    evaluation run on (09_backtest_engine.md; execution_common.md's
+    simulate_entry_fill() / simulate_exit_fill()).
+
+    Runs:
+    - a run is a maximal sequence of consecutive bundles sharing one hour h;
+    - a run of k bundles expands to 10k synthetic ticks, its bundles taking
+      them in (hour, seq_id) order, ten each.
+
+    Placement, per run:
+    - interval: [h0 + 1, h + 1), h0 being the hour of the bundle preceding
+      the run on the same date; [h, h + 1) when none precedes it on that
+      date;
+    - only the interval's non-halt time is used (halts_df);
+    - tick j, j = 0 .. 10k − 1, sits where the non-halt time elapsed since
+      the interval start is j·Δ, Δ = the interval's non-halt length / 10k.
+
+    Per synthetic tick:
+    - volume = its bundle's volume / 10;
+    - price = interpolate_bundle_price() over effective times — prev_bundle
+      and t_prev the preceding bundle and its effective end time (None for
+      the date's first bundle), curr_bundle and t_curr the tick's own bundle
+      and its effective end time, t_target the tick's time.
+
+    A bundle's effective end time is its last synthetic tick's time.
+
+    Times are continuous (seconds since midnight, float). Synthetic ticks are
+    compared with HHMMSS seconds by the integer part of their time (Hour
+    String Utilities' second-stamp semantics).
+
+    Returns:
+        synthetic:     pd.DataFrame [time, price, volume], ordered by time
+        effective_end: pd.Series of effective end times, aligned to ticks' index
     """
     ...
 ```
@@ -179,20 +213,24 @@ def track_price_breach(
 ) -> tuple[str | None, float, str, bool]:
     """
     Detect the first tp/sl threshold breach from fill_second onward.
-    Used directly by BacktestEngine (single threshold pair, immediate exit).
+    Callers:
+    - BacktestEngine, after the entry window, fill_price being the entry's
+      fixed weighted-average fill price (single threshold pair, immediate
+      exit; 09_backtest_engine.md) — a breach inside the window is
+      BacktestEngine's own, evaluated on synthetic ticks;
+    - track_label_breach() (below), for the Labeler.
 
     Phase 1 — tick-level scan within t bar:
-        Iterate tick bundles from the entry fill bundle onward, exclusive,
-        within the t bar. (Named by position rather than by
-        `fill_bundle_idx`: that argument no longer exists on
-        simulate_entry_fill(), which now takes a time-valued
-        entry_anchor_second and derives the index internally —
-        execution_common.md.)
+        Iterate tick bundles after the bundle containing fill_second — the
+        first bundle with hour >= fill_second, itself excluded — within the
+        t bar.
         For each bundle: check if high >= tp_target or low <= sl_target.
         Each breach test is a grid-value decision (Numeric Rules, below).
         Ambiguity: if both thresholds satisfied within the same bundle,
             use ambiguity_priority to break the tie.
-        On breach: interpolate price at breach_second; record direction.
+        On breach: interpolate price at breach_second
+            (interpolate_bundle_price(), its times continuous); record
+            direction.
 
     Phase 2 — bar-level scan (t+1 bar onward):
         For each 1-minute bar: check high/low against thresholds.
@@ -275,6 +313,12 @@ spec.
 ### Hour String Utilities
 
 All functions operate on `HHMMSS` format strings (6-digit, zero-padded).
+
+Second-stamp semantics:
+- an HHMMSS second s — a vendor hour or a 1-tick second — denotes the
+  interval [s, s + 1);
+- a continuous time falls in s when its integer part is s's seconds since
+  midnight.
 
 ```python
 def hour_to_int(hour: str) -> int:
@@ -911,6 +955,9 @@ def dividend_gross_amount(
 
     value: the row's `amount` (DECIMAL(18,8)), taken as float at entry.
 
+    Returns a per-share dividend amount (Numeric Rules), rounded to 8
+    decimal places — dividend_gross_from_events()'s result.
+
     EVERY reader of a 'dividend' amount reads it through this function or
     dividend_gross_from_events() — no caller reads corporate_events.amount
     for a dividend directly.
@@ -954,6 +1001,8 @@ def dividend_gross_from_events(
             (default ['yfinance'] — a source that restates past dividends by
             later splits, basis_date being when the value was fetched)
         value otherwise
+    The product is taken in DOUBLE, and the result is rounded to 8 decimal
+    places — a per-share dividend amount (Numeric Rules).
     Gross, before withholding, exactly as dividend_gross_amount() above.
 
     events_df must hold the ticker's split/reverse_split rows through
@@ -1367,6 +1416,8 @@ def populate_precomputed_session_stats(
             Session S is excluded from the average for hour H only.
             count[H] reflects only sessions with non-halt bar at that slot.
             Other hours of session S are unaffected.
+        intra_return_baseline's prev_close at slot H is the close of the
+        latest valid (non-halt) bar before H.
 
     C. Day-level metrics (gap_pct_mean, gap_pct_std), stored at hour='000000':
         gap_pct = (today_regular_open - prev_close) / prev_close
@@ -1385,10 +1436,11 @@ def populate_precomputed_session_stats(
             it was built for.
 
         today_regular_open determination (for each prior session D-k):
-            1. Try D-k 093000 bar open
-            2. If halt or missing: search forward for first non-halt bar
-               in D-k 093000~100000 (earliest HHMMSS with non-NaN open)
-            3. If no non-halt bar found in first 60 minutes: exclude session
+            - D-k's 093000 bar open;
+            - a halt or missing 093000 bar excludes the session — there is
+              no forward search, matching 02_indicator_calculator.md's
+              gap_percentile(), whose today_regular_open is NaN on a halt
+              093000 bar.
 
         Sessions excluded from either determination reduce count.
 
@@ -1426,9 +1478,9 @@ def populate_precomputed_session_stats(
                             'dividend' row with event_date=D-k (0.0 if none)
                     gap_pct(D-k) = (today_regular_open(D-k) - adjusted_prev_close(D-k))
                                    / adjusted_prev_close(D-k)
-                    (applied using the halt-fallback prev_close/today_open
+                    (applied using the prev_close and today_regular_open
                     values already determined in C above — this adjustment is
-                    independent of, and applied after, the halt fallback)
+                    independent of, and applied after, C's determinations)
 
                 buy_ratio_baseline (a ratio, tick-derived): no adjustment needed
                     — scale-invariant, same reasoning as intra_return_baseline.
@@ -1764,15 +1816,32 @@ Binding on every numeric value the system stores, computes or decides on.
     amounts, prices and quantities from yfinance, SEC companyfacts and
     investing.com;
   - stored `DOUBLE` — `a:b` split ratios and the factors derived from them;
-  - computed values follow these rules, so `predicted_*`, `pnl_pct`,
-    `slippage_pct`, `experiment_log` totals, `precomputed_session_stats`,
-    `tick_bar_aggregates` and `indicator_cache` stay `DOUBLE`.
+  - computed values follow these rules, so these stay `DOUBLE`:
+    - the predicted price columns (`predicted_fill_price`,
+      `predicted_weighted_avg_exit_price`);
+    - `pnl_pct`;
+    - `slippage_pct`;
+    - `experiment_log` totals;
+    - `precomputed_session_stats`;
+    - `tick_bar_aggregates`;
+    - `indicator_cache`.
 - **Widths** (db_schema.md):
   - quantities, per-share prices and broker rates `DECIMAL(18,6)`;
   - cash amounts and Σ quantity × price `DECIMAL(28,6)`;
-  - dividend amounts `DECIMAL(18,8)`.
-- **Rounding:** to 6 decimal places, ties away from zero — DuckDB `CAST` and
-  `round`; Python `ROUND_HALF_UP`, never the `Decimal` default.
+  - per-share dividend amounts `DECIMAL(18,8)`.
+- **Rounding:** to the scale of the value's width, ties away from zero —
+  DuckDB `CAST` and `round`; Python `ROUND_HALF_UP`, never the `Decimal`
+  default:
+  - 8 decimal places for a per-share dividend amount;
+  - 6 for every other value.
+- **Per-share dividend amounts:**
+  - `corporate_events.amount`;
+  - `corporate_event_conflicts.kept_amount` and `other_amount`;
+  - the results of `dividend_gross_amount()` and
+    `dividend_gross_from_events()` — value × split ratio taken in `DOUBLE`,
+    rounded to 8;
+  - the per-share net amount in live_mode_runner.md's dividend cash,
+    converted by V1 at 8 decimal places.
 - **Arithmetic:**
   - ledger values in Python `Decimal`, division in Python `Decimal` then
     rounded;
@@ -1806,7 +1875,9 @@ Binding on every numeric value the system stores, computes or decides on.
     max_up/max_down thresholds;
   - `compute_position_size()` and `check_funds_available()` floors and
     comparisons, BacktestEngine's `DOUBLE` inputs entering by V1;
-  - the fill simulator's `floor(per_tick_vol × rate)` and limit-price gate,
+  - the fill simulator's cumulative fill — min(order quantity,
+    floor(rate × cumulative tick volume after the anchor)) — and limit-price
+    gate,
     its arithmetic float and its output prices passing V1 before any sign
     decision, pnl or write;
   - `stitch_ticks()`'s dedup.
@@ -1948,14 +2019,14 @@ def record_health_event(
 ```python
 def stitch_ticks(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame:
     """
-    Single source of truth for concatenating REST-fetched ticks onto an
-    existing tick buffer/history. Used EVERYWHERE ticks are stitched
-    (live_mode_runner.md's Per-Ticker Tick Buffer):
-    - vendor 10-tick fetches — Watchdog Step 2b's, and a held ticker's in
-      Step 2b form;
-    - the held-ticker 1-tick fetch — a held interval's first fetch, Warm
-      Restart's included, and the poll that serves the WS-dead REST
-      backstop.
+    Single source of truth for concatenating REST-fetched vendor 10-tick
+    bundles onto an existing tick buffer/history. Used EVERYWHERE bundles are
+    stitched (live_mode_runner.md's Per-Ticker Tick Buffer): vendor 10-tick
+    fetches — Watchdog Step 2b's, and a held ticker's in Step 2b form.
+
+    Held-ticker REST 1-tick rows are not stitched here: each REST 1-tick
+    poll's response replaces every held row, WS or REST, at or after its
+    requested second (live_mode_runner.md's held-ticker tape).
 
     TICK IDENTITY RULE (global): two ticks are the SAME only when `hour`
     AND ALL OHLCV fields match. `hour` alone is NOT a key — multiple ticks
@@ -1971,15 +2042,14 @@ def stitch_ticks(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame
     same-second, same-price-band activity within one bundle); recorded, not
     engineered around.
 
-    THAT JUSTIFICATION DOES NOT CARRY TO 1-TICK DATA, where a row is one
-    print: same-second, same-price, same-size prints are ordinary rather
-    than implausible, so the limitation would stop being negligible. It
-    does not become a problem, because 1-tick responses carry an
-    INTRA-SECOND ORDINAL — the `nnnn` tail of the vendor's cont_key,
-    `YYYYMMDDHHMMSSnnnn` — which is the same concept `tick_10.seq_id`
-    encodes as groupby(ticker, date, hour).cumcount(). The `if present`
-    branch below is therefore PRESENT on the live 1-tick path, and the
-    ordinal is a true key there rather than a sort aid.
+    1-TICK ROWS ARE OUTSIDE THIS RULE:
+    - 1-tick response rows carry no intra-second ordinal — the `nnnn` tail
+      of the vendor's cont_key, `YYYYMMDDHHMMSSnnnn`, is valid as a query
+      continuation key but does not appear in response rows;
+    - row order within a second is the response's order;
+    - 1-tick identity is handled by the held-ticker tape's interval
+      replacement (above), and the tuple dedup here applies to vendor
+      10-tick bundles.
     UNSEALED-BUNDLE DISCARD RULE — owned here, referenced by every fetching
     site (live_mode_runner.md):
     - live buffers hold SEALED bundles and 1-tick rows only;
@@ -2020,13 +2090,16 @@ def stitch_ticks(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame
   unchanged; only its live call site was removed. (Formerly also called by
   LiveModeRunner's Position Manager Loop.)
 - `stitch_ticks()`'s tick-identity rule (hour + full OHLCV, not hour alone)
-  applies wherever REST ticks are concatenated — see that function above.
-  At 1-tick granularity the rule is completed by the intra-second ordinal
-  rather than weakened: the tuple alone cannot separate two identical
-  same-second prints, which the ordinal does. Only SEALED bundles are ever
+  applies wherever REST vendor 10-tick bundles are concatenated — see that
+  function above. 1-tick rows carry no intra-second ordinal and are not
+  stitched: their identity is handled by the held-ticker tape's interval
+  replacement (live_mode_runner.md). Only SEALED bundles are ever
   stitched — an unsealed terminal bundle mutates between fetches and would
   dedup as two distinct rows
 - `track_label_breach()` is the high-level wrapper for two-stage label detection (Labeler only)
+- `interpolate_bundle_price()`'s times are continuous — seconds since
+  midnight — never `hour_to_int()` values; `expand_synthetic_ticks()` places
+  BacktestEngine's synthetic ticks and prices them through it
 - `generate_run_id()` not called inside parallel workers or sequential fold loops —
   coordinator pre-generates structured run_ids in all optimizer contexts
 - `compute_vol_regime_holdout()` uses regular session bars only
@@ -2035,11 +2108,16 @@ def stitch_ticks(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame
 - `temporal_split_simple()` applies no balancing — training-only utility for early stopping val
 - `populate_precomputed_session_stats()` uses INSERT OR IGNORE — safe to re-run
 - `populate_precomputed_session_stats()` halt handling must be applied per metric type:
-  cumulative metrics include halt bars as volume=0 AND exclude early-close
-  sessions wholesale; per-bar metrics exclude halt slots per hour and need no
-  early-close handling of their own — an early-close session simply supplies no
-  sample past its close, which the existing per-slot count already expresses;
-  gap_pct uses nearest non-halt bar fallback (see function docstring for details)
+  - cumulative metrics include halt bars as volume=0 AND exclude early-close
+    sessions wholesale;
+  - per-bar metrics exclude halt slots per hour and need no early-close
+    handling of their own — an early-close session simply supplies no sample
+    past its close, which the existing per-slot count already expresses;
+  - intra_return_baseline's prev_close is the latest valid bar before the
+    slot;
+  - gap_pct's prev_close uses the latest non-halt bar fallback, while a halt
+    or missing 093000 bar excludes the session (see function docstring for
+    details)
 - `load_session_stats()` → single (ticker, as_of_date) DB query; output `{metric: {hour: value}}`
   (flat, no ticker/date dimension); used for live mode Phase 2 (per-ticker on demand)
 - `build_session_stats_dict()` → bulk conversion of pre-loaded DataFrame;

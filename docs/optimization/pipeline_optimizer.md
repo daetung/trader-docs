@@ -202,6 +202,15 @@ optimizer:
 #### Nested Validation — Outer Fold Loop
 
 ```python
+# Rate resolution, ONCE for the whole optimizer run, here at the coordinator
+# (execution_common.md's get_execution_param()): every (rate, order type)
+# pair is resolved and overlaid on this in-memory `config` before anything
+# below reads it (execution_common.md's Rate Overlay). The config file is
+# never written; the resolved values and their source (fitted_at or seed)
+# are logged, and a bound fallback is logged only. Every apply_overrides()
+# below applies on top of the overlay; workers and Backtesters receive the
+# resolved config, and BacktestEngine does not resolve again.
+
 outer_cfg  = config["class_balancer"]["outer_fold"]
 inner_cfg  = config["class_balancer"]["inner_fold"]
 eta        = config["optimizer"]["successive_halving"]["eta"]
@@ -784,7 +793,7 @@ class PipelineOptimizer:
         execution PARAMETER SETS (entry_gap_type / entry_gap_value,
         exit_ladder_seed, cancel_after_seconds, entry_order_type), and those
         still separate with the participation model disabled — a different
-        limit_price still gates different bundles, a different
+        limit_price still gates different ticks, a different
         cancel_after_seconds still bounds a different consumption window, and
         the time axis and volume-weighted price path are preserved. The
         separation NARROWS rather than vanishes, and that narrowing is the

@@ -77,12 +77,14 @@ rsi(bars, n)
 
 roc(bars, n)
     → Rate of Change: (close - close[n]) / close[n] * 100
+    → close[n] is the latest valid bar at or before position t−n
+      (Incremental Computation Rule, NaN-term handling)
     → default: n=12
 
 stochastic(bars, n, m)
     → %K = (close - lowest_low_n) / (highest_high_n - lowest_low_n) * 100
     → %K is NaN where highest_high_n == lowest_low_n (a flat window — see
-      Incremental Computation Rule, I5)
+      Incremental Computation Rule, I5a)
     → %D = SMA(%K, m)
     → default: n=14, m=3
 
@@ -90,7 +92,7 @@ cci(bars, n)
     → Commodity Channel Index
     → CCI = (typical_price - SMA(typical_price, n)) / (0.015 * mean_deviation)
     → typical_price = (high + low + close) / 3
-    → CCI is NaN where mean_deviation == 0 (see Incremental Computation Rule, I5)
+    → CCI is NaN where mean_deviation == 0 (see Incremental Computation Rule, I5a)
     → default: n=20
 
 mfi(bars, n)
@@ -105,7 +107,7 @@ bollinger_bands(bars, n, k)
     → upper_band, middle_band (SMA), lower_band
     → pct_b = (close - lower) / (upper - lower)
     → pct_b is NaN where upper == lower (zero variance — see Incremental
-      Computation Rule, I5)
+      Computation Rule, I5a)
     → bandwidth = (upper - lower) / middle
     → default: n=20, k=2
 
@@ -138,9 +140,10 @@ ad(bars)
     → Accumulation/Distribution Indicator
     → money_flow_multiplier = ((close - low) - (high - close)) / (high - low)
     → ad = cumsum(money_flow_multiplier * volume)
-    → a flat bar (high == low) or a NaN input (a halt bar included)
-      contributes 0, and ad carries its prior value at that bar (see
-      Incremental Computation Rule, I5)
+    → a flat bar (high == low) contributes 0 and the output at that bar is
+      defined (Incremental Computation Rule, I5a)
+    → a halt bar outputs NaN and the cumulative sum carries over it
+      (Incremental Computation Rule, I5b)
 
 vwap(bars, reset_mode, regular_start)
     → Volume-Weighted Average Price
@@ -172,6 +175,9 @@ pivot_points(bars)
     → "previous session" = previous date's regular session
       (093000~last_bar(previous date)) — PER DATE, so a session following an
       early close reads that day's real range and not a 15:59 that never existed
+    → prev_close = the close of that session's last valid bar; prev_high and
+      prev_low over its valid bars — a session halted through its close
+      reads its last print (Incremental Computation Rule, I5b)
     → output columns: pp, r1, r2, r3, s1, s2, s3 (absolute prices)
     → distance features derived in Vectorizer via level_distance()
 
@@ -225,6 +231,9 @@ sr_levels(bars, n_levels, window_bars)
       nearest_resistance_dist, sr_asymmetry, etc.) are computed by
       Vectorizer.sr_distance() using P_entry per entry point
     → Pad missing levels with NaN if fewer than n_levels extrema found
+    → peaks are detected over the window's valid bars (Incremental
+      Computation Rule, W2); bars_since_rN counts bar positions, and
+      pivot_hour_rN is unchanged
     → default: n_levels=3, window_bars=480 (~2 trading days)
 
     pivot_hour_rN / pivot_hour_sN:
@@ -245,6 +254,10 @@ lee_ready(ticks, bars)
     → Per bar aggregation:
          buyer_initiated_ratio : buyer ticks / total ticks (0~1)
          tick_direction_momentum : EMA of buyer_initiated_ratio over last N bars
+    → a bar with no ticks has a NaN buyer_initiated_ratio, and
+      tick_direction_momentum carries over it (Incremental Computation Rule,
+      NaN-term handling); the zero-tick direction inheritance is per tick
+      and unchanged across a halt
     → default: momentum_n = 5
 
 roll_spread(bars, n)
@@ -252,6 +265,8 @@ roll_spread(bars, n)
     → Uses 1min close prices; computed over rolling window n
     → Output: roll_spread_pct = roll_spread / close  (normalized)
     → If cov > 0 (model breaks down): return NaN
+    → ΔP pairs are taken between consecutive valid bars of the window
+      (Incremental Computation Rule, W2)
     → default: n = 20
 
 hl_spread(bars)
@@ -259,7 +274,12 @@ hl_spread(bars)
     → Uses intraday high/low of each 1min bar
     → spread = 2*(exp(alpha) - 1) / (1 + exp(alpha))
       where alpha derived from rolling 2-bar H/L ratios
+    → the previous bar of the 2-bar pair is the latest valid bar
+      (Incremental Computation Rule, NaN-term handling)
     → Output: hl_spread_pct per bar (normalized by close)
+    → lee_ready()'s bundle direction, hl_spread_pct and roll_spread_pct also
+      feed execution_common.md's exit spread estimator
+      (`execution.exit_spread_estimator`)
 ```
 
 ### Missing Bar Classification
@@ -340,6 +360,11 @@ tick_burstiness(ticks, bars)
     → NULL if fewer than 2 bundles in the bar (no interval exists)
 ```
 
+Halt and no-trade bars (Incremental Computation Rule, I5a/I5b):
+- every tick-derived output is NaN at a halt bar, `tpm` included;
+- a no_trade bar keeps `tpm` = 0, and a ratio whose denominator is 0 there
+  is NaN (I5a).
+
 ---
 
 ## REFERENCE_SESSION Indicators
@@ -380,18 +405,24 @@ rvol(bars, date, n_sessions, session_mode, session_stats)
          "pre":     prior pre-market bars (040000~092900)
          "combined": both
     → output: per-bar ratio series (today session only; prior session bars → NaN)
+    → the cumulative sum carries over a halt bar, whose output is NaN
+      (Incremental Computation Rule, I5b)
     → output column: rvol
 
 rel_dvol(bars, date, n_sessions, session_mode, session_stats)
     → Relative Dollar Volume: same as rvol but using close * volume (dollar volume)
     → baseline = session_stats["rel_dvol_baseline"][T]
       (prior N sessions avg cumulative dollar volume at hour T; precomputed and stored in DB)
+    → the cumulative sum carries over a halt bar, whose output is NaN
+      (Incremental Computation Rule, I5b)
     → output column: rel_dvol
 
 gap_percentile(bars, date, n_sessions, session_stats, dividend_amount)
     → Today's gap = (today_regular_open - adjusted_prev_close) / adjusted_prev_close
-      today_regular_open = open price of 093000 bar
-      prev_close = close price of previous date's last_bar(previous date)
+      today_regular_open = open price of 093000 bar — NaN when that bar
+                   is a halt bar, with no forward search
+      prev_close = close price of the last valid bar in the previous date's
+                   regular session (093000~last_bar(previous date))
                    — PER DATE. last_bar(), never exit_deadline(): this is the
                    session's final print, a data fact, not the exit policy
       adjusted_prev_close = prev_close - dividend_amount
@@ -412,6 +443,7 @@ gap_percentile(bars, date, n_sessions, session_stats, dividend_amount)
     → NaN conditions:
          - t bar = "093000" (today's open = t bar open = P_entry → FORBIDDEN)
          - t < "093000" (pre-market entry; regular session not yet open)
+         - the 093000 bar is a halt bar
          - baseline has insufficient data (count < n_sessions / 2)
     → output: float | NaN  (single scalar per entry point)
 
@@ -420,7 +452,9 @@ intraday_seasonality(indicator_series, date, n_sessions,
     → Normalize a per-bar metric series against its prior-session baseline
       at the same time-of-day (±delta_minutes window)
     → indicator_series: pre-computed metric time series for today's bars
-         (e.g. volume series from bars, tpm series from tpm(), etc.)
+         (e.g. volume series from bars, tpm series from tpm(), etc.);
+         the price_return series takes prev_close from the latest valid bar
+         (Incremental Computation Rule, NaN-term handling)
     → metric: "volume" | "price_return" | "tpm" | "buy_sell_ratio"
          buy_sell_ratio baseline loaded from precomputed_session_stats (tick-derived,
          pre-computed at migration step — not calculated at runtime)
@@ -465,8 +499,12 @@ relative_avg_vol_per_tick(bars, ticks, date, n_sessions, delta_minutes,
 
 Applies to:
 - every indicator here that CachingIndicatorCalculator maintains
-  incrementally (`caching_calculator.md`);
-- the batch form of the same indicator.
+  incrementally (`caching_calculator.md`), and the batch form of the same
+  indicator, for I1–I4 and I5a;
+- every bar-input indicator in this file, for:
+  - I5b;
+  - NaN-term handling;
+  - W2.
 
 - **I1 — one defined value.** An incrementally maintained indicator has one
   defined value: its update step `(state, bar) → state` applied over the
@@ -488,19 +526,52 @@ Applies to:
   - a vectorized int64 batch path carries an overflow guard that falls back
     to arbitrary precision.
 - **I3 — rebased cumulative series.** An unbounded cumulative series (`obv`,
-  `ad`) is rebased by exact subtraction to the first value of the window
-  being vectorized, before conversion to float.
+  `ad`) is rebased by exact subtraction to the first non-NaN value of the
+  window being vectorized, before conversion to float.
 - **I4 — recursive filters.** A recursive filter on estimates (`ema`, Wilder
   smoothing, `parabolic_sar`) keeps batch-incremental parity through I1. The
   difference between training's origin (full history) and live's origin (the
   `lookback_days` seed) stays bounded by `lookback_days`.
-- **I5 — zero-range denominators and NaN inputs.**
+- **I5a — zero-range denominators.**
   - A ratio output whose denominator is a zero range — a flat bar, a flat
     window, zero variance, zero mean deviation — is NaN: `stochastic`'s %K,
     `bollinger_bands`' `pct_b`, `cci`.
-  - An accumulator term with a zero-range denominator or a NaN input, a halt
-    bar included, contributes 0, and the accumulator emits its carried value
-    at that bar, in batch and incremental alike.
+  - An accumulator term with a zero-range denominator — `ad`'s flat bar —
+    contributes 0, and the output at that bar is defined.
+- **I5b — halt bars.**
+  - A halt bar is identified by NaN OHLC after Missing Bar Classification's
+    filling.
+  - Every term reading a halt bar is a NaN term — its volume term and its
+    tick-derived terms included, the filled volume of 0 being no
+    observation.
+  - The halt bar's own output is NaN.
+- **NaN-term handling**, whatever the NaN's origin:
+  - the origins covered:
+    - I5a;
+    - I5b;
+    - a no-tick bar's 0/0 ratio;
+  - cumulative and recursive state is carried unchanged over a NaN term;
+  - a lag-k reference is the latest valid bar at or before position t−k:
+    - previous close;
+    - previous high/low;
+    - `close[n]`;
+  - window computations follow W2.
+- **W2 — windows over valid bars.**
+  - A window is the last n bar positions.
+  - Every operation in it runs over the window's valid bars in order, NaN
+    terms removed:
+    - sums;
+    - counts;
+    - means;
+    - deviations;
+    - variances and covariances;
+    - extrema;
+    - peak detection;
+    - consecutive pairs.
+  - An output is NaN when the window's valid count is below what its
+    statistic requires — a mean needs 1, a variance 2.
+  - Warm-up — the series holding fewer than n bar positions — remains a
+    separate NaN rule.
 
 ---
 
@@ -833,13 +904,18 @@ indicators:
 - All window sizes and parameters must be accepted as arguments (not hardcoded)
 - NaN handling: return NaN for warm-up period rows; do not forward-fill silently
 - Incrementally maintained indicators follow the Incremental Computation Rule
-  (I1–I5):
+  (I1–I5b):
   - one defined value per indicator;
   - exact accumulators;
-  - rebased cumulative series;
+  - rebased cumulative series, from the window's first non-NaN value;
   - NaN for a zero-range ratio;
   - batch and incremental implementations bitwise equal under a contract
     test
+- Every bar-input indicator follows:
+  - I5b — a halt bar's output is NaN;
+  - NaN-term handling — state carries over NaN terms, and lag references
+    reach the latest valid bar;
+  - W2 — window operations run over valid bars
 - `dmi()` must not duplicate the calculation logic of `adx()` — call or delegate internally
 - VWAP reset behavior is controlled by `reset_mode` argument — caller (FeatureExtractor) reads from config and passes explicitly
 - `fibonacci_retracement()` and `pivot_points()` output level values as absolute prices, not distances — distance features are derived in Vectorizer via `level_distance()`

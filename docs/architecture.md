@@ -141,7 +141,7 @@ Standalone scripts:
 | `utils/execution_common.md` | Execution-time decisions shared between BacktestEngine and LiveModeRunner — signal resolution, cooldown guard, entry/exit fill simulation over a time-valued anchor, position sizing, late-entry residual-edge gate |
 | `utils/utils.md` | Shared utilities: bar sequence, signal resolution, slippage/fill simulation, label breach detection, encoding maps, trading calendar, REFERENCE_SESSION stats (populate + load), corporate-event adjustment (cum_split_ratio, adjust_bars_for_corporate_events, adjust_tick_derived_series_for_corporate_events, estimate_historical_meta, ticker rename stitching) |
 | `live/inferencer.md` | Live inference service object — _prepare_bars, infer/infer_batch, inference_log |
-| `live/live_mode_runner.md` | Live mode execution orchestrator — prefix-scan watchdog loop, recovery lane, position manager loop, session lifecycle, ticker-scoped 1-tick acquisition, real-path-parallel shadow fills |
+| `live/live_mode_runner.md` | Live mode execution orchestrator — prefix-scan watchdog loop, recovery lane, position manager loop, session lifecycle, ticker-scoped 1-tick acquisition, shadow fills on the held-ticker REST tape |
 | `live/caching_calculator.md` | CachingIndicatorCalculator — Layer 1/2 cache, fibonacci deque, sr_levels per-entry-point |
 | `live/auxiliary_stream.md` | In-process host (loop A) for non-trading WebSocket subscriptions on a separate account — delayed-quote capture for feed-coverage measurement is its first consumer |
 | `tools/init_db.md` | Schema bootstrap CLI — creates every table from db_schema.md's canonical DDL; `--verify` reports schema drift read-only. Sole DDL-issuing component; prerequisite for migration_tool |

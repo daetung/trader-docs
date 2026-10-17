@@ -45,7 +45,7 @@ Label search range:    t bar open → last_bar(date) close or the
                        on an early-close day, not 15:59
 10-tick for features:  ticks with timestamp < t bar open only
 10-tick for backtest:  ticks from t bar onward
-                       (entry slippage: entry_hour ~ entry_hour+100s;
+                       (entry slippage: anchor ~ anchor + cancel_after_seconds;
                         exit tracking: full day incl. after-market)
 REFERENCE_SESSION:     prior session baselines sourced from precomputed_session_stats
                        (offline DB table) — NOT from bars feature window

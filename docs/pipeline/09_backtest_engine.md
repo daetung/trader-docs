@@ -157,10 +157,16 @@ WHERE ticker = ? AND date = ?
 ORDER BY hour, seq_id
 ```
 Loaded once per ticker/date combination.
-Full day loaded (including after-market) — filtered in memory by hour range:
-- Entry slippage: `hour >= entry_hour AND hour < hour_add_seconds(entry_hour, 100)`
-- Exit tracking: `hour >= entry_hour onward` (passed as ticks_future to track_price_breach)
-- Partial exit: passed as ticks_exit to simulate_exit_fill (breach bundle onward, full day)
+Full day loaded (including after-market), expanded into synthetic ticks by
+utils.md's `expand_synthetic_ticks()`, and filtered in memory:
+- Entry fills and in-window breach: synthetic ticks whose second is greater
+  than the anchor and at most anchor + cancel_after_seconds (the entry tick
+  range — Entry Slippage Model)
+- Exit tracking after the entry window: synthetic ticks through the
+  continuation's end, then bundles passed as ticks_future to
+  track_price_breach (Exit Logic)
+- Exit fills: synthetic ticks whose second is greater than the exit anchor,
+  through the full day (Exit fill simulation)
 
 ### Trading halts (per ticker/date)
 ```sql
@@ -224,25 +230,13 @@ halts_td = db_conn.execute("""
 """, [ticker, date]).df()
 
 # halts_td passed explicitly to all internal methods
-fill_second  = utils.hour_add_seconds(
+synthetic, effective_end = utils.expand_synthetic_ticks(ticks_td, halts_td)
+anchor     = utils.hour_add_seconds(
     entry_hour, config["execution"]["entry_fill_delay_seconds"])
-search_limit = utils.hour_add_seconds(entry_hour, 100)
-ticks_entry  = ticks_td[(ticks_td["hour"] >= entry_hour) &
-                         (ticks_td["hour"] < search_limit)]
-
-fill_idx, prev_bundle, fill_bundle = utils.find_fill_bundle(ticks_entry, fill_second)
-fill_price = utils.interpolate_bundle_price(prev_bundle, fill_bundle, fill_second) \
-             if fill_bundle is not None else p_entry
-
-direction, exit_price, exit_hour, is_ambiguous = utils.track_price_breach(
-    ohlcv_future=bars_from_t,
-    ticks_future=ticks_td[ticks_td["hour"] >= entry_hour],
-    fill_price=fill_price,
-    fill_second=fill_second,
-    threshold_up=tp_pct,
-    threshold_dn=config["execution"]["stop_loss_pct"],
-    exit_interpolation=config["execution"]["exit_interpolation"],
-)
+window_end = utils.hour_add_seconds(
+    anchor, config["execution"]["cancel_after_seconds"])
+# Entry fills and breach run on one timeline over `synthetic` — Entry
+# Slippage Model and Exit Logic below.
 ```
 
 ---
@@ -284,28 +278,27 @@ one continuous flow, not two independent steps.
 
 ## Entry Slippage Model
 
-Simulate partial entry fills at t bar open + 5s using tick_10 data —
+Simulate partial entry fills from the anchor, t bar open +
+`entry_fill_delay_seconds`, over synthetic ticks expanded from tick_10 —
 mirrors the exit side's `simulate_exit_fill()` rather than assuming a
 single instant fill.
 
 ```
-tick_10.hour = last tick timestamp of each 10-tick bundle (second precision)
-fill_second  = utils.hour_add_seconds(
+tick_10.hour = last tick timestamp of each 10-tick bundle (second
+               precision); a second s denotes [s, s+1) (utils.md's
+               second-stamp semantics)
+synthetic    = utils.expand_synthetic_ticks(ticks_td, halts_td)'s ticks;
+               a synthetic tick's second is the integer part of its time
+anchor       = utils.hour_add_seconds(
     entry_hour, config["execution"]["entry_fill_delay_seconds"])
-search_limit = utils.hour_add_seconds(entry_hour, 100)
+window_end   = utils.hour_add_seconds(
+    anchor, config["execution"]["cancel_after_seconds"])
 
-Rationale for 100s window:
-    A 10-tick bundle represents 10 price ticks. In low-volume or post-halt
-    scenarios, 10 ticks can span up to ~100s (1 tick/10s worst case).
-    Extending beyond the 1-minute t bar boundary captures the fill bundle
-    in these edge cases. Beyond 100s, p_entry fallback is preferred.
+Entry tick range: synthetic ticks whose second is greater than anchor and
+at most window_end. No tick in the range → zero fill → entry_canceled;
+there is no p_entry fallback.
 
 Procedure:
-    ticks_t = tick_10 rows where hour >= entry_hour AND hour < search_limit
-              sorted by (hour, seq_id)
-
-    fill_idx, prev_bundle, fill_bundle = utils.find_fill_bundle(ticks_t, fill_second)
-
     # Sizing uses p_entry, not a post-slippage price — see execution_common.md's
     # Constraints for why this ordering is required (simulate_entry_fill()
     # takes quantity as input, so quantity cannot wait for its own output).
@@ -323,8 +316,17 @@ Procedure:
         per_ticker_share_cap_pct=config["execution"]["per_ticker_share_cap_pct"],
         exposure_cap_pct=config["execution"]["exposure_cap_pct"],
     )
+    order_type = execution_common.permitted_order_type(
+        "buy", config["execution"]["entry_order_type"],
+        phase at the anchor)              # execution_common.md's Session Phase
+    limit_price = None if order_type == "market" \
+        else the Entry Limit Price rule  # execution_common.md: the
+    # entry_gap-derived limit rounded DOWN to tick(price), capped at P_cap
+    # when execution.entry_price_cap_enabled — S from this candidate's
+    # prediction row. A configured market entry forced to limit takes it too.
+    funds_price = p_entry if order_type == "market" else limit_price
     proceed, quantity = execution_common.check_funds_available(
-        quantity, p_entry, remaining_cash,
+        quantity, funds_price, remaining_cash,
         use_all_cash=config["execution"]["use_all_cash"],
     )
     if not proceed:
@@ -339,44 +341,50 @@ Procedure:
     # chronological simulation carries each candidate through its own fill
     # before advancing to the next event.
 
-    limit_price = None if config["execution"]["entry_order_type"] == "market" \
-        else (p_entry * (1 + config["execution"]["entry_gap_value"])
-              if config["execution"]["entry_gap_type"] == "percentage"
-              else p_entry + config["execution"]["entry_gap_value"])
-    # a limit price is rounded DOWN to execution_common.md's tick(price) grid
-    # — the less aggressive direction for a buy, the function live uses too
+    rate = execution_common.entry_fill_rate(config, order_type)
+    if config["backtest"]["entry_fill_rate_disabled"]:
+        rate = 1        # all volume after the anchor; the switch stays a
+                        # config and experiment_log state, not a rate
 
-    if fill_bundle is not None:
-        fill_price, total_filled, unfilled_qty, status = execution_common.simulate_entry_fill(
-            ticks_entry=ticks_t, quantity=quantity,
-            entry_anchor_second=fill_second,   # utils.hour_add_seconds(entry_hour,
-                                               #   entry_fill_delay_seconds), above
-            p_entry=p_entry,
-            # ohlcv_entry dropped and the index argument replaced by a TIME:
-            # backtest COMPUTES this instant while live OBSERVES it as the
-            # time part of the entry 'new' request's sent_at, and the two must never be composed
-            # (execution_common.md). fill_idx is still computed above for the
-            # `fill_bundle is not None` guard; the simulator derives its own.
-            buy_rate=config["execution"]["buy_rate"],
-            halts_df=halts_td, cancel_after_seconds=config["execution"]["cancel_after_seconds"],
-            limit_price=limit_price,
-        )
-        if total_filled == 0:
-            # Fully unfilled — logged as its own trade_log row rather than
-            # silently dropped (see db_schema.md's exit_reason='entry_canceled'):
-            # trade_log row: exit_reason="entry_canceled", quantity=0,
-            #                fill_price=p_entry, exit_bar=entry_bar,
-            #                pnl_pct=NULL — skip remaining Exit Logic entirely
-            #                for this candidate, proceed to next candidate
-        else:
-            # total_filled may be < quantity (order canceled after
-            # cancel_after_seconds) — trade proceeds sized down to total_filled,
-            # no penalty (see execution_common.md Constraints: entry-side
-            # unfilled remainder is canceled, not penalized, unlike exit-side).
-            quantity = total_filled
+    # ONE TIMELINE: fills and the tp/sl breach test advance together, tick by
+    # tick, over the entry tick range in time order.
+    state, breach = None, None
+    for tick in the entry tick range:
+        if fills are open:        # closed after a phase boundary where
+                                  # order_type is not permitted — the entry
+                                  # remainder ends there (ended early)
+            state = execution_common.simulate_entry_fill(
+                state, ticks=[tick], quantity=quantity,
+                entry_anchor_second=anchor, limit_price=limit_price,
+                last_print=last print strictly before the anchor,
+                rate=rate, halts_df=halts_td,
+            )                     # step form, one span: the order is unchanged
+        if state has filled:      # from the first fill on
+            w = state's weighted-average fill price after this tick's step
+            # tp_pct and execution.stop_loss_pct as in Exit Logic
+            if tick.price >= w * (1 + tp_pct) or tick.price <= w * (1 - stop_loss_pct):
+                breach = (direction, tick)
+                break             # the entry stops, remainder canceled; the
+                                  # exit starts on the quantity filled so far
+
+    fill_price, total_filled, unfilled_qty, status = the summary of state
+        # execution_common.md: weighted average, p_entry when nothing filled
+    if total_filled == 0:
+        # Fully unfilled — logged as its own trade_log row rather than
+        # silently dropped (see db_schema.md's exit_reason='entry_canceled'):
+        # trade_log row: exit_reason="entry_canceled", quantity=0,
+        #                fill_price=p_entry, exit_bar=entry_bar,
+        #                pnl_pct=NULL — skip remaining Exit Logic entirely
+        #                for this candidate, proceed to next candidate
     else:
-        fill_price = p_entry    # no bundle within 100s — zero slippage fallback
-        # quantity unchanged — full requested size, filled at p_entry
+        # total_filled may be < quantity (order canceled at the window's end
+        # or stopped by a breach) — trade proceeds sized down to
+        # total_filled, no penalty (see execution_common.md Constraints:
+        # entry-side unfilled remainder is canceled, not penalized, unlike
+        # exit-side).
+        quantity = total_filled
+        # breach found → Exit Logic's take-profit / stop-loss exit at that
+        # tick; none → Exit Logic's continuation after the window
 
 slippage_pct = (fill_price - p_entry) / p_entry
 ```
@@ -560,15 +568,24 @@ skip-on-shortfall behavior exactly.
 tp_pct = config["execution"]["take_profit_up5"] if signal == "up5" \
          else config["execution"]["take_profit_up3"]
 
+# 1. A breach inside the entry window is the Entry Slippage Model's: tested
+#    on synthetic ticks against the running weighted average.
+# 2. Continuation, when the window found none: synthetic ticks after
+#    window_end are tested against the FIXED weighted average fill_price,
+#    through the effective end time (expand_synthetic_ticks()'s
+#    effective_end) of B, the first bundle whose hour >= window_end.
+# 3. Then track_price_breach() continues from B, B itself excluded:
 direction, exit_price, exit_hour, is_ambiguous = utils.track_price_breach(
     ohlcv_future=bars_from_t,
     ticks_future=ticks_td[ticks_td["hour"] >= entry_hour],
-    fill_price=fill_price,
-    fill_second=fill_second,
+    fill_price=fill_price,              # the fixed weighted average
+    fill_second=B.hour,                 # window_end when no B exists that date
     threshold_up=tp_pct,
     threshold_dn=config["execution"]["stop_loss_pct"],
     exit_interpolation=config["execution"]["exit_interpolation"],
 )
+# A breach on a synthetic tick (steps 1–2) gives direction, exit_hour = that
+# tick's second and exit_price = its price; is_ambiguous = False.
 
 if direction is not None:
     # P-10 REVISED (R-2): the former poll-delay alignment
@@ -576,9 +593,10 @@ if direction is not None:
     # modeled the OLD periodic-poll live loop. Live now detects tp/sl at
     # TICK granularity (WS-primary / REST-backstop — see
     # live_mode_runner.md's Exit Architecture), so there is no poll delay
-    # left to model: backtest uses track_price_breach()'s raw
-    # exit_hour/exit_price (already interpolate_bundle_price-precision)
-    # directly for the fill simulation and for trade_log.exit_bar. The
+    # left to model: backtest uses the breach's raw exit_hour/exit_price —
+    # track_price_breach()'s (already interpolate_bundle_price-precision),
+    # or the breaching synthetic tick's — directly for the fill simulation
+    # and for trade_log.exit_bar. The
     # relationship this corrects, STATED AGAINST LIVE'S REST 1-TICK BUFFER
     # and not against live generally: that buffer is vendor-guaranteed
     # complete AND print-ordered, so it is ground truth at tick granularity
@@ -591,22 +609,15 @@ if direction is not None:
     effective_price  = exit_price       # raw interpolate_bundle_price output,
                                         # no re-interpolation at a delayed second
 
-    sell_rate = config["execution"]["sell_rate_tp"] if direction == "up" \
-                else config["execution"]["sell_rate_sl"]
+    exit_reason = "take_profit" if direction == "up" else "stop_loss"
 
-    weighted_avg_exit_price, total_filled, unfilled_qty, _ = execution_common.simulate_exit_fill(
-        ticks_exit=ticks_td[ticks_td["hour"] >= effective_second],
-        position_size=quantity,
-        exit_anchor_second=effective_second,
-        reference_price=effective_price,
-        sell_rate=sell_rate,
-        halts_df=halts_td,
-    )
+    weighted_avg_exit_price, total_filled, unfilled_qty = simulate_exit(
+        anchor=effective_second, reference_price=effective_price,
+        quantity=quantity, exit_reason=exit_reason,
+    )                                   # Exit fill simulation, below
     # ohlcv_exit is gone — it had no reader, and the slice passed here was
-    # filtered on `hour` alone across a MULTI-DATE frame while ticks_exit was
+    # filtered on `hour` alone across a MULTI-DATE frame while the exit ticks were
     # correctly date-scoped, which is itself evidence nothing read it.
-    # bundle_idx_at() is no longer called here: index derivation moved inside
-    # the simulator so both engines pass a TIME (execution_common.md).
 
     if total_filled > 0 and unfilled_qty > 0:
         # PARTIAL fill. Not a dead position — all available ticks (including
@@ -632,8 +643,6 @@ if direction is not None:
         pnl = -config["backtest"]["dead_position_penalty_pct"]
     else:
         pnl = (weighted_avg_exit_price - fill_price) / fill_price
-
-    exit_reason = "take_profit" if direction == "up" else "stop_loss"
 
 else:
     → proceed to session_close / time_limit check
@@ -669,15 +678,15 @@ if current bar hour == exit_deadline(date):     # utils.md — PER DATE
     if exit_deadline(date) bar is halt/no_data:
         fallback: first tick_10 row with hour > exit_deadline(date)
         if none: → dead position          # no ticks at all → no simulator call
-    if not config["execution"]["simulate_nondirectional_exit_fill"]:
+    mode, _ = execution_common.exit_fill_mode(
+        config, "session_end", the exit's permitted order type)
+    if mode == "reference":   # simulate_nondirectional_exit_fill false
         exit_price = the reference price (that bar's close, or the
                      after-market tick fallback above)
     else:
         anchor    = exit_deadline(date)
         reference = last print strictly before the anchor
-        → simulate_exit_fill(..., exit_anchor_second=anchor,
-                              reference_price=reference,
-                              sell_rate=execution.sell_rate_neutral, ...)
+        → simulate_exit(anchor, reference, quantity, "session_end")
 ```
 
 The dead-position test stays AHEAD of the simulator because it is a
@@ -695,18 +704,60 @@ if config["execution"]["max_hold_bars"] valid bars elapsed since entry
     60 would cap the sequence below the count this line tests and make the
     exit unreachable whenever the key exceeds 60):
     exit_reason = "time_limit"
-    if not config["execution"]["simulate_nondirectional_exit_fill"]:
+    mode, _ = execution_common.exit_fill_mode(
+        config, "time_limit", the exit's permitted order type)
+    if mode == "reference":   # simulate_nondirectional_exit_fill false
         exit_price = close of last valid bar
     else:
         anchor    = the instant that count was reached
         reference = last print strictly before the anchor
-        → simulate_exit_fill(..., sell_rate=execution.sell_rate_neutral, ...)
+        → simulate_exit(anchor, reference, quantity, "time_limit")
 ```
 
 Note that once an exit reason is assigned, filling may continue past the
 session close into the after-market — the simulator's own contract. "Session close takes
 priority over time-limit" governs which reason is ASSIGNED, not whether an
 in-progress fill is re-triggered.
+
+### Exit fill simulation
+
+```
+simulate_exit(anchor, reference_price, quantity, exit_reason):
+    order_type = execution_common.permitted_order_type(
+        "sell", config["execution"]["exit_order_type"], phase at the anchor)
+    mode, rate = execution_common.exit_fill_mode(config, exit_reason, order_type)
+    if config["backtest"]["exit_fill_rate_disabled"]:
+        rate = 1                # all volume after the anchor; a switch, not a rate
+    ticks = synthetic ticks whose second is greater than the anchor, through
+            the full day
+
+    Spans — split where the order path changes, each one
+    execution_common.simulate_exit_fill() call (batch form) taking the prior
+    state, the span's order and the last print before the span's start:
+      - market: one span from the anchor. At the session_close boundary a
+        market remainder is not permitted; it continues as a limit ladder
+        from that instant, k starting at exit_ladder_seed on the anchor's
+        clock.
+      - limit — configured, or switched at that boundary: re-quoted from the
+        anchor every live_mode.position_check_interval_seconds (the
+        re-quote cadence):
+            L = m * (1 + s * (1/2 - k)), rounded UP to tick(price)
+            m = the last synthetic tick's price before the re-quote instant
+            s = execution_common.md's Exit Spread Estimator, from bundles
+                sealed (effective end time) and bars completed before that
+                instant
+            k starts at execution.exit_ladder_seed; once the elapsed time
+            since the anchor reaches execution.exit_order_stuck_minutes:
+              - inside the regular session (utils.md's Session Boundary
+                Derivations): the remainder escalates to market pricing;
+              - outside it: k += execution.exit_ladder_increment per
+                re-quote, up to execution.exit_ladder_cap.
+
+    → weighted_avg_exit_price (reference_price when nothing filled),
+      total_filled, unfilled_qty = quantity - total_filled
+    partial_fills_count = the number of distinct integer seconds carrying
+      an exit fill
+```
 
 ---
 
@@ -716,6 +767,9 @@ in-progress fill is re-triggered.
 within the same 10-tick bundle during `track_price_breach()` scan.
 
 Replaces prior definition (1-minute bar level simultaneous breach).
+A breach found on synthetic ticks — inside the entry window or its
+continuation (Exit Logic) — is never ambiguous: each synthetic tick carries
+one price.
 Recorded in `trade_log.is_ambiguous` for post-hoc analysis.
 
 ---
@@ -788,12 +842,13 @@ Case D — Case A path entered, but exit_price unresolvable after fallback
 ```
 
 **Early-close dates are ALWAYS replayed.** `live_mode.trade_early_close_days`
-gates live entry submission only and is not read here — a known one-sided
+gates the day's entry pipeline in live — carried positions being managed by the
+reduced session (live_mode_runner.md) — and is not read here — a known one-sided
 divergence between the engines, in the same family as R-4's breaker being
 computed but never enforced and shadow mode's evaluate-but-don't-enforce. It is
-deliberate: those days are labelled correctly and kept in the corpus precisely so
-backtest can measure whether they are worth trading, and a gate that switched off
-both engines would make that measurement impossible. Nothing is recorded in
+deliberate: those days are labelled correctly and kept in the corpus precisely
+so backtest can measure whether they are worth trading, and a gate that switched
+off both engines would make that measurement impossible. Nothing is recorded in
 `experiment_log` for this, because nothing varies per run — see db_schema.md.
 
 **Cases B/C/D's `exit_bar` is DERIVED, not the literal 155900 it once was.**
@@ -859,13 +914,15 @@ backtest:
                                       # entry-side unfilled remainder is sized
                                       # down, not penalized (see Entry Slippage Model)
   entry_fill_rate_disabled:  false   # counterfactual analysis switches. When on,
-  exit_fill_rate_disabled:   false   # the participation-rate factor is removed
-                                      # from that side and the fill takes the FULL
-                                      # OBSERVED volume — everything else intact:
-                                      # bundles are still walked forward from the
-                                      # anchor, halt intervals still exclude
-                                      # bundles, tick exhaustion still leaves an
-                                      # unfilled remainder, and the price is still
+  exit_fill_rate_disabled:   false   # BacktestEngine passes rate 1 for that side
+                                      # to the fill simulator in place of the
+                                      # selected rate — participation in all
+                                      # traded volume after the anchor — everything
+                                      # else intact: ticks are still walked
+                                      # forward from the anchor, halt intervals
+                                      # still exclude ticks, tick exhaustion still
+                                      # leaves an unfilled remainder, and the
+                                      # price is still
                                       # the volume-weighted path. Keeping the time
                                       # axis and price path is the point; a variant
                                       # that filled instantly at the reference price
@@ -879,11 +936,14 @@ backtest:
                                       # not read it, and shadow must not either,
                                       # shadow existing to reproduce live.
                                       # SWITCHES, not `rate: 1.0`:
-                                      # get_execution_param() (N-7) is the sole read
-                                      # point and carries a resolution chain (fitted
-                                      # execution_params, then config, then a hard
-                                      # bound), so a configured 1.0 can be overridden
-                                      # by a fitted value or clamped by that bound.
+                                      # run_backtest.py's get_execution_param()
+                                      # resolution overlays fitted values on the
+                                      # configured rates (execution_common.md's
+                                      # Rate Overlay), so a configured 1.0 can be
+                                      # replaced by a fitted value. A switch
+                                      # applies after selection
+                                      # (entry_fill_rate() / exit_fill_mode()), in
+                                      # BacktestEngine only.
                                       # The two also differ in kind — 1.0 asserts
                                       # full participation is realistic; the switch
                                       # asserts no participation model is in use,
@@ -930,7 +990,9 @@ backtest:
 ```sql
 -- Added columns (in addition to existing schema):
 weighted_avg_exit_price  DOUBLE,    -- volume-weighted average fill price across partial fills
-partial_fills_count      INTEGER,   -- number of tick bundles used for exit fills
+partial_fills_count      INTEGER,   -- number of distinct integer seconds carrying an
+                                    -- exit fill (synthetic tick times by integer
+                                    -- part) — live's exit_fill_seconds definition
 unfilled_quantity        DECIMAL(18,6), -- shares remaining after ticks exhausted (0 = fully closed)
 is_ambiguous             BOOLEAN,   -- True if simultaneous bundle-level tp/sl breach
 exit_date                VARCHAR,   -- 'YYYYMMDD'; equals `date` for every exit resolved
@@ -939,10 +1001,12 @@ exit_date                VARCHAR,   -- 'YYYYMMDD'; equals `date` for every exit 
                                     -- session — the list is db_schema.md's. NOT NULL: an always-populated column
                                     -- keeps every date-scoped query free of COALESCE.
 requested_quantity       DECIMAL(18,6), -- quantity actually SUBMITTED, i.e. after
-                                    -- check_funds_available() sized it down. The fill-rate
-                                    -- denominator (quantity / requested_quantity) therefore
-                                    -- measures market participation only; a funds-driven
-                                    -- reduction never enters it — same reason
+                                    -- check_funds_available() sized it down. It
+                                    -- decides whether an order filled in full,
+                                    -- which ends fit_execution_params()'s
+                                    -- eligible-volume window (shadow_retraining.md);
+                                    -- a funds-driven reduction is kept out of it
+                                    -- for that reason — same reason
                                     -- entry_rejected is excluded from fit_execution_params()
 ```
 
@@ -962,9 +1026,16 @@ requested_quantity       DECIMAL(18,6), -- quantity actually SUBMITTED, i.e. aft
   - BacktestEngine's `DOUBLE` inputs enter them by V1;
   - the fill simulators' output prices pass V1 before any sign decision, pnl
     or write
-- The fill simulators take the sealed bundle series in both engines — `tick_10`
-  here, live's vendor or derived bundles (live_mode_runner.md's Per-Ticker
-  Tick Buffer) — so `per_tick_vol = bundle.volume / 10` holds in both
+- The fill simulators take tick sequences in every engine, each tick's own
+  volume entering the cumulative fill, min(order quantity, floor(rate ×
+  cumulative tick volume after the anchor)):
+  - here, synthetic ticks expanded from `tick_10` (utils.md's
+    `expand_synthetic_ticks()`)
+  - in live, the REST portion of the held-ticker tape (live_mode_runner.md)
+- BacktestEngine reads rates from the config run_backtest.py resolved and
+  overlaid (execution_common.md's `get_execution_param()`), selecting them
+  through `entry_fill_rate()` / `exit_fill_mode()`; it does not resolve
+  again
 - `db_conn` injected via constructor for testability (mock DB in tests)
 - OHLCV loaded once per ticker for all its entry dates
 - Tick data loaded once per ticker/date (full day); filtered in memory by range
@@ -1004,7 +1075,14 @@ requested_quantity       DECIMAL(18,6), -- quantity actually SUBMITTED, i.e. aft
   rather than failure to fill. `is_dead_position` remains False in both;
   diagnostic via `trade_log.unfilled_quantity`
 - sell_rate_tp > sell_rate_sl: rising-market exits have more available buy-side depth
-- Entry slippage search window: entry_hour to entry_hour + 100s (not limited to 1-minute t bar)
+- Entry tick range: synthetic ticks whose second is greater than the anchor
+  and at most anchor + cancel_after_seconds (not limited to the 1-minute t
+  bar); no tick in the range → entry_canceled
+- Entry fills and the tp/sl breach test run on one timeline: a breach inside
+  the entry window stops the entry; after it, synthetic ticks are tested
+  against the fixed weighted average through the effective end of the first
+  bundle whose hour is at or after the window's last second, then
+  `track_price_breach()` continues from that bundle, itself excluded
 - Cooldown applied continuously across full time axis; no reset at session
   boundaries, but RESET at every date boundary — see execution_common.md's
   Cooldown Guard for why a carried-over `last_entry_hour` blocks the whole
@@ -1015,7 +1093,8 @@ requested_quantity       DECIMAL(18,6), -- quantity actually SUBMITTED, i.e. aft
   removed since live detects tp/sl at tick granularity; see Exit Logic).
   `trade_log.exit_bar` therefore reflects, on the tp/sl path,
   `track_price_breach()`'s raw,
-  bundle-interpolated exit moment directly. `exit_reason='entry_canceled'`
+  bundle-interpolated exit moment, or the breaching synthetic tick's
+  second, directly. `exit_reason='entry_canceled'`
   rows (see Entry Slippage Model) set `exit_bar = entry_bar` — there is no
   distinct exit moment for a trade that never opened.
 - `trades_by_signal` and `trades_by_exit` JSON-serialized before writing to `experiment_log`
@@ -1033,12 +1112,24 @@ requested_quantity       DECIMAL(18,6), -- quantity actually SUBMITTED, i.e. aft
 - `run()` returns `tuple[pd.DataFrame, dict]` — trade_log_df and summary_dict;
   DB writes (trade_log INSERT, experiment_log INSERT) performed by Backtester (run_backtest.py),
   not by BacktestEngine
-- `build_effective_bar_sequence()`, `track_price_breach()`, `find_fill_bundle()`,
-  `interpolate_bundle_price()`, `hour_to_int()`, `hour_to_minutes()`,
-  `hour_add_seconds()` — sourced from `utils.py`
-- `resolve_signal()`, `can_enter()`, `simulate_exit_fill()`, `simulate_entry_fill()`,
-  `compute_position_size()`, `check_funds_available()` —
-  sourced from `docs/utils/execution_common.md`'s module
+- Sourced from `utils.py`:
+  - `build_effective_bar_sequence()`
+  - `track_price_breach()`
+  - `expand_synthetic_ticks()`
+  - `interpolate_bundle_price()`
+  - `hour_to_int()`
+  - `hour_to_minutes()`
+  - `hour_add_seconds()`
+- Sourced from `docs/utils/execution_common.md`'s module:
+  - `resolve_signal()`
+  - `can_enter()`
+  - `simulate_exit_fill()`
+  - `simulate_entry_fill()`
+  - `compute_position_size()`
+  - `check_funds_available()`
+  - `permitted_order_type()`
+  - `entry_fill_rate()`
+  - `exit_fill_mode()`
 - `is_tradable()` is deliberately NOT called here (N-5), unlike every other
   function in the bullet above. `ticker_cik_map`'s rename_pending /
   quarantine_reason (see db_schema.md) reflect data-pipeline/vendor-latency
@@ -1059,9 +1150,12 @@ requested_quantity       DECIMAL(18,6), -- quantity actually SUBMITTED, i.e. aft
   live_mode_runner.md's Position Manager Loop)
 - Backtest-vs-live exit asymmetry (R-2) — THREE distinct kinds, do not
   conflate. (1) ORDERING WITHIN A BUNDLE, irreducible — backtest reads
-  10-tick `tick_10` bundles, and `track_price_breach()`'s Phase 1 tests
+  10-tick `tick_10` bundles, and after the entry window and its
+  continuation `track_price_breach()`'s Phase 1 tests
   `bundle.high >= tp_target or bundle.low <= sl_target`, so an intra-bundle
-  extreme IS seen; what is lost is the ORDER of two extremes inside one
+  extreme IS seen there; inside the window and its continuation the test
+  runs on synthetic tick prices, which interpolate within a bundle and do
+  not carry its high/low. What is lost is the ORDER of two extremes inside one
   bundle, which is exactly what `is_ambiguous` records and
   `ambiguity_priority` resolves. (Previously stated as backtest being unable
   to SEE intra-bundle spikes, and as live's WS STREAM being the "true" one —
