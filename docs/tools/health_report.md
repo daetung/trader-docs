@@ -1,25 +1,36 @@
 # Tool: Health Report
 
 **File:** `tools/health_report.py`
-**Called IN-PROCESS, not as a subprocess** — while the runner holds the DB
-connection it is the only process that may open `market.duckdb`
-(db_schema.md's DB file ownership windows), so every path firing inside that
-window can only be in-process. The former ground for this — findings handed
+**Called IN-PROCESS, not as a subprocess** — every path runs inside the run
+that triggers it (db_schema.md's DB File Ownership Windows): while the runner
+holds the DB no other process may open `market.duckdb`, so a path firing then
+can only be in-process. The former ground for this — findings handed
 LiveModeRunner's in-memory aggregates directly, which a separate process
 could not receive — no longer holds: R-9 moved every one of them to the DB
 axis and `live_aggregates` is EMPTY.
-A CLI entry point still exists for manual runs and is TWO-MODE. Inside that
-window it opens no DB and reads the most recent `scope="whole"` record from
-`log_dir/health_report_{today_date}.log`, reporting it with its `ts`.
-Outside it, including the runner's shutdown stage-2 tail, it opens the DB and
-gathers normally. Both modes yield the same findings set.
+A CLI entry point still exists for manual runs. It is a guest (utils.md's DB
+Access Coordination) and TWO-MODE, the mode chosen by `in_runner_window()` —
+the runner window of the guest admission test, an unreadable coordination
+store counting as in-window:
+- in-window it opens no unit and reads the most recent `scope="whole"`
+  record from `log_dir/health_report_{today_date}.log`, reporting it with
+  its `ts`;
+- outside it, it opens units with `timeout` 0 and gathers normally;
+- both modes yield the same findings set;
+- `--runs [since]` prints `journal_view()` (utils.md).
 **Call paths** are the Invocation Contract's rows (below):
 - scheduled:
   - session start;
   - session end;
   - evening end;
 - event-driven — every other row;
-- from outside any session — the rows whose caller is a batch process.
+- from outside any session:
+  - Evening liveness probe;
+  - Scheduled, evening end;
+  - Owner lock wait;
+  - Token refresh failure;
+  - Owner error end;
+  - Guest DB open failure.
 
 ---
 
@@ -53,18 +64,26 @@ EVENT-DRIVEN invocations fire outside that schedule. These triggers exist:
 - A negative bar-latency sample (finding 27) — the premise Bar-Close
   Authority rests on has been contradicted, so waiting for session end
   would mean a full day of judgements made on a broken assumption.
-- The evening job finding LiveModeRunner's session-end marker missing
+- The evening run's wait finding the runner crashed (`predecessor_crashed`)
   (finding 11);
-- A batch — the evening job or the premarket batch — aborting at its
-  lock-probe deadline (finding 28);
-- A failed overnight token refresh (finding 46).
-- LiveModeRunner's Session Start Gating still unable to open the DB at
-  `premarket_wait_deadline` (finding 47).
+- An owner — the premarket run, LiveModeRunner or the evening run — waiting
+  on a guest or 'unregistered' holder, or reaching its wait deadline
+  (finding 28);
+- A failed overnight token refresh (finding 46);
+- An owner run ending 'error' (finding 11, `owner_error_end`), delivered by
+  the DB access coordination helper (utils.md);
+- A guest's DuckDB open failure while holding `db.lock` (finding 49),
+  delivered by the same helper.
 
-Findings 11, 28 and 46 run in batch processes (metadata_crawler.md), outside
-any session:
-- no in-memory aggregate exists for them;
-- the findings 28 and 46 paths do not reach the DB at all.
+Findings 11, 28, 46 and 49, on these event paths, are produced without a
+session's in-memory aggregates, at these sites:
+- 11 — the evening run's wait (`predecessor_crashed`), and the helper on an
+  owner's 'error' end;
+- 28 — an owner's wait before it holds the DB;
+- 46 — the token refresh;
+- 49 — the helper on a guest's DuckDB open failure.
+The paths whose Invocation Contract DB column reads **no** do not reach the
+DB.
 
 Report scope:
 - the breaker trip and the `clock_check` abort send the WHOLE report;
@@ -75,8 +94,8 @@ many times a minute must not drag the entire report along each time. This
 distinction is what `findings_subset` exists for — see Invocation Contract.
 
 None of this needs new delivery infrastructure — the Discord and email
-channels below already existed and were simply never wired to a mid-session,
-pre-session, or post-session event.
+channels (alert_delivery.md) already existed and were simply never wired to
+a mid-session, pre-session, or post-session event.
 
 ---
 
@@ -114,10 +133,22 @@ def gather_findings(db_conn, today_date, log_dir,
        - evening liveness probe: today's premarket stages and today's
          runner-written work stages (none on a reduced-session day), its
          own run's evening stages excluded;
-       - evening end: that evening run's own stages;
+       - evening end: the stages that evening run executed; a stage it
+         skipped — by a --skip-* flag, or evening_backup skipped because a
+         later-dated evening_* batch_runs row exists — is listed as an
+         informational skipped item, taken from that run's own invocation,
+         not as an alert and not as a missing row;
        - a non-trading day per trading_calendar: empty.
        A stage of the expected set with no row at all (not even 'running')
-       is reported distinctly from a 'failed' row.
+       is reported distinctly from a 'failed' row, with its cause, from
+       run_info() (utils.md) and the crawler log's RUN line:
+       - yielded;
+       - crashed;
+       - ended by error or self-termination;
+       - skipped by flag;
+       - not executed by a partial run.
+       With the coordination store unreadable, the cause reads run history
+       unavailable.
     2. ticker_cik_map — entry-blocked ticker count and detail (rewritten:
        the original `status`/`suspend_reason` columns this finding named
        were removed by N-2's restructure into two independent columns,
@@ -145,17 +176,16 @@ def gather_findings(db_conn, today_date, log_dir,
        Alert threshold: TBD — not yet set (same deferral status as findings
        6 and 7's thresholds below; the rate itself is always computed and
        loggable, only the warn/abort cutoff is undecided).
-    4. Structured logs — the SUMMARY lines of the work stages carrying a
-       SUMMARY obligation (premarket_*, evening_*, premarket_recheck_bundle;
-       live_session_start and live_session_end are outside this domain).
-       For each such stage of finding 1's expected set, the SUMMARY lines of
-       that stage's own date are collected from
+    4. Structured logs — the STAGE and SUMMARY lines of the work stages
+       carrying a SUMMARY obligation (premarket_*, evening_*,
+       premarket_recheck_bundle). For each such stage of finding 1's expected
+       set, the lines of that stage's own date are collected from
        logs/metadata_crawler_{date}.log and logs/live_mode_runner_{date}.log
-       and matched to batch_runs rows by stage name (see
-       metadata_crawler.md's Output / Logging). A stage with a batch_runs
-       'success'/'failed' row but no matching SUMMARY line is flagged as a
-       logging-mismatch finding on its own — distinct from the batch's own
-       status.
+       and matched by stage name and run_id (see metadata_crawler.md's
+       Output / Logging). A stage whose STAGE line exists in its process log
+       with no matching SUMMARY line, in a run ended 'normal' (run_info(),
+       utils.md), is flagged as a logging-mismatch finding on its own —
+       distinct from the batch's own status.
     5. tick_bar_aggregates Tier-2/3 fallback rate — LiveModeRunner's Health
        Gate 2 result for the current session, not recomputed here (see
        live_mode_runner.md). Read (R-9) from
@@ -263,12 +293,30 @@ def gather_findings(db_conn, today_date, log_dir,
         runner log; crawl_corporate_events_investing() writes one per call
         to its hosting process's log. Finding 10 sums items and unmatched
         per source over today_date.
-    11. Session end marker missing (R-2) — set when the evening job's
-        DuckDB-lock liveness probe (see metadata_crawler.md's "Evening job
-        start gate") finds LiveModeRunner dead with no clean shutdown
-        (live_session_start still 'running', no live_session_end row).
-        Distinct from a normal 'failed' status — this is a crash signal,
-        not a stage failure.
+    11. Abnormal process end — from utils.md's abnormal_runs() and
+        missed_scheduled_run():
+        - a crashed run of any role, the runner crash included;
+        - a run ended 'error', 'self_terminated' or 'yielded' — 'aborted' and
+          'hard_cap' ends are reported by finding 28, and 'timed_out' and
+          'not_expected' ends are not reported;
+        - a scheduled run missing at its checkpoint:
+          - premarket — at the runner's phase-A deadline, with no scheduled
+            premarket run today;
+          - runner — at the evening's phase A, with session_expected true and
+            no scheduled runner run today;
+          - evening — at session start, with no scheduled evening run on the
+            previous trading day;
+          - token refresh — at session start, before the token coverage gate,
+            with no scheduled refresh run today;
+        - each listed run given with the stages its process log shows started
+          without a SUMMARY.
+        Reported at session start and at evening end over the span since the
+        previous report. Also delivered for one run alone by the DB access
+        coordination helper when an owner run ends 'error' (`owner_error_end`,
+        utils.md's Helper deliveries).
+        With the coordination store unreadable — the report functions raising
+        (utils.md) — it reports the store unreadable, severity 'abort', in
+        place of its run list.
     12. Unknown broker order/position at reconcile (R-2/R-3) — at any Broker
         Reconcile call site (session start, warm restart, feed outage, and the
         Positions branch run at the event-day exit gate's release):
@@ -492,8 +540,11 @@ def gather_findings(db_conn, today_date, log_dir,
         ahead of Gate 2 and the measured offset is the only evidence for that
         abort — the evening liveness probe recovers the crash FACT (finding
         11) but never the measurements. clock_offset_end is stored null at
-        session start and filled at shutdown, so its absence reads as "never
-        reached shutdown" rather than as a missing key. A warm restart
+        session start and filled at shutdown, a measurement only. A session
+        boundary source line, from session_diagnostics.boundary_source,
+        reports the source used — 'premarket_state', 'evening_state' or
+        'default' — with its fallback and mismatch flags (live_mode_runner.md's
+        Session Start Gating). A warm restart
         overwrites the probe values with the newly measured ones and
         increments restart_count: these are current operating settings, not a
         session baseline. restart_count is reported alongside, and it
@@ -604,27 +655,33 @@ def gather_findings(db_conn, today_date, log_dir,
         indicator state that absorbed a partial bar. That is a knowingly
         accepted exposure, recorded here rather than in a session doc so it
         stays attached to the signal that detects it.
-    28. Batch lock-probe deadline abort (`batch_lock_deadline_abort`) — a
-        batch gave up waiting for the DuckDB write lock at its lock-probe
-        deadline and aborted. Detail `job` ∈ 'evening' | 'premarket':
-        - 'evening' — the evening batch, at `evening_wait_hard_deadline`
-          (metadata_crawler.md's evening job start gate);
-        - 'premarket' — `--premarket-open`, at `premarket_wait_deadline`
-          (metadata_crawler.md's premarket start gate).
-        Severity 'abort'. Needs neither the DB nor any in-memory aggregate,
-        which is the point: it fires precisely because the DB could not be
-        opened.
+    28. Owner lock wait (`owner_lock_wait`) — an owner's wait for `db.lock`
+        (utils.md's acquire loop). Detail `{owner, phase: 'waiting' |
+        'deadline', holder, outcome, open_error}`:
+        - phase 'waiting' — emitted, severity 'warn', when an owner starts
+          waiting on a guest or 'unregistered' holder;
+        - phase 'deadline' — severity 'abort', at the owner's wait deadline;
+        - outcome `holder_self_terminated` when the holder ended itself;
+        - open_error `{class: 'lock_conflict' | 'unmatched', message}` present
+          with an 'unregistered' holder; for class 'unmatched' the alert names
+          a possibly damaged file and the DuckDB recovery procedure
+          (shadow_retraining.md).
+        Delivered DB-less: it fires precisely because the owner does not
+        hold the DB.
         Named for the observed event, not a presumed cause — whether the
         holder is a live runner still working or a hung process is exactly
         what is unknown at this moment, and is what the manual intervention
         it requests has to determine.
-        Consequence worth stating:
-        - `job='evening'`: tomorrow's Health Gate 1a will abort tomorrow's
-          session on missing session stats — the intended fail-safe, reached
-          loudly;
-        - `job='premarket'`: the runner's start follows Session Start
-          Gating's proceed rule (live_mode_runner.md), Health Gate 1c
-          judging the premarket markers.
+        Each owner's spec keeps its deadline action:
+        - `owner='evening'` — the run aborts, and tomorrow's Health Gate 1a
+          will abort tomorrow's session on missing session stats — the
+          intended fail-safe, reached loudly;
+        - `owner='premarket'` — the run aborts, and the runner's start follows
+          its own wait spec (live_mode_runner.md's Session Start Gating),
+          Health Gate 1c judging the premarket markers;
+        - `owner='runner'` — one notification at the premarket deadline,
+          attempts continuing, and the hard cap ending the runner without a
+          session.
 
     29. Watchdog working set empty during the regular session
         (`watchdog_empty_working_set`) — `watchdog.get_candidates()`
@@ -820,7 +877,8 @@ def gather_findings(db_conn, today_date, log_dir,
         - 'insufficient_data' — paging exhausted with the alignment window
           short of its conditions;
         - 'no_unique_offset' — recorded after the alignment's retries;
-        - 'later_mismatch' — unchanged.
+        - 'later_mismatch' — a vendor bundle obtained after alignment
+          disagrees (live_mode_runner.md).
         Level: warn — entries are not blocked.
     46. Token refresh failed (`token_refresh_failed`) — the overnight token
         refresh failed for an account (metadata_crawler.md's Overnight Token
@@ -828,14 +886,23 @@ def gather_findings(db_conn, today_date, log_dir,
         Detail `{account, attempts, last_error}`. Level: warn — a batch's
         own automatic reissue can still leave a token covering the session,
         and live_mode_runner.md's Token coverage gate is the session's test.
-    47. Session lock wait exceeded (`session_lock_wait_exceeded`) —
-        LiveModeRunner's Session Start Gating open still failing at
-        `premarket_wait_deadline` (live_mode_runner.md), sent once. The
-        runner keeps retrying: its first successful open proceeds per
-        Session Start Gating's proceed rule, and an open still failing at
-        the process hard cap ends the runner without a session. Level:
-        abort — manual intervention requested. Delivered DB-less: no
-        `alert_log` row, the send outcome written to the runner log.
+    47. Merged into finding 28.
+    48. Auxiliary loop stopped (`auxiliary_loop_stopped`) — Source:
+        health_events where finding_name='auxiliary_loop_stopped', recorded
+        once each time a loop A thread stops on an exception caught at its
+        top level (a Warm Restart's new loop A thread records again if it
+        stops), via `record_health_event(write_fn=db_write)` from loop A's
+        thread before it stops; detail `{stopped_at, exception_type,
+        exception_message}`. Level: warn.
+    49. Guest DB open failed (`guest_db_open_failed`) — a guest's DuckDB open
+        failing while it holds `db.lock`. Source: the DB access coordination
+        helper (utils.md's Helper deliveries), which builds and delivers it
+        DB-less at the run's first failure and at each change of class;
+        gather_findings() does not collect it. Detail `{run_id, tool, unit,
+        open_error: {class, message}}`. Severity:
+        - 'warn' for class 'lock_conflict';
+        - 'abort' for class 'unmatched', the alert naming a possibly damaged
+          file and the DuckDB recovery procedure (shadow_retraining.md).
 
     Returns: dict of {finding_name: {severity: 'ok'|'warn'|'abort', detail: ...}}
     """
@@ -846,8 +913,8 @@ def gather_findings(db_conn, today_date, log_dir,
 
 ## DB Health Observation (R-9)
 
-A read-only summary emitted once at each FIRST-DB-ACCESS point: live session
-start, evening batch start, and premarket batch start. It reports:
+A read-only summary emitted at each owner's acquisition of the DB (utils.md's
+acquire()), warm restarts and manual owner runs included. It reports:
 
 - the `data/market.duckdb` file size
 - row counts for every `PURGE_REGISTRY` member (metadata_crawler.md) and for
@@ -885,54 +952,25 @@ so it lands in `alert_log` like any other delivery and its remote arrival is
 verifiable by querying `alert_log.outcome` rather than by asking someone
 whether the mail showed up. Because suppression is per `(alert_key,
 channel)`, this stream can only ever displace itself — it cannot mask a
-session-start or breaker-trip alert, and those cannot mask it. It fires at
-most three times a day, so `rate_limited` is not expected to engage.
+session-start or breaker-trip alert, and those cannot mask it. It fires once
+per owner acquisition of the DB, so `rate_limited` is not expected to engage.
 
 ---
 
-## Log Writing (always, regardless of delivery)
+## Alert Delivery
 
-```python
-def write_to_log(findings: dict, log_path: Path) -> None:
-    """
-    Appends ONE JSONL record per invocation:
+alert_delivery.md holds:
+- logging;
+- the `alert_level` filter;
+- queueing;
+- suppression;
+- the senders;
+- the drain.
 
-      {"ts":"<UTC ISO-8601>","alert_key":"<the invoking path's alert_key>",
-       "scope":"whole"|"partial","severity":"ok"|"warn"|"abort",
-       "finding_count":<int>,"findings":{...}}
-
-    `scope` is what marks a subset invocation, so a reader cannot mistake
-    one for a whole report. `severity` is the highest among that
-    invocation's findings, and `findings` is gather_findings()'s returned
-    dict verbatim. The scalar fields lead so the head of a line is readable
-    without parsing the body, and the CLI's in-window mode selects on them.
-
-    Findings are always written to the local log file first, independent of
-    whether any alert channel delivery succeeds below. Delivery and logging
-    are deliberately independent — logging is not a "fallback" for a failed
-    send, it always happens.
-
-    A failure of THIS function (disk full, permissions) is caught and never
-    propagated — a diagnostic write must not abort a trading session, the
-    same rule db_schema.md states for diagnostic DB writes. It cannot be
-    recorded in the log it just failed to write, so instead a synthetic
-    `log_write_failed` finding (severity 'abort') is injected into the
-    delivery payload: the two paths back each other up, and since they are
-    independent by design a dead log still reaches the operator by alert. It
-    carries its own alert_key so suppression can never hide it. If logging
-    AND every channel fail together there is nothing left but stderr — an
-    accepted terminal case, not a handled one.
-
-    Called on a subset invocation too, where it records a PARTIAL set. Such
-    an entry does not substitute for the scheduled whole-report write, and
-    the log line is marked so a reader cannot mistake one for the other.
-    """
-    ...
-```
-
----
-
-## Alert Delivery (best-effort)
+This file holds:
+- each path's arguments (Invocation Contract);
+- each path's drain timeout;
+- the session-end order.
 
 ```python
 def run_health_report(db_conn, today_date, log_dir, config,
@@ -945,113 +983,17 @@ def run_health_report(db_conn, today_date, log_dir, config,
     findings = gather_findings(db_conn, today_date, log_dir,
                                subset=findings_subset,
                                live_aggregates=live_aggregates)
-    write_to_log(findings, log_dir / f"health_report_{today_date}.log")
-
-    if config["alerting"]["alert_level"] == "abort_only":
-        send_findings = {k: v for k, v in findings.items() if v["severity"] == "abort"}
-    elif config["alerting"]["alert_level"] == "warn_and_above":
-        send_findings = {k: v for k, v in findings.items() if v["severity"] in ("warn", "abort")}
-    else:  # "all" (default)
-        send_findings = findings
-
-    # Report severity = MAX over the findings it carries. A report is one
-    # delivery, so it needs one grade; the suppression mode below is keyed on
-    # it, and it is re-derived per call rather than fixed per path (the same
-    # path yields different grades on different days).
-    severity = max_severity(send_findings)
-    mode = config["alerting"]["event_alert_suppression"][severity]["mode"] \
-        if suppressible else "always"
-
-    for channel in config["alerting"]["channels"]:
-        # alert_level first, suppression second — the reverse order would let
-        # a report that was never going to be sent consume the rate-limit
-        # window and suppress the next one that would have been.
-        enqueue(channel, alert_key, severity, send_findings, mode, config)
+    alert_delivery.deliver(alert_key, findings, config, log_dir,
+                           db_conn=db_conn, suppressible=suppressible,
+                           scope="whole" if findings_subset is None
+                                 else "partial")
 ```
-
-`enqueue()` returns once the `alert_log` row is written (db_schema.md) with
-`dispatched_at` set and `outcome` NULL, or immediately with
-`outcome='suppressed'`.
-
-Paths whose DB axis is "no":
-- `batch_lock_deadline_abort`;
-- `token_refresh_failed`;
-- `session_lock_wait_exceeded`.
-
-On such a path:
-- no `alert_log` row is written — `enqueue()` skips the row;
-- the send outcome is written to the `log_dir` log;
-- the process drains delivery, up to the path's drain timeout (Shutdown
-  Order and Drain, below), before it exits.
-
-**Delivery itself is asynchronous** — a background worker per channel
-performs the actual send and fills in `completed_at` / `outcome`.
-`run_health_report()` therefore returns as soon as logging is done and
-never blocks its caller on a socket.
-
-Recording `completed_at` on SUCCESS, not only on failure, is deliberate: the
-pair with `dispatched_at` gives every send its own duration, per channel, and
-that distribution is the evidence `drain_timeout_seconds` below will
-eventually be re-tuned against. Its current value is a placeholder with
-nothing measured behind it.
-
-This is not optional polish. Finding 27 fires from inside the
-`poll_interval_seconds` loop — the first event-driven trigger that does — and
-both channels carry a 10s timeout, so a synchronous send would stall the
-polling loop by up to 20s per detection. Under a timestamp-convention
-mismatch, firing dozens of times a minute, that would halt the loop
-entirely, inflate Bar-Close Authority's `missed` set, and trip Feed Outage
-Recovery: the diagnostic destroying what it diagnoses. Threads rather than
-asyncio, because the evening batch has no event loop.
-Logging stays synchronous. The asynchrony is scoped to `send()` alone,
-preserving "logging always happens, first".
-
-**Suppression** (`mode`, per severity; `event_alert_timeout_seconds`, per
-channel) applies ONLY to suppressible paths:
-- `always` — no suppression. Debug/escape-hatch setting; also the default
-  for `warn`/`ok`, which are currently unreachable here because every
-  event-driven path is `abort` today. Provisioned for the case finding 27 is
-  later downgraded while keeping its trigger.
-- `once_per_session` — first occurrence only. Runtime state, like
-  `last_halt_state`: a warm restart may cost one extra alert, which is not a
-  correctness defect.
-- `rate_limited` (default) — at most one send per `(alert_key, channel)` per
-  `event_alert_timeout_seconds`, measured from the LAST SEND. Explicitly NOT
-  a timer reset by each event: that variant goes permanently silent exactly
-  when events are continuous, i.e. in the worst case. As specified, a
-  sporadic fault alerts sporadically and a total fault alerts at the cap,
-  so the rhythm of the alerts itself conveys severity — which is why no
-  separate escalation-on-count rule is needed.
-
-Every send carries the count suppressed on that `(alert_key, channel)` since
-its last send. That is what makes suppression accountable without a separate
-summary path — and the count legitimately DIFFERS between channels for one
-alert_key, since each channel has its own timeout. Suppression is keyed on
-the PATH, not the finding, because an invocation delivers a report.
-
-Finding 27 therefore holds ONE key for the whole session, not one per ticker.
-Per-ticker keys would multiply with the candidate count, exhaust
-`max_pending_alert_keys` at once, and slice the rate limit so finely that it
-would stop limiting anything — under the very fault where limiting matters
-most. Which tickers are affected is carried in the finding's own detail.
-
-Suppression state — last-send timestamps and the once-per-session flags — is
-runtime only for every mode. A restart may cost one extra alert, which is
-not a correctness defect, and this introduces no new persisted state.
-
-Queue: per channel, so a dead email channel's timeouts cannot delay Discord
-— the same independence the per-channel best-effort rule already asserts,
-extended to time. Cap `max_pending_alert_keys` per channel, holding only the
-LATEST pending entry per `alert_key`. Dropping the oldest instead would let
-finding 27's stream evict a breaker trip or a session-end report; keyed this
-way, a noisy path can only ever displace itself. Displaced and dropped
-entries are recorded (`outcome='dropped_queue'`), not merely counted.
 
 ### Shutdown Order and Drain
 
 At session end, four requirements fix the order: finding 26 reads
 `bar_latency_daily`, findings 30-32 and 35 read `live_scan_daily`,
-`gather_findings()` needs the DB, and the evening batch needs the write lock
+`gather_findings()` needs the DB, and the evening run needs `db.lock`
 released.
 ```
 1. final flush of bar_latency_daily      (else finding 26 loses the last
@@ -1078,21 +1020,20 @@ released.
                                           needs no step here: it is written at
                                           each position's close transition, not
                                           at shutdown)
-2. gather_findings + write_to_log
+2. gather_findings + write_to_log        (alert_delivery.md's deliver())
 3. dispatch delivery                     (background)
 4. drain, up to alerting.drain_timeout_seconds
-5. flip live_session_end / live_session_start markers to 'success'
-6. close the DB connection
+                                         (alert_delivery.md's drain())
+5. Handle.close('done')                  (the session state, the DuckDB
+                                          close, the db.lock release —
+                                          utils.md's DB Access Coordination)
 ```
-Draining BEFORE closing the DB is what lets the background workers write
-`completed_at` / `outcome` — including `outcome='dropped_drain'` for anything
-still pending at the timeout. Nothing about delivery is therefore invisible.
+Why the drain precedes the DB close is alert_delivery.md's Drain.
 
-The markers come AFTER the drain because the evening job's start gate treats
-"marker present" as "lock released" (metadata_crawler.md). Writing them
-before draining would leave that invariant false for up to the drain timeout.
-Delaying them costs nothing: a crash leaves no marker at all, which is what
-crash detection keys on.
+The session state turns `done` in step 5's close, AFTER the drain, and the
+evening run's wait reads the runner as ended from then (metadata_crawler.md).
+Delaying it costs nothing: a crash leaves the state non-terminal with the run
+lock free, which is what crash detection keys on.
 
 Timing: shutdown STAGE 1 — trading end and DB RELEASE — falls at that date's
 `after_hours_end` minus `live_mode.session_hard_exit_offset_minutes` (see
@@ -1100,7 +1041,7 @@ live_mode_runner.md's Session Shutdown), and the evening batch starts at 21:00,
 so on an ordinary 20:00 close at the default zero offset a 600s drain leaves
 roughly 50 minutes' margin. The margin is measured to stage 1, not to process
 exit: the process lives on through stage 2 for `auxiliary_stream.tail_minutes`,
-but it holds no DB connection then, so the ownership handoff is already free.
+but it holds no DB connection then, so `db.lock` is already released.
 That margin is why `drain_timeout_seconds` cannot simply be raised.
 
 The two values are still coupled, but the far end is now half calendar and half
@@ -1115,7 +1056,7 @@ So the 50 minutes is a floor twice over: the ordinary exit precedes the cap,
 and an early close ends the extended session at 17:00 and widens the gap to the
 evening batch rather than narrowing it.
 
-Steps 2-4 failing does NOT stop 5-6. Holding the DB open on an alerting
+Steps 2-4 failing does NOT stop step 5. Holding the DB open on an alerting
 failure would make the evening batch wait to its own deadline and abort,
 costing two days of operation over an undelivered message.
 
@@ -1123,56 +1064,12 @@ Drain timeout, by path:
 - `abort_drain_timeout_seconds` — the paths whose finding requests manual
   intervention; such a path has already asked for manual intervention, so a
   process lingering an hour afterwards is an operational trap:
-  - `batch_lock_deadline_abort`, job 'evening' and 'premarket' alike;
-  - `session_lock_wait_exceeded`, whose drain takes place at the runner's
-    give-up exit;
-- `drain_timeout_seconds` — every other path, `token_refresh_failed` and
-  `evening_end` included.
-
-### Discord
-
-```python
-import requests
-from datetime import datetime, timezone
-
-def send_discord_alert(webhook_url: str, title: str, severity: str, fields: dict) -> bool:
-    """severity: 'ok' | 'warn' | 'abort'. Returns False on any failure —
-    caller logs the failure per run_health_report() above."""
-    color = {'ok': 0x2ECC71, 'warn': 0xF1C40F, 'abort': 0xE74C3C}[severity]
-    embed = {
-        "title": title,
-        "color": color,
-        "fields": [{"name": k, "value": str(v), "inline": True} for k, v in fields.items()],
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-    try:
-        resp = requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
-        return resp.status_code in (200, 204)
-    except requests.RequestException:
-        return False
-```
-
-### Email
-
-```python
-import smtplib
-from email.mime.text import MIMEText
-
-def send_email_alert(smtp_config: dict, title: str, severity: str, fields: dict) -> bool:
-    body = "\n".join(f"{k}: {v}" for k, v in fields.items())
-    msg = MIMEText(body, "plain")
-    msg["Subject"] = f"[{severity.upper()}] {title}"
-    msg["From"] = smtp_config["from_addr"]
-    msg["To"] = smtp_config["to_addr"]
-    try:
-        with smtplib.SMTP(smtp_config["host"], smtp_config["port"], timeout=10) as server:
-            server.starttls()
-            server.login(smtp_config["username"], smtp_config["password"])
-            server.send_message(msg)
-        return True
-    except (smtplib.SMTPException, OSError):
-        return False
-```
+  - `owner_lock_wait`, drained at the owner's abort or give-up exit;
+  - `owner_error_end`;
+  - `guest_db_open_failed` for class 'unmatched';
+- `drain_timeout_seconds` — every other path, `token_refresh_failed`,
+  `evening_end` and `guest_db_open_failed` for class 'lock_conflict'
+  included.
 
 ---
 
@@ -1192,15 +1089,19 @@ across three files and drifted.
 | Negative bar-latency sample | `bar_close_premise_violation` | finding 27 | True | yes | yes | — |
 | Evening liveness probe | `evening_liveness_probe` | DB-only findings | False | yes | yes | — |
 | Scheduled, evening end | `evening_end` | findings 1 and 4 over that evening run's stages; finding 9 when that run's `evening_execution_param_fit` SUMMARY line reports the fit executed | False | yes | yes | — |
-| Batch lock-probe deadline abort | `batch_lock_deadline_abort` | finding 28 | False | **no** | yes | — |
+| Owner lock wait | `owner_lock_wait` | finding 28 | False | **no** | yes | — |
 | Token refresh failure | `token_refresh_failed` | finding 46 | False | **no** | yes | — |
-| Session lock wait exceeded | `session_lock_wait_exceeded` | finding 47 | False | **no** | yes | — |
+| Owner error end | `owner_error_end` | finding 11 (that run) | False | **no** | yes | — |
+| Guest DB open failure | `guest_db_open_failed` | finding 49 | False | **no** | yes | — |
 
-- A path whose DB column reads **no** writes no `alert_log` row (see the
-  delivery rules below).
+- A path whose DB column reads **no** writes no `alert_log` row
+  (alert_delivery.md's Delivery).
+- The owner error end and guest DB open failure paths are delivered by the DB
+  access coordination helper (utils.md's Helper deliveries), which builds
+  their finding entries and passes them to alert_delivery.md's `deliver()`.
 - `log_write_failed` is also an `alert_key` but not a path — it is injected
-  into whichever delivery is in flight (see Log Writing) and is never
-  suppressed.
+  into whichever delivery is in flight (alert_delivery.md's Log Writing) and
+  is never suppressed.
 - `db_health_observation` (R-9) is another: it is a delivery stream, not a
   findings-gathering path, so it appears in `alert_log` and in the
   suppression key space but has no row above — it passes no
@@ -1210,7 +1111,7 @@ across three files and drifted.
 **Evening end** (`evening_end`) is the evening run's final step, after
 `evening_backup`, whatever the earlier stages' status:
 - order: gather → write_to_log → dispatch → drain, up to
-  `alerting.drain_timeout_seconds`;
+  `alerting.drain_timeout_seconds` (alert_delivery.md);
 - it writes, under `stage='evening_health_report'`, in this order:
   - its own `batch_runs` row as 'running', at start;
   - its `SUMMARY` line;
@@ -1226,11 +1127,12 @@ across three files and drifted.
     - finding 1's rows;
     - finding 4's `SUMMARY` lines from `metadata_crawler_{that date}.log`.
 
-**Requirement axes — three, not two.** Beyond the DB and `live_aggregates`,
+**Requirement axes.** Beyond the DB and `live_aggregates`,
 `gather_findings()` also reads the crawler log FILES under `log_dir`, which
-is neither. All three axes had been invisible until now because every call
-gathered everything from inside a session, where all three were always
-present.
+is neither, and run history from the coordination store. The DB,
+`live_aggregates` and `log_dir` axes had been invisible until now because
+every call gathered everything from inside a session, where each of them was
+always present.
 - **`live_aggregates`**: EMPTY as of R-9 — no finding is computed this way
   any more. Findings 5, 8, 21 and 22 now read
   live_session_state.session_diagnostics, and 12, 24 and 25 now aggregate
@@ -1241,15 +1143,16 @@ present.
   Every path's entry is `—` for now, including `clock_check_abort`, whose
   former `partial` described exactly the case R-9 removed — an abort before
   Gate 2 now leaves its probe measurements in the DB rather than in memory.
-- **`log_dir` files** — `logs/metadata_crawler_{date}.log` and
-  `logs/live_mode_runner_{date}.log`:
+- **`log_dir` files** — the `SUMMARY`, `RESIDUE`, `RUN` and `STAGE` lines of
+  `logs/metadata_crawler_{date}.log` and `logs/live_mode_runner_{date}.log`:
   - finding 4;
   - finding 10;
-  - the missing-`SUMMARY` finding.
+  - the missing-`SUMMARY` finding;
+  - finding 1's no-row cause.
   Readable without the DB, which is why the DB-less paths can produce
   anything at all.
 - **DB**: findings 1, 2, 3, 5, 8, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
-  22, 23, 24, 25, 26, 27, 29, 30, 31, 32, 33, 34, 35, 36-45. Of those, 30-33 and 35
+  22, 23, 24, 25, 26, 27, 29, 30, 31, 32, 33, 34, 35, 36-45, 48. Of those, 30-33 and 35
   read `live_scan_daily`; 33 alone reads a row written by the evening batch
   rather than by the session being reported, so on a session-end call it
   describes the PREVIOUS day.
@@ -1257,10 +1160,16 @@ present.
   - finding 6 (placeholder);
   - finding 7 (placeholder);
   - finding 28;
-  - finding 46;
-  - finding 47.
-- Finding 11 is produced BY the evening liveness probe rather than gathered
-  during it — it is that path's own conclusion, not a query result.
+  - finding 46.
+- **Run history** — utils.md's report functions over the coordination store,
+  readable on every path, so the table above has no column for it:
+  - finding 11 (`abnormal_runs()`, `missed_scheduled_run()`);
+  - finding 1's no-row cause (`run_info()`).
+- Finding 49, and finding 11 under `owner_error_end`, are built by the DB
+  access coordination helper, not gathered.
+- On the evening liveness probe, finding 11 is that path's own conclusion —
+  the crash its wait found (`predecessor_crashed`) — with the run's details
+  from run history (`abnormal_runs()`).
 
 **`evening_liveness_probe`'s subset is deliberately wider than finding 11.**
 That path exists
@@ -1274,7 +1183,8 @@ partial: findings 5, 8, 12, 21, 22, 24 and 25 were the ones it could not
 reach, and all seven are now DB-computable, so a crashed session loses only
 what the flush cadence had not yet written — at most one flush interval of
 the running counters (findings 8 and 22).
-If `live_session_start` has no row for the date, the session never started —
+If today's runner run ended `not_expected` or no runner run exists today,
+the session never started —
 an ordinary non-trading outcome, not a crash — and the subset narrows to
 finding 1. Reporting the full sweep there would emit an all-zero report that
 reads like an incident.
@@ -1310,42 +1220,7 @@ probe values in the same row report normally.
 
 ## Config Keys (pipeline_config.yaml)
 
-```yaml
-alerting:
-  alert_level: "all"                       # "all" | "warn_and_above" | "abort_only"
-  channels: ["discord", "email"]           # empty list = log-only, no delivery attempted
-  event_alert_suppression:                 # event-driven, single-report
-    abort: { mode: "rate_limited" }        #   deliveries only — scheduled
-    warn:  { mode: "always" }              #   batch reports are never
-    ok:    { mode: "always" }              #   suppressed (see Constraints)
-  max_pending_alert_keys: 10               # per channel; distinct alert_keys,
-                                           # latest entry per key retained
-  drain_timeout_seconds: 600               # normal shutdown: wait for pending
-                                           # deliveries. Bounded by the ~50min
-                                           # gap to the 21:00 evening batch
-  abort_drain_timeout_seconds: 600         # paths whose finding requests
-                                           # manual intervention —
-                                           # batch_lock_deadline_abort and
-                                           # session_lock_wait_exceeded —
-                                           # intervention is already pending,
-                                           # so do not linger
-  discord:
-    webhook_url_env: "DISCORD_WEBHOOK_URL" # env var name, not the value — never in config
-    event_alert_timeout_seconds: 10        # rate_limited window for this
-                                           # channel; webhooks absorb a high
-                                           # rate
-  email:
-    event_alert_timeout_seconds: 60        # SMTP cannot absorb Discord's rate;
-                                           # each send still carries its own
-                                           # suppressed count, so the coarser
-                                           # window loses no information
-    smtp_host: "smtp.gmail.com"
-    smtp_port: 587
-    from_addr: ""
-    to_addr: ""
-    username_env: "ALERT_EMAIL_USERNAME"
-    password_env: "ALERT_EMAIL_PASSWORD"
-```
+The `alerting:` block is alert_delivery.md's (Config Keys).
 
 ---
 
@@ -1360,30 +1235,16 @@ alerting:
   stopping; that coincidence is over, and each finding's operational
   consequence, if any, is stated in its own entry above
 - Call paths, their arguments, and which findings need the DB / `log_dir` /
-  `live_aggregates` are specified in Invocation Contract above — not
-  restated per finding, so there is one place to keep correct
-- `event_alert_timeout_seconds` is per channel and has NO default. A channel
-  added later must declare its own; no fallback is defined, deliberately, so
-  that the decision is forced rather than silently inheriting a value sized
-  for a different transport. No further channels are planned
-- Suppression applies ONLY to event-driven, single-report deliveries. Scheduled
-  invocations send every finding in one batched message, which suppression's
-  per-`alert_key` model does not address, and at one call per scheduled point
-  they could not reach a rate limit anyway. This is a consequence of the
-  DELIVERY UNIT, not of severity — which is why the `warn`/`ok` entries in
-  `event_alert_suppression` are inert today rather than wrong
-- `write_to_log()` always runs before any delivery attempt; delivery success
-  or failure never affects whether findings are logged
-- Delivery is best-effort per channel — a failure on one configured channel
-  does not block attempting the others
-- Delivery failure itself is logged (as `event=alert_delivery_failed`) so a
-  silently-dead alert channel is eventually discoverable from the log alone
-- Webhook URLs and SMTP credentials are never stored in `pipeline_config.yaml`
-  directly — only the environment-variable name they're read from
-  (`*_env` keys), consistent with `secrets.yaml`'s gitignore discipline in
-  metadata_crawler.md
-- `channels: []` (empty) means log-only — a valid, supported configuration,
-  not an error state
+  `live_aggregates` / run history are specified in Invocation Contract
+  above — not restated per finding, so there is one place to keep correct
+- alert_delivery.md's Constraints state the delivery rules:
+  - `event_alert_timeout_seconds` per channel, with no default;
+  - logging before any delivery attempt;
+  - suppression's scope;
+  - per-channel best effort;
+  - delivery-failure logging;
+  - credentials read from environment variables;
+  - `channels: []` as log-only
 - A `SUMMARY` line's absence from a crawler log (see metadata_crawler.md) is
   reported as its own finding, distinct from a nonzero `failed` count within
   a `SUMMARY` line that does exist

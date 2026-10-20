@@ -111,17 +111,24 @@ form belongs to which.
   - `WARN`;
   - `SUMMARY`;
   - `RESIDUE`;
+  - `STAGE`;
+- every line carries `run_id`;
+- each runner-written work stage (`premarket_recheck_bundle`,
+  `premarket_quarantine_recheck`) writes a `STAGE` line (`stage`, `date`,
+  `run_id`) at its start;
 - a warm restart appends to that date's file;
 - a function logs into the structured log of the process hosting it, each
   entry point configuring that log, with no function signature change —
   in-process, `check_corporate_event_anomaly()`'s and the recheck bundle's
   `SUMMARY` lines go here;
 - `tools/*_candidates.log` files stay shared review queues;
-- health_report.md's finding 4 reads `SUMMARY` lines from this file beside
-  `metadata_crawler_{date}.log`.
+- health_report.md's finding 4 reads `STAGE` and `SUMMARY` lines from this
+  file beside `metadata_crawler_{date}.log`.
 
 Loop A's thread catches exceptions at its top level, logs, stops only that
-thread, and records ONE health event per session; trading continues. The
+thread, and records the health event `auxiliary_loop_stopped`
+(health_report.md finding 48) once each time a loop A thread stops; trading
+continues. The
 SDK already swallows callback-path exceptions, so this covers the flush
 path. Memory is structurally bounded there: the aggregate dict is keyed by
 `(ticker, second)` and every flush empties the sealed seconds.
@@ -134,23 +141,25 @@ ONE connection, not two. DuckDB refuses a second open of the same file
 under a different configuration in the same process, and its file lock is
 exclusive across processes, so a read-only handle beside the writer is not
 available either way. Per-thread and per-component handles derive from the
-single connection with `.cursor()`. Ownership over the day is TEMPORAL, and
-db_schema.md's DB file ownership windows section is the single site of that
-design — this section and Session Start Gating below reference it rather
-than restating it.
+single connection with `.cursor()`. LiveModeRunner is an owner: it opens
+its connection through utils.md's DB Access Coordination under its wait
+spec (db_schema.md's DB File Ownership Windows) — this section and Session
+Start Gating below reference it rather than restating it. Its process entry
+runs inside `register('owner', 'live_mode_runner', trigger, owner='runner')`.
 
 ```python
-conn = duckdb.connect(db_path)   # read-write, the process's only open of
-                                 # this file. Sub-handles: conn.cursor().
+conn = handle.conn   # handle: Session Start Gating's acquire() result;
+                     # read-write, the process's only open of this file.
+                     # Sub-handles: conn.cursor().
 write_lock = Lock()
                  # ALL writes funnel through db_write() below —
                  # inference_log, indicator_cache (any mode as of R-2 — see
                  # below; previously "db" mode only), trade_log (shadow
-                 # mode), batch_runs (this session's own live_session_start
-                 # / live_session_end markers — see Session Lifecycle Step
-                 # 1c and Session Shutdown below), and, as of R-2,
-                 # live_positions and live_session_state (see "Session
-                 # Restart (Warm Start)" below), the order and fill ledger
+                 # mode), and, as of R-2, live_positions and
+                 # live_session_state (see "Session Restart (Warm Start)"
+                 # below; the session state itself is the coordination
+                 # store's, written through utils.md's helper, not here),
+                 # the order and fill ledger
                  # (live_orders, live_order_requests, live_fills,
                  # live_position_adjustments) plus the In-Process
                  # Premarket Recheck task's writes (R-1, see that section —
@@ -191,7 +200,7 @@ if today_close != the ordinary close
     write live_session_state.session_diagnostics: participation blocked,
         today's session_close, and the KEY'S VALUE AT THIS RUN
     run Session Start Probes, then Session Lifecycle steps 1a–1d (token
-        coverage gate, balance query, live_session_start persistence,
+        coverage gate, balance query, session-state persistence,
         Broker Reconcile) and step 1e's rate resolution
     no lifecycle='live' position (shadow included) and no 'open' logical
         order left → Session Shutdown, and exit
@@ -273,44 +282,56 @@ any 'open' logical order, are managed by the reduced session above, Unified
 Overnight Policy liquidating carried positions at its first Position Manager
 evaluation.
 
-## Session Start Gating (P-5 temporal ownership)
+## Session Start Gating (P-5)
 
-Before opening the DB connection above, LiveModeRunner waits out the
-premarket batch:
+The dispatcher launches LiveModeRunner at `coordination.schedule.runner.time`
+on its `days` (metadata_crawler.md's Cron / Scheduler Setup). Before opening
+the DB connection above, LiveModeRunner waits under its wait spec through
+utils.md's `acquire()` (db_schema.md's DB File Ownership Windows):
 - this is a *timing* concern — don't open a connection while the premarket
   job might still be writing;
 - it is distinct from Health Gate 1's premarket-marker check, a
   *data-completeness* concern evaluated afterward, once the session has
   already started;
-- premise: `--premarket-open` holds one connection from its lock probe to
-  its process exit (metadata_crawler.md).
+- premise: `--premarket-open` holds the DB from its acquisition to its
+  process exit (metadata_crawler.md's Premarket start gate).
 
-```
-premarket_wait_deadline   # top-level config key, "05:00" ET
-                          # (metadata_crawler.md's Config Keys) — also
-                          # --premarket-open's lock-probe deadline
-each poll (interval unspecified — cheap, low-stakes) is a read-write open
-    attempt of market.duckdb; a failed open is retried
-on a successful open, read today's premarket batch_runs rows:
-    none present:
-        before premarket_wait_deadline → close the connection before the
-            next poll
-        at or after it → proceed on that connection: the "degraded start"
-            path (Health Gate 1c's warn-and-suppress-affected-tickers
-            behavior handles the consequences)
-    one or more present → the premarket run has ended: proceed on that
-        connection at once, Health Gate 1c judging the markers
-an open still failing at premarket_wait_deadline → health_report finding 47
-    (session_lock_wait_exceeded), sent once, and keep retrying; the first
-    successful open proceeds per the rule above, Session Lifecycle Step 4b's
-    late-start branch applying past premarket_recheck_time
-an open still failing at the process hard cap (after_hours_end −
-    session_hard_exit_offset_minutes) → the runner ends without a session,
-    draining delivery up to alerting.abort_drain_timeout_seconds before exit
-```
+Wait spec:
+- phase A, read from the coordination store:
+  - today's premarket state `done` or `failed`, or that run crashed →
+    phase B;
+  - `session_expected` false → the run ends `not_expected` without a
+    session and without opening the DB;
+  - the premarket in a non-terminal state with its run lock held, or not
+    yet run today → wait;
+  - at `coordination.schedule.premarket.deadline` → phase B, the "degraded
+    start" path (Health Gate 1c's warn-and-suppress-affected-tickers
+    behavior handles the consequences);
+- phase B — `db.lock` attempts:
+  - starting to wait on a guest or 'unregistered' holder → health_report.md
+    finding 28 phase `waiting`;
+  - still failing at `coordination.schedule.premarket.deadline` → one
+    notification, finding 28 phase `deadline` (`owner='runner'`), and the
+    attempts continue; the first acquisition proceeds, Session Lifecycle
+    Step 4b's late-start branch applying past `premarket_recheck_time`;
+- the hard cap (after_hours_end − session_hard_exit_offset_minutes, taken
+  before the DB is held from the boundaries entry in owner state —
+  utils.md's Session expectation and boundaries) → the run ends `hard_cap`
+  without a session, draining delivery up to
+  `alerting.abort_drain_timeout_seconds` (alert_delivery.md) before exit.
 
-The runner holds no connection between polls; the successful open is the
-session's one connection.
+Once the DB is held:
+- a non-trading day per `trading_calendar` → the run ends `not_expected`
+  without a session;
+- the boundaries used are compared with `trading_calendar` for today, the
+  DB values taken on a difference, and the outcome recorded in
+  `session_diagnostics.boundary_source` (write point (a)) —
+  `{source: 'premarket_state' | 'evening_state' | 'default', fallback,
+  mismatch, mismatched_fields}`.
+
+The session state turns `done` at Session Shutdown stage 1, before the DB
+connection's release. The acquisition's `handle.conn` is the session's one
+connection.
 
 ## Session Start Probes (R-7 / R-8)
 
@@ -397,7 +418,8 @@ Write points:
 (a) immediately after the probes above, BEFORE Health Gate 2
       clock_offset_start, clock_offset_end=null, retention_boundary; each
       probe flagged 'disabled' | 'succeeded' | 'fell_back' so "never ran"
-      and "ran and fell back" stay distinct
+      and "ran and fell back" stay distinct; boundary_source (Session Start
+      Gating)
 (b) immediately after Health Gate 2
       adds the tier-fallback summary (finding 5)
 (c) on the existing bar_latency_daily flush cadence
@@ -417,9 +439,8 @@ with `on_exceed: "abort"` terminates the session before Gate 2 is reached,
 and the measured offset is the only evidence for why. The evening probe
 recovers the crash FACT (finding 11) but never the measurements.
 
-`clock_offset_end` is written as `null` at (a) rather than left absent, so
-its absence at report time reads as "session did not reach shutdown" rather
-than as a missing key.
+`clock_offset_end` is written as `null` at (a) and filled at (d), Session
+Shutdown.
 
 A flush failure at (c) is swallowed per db_schema.md's standing rule, and
 must NOT increment finding 22's own counter — otherwise a persistent write
@@ -450,17 +471,17 @@ Stage 1 performs:
   close-pending positions then closing on the tape it covers (Position
   close, Position Manager Loop);
 - the `live_session_state` write;
-- the `batch_runs stage='live_session_end'` marker;
 - closing any open `live_halt_episodes` interval;
-- RELEASE of the DB connection;
+- `handle.close('done')` — the session state `done`, then the DuckDB close
+  and the `db.lock` release (utils.md's DB Access Coordination);
 - stopping loop P.
 
 Stage 2, at stage 1 plus `auxiliary_stream.tail_minutes`, stops
 loop A, takes its final sealed-second flush, and exits the process. R-9's
 purpose is unchanged: the boundary is still a fixed instant, not a
-condition on positions. The DB release at stage 1 is what db_schema.md's
-ownership windows section uses as the session window's exit condition, so
-the evening batch's lock probe reads the runner as absent throughout the
+condition on positions. The session state `done` and the `db.lock` release
+at stage 1 are what the evening run's wait reads (metadata_crawler.md's
+Evening job start gate), so it reads the runner as ended throughout the
 stage-2 tail.
 (a) is the ordinary path — on a normal day the 15:59 `session_end` exits
 fill within minutes and the process leaves shortly after 16:00; on an
@@ -482,7 +503,8 @@ the coincidence was doing the explaining.
 
 The offset is kept rather than derived away because what the cap is FOR is a
 policy: leaving margin before the 21:00 evening batch, which is what
-health_report.md's `drain_timeout_seconds` is sized against. Stage 2 sits
+alert_delivery.md's `alerting.drain_timeout_seconds` is sized against.
+Stage 2 sits
 inside that margin: `auxiliary_stream.tail_minutes` is now the length of
 stage 2, and it carries three roles — that duration, the subscription
 hold-down, and covering the delayed stream's 15-minute lag. R-7 kept
@@ -498,8 +520,9 @@ is trying to avoid, and the row is durable (R-2), so the next session
 finds it rather than discovering an orphan.
 
 **Every 'open' logical order is canceled at stage 1**, entry and exit,
-before the markers below (`terminal_cause='shutdown'`). Whether an order
-left resting after the process dies survives the session-close boundary is
+before the session state turns `done` (`terminal_cause='shutdown'`).
+Whether an order left resting after the process dies survives the
+session-close boundary is
 unverified (api_contract_checklist.md T-19); the cancel does not depend on
 the answer. An order whose cancel is still unconfirmed at process end stays
 'open' for the next start, whose startup procedure classifies it — live and
@@ -525,31 +548,11 @@ A logical order with `purpose='overnight_liquidation'` writes no
 `exit_trigger_agreement_daily` contribution. A position carried without
 Session Shutdown has neither.
 
-LiveModeRunner's last action before process exit, after both loops have
-been signaled to stop and any final position/order state has settled:
-```
-db_write(
-    "UPDATE batch_runs SET status='success', finished_at=?
-     WHERE stage='live_session_end' AND date=?",
-    ...
-)
-# or INSERT if no 'running' row was created at session start — either is
-# fine as long as exactly one live_session_end row per date results.
-
-# R-2: also flip the session's own start marker (written 'running' at
-# Session Lifecycle Step 1c) to 'success':
-db_write(
-    "UPDATE batch_runs SET status='success', finished_at=?
-     WHERE stage='live_session_start' AND date=?",
-    ...
-)
-# Invariant this maintains: a today live_session_start row still 'running'
-# with no live_session_end row = crashed session — this is exactly what
-# warm-restart detection keys on (see "Session Restart (Warm Start)"
-# below). A clean shutdown always flips both markers together.
-```
-The evening batch job (metadata_crawler.md) waits on this marker before
-its own first stage begins — see metadata_crawler.md's Dual Schedule.
+Stage 1's `handle.close('done')` is the session state's terminal write; a
+crash leaves the state non-terminal with the run lock free, which is what
+warm-restart detection and the evening run's crash path key on (see
+"Session Restart (Warm Start)" below; metadata_crawler.md's Evening job
+start gate).
 
 ---
 
@@ -616,8 +619,6 @@ LiveModeRunner.start_session(today_date):
       real-time queried balance instead — see that call site.
 
   1c. Persist session start (R-2):
-         db_write INSERT batch_runs stage='live_session_start',
-             date=today, status='running'.
          db_write INSERT live_session_state (date, run_id,
              session_start_cash, started_at).
       This is the authoritative sizing basis for the session — a warm
@@ -637,11 +638,12 @@ LiveModeRunner.start_session(today_date):
       Warm restart already reconciles in its own step 1 and does not
       double-run this.
 
-  1e. Rate resolution: execution_common.md's get_execution_param() resolves
-      every (rate, order type) pair once, and the results overlay this
-      process's in-memory config (execution_common.md's Rate Overlay) —
-      the config file is never written. The resolved values and their
-      source (fitted_at, or seed) are logged; a hard-bound fallback writes
+  1e. Rate resolution: execution_common.md's resolve_rates() resolves every
+      (rate, order type) pair once through get_execution_param(), and the
+      results overlay this process's in-memory config (execution_common.md's
+      Rate Overlay) — the config file is never written. The resolved values
+      and their source (fitted_at, 'seed' or 'seed_bound_fallback') are
+      logged; a hard-bound fallback writes
       the health event execution_param_bound_fallback, detail {param,
       order_type, stored, seed} (health_report.md finding 9). Every
       simulator call site this session — shadow entry and exit, the pilot
@@ -780,12 +782,13 @@ LiveModeRunner.start_session(today_date):
      Any ABORT SESSION outcome stops here — Eager Pool (Step 5) never runs.
 
   4b. [Late-start freshness branch — R-1] Evaluate once, here, before Eager
-      Pool. Session Start Gating proceeds by premarket_wait_deadline unless
-      the open itself keeps failing, so this branch matters only when a
-      start lands past recheck_time — a manual restart (e.g. after a Health
-      Gate 1 abort elsewhere in the morning), or a runner whose first
-      successful open came late; it also correctly no-ops for an Eager
-      Pool that is merely running late on a normal start.
+      Pool. Session Start Gating's wait spec reaches phase B by
+      coordination.schedule.premarket.deadline at the latest, so this branch
+      matters only when a start lands past recheck_time — a manual restart
+      (e.g. after a Health Gate 1 abort elsewhere in the morning), or a
+      runner whose acquisition of db.lock came late; it also correctly
+      no-ops for an Eager Pool that is merely running late on a normal
+      start.
 
          if now >= config["live_mode"]["premarket_recheck_time"]
                 and the recheck bundle is not done:   # its batch_runs row,
@@ -994,7 +997,8 @@ watchdog and 5s position loops are not stalled):
   - 'success' once step 5's per-ticker work is complete;
 - a same-day re-run overwrites the existing (stage, date) rows of
   'premarket_recheck_bundle' and 'premarket_quarantine_recheck';
-- its `SUMMARY` line, and step 2's, go to this process's runner log
+- its `STAGE` and `SUMMARY` lines, and step 2's, go to this process's runner
+  log
   (`logs/live_mode_runner_{date}.log`, metadata_crawler.md's Output /
   Logging).
 
@@ -1556,9 +1560,17 @@ loop every poll_interval_seconds:
                      capped at P_cap when execution.entry_price_cap_enabled
                      — S from this signal's inference, computed once here.
                      A configured market entry forced to limit takes it too.
-            funds_price = ask1 * config["live_mode"]["market_buy_price_margin"] \
-                          if order_type == "market" else limit_price
-                # ask1: signal_time_rest's level-1 quote at this signal
+            if order_type == "market":
+                base, basis = ask1, 'ask1'       # signal_time_rest's level-1
+                    # quote at this signal, when that response has arrived
+                    # by now; otherwise the latest trade print in this
+                    # ticker's bar-close superset fetch, basis
+                    # 'last_print' — signal_time_rest stays un-awaited
+                R = base * config["execution"]["market_buy_price_margin"],
+                    rounded DOWN to tick(price)
+                funds_price = R
+            else:
+                funds_price = limit_price
             proceed, quantity = execution_common.check_funds_available(
                 quantity, funds_price, available_cash,
                 use_all_cash=config["execution"]["use_all_cash"],
@@ -1602,7 +1614,10 @@ loop every poll_interval_seconds:
              # purpose='entry', requested_qty=quantity, status='open'), and
              # INSERT its live_order_requests row (request_type='new',
              # qty=quantity, price=limit_price, status='intent',
-             # intent_at=now). The row is written BEFORE the submission,
+             # intent_at=now; for a market entry also
+             # market_buy_limit_price=R and market_buy_limit_basis=basis,
+             # NULL otherwise — in every stage). The row is written BEFORE
+             # the submission,
              # for BOTH order types, so a submission that landed but whose
              # response was lost is still recorded, and the startup
              # procedure resolves it (Broker Reconcile).
@@ -1645,7 +1660,8 @@ loop every poll_interval_seconds:
                                       the anchor's second and inside the
                                       window>,
                          quantity=quantity, entry_anchor_second=anchor,
-                         limit_price=limit_price,
+                         limit_price=<limit_price; for a market entry the
+                                      request's market_buy_limit_price>,
                          last_print=<the last print strictly before the
                                      anchor>,
                          rate=execution_common.entry_fill_rate(config,
@@ -1733,7 +1749,7 @@ loop every poll_interval_seconds:
                      # response carrying both values.
                      # MARKET entries skip this entirely and keep the
                      # existing balance-query path unchanged, having no
-                     # quotable price to submit"
+                     # quotable price to submit.
 ```
 
 ---
@@ -2268,7 +2284,8 @@ shadow: caps shape what live would have done, the breaker only reacts to it.
 
 **On trip, health_report.py is invoked immediately** — a third trigger beside
 session start and session end — at `abort` severity, so it reaches even
-`alert_level: "abort_only"`. No new alerting infrastructure: the Discord and
+`alerting.alert_level: "abort_only"` (alert_delivery.md). No new alerting
+infrastructure: the Discord and
 email channels already exist and were simply never wired to a mid-session
 event.
 
@@ -2287,7 +2304,9 @@ ticker at the event-day exit gate's release (Position Manager Loop step 2).
 Restart step 1 and Feed Outage step 4:
 1. Load the 'open' logical orders (`open_orders`).
 2. Query `inquiry/transaction-history` from their earliest `order_date`
-   through today, continuation pages included.
+   through today, continuation pages included; each returned order's
+   `AstkOrdPrc` is recorded as `broker_order_price` on the request it
+   resolves to — an 'intent' request's once step 3 resolves it.
 3. Resolve each 'intent' request:
    - amend / cancel — exactly, by `OrgOrdNo` + `OrdTrdTpCode`;
    - new — by its request parameters and an order time after its
@@ -2407,8 +2426,10 @@ is set.
   - 'estimate' sets `amount` = `qty` × the position's
     `weighted_avg_exit_price`, or, with no exit fill, `qty` × the close of
     the last regular-session `ohlcv_1min` bar of the first trading day on or
-    after `event_date`; `amount_source='estimated'`; `price` = `amount` ÷
-    `qty` rounded; `priced_at`;
+    after `event_date` on which the ticker has a regular-session bar,
+    searched through the trading day before the current session;
+    `amount_source='estimated'`; `price` = `amount` ÷ `qty` rounded;
+    `priced_at`; with no such day the 'none' outcome below applies;
   - 'none' leaves `amount` NULL (no proceeds for it);
   - the position closes, and `event_settlement_stalled`
     `kind='cash_unobserved'` is recorded.
@@ -2440,9 +2461,8 @@ is set.
     any exists;
   - for one ticker, over the Positions branch's window, when the branch
     evaluates deferral (iv) for it or runs event settlement on it;
-  - at the session-start Broker Reconcile call, account-wide, from the date
-    of the previous `batch_runs` row with `stage='live_session_start'`
-    through today.
+  - at the session-start Broker Reconcile call, account-wide, from the
+    previous `live_session_state` date through today.
 - Fetched rows are classified per Broker summary vocabulary and grouped by
   `AstkIsuNo`.
 - Cash-in-lieu sources, config key `live_mode.cash_in_lieu_sources`, an
@@ -2562,16 +2582,17 @@ such write is swallowed and must not abort the reconcile.
 
 ## Session Restart (Warm Start) — R-2
 
-Detected at startup: today's `live_session_start` row is `status='running'`,
-there is no `live_session_end` row, and now is within session hours on a
-trading day. (Else: ordinary cold start.) Distinct from Feed Outage
+Detected at startup: today's previous session row (`owner_status('runner')`,
+utils.md), read before registration, is in a non-terminal or `crashed`
+state, and now is within session hours on a trading day. (Else: ordinary
+cold start.) Distinct from Feed Outage
 Recovery above — that handles connectivity loss within a still-running
 process; this handles the process itself having died and restarted.
 
 The procedure is idempotent from step 1 — a crash during recovery leaves it
-safely re-runnable. Throughout, the `live_session_start` marker stays
-`'running'` (only a clean resume/shutdown flips it — see Session Shutdown),
-so a re-crash during recovery re-enters warm restart on the same signature.
+safely re-runnable. Throughout, the session state stays non-terminal (only
+Session Shutdown's `handle.close('done')` ends it), so a re-crash during
+recovery re-enters warm restart on the same test.
 
 ```
 1. Broker Reconcile (shared procedure — see R-3's "Broker Reconcile"),
@@ -3547,7 +3568,7 @@ counter adds another unmeasured threshold).
 placed order is tracked and never reads as a ghost. This is an OPERATOR
 CONVENTION and is unenforceable — the system cannot prevent an operator using
 the broker's own app, and the convention is likeliest to break during exactly
-the incident `health_report.md`'s finding 28 (`batch_lock_deadline_abort`)
+the incident `health_report.md`'s finding 28 (`owner_lock_wait`)
 asks for manual intervention in.
 At a 60-second threshold there is effectively no human-in-the-loop grace,
 which is what makes the convention load-bearing. A CLI route for it is an open
@@ -3606,7 +3627,8 @@ logical order 'canceled' after its final fills fold. 14 (rejected) marks the
 request 'rejected' and, for a 'new' request, the logical order 'rejected'; a
 rejected amend / cancel leaves the logical order 'open'. 12 (amend
 confirmed) sets `current_request_id` to whichever of the original and amend
-order numbers OUTSTANDING lists.
+order numbers OUTSTANDING lists. Each event's reported `Sastkordprc` is
+recorded on its request as `broker_order_price`.
 
 **WS connections.** TWO connections, both opened at session start and
 held for the whole session: one carrying the quote stream (Exit
@@ -3752,6 +3774,8 @@ loop every position_check_interval_seconds (config, default: 5s):
   # (b) cannot replace (a): a fully filled order also disappears from
   # (b), so absence there alone does not separate cancellation from
   # completion.
+  # Each returned order's AstkOrdPrc is recorded on its request as
+  # broker_order_price — no new call.
   # Record (a)'s RETURNED ROW COUNT each cycle into live_scan_daily's
   # fill_page_rows_p50/_p95. The page size is a server-side parameter with
   # no request field and it varies per call, so this is the only way the
@@ -4355,7 +4379,7 @@ no entry logical order is 'open', and no `side='exit'` 'event_settlement'
 adjustment has `amount` NULL (Broker Reconcile's settlement pending
 excepted, whose 'none' fallback closes with `amount` NULL). Then
 `lifecycle='closed'` and the `trade_log` row is written, in the basis as of
-the close:
+the close (db_schema.md's `trade_log` basis comment):
 - Average prices are computed in Python from `live_position_state`'s sums,
   divided in `Decimal` (utils.md's Numeric Rules):
   `weighted_avg_entry_price` = `entry_fill_amount` ÷ `entry_filled_qty`, or
@@ -4371,7 +4395,8 @@ the close:
   `exit_filled_qty_first_session`, 0 when the position closed in its first
   exit session.
 - `partial_fills_count` = `exit_fill_seconds`.
-- Exit time = `last_exit_fill_at`; when an adjustment completes the close
+- Exit time (`exit_bar` / `exit_date`) = `last_exit_fill_at`; when an
+  adjustment completes the close
   (shortfall, or event settlement), that adjustment's `observed_at`, or its
   `priced_at` when the measured `amount` completes it.
 - `exit_reason` = the latest exit logical order's `exit_reason`; when a
@@ -4400,16 +4425,15 @@ the close:
   `p_entry`) ÷ `p_entry`, in the entry date's basis; NULL for a position with
   no entry fill.
 - `pnl_pct` = (`pnl_proceeds_amount` + dividend cash − `pnl_cost_amount`) ÷
-  `pnl_cost_amount`, computed in `Decimal`, stored as DOUBLE. Dividend cash,
-  over `corporate_events` 'dividend' rows for the ticker with `event_date`
-  after the first entry fill's date and no later than the close:
-  - per event, the per-share net amount `utils.dividend_gross_amount()` ×
-    (1 − `corporate_events.dividend_withholding_rate`) is taken in float and
+  `pnl_cost_amount`, computed in `Decimal`, stored as DOUBLE. Dividend cash
+  follows utils.md's `dividend_gross_amount()` cash-flow reader rule, over
+  `corporate_events` 'dividend' rows for the ticker with `event_date` after
+  the first entry fill's date and no later than the close:
+  - per event, the rule's per-share net amount is taken in float and
     converted by V1 at 8 decimal places — a per-share dividend amount
     (utils.md's Numeric Rules);
-  - it is multiplied in `Decimal` by the shares held at the start of that
-    `event_date`, in that date's basis, and the product rounded to 6
-    decimal places;
+  - it is multiplied in `Decimal` by the rule's share count, and the product
+    rounded to 6 decimal places;
   - dividend cash is the Σ of those per-event values.
 - Writes to `trade_log`:
   - its DECIMAL price columns bind the rounded `Decimal` (V4), and
@@ -4463,9 +4487,14 @@ the real request path's changes (execution_common.md's Fill Simulation
 Model) — no incremental steps and no Warm Restart replay:
 - entry:
   - anchor the 'new' request's `sent_at`;
-  - the real order type and limit price (`live_order_requests.price`);
+  - the real order type;
+  - the limit price:
+    - a limit entry's `live_order_requests.price`;
+    - a market entry's `broker_order_price` when > 0, otherwise its
+      `market_buy_limit_price`; no column records which was used;
   - quantity `trade_log.requested_quantity`;
-  - the rate by `entry_fill_rate()`;
+  - the rate by `entry_fill_rate()` for the real order type —
+    `entry_fill_rate(config, 'market')` for a market entry;
   - window to anchor + `cancel_after_seconds`, or to the ended-early end
     instant;
 - exit:
@@ -4481,16 +4510,16 @@ Model) — no incremental steps and no Warm Restart replay:
   - halts skipped;
   - steps ending at the end of `last_exit_fill_at`'s second, the unfilled
     remainder kept;
+- `predicted_partial_fills_count` is the number of the exit side's fill
+  increments (execution_common.md's `FillState`);
 - the exit side is NULL:
-  - for an exit_reason other than:
-    - take_profit;
-    - stop_loss;
-    - time_limit;
-    - session_end;
+  - for an exit_reason outside the strategy-trigger family (db_schema.md's
+    `trade_log.exit_reason` values section);
   - for a close completed by an adjustment;
   - on an 'entry_canceled' row, whose entry side is still computed;
-- Session Shutdown's carried case uses the same inputs, the exit steps
-  ending at the stage 1 cancel instant, stored on `live_orders`.
+- Session Shutdown's carried case uses the same inputs, the entry's limit
+  price by the same rule from the stored request row, the exit steps ending
+  at the stage 1 cancel instant, stored on `live_orders`.
 
 `entry_eligible_volume` / `exit_eligible_volume` (shadow_retraining.md's
 Σ Vᵢ):
@@ -4499,7 +4528,8 @@ Model) — no incremental steps and no Warm Restart replay:
 - computed at the same transition (at Session Shutdown stage 1 for a
   carried position) before the tape's release, over the same span split;
 - the tick volume after the anchor on which the real order could fill,
-  along the real request path.
+  along the real request path — on the entry side, the ticks the entry
+  limit price above lets fill under its entry limit rule.
 
 ---
 
@@ -4599,29 +4629,6 @@ live_mode:
   ws_reconnect_max_attempts:      5          # consecutive reconnect failures
                                              # before the escalation ladder
                                              # advances — see "WS connections"
-  market_buy_price_margin:        1.05       # seed value — stage 1 of the
-                                             # market-BUY funds gate sizes
-                                             # against ask1 * this, since the
-                                             # vendor converts a market BUY to
-                                             # a limit at a reference price it
-                                             # does not disclose
-                                             # (execution_common.md's Session
-                                             # Phase). Under live_mode:, not
-                                             # execution:, because
-                                             # BacktestEngine has no bid/ask
-                                             # model: a market entry fills at
-                                             # tick prices in every engine, and
-                                             # backtest's funds check prices a
-                                             # market entry at p_entry
-                                             # (execution_common.md).
-                                             # Set GENEROUS deliberately, on
-                                             # the one-sided-error posture
-                                             # this spec set takes wherever a
-                                             # bound stands in for an unknown:
-                                             # too high costs an occasionally
-                                             # under-sized entry, too low a
-                                             # vendor rejection the entry-side
-                                             # path already handles
   # exit_ladder_seed, exit_ladder_increment, exit_ladder_cap and
   # exit_order_stuck_minutes live under execution: (execution_common.md),
   # read by every engine; position_check_interval_seconds above stays here
@@ -4702,7 +4709,7 @@ live_mode:
                                              # a POLICY — margin before the
                                              # 21:00 evening batch must stay
                                              # expressible, and that margin is
-                                             # what health_report.md's
+                                             # what alert_delivery.md's
                                              # drain_timeout_seconds is sized
                                              # against. Default 0 puts the cap
                                              # at the extended-session end,

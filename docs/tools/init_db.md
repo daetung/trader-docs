@@ -26,16 +26,16 @@ separate means the destructive-looking one (schema creation) is always an
 explicit, deliberate invocation rather than something that can happen as a
 side effect of a data job.
 
-**Concurrency assumption**: identical to `migration_tool.md`'s. Run
-manually and rarely — in the ordinary case exactly once, when a database is
-first created — never on an automated schedule, and never concurrently with
-a live trading session or the evening/premarket batch jobs (see
-`db_schema.md`'s DB File Ownership Windows, the single site of that design,
-which this tool does not participate in — no `batch_runs` marker writes
-here).
-Running it while any of those hold the writer connection fails with a DuckDB
-lock error rather than corrupting anything: an operator error to avoid, not
-a case this tool detects or works around.
+**DB access role**: a guest (db_schema.md's DB File Ownership Windows),
+through utils.md's DB Access Coordination. Run manually and rarely — in the
+ordinary case exactly once, when a database is first created — never on an
+automated schedule:
+- the entry point runs inside `register('guest', 'init_db', trigger)`;
+- `market.duckdb` is opened only inside `guest_unit('init_db', None)`, which
+  waits for admission without limit;
+- the run is one unit;
+- while an owner waits past `coordination.guest_max_hold_seconds`, the run
+  ends by self-termination and is re-run.
 
 ---
 
@@ -59,9 +59,33 @@ Statements are already written `CREATE TABLE IF NOT EXISTS` (and the one view
 this tool decides or adds.
 
 **When `db_schema.md` changes, `SCHEMA_STATEMENTS` is re-transcribed from it.**
-Re-transcription has now been required ELEVEN times. The most recent occasion
-is the fill-simulation record and the per-order-type rates, one DDL set
-decided together, adding no table:
+The most recent occasion is the carried-exit records, the market-BUY limit
+record and the run-state records, one DDL set decided together, adding no
+table and applied while no database holds rows, so with no existing-row step:
+- `trade_log` (class 2): nullable columns, added by `ADD COLUMN` alone:
+  - `dead_position_case` (`VARCHAR`);
+  - `carry_breakdown` (`VARCHAR`);
+  - `exit_anchor_bar` (`INTEGER`);
+  - `exit_anchor_date` (`VARCHAR`);
+  - `entry_end_cause` (`VARCHAR`);
+  - `fill_increments` (`VARCHAR`).
+- `live_order_requests` (class 2): nullable columns, added by `ADD COLUMN`
+  alone:
+  - `market_buy_limit_price` (`DECIMAL(18,6)`);
+  - `market_buy_limit_basis` (`VARCHAR`);
+  - `broker_order_price` (`DECIMAL(18,6)`).
+- `experiment_log` (class 2):
+  - nullable columns, added by `ADD COLUMN` alone:
+    - `negative_cash_count` (`INTEGER`);
+    - `effective_config` (`VARCHAR`);
+    - `data_end_date` (`VARCHAR`);
+  - `record_fill_increments` (`BOOLEAN`): `ADD COLUMN`, then
+    `ALTER COLUMN ... SET NOT NULL`; its `DEFAULT TRUE` is carried by
+    `db_schema.md`'s `CREATE TABLE`.
+- `batch_runs`: no DDL change — its stage values are a comment.
+
+The occasion before it was the fill-simulation record and the per-order-type
+rates, one DDL set decided together, adding no table:
 - `trade_log` (class 2, `ADD COLUMN`): nullable columns, added by
   `ADD COLUMN` alone:
   - `predicted_entry_filled_qty` (`DECIMAL(18,6)`);
@@ -287,8 +311,9 @@ re-transcribing and before assuming the change has landed.
 
 ## Output / Logging
 
-Plain stdout; no log file and no `batch_runs` row (this tool is outside the
-batch-marker scheme entirely — see the concurrency assumption above).
+Plain stdout; no log file and no `batch_runs` row (its DB access is the
+guest role above; the helper writes its `UNIT` lines, utils.md's DB Access
+Coordination).
 
 ```
 init:   created 40 tables, 0 already present    # fresh database
@@ -325,5 +350,5 @@ verify: 40 tables checked, 1 difference          # the view
   behind
 - Never alters or drops an existing table, under any flag
 - `--verify` is strictly read-only
-- No `batch_runs` marker, no scheduled invocation, never run concurrently
-  with a live session or a batch job
+- No `batch_runs` marker and no scheduled invocation; a guest whose run is
+  one unit (DB access role above)

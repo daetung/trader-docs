@@ -21,7 +21,15 @@ are handled entirely by ClassBalancer.
 
 ## Input / Output
 
-**Session-window exclusion.** This entry point opens `market.duckdb` and so must NOT run while LiveModeRunner holds the connection — see db_schema.md's DB file ownership windows.
+**DB access role.** A guest (db_schema.md's DB File Ownership Windows),
+through utils.md's DB Access Coordination:
+- the entry point runs inside `register('guest', 'run_preprocess', trigger)`;
+- `market.duckdb` is opened only inside `guest_unit('run_preprocess', None)`,
+  which waits for admission without limit;
+- the run is one unit, the connection that unit yields passed wherever
+  this entry point takes `db_conn`;
+- while an owner waits past `coordination.guest_max_hold_seconds`, the run
+  ends by self-termination and is re-run.
 
 **Input:**
 ```python

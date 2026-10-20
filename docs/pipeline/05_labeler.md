@@ -241,9 +241,9 @@ In this case:
         r = split_ratio_from_events() over (D, D+1], from the
             corporate_events frame   (utils.md's split factor; 1.0 if none)
         dividend_term = Σ over 'dividend' rows with event_date IN (D, D+1] of
-            the net amount (utils.md's dividend_gross_from_events(), from
-            the same frame: the gross amount in its event_date basis ×
-            (1 − corporate_events.dividend_withholding_rate)) × the split
+            the per-share net amount by utils.md's dividend_gross_amount()
+            cash-flow reader rule (its gross through
+            dividend_gross_from_events(), from the same frame) × the split
             factor over (D, that event_date] (split_ratio_from_events())
             (0.0 if none; same overnight window as r — a
             split or ex-dividend date effective D+1 is what would otherwise

@@ -131,7 +131,13 @@ COMPLETE in a single INSERT rather than inserted and updated later:
     - `predicted_exit_filled_qty`;
   - entry:
     - anchor the 'new' request's `sent_at`;
-    - the real order type and limit price (`live_order_requests.price`);
+    - the real order type;
+    - the limit price:
+      - a limit entry's `live_order_requests.price`;
+      - a market entry's `broker_order_price` when > 0, otherwise its
+        `market_buy_limit_price`, with the rate
+        `entry_fill_rate(config, 'market')`; no column records which was
+        used;
     - quantity `trade_log.requested_quantity`;
     - window to anchor + `cancel_after_seconds`, or to the ended-early end
       instant (below);
@@ -149,16 +155,14 @@ COMPLETE in a single INSERT rather than inserted and updated later:
     - steps ending at the end of `last_exit_fill_at`'s second, the unfilled
       remainder kept;
   - the exit side is NULL:
-    - for an exit_reason other than:
-      - take_profit;
-      - stop_loss;
-      - time_limit;
-      - session_end;
+    - for an exit_reason outside the strategy-trigger family (db_schema.md's
+      `trade_log.exit_reason` values section);
     - for a close completed by an adjustment;
     - on an 'entry_canceled' row, whose entry side is still computed;
 - the eligible volume `entry_eligible_volume` / `exit_eligible_volume` —
   the fit's Σ Vᵢ terms (below) — over the same span split, before the
-  tape's release.
+  tape's release; on the entry side, the ticks the entry limit price above
+  lets fill under its entry limit rule.
 
 `predicted_*` serve `health_report.md`'s finding 7; the fit reads the real
 fills and the eligible volume.
@@ -458,12 +462,14 @@ the current market regime.
 
 **Timezone / DST Discipline.** All schedule times in this system are
 wall-clock America/New_York times, which observe DST:
-- 03:00 ET `--token-refresh` — see metadata_crawler.md's "Overnight Token
-  Refresh"; it writes no `batch_runs` row, its failure surfacing through
-  the `token_refresh_failed` alert;
-- 04:00 ET `--premarket-open`;
-- 05:00 ET `premarket_wait_deadline` — the premarket lock probe's and
-  Session Start Gating's deadline;
+- 03:00 ET `--token-refresh`, `coordination.schedule.token_refresh.time` —
+  see metadata_crawler.md's "Overnight Token Refresh"; it writes no
+  `batch_runs` row, its failure surfacing through the `token_refresh_failed`
+  alert;
+- 04:00 ET `--premarket-open`, `coordination.schedule.premarket.time`;
+- 04:00 ET LiveModeRunner, `coordination.schedule.runner.time`;
+- 05:00 ET `coordination.schedule.premarket.deadline` — the deadline of the
+  premarket's and the runner's waits;
 - 09:20 ET `--premarket-recheck` — R-1: the 09:20 pass is now a
   LiveModeRunner in-process task, not a cron entry — see
   metadata_crawler.md's "Dual Schedule", N-1/N-3;
@@ -476,12 +482,12 @@ wall-clock America/New_York times, which observe DST:
 - `after_hours_end(date)` — also the live process's R-9 hard cap once
   `live_mode.session_hard_exit_offset_minutes` is subtracted, and so ONE
   entry here rather than two;
-- 21:00 ET evening batch run;
-- 23:30 ET `evening_wait_hard_deadline`.
+- 21:00 ET evening batch run, `coordination.schedule.evening.time`;
+- 23:30 ET `coordination.schedule.evening.deadline`.
 
 The set above is every wall-clock time the system schedules or gates
 behaviour against, whatever the mechanism:
-- a cron entry;
+- a dispatcher launch (metadata_crawler.md's Cron / Scheduler Setup);
 - an in-process scheduled task;
 - a market boundary the code branches on.
 
@@ -489,9 +495,6 @@ That criterion is why 09:20 stays listed after it ceased to be a cron. This
 enumeration is a convenience copy, so it can be compared mechanically
 against each value's authority — where the value is set:
 - a config key;
-- a crontab entry — one whose time a config key also states (03:00,
-  `token_refresh_time`) is set from that key, a divergence resolved in the
-  key's favour;
 - `trading_calendar`, through utils.md's Session Boundary Derivations;
 - execution_common.md's session-phase table literal.
 
@@ -502,14 +505,15 @@ time, and this is enforced rather than merely recommended — LiveModeRunner's
 `clock_check` probe aborts the session by default when the offset exceeds
 `max_offset_seconds`. The host
 must set its system TZ to `America/New_York` (not a fixed UTC offset), so
-that all cron schedules, the in-process recheck's scheduled time, and
+that the dispatcher's schedule times, the in-process recheck's scheduled
+time, and
 bar-close authority (see live_mode_runner.md)
 shift correctly across the two annual transitions. Operator checklist: on
 the Monday following each DST transition (mid-March, early November),
 before trusting the session, verify:
 - the 03:00 token refresh — each account's SDK token cache `expires_at`
-  equalling that day's `token_refresh_time` + 24h, or that day's
-  `token_refresh_failed` alert;
+  equalling that day's `coordination.schedule.token_refresh.time` + 24h, or
+  that day's `token_refresh_failed` alert;
 - every other scheduled run — that day's `batch_runs` rows landed at the
   expected wall-clock times.
 
@@ -519,24 +523,41 @@ LAST BAR (`last_bar()`, ordinarily 15:59) and the EXCHANGE CLOSE
 (`session_close()`, ordinarily 16:00) differ by a minute and were both written
 as bare times here. On an early-close day they are 12:59 and 13:00, and
 `after_hours_end` is 17:00 rather than 20:00. The 21:00 and 23:30 slots do NOT
-move — see metadata_crawler.md for why the evening cron is not pulled earlier.
+move — see metadata_crawler.md for why the evening run is not pulled earlier.
 The session-boundary entries above are now DERIVED rather than fixed, which does
 not remove them from the enumeration: the criterion is that the system gates
 behaviour on the value, not that the value is a literal. Membership rule for the
 comparison described above — an entry is compared against its authority:
 - a config key;
-- a crontab entry;
 - the `trading_calendar` column;
 - the session-phase table literal.
 
 **DuckDB Backup/Recovery.** For `data/market.duckdb`:
-- Backup: the evening run's final stage, `evening_backup`
-  (metadata_crawler.md's Nightly Backup), its window per db_schema.md's DB
-  File Ownership Windows, the single site of that design.
+- Backup: the evening run's last stage before the evening end report,
+  `evening_backup` (metadata_crawler.md's Nightly Backup), its DB access the
+  evening run's as an owner (db_schema.md's DB File Ownership Windows). It
+  also copies `coordination.sqlite` to `backup_dir` as
+  `coordination_YYYYMMDD.sqlite` (utils.md's `backup_store()`).
 - Retention: follows the posture the table purge registry takes — nightly
   copies are kept without limit until an operator sets a window against
   observed disk growth, so nothing is deleted by default and the growth is
   the operator's to watch.
-- Recovery: a plain file-copy restore of the single `.duckdb` file — any
-  existing `market.duckdb.wal` is removed before the copy is placed; no
-  WAL/point-in-time replay involved.
+- Recovery — the operator procedure, the helper functions being utils.md's
+  Recovery:
+  - the DuckDB file:
+    1. with the coordination store unreadable, the store's rebuild (below)
+       runs first;
+    2. an owner waiting on the damaged file is ended by the operator, its
+       run then found crashed;
+    3. `restore_db(backup_path)` is called — a guest run that removes
+       `market.duckdb.wal` and replaces `market.duckdb` with the backup copy;
+       no WAL/point-in-time replay involved;
+  - the coordination store — `rebuild_store(backup_path)` from a
+    `coordination_YYYYMMDD.sqlite` copy:
+    - the dispatcher's crontab entry is paused before the call and restored
+      after;
+    - known results:
+      - today's state is empty, the runner's phase A then waiting to the
+        premarket deadline;
+      - runs between the backup and the rebuild may be reported by
+        `missed_scheduled_run()`.

@@ -17,17 +17,19 @@ tool issues no DDL: its processing steps INSERT into tables and call the
 populate helpers, all of which assume those tables are present. Creating
 them is `tools/init_db.py`'s job (see `init_db.md`), so the new-database
 workflow is `init_db.py` first, then this tool. The two are peers with the
-same concurrency assumption below — neither imports the other, and this
+same DB access role below — neither imports the other, and this
 tool does not defensively re-create anything.
 
-**Concurrency assumption**: this tool is run manually/rarely, never on an
-automated schedule, and is assumed to never run concurrently with a live
-trading session or the evening/premarket batch jobs (see db_schema.md's DB
-File Ownership Windows, the single site of that design, which this
-tool does not participate in — no `batch_runs` marker writes here). Running
-it while any of those hold the writer connection will fail with a DuckDB
-lock error rather than corrupt data — an operator error to avoid, not a
-case this tool detects or works around.
+**DB access role**: a guest (db_schema.md's DB File Ownership Windows),
+through utils.md's DB Access Coordination. This tool is run manually and
+rarely, never on an automated schedule:
+- the entry point runs inside `register('guest', 'migration_tool', trigger)`;
+- `market.duckdb` is opened only inside `guest_unit('migration_tool', None)`,
+  which waits for admission without limit;
+- the run is one unit, the connection that unit yields passed wherever
+  this tool takes `db_conn`;
+- while an owner waits past `coordination.guest_max_hold_seconds`, the run
+  ends by self-termination and is re-run.
 
 ---
 
@@ -327,14 +329,16 @@ python tools/collect_daily.py \
     --date {last_ingested_date}
 
 # Option B: Manually populate session_stats for the first live date
+# (a guest through utils.md's DB Access Coordination)
 python - <<'EOF'
-import duckdb
-from utils import populate_precomputed_session_stats, get_next_trading_day
-con = duckdb.connect("data/market.duckdb")
-last_date = con.execute("SELECT MAX(date) FROM ohlcv_1min").fetchone()[0]
-first_live_date = get_next_trading_day(last_date, con)
-populate_precomputed_session_stats(con, dates=[first_live_date], n_sessions=20)
-print(f"Session stats populated for {first_live_date}")
+from utils import (register, guest_unit, populate_precomputed_session_stats,
+                   get_next_trading_day)
+with register("guest", "migration_tool", "manual"):
+    with guest_unit("migration_tool", None) as con:
+        last_date = con.execute("SELECT MAX(date) FROM ohlcv_1min").fetchone()[0]
+        first_live_date = get_next_trading_day(last_date, con)
+        populate_precomputed_session_stats(con, dates=[first_live_date], n_sessions=20)
+        print(f"Session stats populated for {first_live_date}")
 EOF
 ```
 

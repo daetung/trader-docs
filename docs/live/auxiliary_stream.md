@@ -65,8 +65,11 @@ loop is fault and GIL isolation, and the GIL cost is bounded: the callback
 mutates a dict and the flush serialises at most `flush_seconds` ×
 `execution.ws_ticker_limit` records, since callbacks aggregate into
 `(ticker, second)` buckets rather than accumulating rows. Fault isolation is
-provided instead by loop A's thread catching at its top level, stopping only
-itself, and recording one health event per session (live_mode_runner.md).
+provided instead by loop A's thread:
+- catching at its top level;
+- stopping only itself;
+- recording the health event `auxiliary_loop_stopped` (health_report.md
+  finding 48) once each time a loop A thread stops (live_mode_runner.md).
 
 **"Itself" is not this component alone.** Loop A also carries the demo REST
 quote leg (live_mode_runner.md; trading_api.md's Leg assignment) of:

@@ -223,8 +223,8 @@ the calculator's O(1) incremental discipline for no gain.
 
 The origin-invariance rests on `02_indicator_calculator.md`'s Incremental
 Computation Rule, I3: the window is rebased by exact subtraction to its first
-value before conversion to float, so the two paths' differing origins never
-reach a float value.
+non-NaN value before conversion to float, so the two paths' differing origins
+never reach a float value.
 
 ---
 

@@ -457,14 +457,14 @@ CREATE TABLE IF NOT EXISTS ticker_data_coverage (
 );
 
 -- Completion markers for daily batch stages (metadata_crawler.md's Dual
--- Schedule + LiveModeRunner's own session-end marker). Backs two things:
--- (1) LiveModeRunner's Health Gate 1/2 (live_mode_runner.md) reads this to
---     detect a stale/failed/still-running upstream batch before trading
---     starts; (2) DuckDB access-ownership sequencing (P-5): the premarket
---     run's rows gate LiveModeRunner's session start (Session Start Gating's
---     proceed rule; DB File Ownership Windows below), and
---     LiveModeRunner's own 'live_session_end' row gates the evening stage's
---     start — see live_mode_runner.md and metadata_crawler.md.
+-- Schedule):
+-- - LiveModeRunner's Health Gate 1/2 (live_mode_runner.md) reads this to
+--   detect a stale/failed/still-running upstream batch before trading starts;
+-- - a row is the latest attempt of that stage for that date — a re-run
+--   overwrites the rows of the stages it executes;
+-- - DuckDB access sequencing is not kept here: the session state and
+--   run_journal hold it (utils.md's DB Access Coordination; DB File Ownership
+--   Windows below).
 -- Retention: purge-registry member — date_column `date`, retention_days: inf
 --   (see metadata_crawler.md's evening purge stage).
 CREATE TABLE IF NOT EXISTS batch_runs (
@@ -481,10 +481,10 @@ CREATE TABLE IF NOT EXISTS batch_runs (
                                       -- 'evening_detection_gap' |
                                       -- 'evening_halt_comparison' |
                                       -- 'evening_execution_param_fit' |
+                                      -- 'evening_fundamentals' |
                                       -- 'evening_retention_purge' |
                                       -- 'evening_backup' |
-                                      -- 'evening_health_report' |
-                                      -- 'live_session_start' | 'live_session_end'
+                                      -- 'evening_health_report'
     date         VARCHAR   NOT NULL,  -- 'YYYYMMDD' — the trading day this batch targets
     status       VARCHAR   NOT NULL,  -- 'running' | 'success' | 'failed'
     started_at   TIMESTAMP NOT NULL,
@@ -493,11 +493,8 @@ CREATE TABLE IF NOT EXISTS batch_runs (
 );
 -- The overnight token refresh writes no row here: it opens no DB connection
 -- (metadata_crawler.md's Overnight Token Refresh).
--- 'live_session_start' (R-2): written 'running' at Session Lifecycle Step
--- 1c, flipped to 'success' at clean Session Shutdown alongside
--- 'live_session_end'. A today row still 'running' with no
--- 'live_session_end' row is the crash signature warm-restart detection
--- keys on — see live_mode_runner.md.
+-- LiveModeRunner writes no row here: warm-restart detection reads the session
+-- state (utils.md's DB Access Coordination; live_mode_runner.md).
 -- 'premarket_recheck_bundle': written by the In-Process Premarket Recheck's
 -- bundle itself — 'running' at start, 'failed' when its fetches fail,
 -- 'success' once its per-ticker work is complete. Absent or 'running' means
@@ -512,10 +509,11 @@ CREATE TABLE IF NOT EXISTS batch_runs (
 -- shadow_retraining.md's fit_execution_params()). The `execution:` config
 -- block values (execution_common.md) are seed defaults only — one scalar per
 -- rate, shared by every order type — used until the first row lands here for
--- a (param_name, order_type) pair. get_execution_param() resolves the latest
--- row per pair once per top-level run — LiveModeRunner's session start,
--- run_backtest.py's start, pipeline_optimizer's coordinator — in preference to
--- the config seed, overlaying the in-memory config (execution_common.md);
+-- a (param_name, order_type) pair. resolve_rates() resolves the latest row
+-- per pair through get_execution_param() once per top-level run —
+-- LiveModeRunner's session start, run_backtest.py's start,
+-- pipeline_optimizer's coordinator — in preference to the config seed,
+-- overlaying the in-memory config (execution_common.md);
 -- this table is never written by hand.
 -- Retention: NEVER purged — structurally excluded from the purge registry
 --   (fitted-parameter history).
@@ -862,8 +860,27 @@ CREATE TABLE IF NOT EXISTS experiment_log (
                                  -- by, and 0 would misread as "no loss"
     breaker_max_consecutive_losses  INTEGER,
     breaker_peak_entries_per_hour   INTEGER,
+    negative_cash_count             INTEGER,  -- under backtest.open_buy_cash_hold
+                                 -- 'none', the number of entry fill increment
+                                 -- debits after which remaining_cash < 0; 0
+                                 -- under 'order_amount'; NULL when
+                                 -- initial_cash is 0
     entry_fill_rate_disabled BOOLEAN NOT NULL DEFAULT FALSE,
     exit_fill_rate_disabled  BOOLEAN NOT NULL DEFAULT FALSE,
+    record_fill_increments   BOOLEAN NOT NULL DEFAULT TRUE,  -- backtest.
+                                 -- record_fill_increments for this run:
+                                 -- whether trade_log.fill_increments was written
+    effective_config     VARCHAR,                -- JSON {"config", "rate_sources"}: the
+                                                 --   run's whole in-memory config after
+                                                 --   the rate overlay and apply_overrides,
+                                                 --   never secrets.yaml content, and
+                                                 --   {param_name: {order_type: {value,
+                                                 --   source}}}, source the
+                                                 --   execution_params row's fitted_at,
+                                                 --   'seed' or 'seed_bound_fallback'
+    data_end_date        VARCHAR,                -- 'YYYYMMDD': the latest
+                                                 --   trading_calendar date with
+                                                 --   has_data = TRUE at the run's start
     -- NO early-close column here, and the absence is DELIBERATE — recorded so
     -- it is not proposed again. The pair above exists because those switches
     -- vary per RUN and cannot be reconstructed afterwards. Early-close handling
@@ -883,7 +900,7 @@ CREATE TABLE IF NOT EXISTS experiment_log (
     -- The two backtest: participation-rate switches, recorded per RUN
     -- (09_backtest_engine.md). Recorded as switch state rather than as the
     -- resolved rate values, for three reasons: a rate would place the
-    -- switch back among the rates run_backtest.py's get_execution_param()
+    -- switch back among the rates run_backtest.py's resolve_rates()
     -- resolution overlays on the config (execution_common.md's Rate
     -- Overlay), which the switch — applied after selection — exists to
     -- bypass; it would scatter one fact across buy_rate and the sell_rate_*
@@ -892,10 +909,13 @@ CREATE TABLE IF NOT EXISTS experiment_log (
     -- one without, so these columns are what keeps a ranking from being
     -- read outside the state it was produced in
     -- (pipeline_optimizer.md's execution_eval fixes them per run).
+    -- effective_config is the general run-state record — the whole resolved
+    -- config and the rate sources; these switch columns stay as filter
+    -- columns beside it.
     trades_by_signal     VARCHAR,                -- JSON
     trades_by_exit       VARCHAR,                -- JSON
-    -- Column vs JSON: trades_by_exit is JSON because exit_reason is an OPEN,
-    -- growing set (four new values landed in this session alone). The gate
+    -- Column vs JSON: trades_by_exit is JSON because exit_reason is an OPEN
+    -- set, registered in the trade_log.exit_reason values section. The gate
     -- and breaker counters above are CLOSED sets known at design time, so
     -- they are columns — this is what makes `WHERE
     -- gate_blocked_cap_tickers > 0` a plain filter instead of a
@@ -903,6 +923,8 @@ CREATE TABLE IF NOT EXISTS experiment_log (
     -- select these columns does not pay for their presence; the column
     -- count on this table is not a performance concern at the row volumes
     -- this table sees (one row per backtest run).
+    -- trade_log's diagnostic JSON columns (carry_breakdown, fill_increments)
+    -- are JSON with a fixed key set.
     PRIMARY KEY (run_id)
 );
 
@@ -953,7 +975,10 @@ CREATE TABLE IF NOT EXISTS trade_log (
     ticker                  VARCHAR      NOT NULL,
     date                    VARCHAR      NOT NULL,
     entry_bar               INTEGER      NOT NULL,  -- HHMMSS as integer
-    exit_bar                INTEGER      NOT NULL,
+    exit_bar                INTEGER      NOT NULL,  -- the instant the writing engine
+                                        -- records the position's close as complete
+                                        -- (HHMMSS as integer); per value in the
+                                        -- trade_log.exit_reason values section
     exit_date               VARCHAR      NOT NULL,  -- 'YYYYMMDD' — the date exit_bar
                                         -- belongs to. ALWAYS populated: equal to
                                         -- `date` for every exit resolved on the entry
@@ -976,6 +1001,8 @@ CREATE TABLE IF NOT EXISTS trade_log (
                                         --   a carried position closed under its
                                         --     inherited trigger label (a prior exit
                                         --     logical order existed)
+                                        --   a BacktestEngine carried row — closed on
+                                        --     a later date than its entry date
                                         -- health_report.md's "what did this session
                                         -- close" queries key on this column, not
                                         -- `date`.
@@ -993,88 +1020,10 @@ CREATE TABLE IF NOT EXISTS trade_log (
                                         -- close
     weighted_avg_exit_price DECIMAL(18,6),
     pnl_pct                 DOUBLE,
-    exit_reason             VARCHAR,     -- TWO families below sit outside ordinary
-                                        -- strategy PnL attribution, for DIFFERENT
-                                        -- reasons. They are named and kept separate
-                                        -- deliberately: health_report.md reports them
-                                        -- as distinct findings, and
-                                        -- 09_backtest_engine.md's summary denominators
-                                        -- treat only one of them as a trade.
-                                        --
-                                        -- (1) NEVER-OPENED family — no position ever
-                                        -- existed (quantity=0, pnl_pct=NULL), so there
-                                        -- is no PnL to exclude; it structurally does
-                                        -- not exist. Excluded from total_trades /
-                                        -- winning_rate / avg_pnl_pct / total_pnl_abs,
-                                        -- but still visible via trades_by_exit:
-                                        --   'entry_canceled' — the entry ended with
-                                        --     nothing filled, other than by rejection,
-                                        --     whatever its terminal_cause
-                                        --     (live_mode_runner.md); a real
-                                        --     observation, not omitted from the table.
-                                        --     fit_execution_params() reads every row
-                                        --     for buy_rate — an entry that ended early
-                                        --     read on the window it actually had
-                                        --     (shadow_retraining.md).
-                                        --   'entry_rejected' (R-7, LIVE-ONLY) — the
-                                        --     broker or the account refused the
-                                        --     submission itself (account restriction,
-                                        --     insufficient funds at the actual price,
-                                        --     ticker not permitted). Same row shape as
-                                        --     'entry_canceled', and it likewise counts
-                                        --     as a cooldown attempt — but it is
-                                        --     EXCLUDED from fit_execution_params(),
-                                        --     because a refusal carries no evidence
-                                        --     about how the market absorbed an order.
-                                        --     The two labels are opposites on exactly
-                                        --     that point.
-                                        --
-                                        -- (2) LIVE-ONLY OPERATIONAL family — a real
-                                        -- position existed and produced real PnL, but
-                                        -- was closed by operational handling rather
-                                        -- than by the strategy, so it is excluded from
-                                        -- attribution as reflecting handling, not
-                                        -- strategy performance:
-                                        --   'feed_gap_exit' — exit condition
-                                        --     triggered during a Feed Outage
-                                        --     Recovery gap (live_mode_runner.md).
-                                        --   'restart_gap_exit' (R-2) — tp/sl
-                                        --     breached during a crash gap,
-                                        --     detected retroactively on warm
-                                        --     restart via gap-fill ticks + the
-                                        --     2-print guard, and liquidated at
-                                        --     CURRENT price (the historical breach
-                                        --     price is stale by then). If the gap
-                                        --     already exceeds
-                                        --     execution.max_hold_bars,
-                                        --     retro-detection is skipped and the
-                                        --     position is liquidated immediately,
-                                        --     still 'restart_gap_exit'.
-                                        --   'overnight_exit' (R-3) — a position
-                                        --     carried from a PRIOR trading day
-                                        --     with no exit logical order before
-                                        --     the carry, or an adopted broker
-                                        --     position (origin='adopted'),
-                                        --     liquidated by the Unified Overnight
-                                        --     Policy as soon as tradable. NOT
-                                        --     covered: a halt-carried position —
-                                        --     its ticker's live_halt_episodes
-                                        --     interval on its date contains
-                                        --     exit_deadline(date) — which is
-                                        --     'dead_position', PnL included; and a
-                                        --     carried position with a prior exit
-                                        --     logical order, attributed under its
-                                        --     inherited trigger label, PnL
-                                        --     included.
-                                        --   'reconcile_ghost' (R-3) — a position
-                                        --     closed by a shortfall adjustment:
-                                        --     Broker Reconcile found fewer shares
-                                        --     at the broker than the ledger holds
-                                        --     (live_mode_runner.md's Positions
-                                        --     branch). quantity = entry_qty.
-                                        -- See live_mode_runner.md's "Broker
-                                        -- Reconcile (shared procedure)" and
-                                        -- "Unified Overnight Policy."
+    exit_reason             VARCHAR,     -- a value registered in the trade_log.exit_reason
+                                        -- values section (after this DDL region): its
+                                        -- family, writing engine, PnL attribution,
+                                        -- is_dead_position and exit_bar
     is_dead_position        BOOLEAN      NOT NULL DEFAULT FALSE,
     slippage_pct            DOUBLE,
     quantity                DECIMAL(18,6),
@@ -1144,9 +1093,9 @@ CREATE TABLE IF NOT EXISTS trade_log (
                                         -- a crash mid-session no longer loses the whole
                                         -- day's predicted_* values.
     predicted_weighted_avg_exit_price DOUBLE,  -- same, exit side. The exit side is
-                                        -- NULL for an exit_reason other than
-                                        -- take_profit, stop_loss, time_limit and
-                                        -- session_end, for a close completed by an
+                                        -- NULL for an exit_reason outside the
+                                        -- strategy-trigger family (trade_log.exit_reason
+                                        -- values section), for a close completed by an
                                         -- adjustment, and on an 'entry_canceled' row
     predicted_partial_fills_count     INTEGER, -- same, exit side — diagnostic
                                         -- counterpart to partial_fills_count above.
@@ -1180,15 +1129,66 @@ CREATE TABLE IF NOT EXISTS trade_log (
                                         -- that order's first request's order_date to
                                         -- the close; the fit reads the live_orders raw
                                         -- values for a carried position.
+    dead_position_case                VARCHAR, -- written by BacktestEngine, distinct
+                                        -- from labeled_samples.dead_position_case:
+                                        -- 'A' | 'B' | 'C' | 'D' on the dead-position
+                                        -- Case rows resolved on the entry date;
+                                        -- 'B' | 'C' on a carried row whose remaining
+                                        -- quantity took Case B or carried Case C
+                                        -- pricing; NULL otherwise and on
+                                        -- LiveModeRunner rows
+    carry_breakdown                   VARCHAR, -- JSON with a fixed key set, each in
+                                        -- the completion date's basis, values passed
+                                        -- through V1:
+                                        --   carried_qty, carried_amount — exit fills
+                                        --     after the first exit date, the amount
+                                        --     before backtest.carried_exit_penalty_pct
+                                        --   carried_penalty — the amount that key
+                                        --     deducts
+                                        --   fraction_qty, fraction_value — after the
+                                        --     'held' haircut
+                                        --   fraction_haircut — the amount the 'held'
+                                        --     haircut deducts
+                                        --   roundup_qty
+                                        --   dividend
+                                        --   dead_qty, dead_value
+                                        -- Populated on BacktestEngine rows carried
+                                        -- past their first exit date; NULL otherwise
+                                        -- and on LiveModeRunner rows
+    exit_anchor_bar                   INTEGER, -- utils.hour_to_int(): the instant
+    exit_anchor_date                  VARCHAR, --   the exit reason was assigned:
+                                        --   the tp/sl effective_second; the
+                                        --   time_limit instant the valid-bar count
+                                        --   was reached; exit_deadline(date) for
+                                        --   session_end and the dead-position Cases
+                                        --   reached through it
+                                        -- in the reference mode too. Written by
+                                        -- BacktestEngine; NULL on never-opened rows
+                                        -- and on LiveModeRunner rows
+    entry_end_cause                   VARCHAR, -- 'filled' | 'window_end' | 'breach' |
+                                        -- 'phase_boundary'; an entry with no tick in
+                                        -- its range takes 'window_end'. Written by
+                                        -- BacktestEngine; NULL on LiveModeRunner rows
+    fill_increments                   VARCHAR, -- JSON {"entry": [[second, quantity,
+                                        -- price], …], "exit": [[date, second,
+                                        -- quantity, price], …]}: second as
+                                        -- utils.hour_to_int()'s integer, date
+                                        -- 'YYYYMMDD', from the FillState fill
+                                        -- increments, quantities and prices raw as
+                                        -- filled in their date's basis, through V1.
+                                        -- Written when backtest.record_fill_increments
+                                        -- is true; NULL otherwise and on
+                                        -- LiveModeRunner rows
     PRIMARY KEY (run_id, ticker, date, entry_bar),
     CHECK ((signal IS NULL) = (entry_bar = -1))
 );
--- A LIVE row's per-share price columns, predicted_* included, and its
---   share-count columns are in the basis as of its close (live_mode_runner.md's
---   position close). quantity × fill_price matches the entry cost only to
---   rounding when a split ratio does not terminate; pnl_pct can differ from the
---   price-based return by dividend cash; on a carried row, predicted_* cover
---   the first exit session only.
+-- Basis, on every writer's rows: per-share price columns, predicted_*
+--   included, and share-count columns are in the basis as of the row's
+--   exit_date — a BacktestEngine row's exit, a LiveModeRunner row's close
+--   (live_mode_runner.md's position close). quantity × fill_price matches the
+--   entry cost only to rounding when a split ratio does not terminate; pnl_pct
+--   can differ from the price-based return by dividend cash; on a carried live
+--   row, predicted_* cover the first exit session only.
 
 -- Inference log (live mode inference events and preload failures)
 -- Retention: purge-registry member — date_column `date`, retention_days: inf
@@ -1372,7 +1372,7 @@ CREATE TABLE IF NOT EXISTS inference_log (
     -- General principle, applying to every diagnostic write in this system: a
     -- logging failure of ANY kind — PK collision, disk, lock, serialisation —
     -- must never abort trading. Wrap the write, count the failure, continue.
-    -- Same discipline as health_report.md's write_to_log(), which always runs
+    -- Same discipline as alert_delivery.md's write_to_log(), which always runs
     -- regardless of whether alert delivery succeeds.
     -- Note the PK's remaining scope is narrow: after the two changes above, the
     -- only thing it still prevents is duplicate insertion on replay, and live
@@ -1536,10 +1536,10 @@ CREATE TABLE IF NOT EXISTS live_positions (
 --   close is found next day by a REAL session's Broker Reconcile, has no
 --   broker counterpart, is dated to a prior day, and is routed to a real
 --   market liquidation for a position that never existed. Joining rows to
---   sessions by time cannot cover it either: an abnormal exit leaves
---   live_session_start open with no live_session_end, so the interval is
---   unclosed exactly for the rows that need classifying, and reading it as
---   open-to-now swallows the next day's real rows.
+--   sessions by time cannot cover it either: an abnormal exit leaves the
+--   session state non-terminal with no 'ended' run_journal row, so the
+--   interval is unclosed exactly for the rows that need classifying, and
+--   reading it as open-to-now swallows the next day's real rows.
 -- Boolean, not three-valued: its three consumers — reconcile_ghost
 --   suppression, overnight-liquidation blocking, and fit_execution_params —
 --   ask only whether a REAL order was placed, which does not separate pilot
@@ -1640,6 +1640,15 @@ CREATE TABLE IF NOT EXISTS live_order_requests (
     sent_at          VARCHAR,
     confirmed_at     VARCHAR,
     updated_at       VARCHAR NOT NULL,
+    market_buy_limit_price DECIMAL(18,6), -- R, on a market BUY 'new' request's
+                                         --   intent row in every stage; NULL on
+                                         --   other requests (live_mode_runner.md)
+    market_buy_limit_basis VARCHAR,      -- 'ask1' | 'last_print': R's base
+    broker_order_price     DECIMAL(18,6), -- the last order price the broker
+                                         --   reported for the request — IS2
+                                         --   Sastkordprc or inquiry/transaction-
+                                         --   history AstkOrdPrc; NULL until
+                                         --   reported
     UNIQUE (order_date, broker_order_no)
 );
 
@@ -1913,11 +1922,11 @@ CREATE TABLE IF NOT EXISTS live_session_state (
                                           -- values and were
                                           -- indistinguishable in the data.
                                           -- Session start/end TIMES are not
-                                          -- duplicated here — batch_runs'
-                                          -- live_session_start /
-                                          -- live_session_end rows hold them
-                                          -- and Warm Restart detection
-                                          -- reads them there.
+                                          -- duplicated here — the runner's
+                                          -- run_journal rows hold them, and
+                                          -- Warm Restart detection reads the
+                                          -- session state (utils.md's DB
+                                          -- Access Coordination).
     breaker_tripped_at VARCHAR,           -- R-4/Warm Restart: NULL until the
                                           -- circuit breaker trips this
                                           -- session, then the trip
@@ -1988,7 +1997,13 @@ CREATE TABLE IF NOT EXISTS live_session_state (
                                           -- — first-listing attempts, failures,
                                           -- and THE BLOCKED TICKERS BY NAME
                                           -- (live_mode_runner.md's Per-Ticker
-                                          -- Trading Terms); and restart_count.
+                                          -- Trading Terms); boundary_source
+                                          -- {source: 'premarket_state' |
+                                          -- 'evening_state' | 'default',
+                                          -- fallback, mismatch,
+                                          -- mismatched_fields}
+                                          -- (live_mode_runner.md's Session
+                                          -- Start Gating); and restart_count.
                                           -- margin_ratio is GONE from this list:
                                           -- the margin rate is per-ticker with
                                           -- no account-level counterpart, so
@@ -2006,11 +2021,8 @@ CREATE TABLE IF NOT EXISTS live_session_state (
                                           -- under a length-agreement
                                           -- constraint.
                                           -- clock_offset_end is written NULL at
-                                          -- session start rather than left
-                                          -- absent, so its absence at report
-                                          -- time reads as "never reached
-                                          -- shutdown" instead of as a missing
-                                          -- key.
+                                          -- session start and filled at
+                                          -- Session Shutdown.
                                           -- Written ONLY by whole-value
                                           -- replacement, never read-modify-
                                           -- write — see live_mode_runner.md's
@@ -2535,8 +2547,8 @@ CREATE TABLE IF NOT EXISTS exit_trigger_agreement_daily (
 -- exit_rejection_streak, reconcile_deferred, event_settlement_stalled,
 -- summary_vocabulary_candidate, dividend_withholding_mismatch,
 -- regime_holdout_gate_failed, regime_holdout_verdict,
--- tick_alignment_failed, and finding 9's execution_param_fit_rejected and
--- execution_param_bound_fallback.
+-- tick_alignment_failed, auxiliary_loop_stopped (finding 48), and finding
+-- 9's execution_param_fit_rejected and execution_param_bound_fallback.
 -- Findings 13 and 15 deliberately do NOT: each already writes its own
 -- trade_log row (finding 13: exit_reason='restart_gap_exit'; finding 15:
 -- rows with exit_date > date OR exit_reason='overnight_exit', and
@@ -2570,7 +2582,7 @@ CREATE TABLE IF NOT EXISTS health_events (
 
 -- Alert delivery log — one row per delivery ATTEMPT, i.e. per (alert, channel).
 -- Fills a gap that stood until this design: a SUCCESSFUL send was recorded
--- nowhere at all. write_to_log() records what was FOUND, and
+-- nowhere at all. alert_delivery.md's write_to_log() records what was FOUND, and
 -- event=alert_delivery_failed records failures, so "what actually reached the
 -- operator, and when" was not reconstructible — which left a silently
 -- degrading channel invisible and gave an alert no traceable link to the events
@@ -2587,13 +2599,13 @@ CREATE TABLE IF NOT EXISTS health_events (
 -- references — alert_log holds the column and health_events the rows it
 -- points at — which is a reason to keep any window no shorter than
 -- health_events'.
--- ONE EXCEPTION, structural: the evening job's hard-deadline abort
--- (metadata_crawler.md's evening job start gate) cannot write here at all — it
--- is aborting precisely BECAUSE it never acquired the DB lock, which a hung
--- LiveModeRunner still holds. That alert is file-log-only by necessity, not by
--- choice. Deferring its row to whichever process next holds the lock was
--- considered and rejected: a pending-alert-write queue is new infrastructure
--- for the one case where a human is already reading the log.
+-- EXCEPTION, structural: a path delivered DB-less (health_report.md's
+-- Invocation Contract, DB column no) writes no row here — the delivering
+-- process has no usable DuckDB connection at that point. Such an alert is
+-- file-log-only by necessity, not by choice. Deferring its row to whichever
+-- process next holds the lock was considered and rejected: a
+-- pending-alert-write queue is new infrastructure for cases where a human is
+-- already reading the log.
 CREATE TABLE IF NOT EXISTS alert_log (
     alert_id         VARCHAR NOT NULL,   -- same format and generator style as
                                          --   health_events.event_id. One id per
@@ -2621,12 +2633,12 @@ CREATE TABLE IF NOT EXISTS alert_log (
                                          --   delivers a REPORT, not one finding —
                                          --   so suppression is keyed on
                                          --   (alert_key, channel) as well.
-                                         --   The DB-less paths —
-                                         --   'batch_lock_deadline_abort' and
-                                         --   'token_refresh_failed' — write no
+                                         --   The DB-less paths — those whose
+                                         --   Invocation Contract DB column reads
+                                         --   no (health_report.md) — write no
                                          --   row here: their send outcome goes
                                          --   to the log_dir log
-                                         --   (health_report.md)
+                                         --   (alert_delivery.md)
     channel          VARCHAR NOT NULL,   -- 'discord' | 'email'
     severity         VARCHAR NOT NULL,   -- 'ok' | 'warn' | 'abort' — the MAXIMUM
                                          --   severity across the findings this
@@ -2639,8 +2651,8 @@ CREATE TABLE IF NOT EXISTS alert_log (
                                          --   resolves. Still written for a
                                          --   drain-timeout drop, because the DB
                                          --   connection deliberately outlives the
-                                         --   drain (see health_report.md's
-                                         --   shutdown order)
+                                         --   drain (see alert_delivery.md's
+                                         --   Drain)
     outcome          VARCHAR,            -- 'sent' | 'failed' | 'suppressed' |
                                          --   'dropped_queue' | 'dropped_drain'.
                                          --   NULL only while genuinely in flight
@@ -2661,40 +2673,131 @@ CREATE TABLE IF NOT EXISTS alert_log (
 
 ---
 
+## `trade_log.exit_reason` Values
+
+The single registry of `trade_log.exit_reason` values. A reference elsewhere
+to a family names it by reference to this section rather than enumerating its
+values.
+
+Families, each defined by its membership rule:
+- **strategy trigger** — the trigger that closed the position, including a
+  carried position closed under its inherited trigger label;
+- **dead-position** — a close resolved by dead-position handling rather than
+  by an intraday exit: a backtest dead position Case (09_backtest_engine.md)
+  or a live halt-carried position (live_mode_runner.md's Unified Overnight
+  Policy Label rule);
+- **never-opened** — no position ever existed (`quantity=0`,
+  `pnl_pct=NULL`), so there is no PnL to exclude; excluded from
+  `total_trades` / `winning_rate` / `avg_pnl_pct` / `total_pnl_abs`, still
+  visible via `trades_by_exit`;
+- **live-only operational** — a real position existed and produced real PnL,
+  but was closed by operational handling rather than by the strategy, so it is
+  excluded from attribution as reflecting handling, not strategy performance.
+
+The never-opened and live-only operational families sit outside ordinary
+strategy PnL attribution, for different reasons. They are named and kept
+separate deliberately: health_report.md reports them as distinct findings,
+and 09_backtest_engine.md's summary denominators treat only one of them as a
+trade.
+
+| value | family | writing engine | PnL attribution | `is_dead_position` | `exit_bar` (close instant) | assigned at | note |
+|---|---|---|---|---|---|---|---|
+| `take_profit` | strategy trigger | backtest, live | included | FALSE; TRUE on a backtest carried row whose remaining quantity took Case B or carried Case C pricing | backtest: the close-completion instant of 09_backtest_engine.md's exit fill simulation, or, on a carried row whose remaining quantity took Case B or carried Case C pricing, `last_bar` of the last date the position was carried in; live: the live rule below | 09_backtest_engine.md Exit Logic; live_mode_runner.md Position Manager Loop | |
+| `stop_loss` | strategy trigger | backtest, live | included | FALSE; TRUE on a backtest carried row whose remaining quantity took Case B or carried Case C pricing | as `take_profit` | 09_backtest_engine.md Exit Logic; live_mode_runner.md Position Manager Loop | |
+| `time_limit` | strategy trigger | backtest, live | included | FALSE; TRUE on a backtest carried row whose remaining quantity took Case B or carried Case C pricing | as `take_profit` | 09_backtest_engine.md Exit Logic; live_mode_runner.md Position Manager Loop | |
+| `session_end` | strategy trigger | backtest, live | included | FALSE; TRUE on a backtest carried row whose remaining quantity took Case B or carried Case C pricing | as `take_profit` | 09_backtest_engine.md Exit Logic; live_mode_runner.md Position Manager Loop | |
+| `dead_position` | dead-position | backtest (Case A), live (halt-carried position) | included | TRUE | backtest Case A: the timestamp of the source that resolved `exit_price` (D+1); live: the live rule below | 09_backtest_engine.md Dead Position Case A; live_mode_runner.md Unified Overnight Policy Label rule | |
+| `dead_position_delisted` | dead-position | backtest | included | TRUE | `last_bar(D)` | 09_backtest_engine.md Dead Position Case B | |
+| `dead_position_no_data` | dead-position | backtest | included | TRUE | `last_bar(D)` | 09_backtest_engine.md Dead Position Case C | |
+| `dead_position_extended_halt` | dead-position | backtest | included | TRUE | `last_bar(D)` | 09_backtest_engine.md Dead Position Case D | |
+| `entry_canceled` | never-opened | backtest, live | not a trade | FALSE | `entry_bar` | 09_backtest_engine.md Entry Slippage Model; live_mode_runner.md Position Manager Loop | The entry ended with nothing filled, other than by rejection, whatever its terminal_cause (live_mode_runner.md); a real observation, not omitted from the table. `fit_execution_params()` reads every row for `buy_rate` — an entry that ended early read on the window it actually had (shadow_retraining.md). |
+| `entry_rejected` | never-opened | live | not a trade | FALSE | `entry_bar` | live_mode_runner.md Watchdog Polling Loop and Position Manager Loop | (R-7) The broker or the account refused the submission itself (account restriction, insufficient funds at the actual price, ticker not permitted). Same row shape as `entry_canceled`, and it likewise counts as a cooldown attempt — but it is EXCLUDED from `fit_execution_params()`, because a refusal carries no evidence about how the market absorbed an order. The two labels are opposites on exactly that point. |
+| `feed_gap_exit` | live-only operational | live | excluded | FALSE | the live rule below | live_mode_runner.md Feed Outage Recovery | Exit condition triggered during a Feed Outage Recovery gap (live_mode_runner.md). |
+| `restart_gap_exit` | live-only operational | live | excluded | FALSE | the live rule below | live_mode_runner.md Session Restart (Warm Start) | (R-2) tp/sl breached during a crash gap, detected retroactively on warm restart via gap-fill ticks + the 2-print guard, and liquidated at CURRENT price (the historical breach price is stale by then). If the gap already exceeds `execution.max_hold_bars`, retro-detection is skipped and the position is liquidated immediately, still `restart_gap_exit`. |
+| `overnight_exit` | live-only operational | live | excluded | FALSE | the live rule below | live_mode_runner.md Unified Overnight Policy Label rule | (R-3) A position carried from a PRIOR trading day with no exit logical order before the carry, or an adopted broker position (`origin='adopted'`), liquidated by the Unified Overnight Policy as soon as tradable. NOT covered: a halt-carried position — its ticker's `live_halt_episodes` interval on its date contains `exit_deadline(date)` — which is `dead_position`, PnL included; and a carried position with a prior exit logical order, attributed under its inherited trigger label, PnL included. |
+| `reconcile_ghost` | live-only operational | live | excluded | FALSE | the live rule below | live_mode_runner.md Position Manager Loop Position close | (R-3) A position closed by a shortfall adjustment: Broker Reconcile found fewer shares at the broker than the ledger holds (live_mode_runner.md's Positions branch). `quantity` = `entry_qty`. |
+
+The live rule for `exit_bar`, on every live-written row outside the
+never-opened family: `last_exit_fill_at`, or, when an adjustment completes
+the close, that adjustment's `observed_at`, or its `priced_at` when the
+measured `amount` completes it.
+
+See live_mode_runner.md's "Broker Reconcile (shared procedure)" and "Unified
+Overnight Policy."
+
+---
+
 ## DB File Ownership Windows
 
 A WRITER on `market.duckdb` is exclusive. Measured: DuckDB refuses a second
 open of the same file under a different configuration within one process, and
 its file lock blocks every other open across processes while a writer holds
-it — read-only included. With NO writer, concurrent read-only opens from
-several processes all succeed, which is what `pipeline_optimizer.md`'s
-workers rely on. Ownership is therefore TEMPORAL, and this section is the
-single site of that design; the files below reference it rather than
-restating it.
+it — read-only included. Access is therefore serialized by `db.lock`:
+- utils.md's DB Access Coordination owns the mechanism, and is the only place
+  stating it:
+  - the coordination store — its tables, states and journal events;
+  - the lock files;
+  - the fact classes;
+  - the store and lock access rule;
+  - the acquire loop;
+- this section states the roles and the wait specs;
+- the files below reference this section and that one rather than restating
+  them.
 
-| Window | Owning process | Entry condition | Exit condition |
+Roles:
+- owner — whether launched by the dispatcher or by hand:
+  - `collect_daily.py --premarket-open`;
+  - LiveModeRunner;
+  - the full evening run;
+- aux — a process registered with the helper that never opens
+  `market.duckdb`:
+  - the dispatcher;
+  - the overnight token refresh;
+- guest — every other process that opens `market.duckdb`:
+  - every other `collect_daily.py` flag;
+  - health_report.md's CLI;
+  - run_preprocess;
+  - run_train;
+  - run_backtest;
+  - pipeline_optimizer's coordinator;
+  - detection_benchmark;
+  - init_db;
+  - migration_tool;
+  - the DuckDB recovery (`restore_db()`).
+
+Precedence: runner > premarket > evening > guest. The evening run yields at
+stage boundaries to a waiting premarket or runner (utils.md's Precedence and
+yield; metadata_crawler.md); the runner and the premarket never yield.
+
+Wait specs — phase A is the role's precondition, read from the coordination
+store; phase B takes `db.lock` by non-blocking attempts (utils.md's acquire
+loop):
+
+| Role | Phase A | Phase B | Deadline |
 |---|---|---|---|
-| 04:00 ET– | metadata_crawler `--premarket-open` | cron, then a read-write open succeeding (lock probe, deadline `premarket_wait_deadline`) | `--premarket-open` releasing its connection at process exit |
-| Session | LiveModeRunner | Session Start Gating's proceed rule (live_mode_runner.md): a read-write open succeeding with today's premarket batch_runs rows present, or at or after `premarket_wait_deadline` (degraded start) | RELEASE of the DB connection at shutdown stage 1, which PRECEDES process exit — the Early-Close gate's non-participation exit included |
-| 21:00 ET– | metadata_crawler evening batch | `stage='live_session_end'` status='success', or a read-write open succeeding (the runner-absent verdict) | `stage='evening_health_report'` complete |
+| premarket | none | attempts until `db.lock` is taken | `coordination.schedule.premarket.deadline` → abort |
+| runner | today's premarket state `done` or `failed`, or that run crashed → phase B; `session_expected` false → end `not_expected` without opening the DB; the premarket in a non-terminal state with its run lock held, or not yet run today → wait | attempts continue past the phase A deadline; one notification at that instant | phase A: `coordination.schedule.premarket.deadline` → phase B degraded; the hard cap → end without a session |
+| evening | today's session state terminal (`done`, `failed`, `not_expected`) → phase B; non-terminal with the runner alive → wait; the runner crashed → `predecessor_crashed`, phase B; no session state today and no runner run today → phase B | attempts until `db.lock` is taken | `coordination.schedule.evening.deadline` → abort, in either phase |
+| guest | the admission test (utils.md's Guest admission and units) | within the admitted unit | `timeout` → `timed_out` |
 
-While the runner holds the DB connection no separate process may open
-`market.duckdb`, read-only included. That window ends at shutdown stage 1,
-not at process exit, so the runner's stage-2 tail is outside it. Forbidden
-to run independently inside the window:
-- `detection_benchmark.py`
-- `run_preprocess.py`
-- `run_train.py`
-- `run_backtest.py`
-- `pipeline_optimizer`'s workers and coordinator
-- `collect_daily.py --backup-only`
+An owner run started after its deadline instant aborts at its first failed
+attempt.
 
-Referencing this section: `live_mode_runner.md`'s DB Connection Management
-(P-5) and Session Start Gating, `metadata_crawler.md`'s evening job start
-gate, `health_report.md`, `init_db.md`, `migration_tool.md`,
-`shadow_retraining.md`,
-`detection_benchmark.md`, `run_preprocess.md`, `run_train.md`,
-`run_backtest.md` and `pipeline_optimizer.md`.
+Referencing this section:
+- `utils.md`'s DB Access Coordination;
+- `live_mode_runner.md`'s DB Connection Management (P-5) and Session Start
+  Gating;
+- `metadata_crawler.md`'s evening job start gate, premarket start gate and
+  Nightly Backup;
+- `health_report.md`;
+- `init_db.md`;
+- `migration_tool.md`;
+- `shadow_retraining.md`;
+- `detection_benchmark.md`;
+- `run_preprocess.md`;
+- `run_train.md`;
+- `run_backtest.md`;
+- `pipeline_optimizer.md`.
 
 ---
 
@@ -2850,6 +2953,7 @@ dead_dist = con.execute("""
 """).df()
 
 # Partial fill analysis — unfilled position rate
+# (rows with unfilled_quantity > 0 are positions carried past their first exit date)
 unfilled_rate = con.execute("""
     SELECT
         COUNT(*) FILTER (WHERE unfilled_quantity > 0) AS unfilled_count,

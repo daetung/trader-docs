@@ -1,7 +1,7 @@
 # Tool: Metadata Crawler + Daily Data Collector
 
 **File:** `tools/collect_daily.py`
-**Standalone CLI tool — runs daily via cron or task scheduler**
+**Standalone CLI tool — its scheduled runs are launched by the dispatcher (see Cron / Scheduler Setup)**
 
 ---
 
@@ -24,9 +24,10 @@ Refresh"):
    for newly ingested dates (REFERENCE_SESSION baselines)
 6. **Tick bar aggregates update** — compute and store `tick_bar_aggregates`
    for newly ingested dates (see db_schema.md, utils.compute_tick_bar_aggregates())
-7. **Ticker rename detection + fundamentals collection** — premarket CIK-map-based
-   rename detection (with evening self-correction) and incremental
-   fundamentals_quarterly collection (see new sections below)
+7. **Ticker rename detection + fundamentals collection** (see new sections
+   below):
+   - premarket CIK-map-based rename detection, with evening self-correction;
+   - evening incremental `fundamentals_quarterly` collection.
 
 ---
 
@@ -329,18 +330,16 @@ Schedule" below for why they differ:
                                                              #   stage='premarket_corporate_events'
     3b. crawl_corporate_events_investing("this_week", db_conn) # item N: investing.com
                                                              # bulk (own db_conn —
-                                                             # LiveModeRunner holds no
-                                                             # DB connection before its
-                                                             # ownership window, no
-                                                             # write-serialization
-                                                             # concern at this hour)
+                                                             # the premarket run holds
+                                                             # db.lock; no other
+                                                             # writer)
     4. check_corporate_event_anomaly(db_conn, config, quotes, halt_status)
                                                              # writes batch_runs
                                                              #   stage='premarket_quarantine_check'
 
 09:20 ET (R-1: LiveModeRunner in-process task — see live_mode_runner.md's
 "In-Process Premarket Recheck"; --premarket-recheck below is manual/debug
-only, cannot open the DB read-write during a live session):
+only, a guest not admitted in the runner window):
     1. quotes       = bulk_fetch_today_first_price(...)     # trading API, chunked
        halt_status  = utils.query_halt_status(...)           # NOT a dbsec call;
                                                              #   no chunk size
@@ -651,7 +650,7 @@ loop A always starts and always subscribes, the former
 | Condition | Outcome |
 |---|---|
 | Neither file exists | SKIP — no-op `batch_runs` row, the same shape the non-trading-day crons already write |
-| Exactly one file exists | FAILURE — one process writes both sides now, so live-only means loop A's thread died and delayed-only means the runner never wrote its own aggregates; loop A's per-session health event corroborates the former |
+| Exactly one file exists | FAILURE — one process writes both sides now, so live-only means loop A's thread died and delayed-only means the runner never wrote its own aggregates; the `auxiliary_loop_stopped` health event (health_report.md finding 48) corroborates the former |
 | Either file fails to parse | FAILURE |
 | A file stops mid-session | SUCCESS — analysed for what it holds |
 
@@ -734,7 +733,7 @@ invisible from inside the session by construction. This stage is the only
 independent ground truth in the system, which is what makes accepting the
 assumption defensible rather than merely convenient.
 
-**Placed sixth, immediately before Retention Purge.** It needs the day's
+**Placed sixth, before Retention Purge.** It needs the day's
 bars, so it must run after ingestion; it writes a purge-registry member, so
 it must run before the purge, for the same reason Feed Coverage Analysis
 does. It is non-destructive and nothing downstream depends on it.
@@ -920,19 +919,31 @@ whatever the earlier stages' status:
 Any step failing → `status='failed'`, the `.partial` file deleted, and the
 evening run ending normally.
 
+The stage also copies `coordination.sqlite` to
+`backup_dir/coordination_YYYYMMDD.sqlite` through the SQLite backup API, by
+utils.md's `backup_store(dest_path)`, under the stage's own run and skip rules.
+
 - `YYYYMMDD` and the `batch_runs` date are the evening run's date basis.
 - Writes its own `batch_runs` row (`'running'` at start, then
   `'success'`/`'failed'`) and its own `SUMMARY` line.
 - Not a Health Gate condition.
-- Runs in the full evening run, with or without its `--skip-*` flags, and
-  under `--backup-only`; no other partial-run flag runs it.
+- Run condition:
+  - in the full evening run, with or without its `--skip-*` flags, it runs
+    only when no `evening_*` `batch_runs` row exists for a date later than
+    the run's date;
+  - otherwise it is skipped — no row written, an existing row kept, the skip
+    shown on the console and listed as skipped in the evening end report's
+    finding 1;
+  - under `--backup-only`; no other partial-run flag runs it.
 - `--backup-only` is the manual re-run:
-  - it runs this stage alone, with one read-write open;
-  - on failure it exits with an error, with no lock-probe wait;
+  - it runs this stage alone, as a guest unit with `timeout` 0 (utils.md's
+    DB Access Coordination) — not admitted, it exits with an error;
+  - on failure it exits with an error;
   - the copy and its `batch_runs` row take the latest date carrying an
     `evening_*` `batch_runs` row; with none, it exits with an error.
-- Its window is db_schema.md's DB File Ownership Windows: the evening
-  window's exit condition is the evening end report's completion (below).
+- Its DB access is the evening run's as an owner (db_schema.md's DB File
+  Ownership Windows), held through the evening end report (below); under
+  `--backup-only` it is a guest unit.
 
 ---
 
@@ -941,11 +952,17 @@ evening run ending normally.
 The evening run's final step, after `evening_backup`, run whatever the
 earlier stages' status: health_report.md's `evening_end` path.
 - Covers:
-  - findings 1 and 4 over this run's stages;
+  - findings 1 and 4 over the stages this run executed;
+  - a stage the run skipped — by a `--skip-*` flag, or `evening_backup`
+    skipped because a later-dated `evening_*` `batch_runs` row exists — listed
+    under finding 1 as an informational skipped item, taken from this run's
+    own invocation;
   - finding 9 when this run's `evening_execution_param_fit` stage executed
     the fit.
-- Order: gather → write_to_log → dispatch → drain, up to
-  `alerting.drain_timeout_seconds`.
+- Runs in the full evening run, with or without its `--skip-*` flags; no
+  partial-run flag runs it.
+- Order: gather → alert_delivery.md's `deliver()` (log, dispatch) →
+  `drain()`, up to `alerting.drain_timeout_seconds` (alert_delivery.md).
 - Writes, in this order:
   - its own `batch_runs` row as 'running', at start;
   - its `SUMMARY` line;
@@ -973,8 +990,9 @@ for ticker in todays_ingested_tickers:
     # INSERT OR IGNORE into tick_bar_aggregates
 ```
 
-Skipped if `--skip-tick-bar-aggregates` is passed (session stats step still
-runs — falls back to Tier 2/3 on-the-fly resolution per utils.md).
+Runs in the full evening run and under `--ingest-only`, in each honouring
+`--skip-tick-bar-aggregates`: skipped when it is passed (session stats step
+still runs — falls back to Tier 2/3 on-the-fly resolution per utils.md).
 
 ---
 
@@ -1022,7 +1040,7 @@ def detect_rename_candidates(db_conn) -> list[dict]:
 ```
 
 Scheduled automatically as Step 1 of `--premarket-open` (see "Dual
-Schedule" below and Constraints) — no separate cron entry. Available
+Schedule" below and Constraints) — no separate scheduled run. Available
 standalone as `--ticker-rename-only` for manual re-run/debugging only
 (same "legacy flags remain for isolated re-runs" convention as
 `--corporate-events-only` — see Constraints):
@@ -1178,7 +1196,16 @@ def collect_fundamentals_incremental(db_conn) -> int:
     via resolve_xbrl_tag_value() (see utils.md) per configs/xbrl_tag_map.json
     tag priority. Skipped if --skip-fundamentals.
     """
+```
 
+- Runs in the full evening run as `stage='evening_fundamentals'`, after
+  Execution-Parameter Fit and before Retention Purge; its failure blocks no
+  downstream stage.
+- Writes its own `batch_runs` row and its own `SUMMARY` line:
+  - `processed` — tickers with a CIK queried;
+  - `updated` — tickers whose `fundamentals_quarterly` rows were upserted;
+  - `failed` — tickers whose submissions or companyfacts fetch failed.
+- Its `int` return equals `updated`.
 
 ---
 
@@ -1200,8 +1227,8 @@ outright: expiry becomes a constant, always the same wall-clock time on the
 following day, and never inside a session.
 
 ```bash
-# Overnight token refresh — config token_refresh_time (this file's Config
-# Keys), default "03:00" America/New_York. The scheduled (bare) form
+# Overnight token refresh — coordination.schedule.token_refresh.time
+# (utils.md), default "03:00" America/New_York. The scheduled (bare) form
 # processes the production and demo accounts in one process, each with its
 # own skip and its own retry budget.
 python tools/collect_daily.py \
@@ -1230,7 +1257,8 @@ premarket batch is where the most of it is available.
 
 **Idempotency.** Per account:
 - the refresh is SKIPPED when that account's SDK token cache holds
-  `expires_at` ≥ today's `token_refresh_time` + 24h — a refresh already done
+  `expires_at` ≥ today's `coordination.schedule.token_refresh.time` + 24h — a
+  refresh already done
   today;
 - a duplicate revoke-and-reissue would spend the issuance budget and can
   leave no usable token at all;
@@ -1296,7 +1324,7 @@ python tools/collect_daily.py \
 # recheck is now a LiveModeRunner in-process task (see
 # live_mode_runner.md's "In-Process Premarket Recheck"). This flag remains
 # for running the quotes/halt + anomaly-check pass by hand OUTSIDE a live
-# session — it cannot open the DB read-write while LiveModeRunner holds it.
+# session — as a guest it is not admitted in the runner window.
 python tools/collect_daily.py \
     --db-path data/market.duckdb \
     --premarket-recheck
@@ -1360,17 +1388,23 @@ catches in time.
 
 ```bash
 # Full daily run: metadata + corporate events + ingest + calendar update + session stats
+# (the full evening run — an owner, whether launched by the dispatcher or by
+# hand; --trigger scheduled is the dispatcher's, a run without it is 'manual')
 python tools/collect_daily.py \
     --db-path data/market.duckdb \
     --data-root /path/to/json/data \
     --date today
 
-# Metadata only (includes corporate events)
+# Metadata only (includes corporate events) — a guest; writes no batch_runs row
 python tools/collect_daily.py \
     --db-path data/market.duckdb \
     --metadata-only
 
-# Ingest only (includes calendar update and session stats)
+# Ingest only — a guest: ingestion → calendar/coverage update → tick bar
+# aggregates update → session stats update, each honouring its --skip-* flag
+# and writing its own stage's batch_runs row; every other evening stage, the
+# evening ticker rename self-correction included, runs in the full evening
+# run only
 python tools/collect_daily.py \
     --db-path data/market.duckdb \
     --data-root /path/to/json/data \
@@ -1385,7 +1419,7 @@ python tools/collect_daily.py \
     --skip-session-stats
 
 # Nightly backup only — manual re-run of the evening_backup stage (see
-# "Nightly Backup"); one read-write open, no lock-probe wait
+# "Nightly Backup"); a guest unit with timeout 0
 python tools/collect_daily.py --db-path data/market.duckdb --backup-only
 
 # Skip tick bar aggregates / fundamentals collection independently
@@ -1416,12 +1450,15 @@ python tools/collect_daily.py \
     --tickers AAPL,MSFT,NVDA \
     --metadata-only
 
-# Backfill metadata for all tickers
+# Backfill metadata for all tickers — a guest; writes no batch_runs row
 python tools/collect_daily.py \
     --db-path data/market.duckdb \
     --backfill-meta
 
-# Corporate events only (premarket refresh — see Dual Schedule above)
+# Corporate events only — a guest: --premarket-open's corporate-events crawl
+# steps (the yfinance per-ticker crawl and the investing.com bulk call),
+# writing the premarket_corporate_events row dated the run day; no anomaly
+# check
 python tools/collect_daily.py \
     --db-path data/market.duckdb \
     --corporate-events-only
@@ -1453,6 +1490,10 @@ python tools/collect_daily.py \
 python tools/collect_daily.py \
     --db-path data/market.duckdb \
     --token-refresh --account production
+
+# Dispatcher (see Cron / Scheduler Setup) — the one crontab entry; launches
+# the scheduled runs with --trigger scheduled
+python tools/collect_daily.py --db-path data/market.duckdb --dispatch --trigger scheduled
 ```
 
 ---
@@ -1530,21 +1571,28 @@ Daily Collection — 20250715
 ```
 
 File log (machine-parseable, for `tools/health_report.md` — see that doc):
-written to `logs/metadata_crawler_{date}.log` (one file per run date, not
-appended across dates), every line tab-separated `key=value`, no free-form
-text:
+written to `logs/metadata_crawler_{date}.log`, every line tab-separated
+`key=value`, no free-form text. Every invocation appends to that date's file
+when it exists — same-date re-runs, and the premarket and evening runs of one
+date, share the file:
 
 ```
+2026-07-11T04:00:02	RUN	run_id=20260711_040002_4127	trigger=scheduled	flags=--premarket-open	date=20260711
+2026-07-11T04:00:05	STAGE	stage=premarket_rename	date=20260711	run_id=20260711_040002_4127
 2026-07-11T04:23:01	INFO	ticker=AAPL	status=updated	source=yfinance
 2026-07-11T04:23:47	WARN	ticker=XYZ	status=failed	source=yfinance	fallback=fmp	fallback_status=success
-2026-07-11T05:47:33	SUMMARY	stage=evening_ingestion	date=20260711	processed=11847	updated=11820	failed=27
+2026-07-11T05:47:33	SUMMARY	stage=evening_ingestion	date=20260711	processed=11847	updated=11820	failed=27	run_id=20260710_210001_3311
 ```
 
-A `SUMMARY` line is written at the end of each stage. Its absence (rather
-than a `failed` count) is `health_report.md`'s signal for an abnormal
-termination, distinct from a high-but-nonzero failure count. Per-ticker
-`INFO`/`WARN` lines are for human debugging; `health_report.md` parses only
-`SUMMARY` and `RESIDUE` lines.
+Line types written by every `collect_daily.py` invocation:
+- a `RUN` line at start — `run_id`, `trigger`, `flags`, `date`;
+- a `STAGE` line at the start of each stage it executes — `stage`, `date`,
+  `run_id`;
+- a `SUMMARY` line at the end of each stage, carrying `run_id`. Its absence
+  (rather than a `failed` count) is `health_report.md`'s signal for an
+  abnormal termination, distinct from a high-but-nonzero failure count.
+Per-ticker `INFO`/`WARN` lines are for human debugging; `health_report.md`
+parses only `RUN`, `STAGE`, `SUMMARY` and `RESIDUE` lines.
 
 A `RESIDUE` line records one symbol-matching pass's residue for
 `health_report.md`'s finding 10:
@@ -1570,103 +1618,105 @@ The structured log is per hosting process:
 
 ## Cron / Scheduler Setup
 
-**Evening job start gate (R-2: DuckDB-lock liveness probe).** Before its
-first stage (metadata/corporate-events crawl) begins, the evening run
-resolves LiveModeRunner's liveness — this closes the failure mode where a
-crash (not a clean shutdown) turned into a silent, unbounded wait and,
-via next-day Health Gate 1a, a two-day outage:
-```
-loop:   # the evening half of db_schema.md's DB file ownership windows
-  if batch_runs has stage='live_session_end', date=today, status='success':
-      → open RW, run normally.  # clean shutdown — the original path
-  else:
-      attempt to open market.duckdb read-WRITE:
-        if open SUCCEEDS (no writer holds the lock):
-            → LiveModeRunner is not running. Marker absent + lock free on
-              a trading day past close = crashed (or never-started)
-              session. KEEP this connection (do not close/reopen — avoids
-              a race), record a health_report finding ("session end marker
-              missing — LiveModeRunner did not shut down cleanly"), and
-              run the evening batch normally — ingestion / session-stats
-              inputs are runner-independent, so the run is valid.
-              # R-9: the DB-only findings subset swept here now also
-              # recovers 5, 8, 12, 21, 22, 24 and 25. Those were the
-              # in-memory tallies this probe could never reach; findings
-              # 5/8/21/22 now live in
-              # live_session_state.session_diagnostics and 12/24/25 in
-              # health_events, so a crashed session's findings are
-              # recovered in full rather than in part — see
-              # health_report.md's Invocation Contract.
-        if open FAILS (lock held):
-            → runner still alive (or hung). Sleep and retry, BUT: if now >
-              evening_wait_hard_deadline (config, default 23:30 ET): alert
-              (health_report.md finding 28, `batch_lock_deadline_abort`,
-              job='evening') + abort this evening run (manual
-              intervention). A hung-past-
-              deadline run aborts loudly tonight; tomorrow's Health Gate 1a
-              then correctly aborts tomorrow on missing session stats — the
-              right fail-safe, now reached noisily instead of silently.
-```
-This is the DuckDB-ownership-handoff half of P-5's temporal ownership
-design (the other half — LiveModeRunner's read-write open attempts,
-proceeding per its proceed rule — is in live_mode_runner.md's Session
-Start Gating). The original reasoning ("don't write while the runner
-might still be writing") is preserved exactly — the loop still only
-proceeds once the lock is free, either via the clean-shutdown marker or
-via the lock-probe fallback above.
+**Evening job start gate.** The full evening run is an owner (db_schema.md's
+DB File Ownership Windows): before its first stage (metadata/corporate-events
+crawl) it waits under its wait spec through utils.md's `acquire()`:
+- phase A:
+  - today's session state terminal (`done`, `failed`, `not_expected`) →
+    phase B;
+  - non-terminal with the runner alive → wait;
+  - the runner crashed → `predecessor_crashed`, phase B, the crash path
+    below;
+  - no session state today and no runner run today → phase B;
+- phase B: `db.lock` attempts; starting to wait on a guest or 'unregistered'
+  holder emits health_report.md finding 28 phase `waiting`;
+- `coordination.schedule.evening.deadline` (utils.md, default 23:30 ET), in
+  either phase → finding 28 phase `deadline` (`owner='evening'`) and the run
+  aborts — manual intervention. Tomorrow's Health Gate 1a then aborts
+  tomorrow on missing session stats — the right fail-safe, reached noisily
+  instead of silently.
 
-**Premarket start gate (lock probe).** `--premarket-open` runs the same lock
-probe before its first DB access:
-1. a read-write open, sleeping and retrying while it fails;
-2. deadline: `premarket_wait_deadline` (Config Keys, below), the same key
-   Session Start Gating reads;
-3. past it, the run alerts (health_report.md finding 28, `job='premarket'`)
-   and aborts, and the runner's start follows Session Start Gating
-   (live_mode_runner.md).
+Crash path, taken on `predecessor_crashed`:
+- health_report.md finding 11 and the evening liveness probe's full sweep —
+  the DB-only findings subset (health_report.md's Invocation Contract);
+- the run then proceeds normally — ingestion / session-stats inputs are
+  runner-independent, so the run is valid;
+- R-9: the subset swept recovers 5, 8, 12, 21, 22, 24 and 25 —
+  findings 5/8/21/22 live in `live_session_state.session_diagnostics` and
+  12/24/25 in `health_events` — so a crashed session's findings are
+  recovered in full rather than in part.
+The liveness probe also runs, narrowed to finding 1, when today's runner run
+ended `not_expected` or no runner run exists today.
 
-On success, `--premarket-open` holds that one connection until its process
-exit. This is the premarket half of db_schema.md's DB File Ownership
-Windows, its 04:00 ET row's conditions being:
-- entry: cron, then a read-write open succeeding;
-- exit: that connection's release at process exit.
+Yield: at each stage boundary the evening run calls `should_yield()` (utils.md)
+and yields when the premarket or the runner is `waiting` with its run lock
+held:
+- it ends with state and end kind `yielded`;
+- it runs no further stage, no `evening_backup` and no
+  `evening_health_report`, and writes no row for them;
+- it says so on the console;
+- this is the exception to the evening end report running in every full
+  evening run.
+
+**Premarket start gate.** `--premarket-open` is an owner and waits under its
+wait spec through `acquire()` before its first DB access:
+- no phase A; phase B takes `db.lock` by attempts;
+- at `coordination.schedule.premarket.deadline` (utils.md, default 05:00 ET)
+  the run alerts (health_report.md finding 28 phase `deadline`,
+  `owner='premarket'`) and aborts, and the runner's start follows its own
+  wait spec (live_mode_runner.md's Session Start Gating);
+- it holds the DB from acquisition to its process exit.
+
+**Owner state.** Each owner run records in its coordination state, through
+utils.md's helper:
+- `--premarket-open`: today's `session_expected`
+  (`trading_calendar.is_trading_day(today)`) and boundaries
+  `{date, is_trading_day, session_close, after_hours_end, written_at,
+  calendar_read_at}`;
+- the full evening run, after its Calendar and Coverage Update: the next
+  weekday's `session_expected` and boundaries in the same form.
+
+**Dispatcher.** One crontab entry replaces the per-run entries:
+`collect_daily.py --dispatch`, an aux run (utils.md's DB Access Coordination):
+- it reads config only — no coordination-store state and no lock beyond its
+  run lock;
+- each minute it launches, as a detached process passing
+  `--trigger scheduled`, each of the scheduled runs whose
+  `coordination.schedule.<name>.time` equals the current ET minute on one of
+  its `days`:
+  - `--premarket-open`;
+  - LiveModeRunner;
+  - the full evening run;
+  - the overnight token refresh;
+- a run started without `--trigger` is 'manual';
+- it registers only when it launches one;
+- a missed minute gets no later launch.
 
 ```bash
-# Run after the day's JSON dump completes (weekdays only), 21:00 ET — NOT
-# merely after market close: the dump ends at 20:00 ET, which is also the
-# ingestion range's own upper bound (see Constraints)
-# Full run: metadata + corporate events + ingest + calendar update + session stats
-0 21 * * 1-5 cd /path/to/stock-scalping && \
+# The dispatcher — every minute, weekdays; the times live in
+# coordination.schedule (utils.md):
+# - evening 21:00 ET: after the day's JSON dump completes — NOT merely after
+#   market close: the dump ends at 20:00 ET, which is also the ingestion
+#   range's own upper bound (see Constraints);
+# - token_refresh 03:00 ET, weekdays: no API consumer exists at the weekend,
+#   and Monday 03:00 has no token to revoke at all — the one issued Friday
+#   expired Saturday — so it is a pure issue, the safer path rather than a
+#   gap;
+# - premarket 04:00 ET: --premarket-open (N-1), which replaced separate
+#   --ticker-rename-only and --corporate-events-only runs at that time (see
+#   "Dual Schedule" above and Constraints for the collision this merge
+#   removes);
+# - runner 04:00 ET: LiveModeRunner, whose wait spec follows the premarket.
+* * * * 1-5 cd /path/to/stock-scalping && \
     source .venv/bin/activate && \
     python tools/collect_daily.py \
         --db-path data/market.duckdb \
-        --data-root /path/to/json/data \
-        --date today >> logs/collect_daily.log 2>&1
+        --dispatch --trigger scheduled >> logs/collect_daily_dispatch.log 2>&1
 
-# Overnight token refresh — 03:00 ET, weekdays
-# Weekday-only is correct: no API consumer exists at the weekend (both
-# other entries are 1-5), and Monday 03:00 has no token to revoke at all —
-# the one issued Friday expired Saturday — so it is a pure issue, which is
-# the safer path rather than a gap.
-0 3 * * 1-5 cd /path/to/stock-scalping && \
-    source .venv/bin/activate && \
-    python tools/collect_daily.py \
-        --db-path data/market.duckdb \
-        --token-refresh >> logs/collect_daily_token.log 2>&1
-
-# Premarket open (N-1) — replaces separate --ticker-rename-only and
-# --corporate-events-only cron entries previously here, both at 04:00 ET
-# (see "Dual Schedule" above and Constraints for the collision this
-# merge removes)
-0 4 * * 1-5 cd /path/to/stock-scalping && \
-    source .venv/bin/activate && \
-    python tools/collect_daily.py \
-        --db-path data/market.duckdb \
-        --premarket-open >> logs/collect_daily_premarket.log 2>&1
-
-# (R-1: the 09:20 ET recheck is no longer a cron entry. It now runs as a
+# (R-1: the 09:20 ET recheck is not a scheduled run. It runs as a
 # LiveModeRunner in-process task — see live_mode_runner.md's "In-Process
 # Premarket Recheck." --premarket-recheck survives as a manual/debug flag
-# only; it cannot open the DB read-write during a live session.)
+# only; as a guest it is not admitted in the runner window.)
 ```
 
 ---
@@ -1683,36 +1733,28 @@ fmp_api_key: "your_key_here"
 ## Config Keys (pipeline_config.yaml)
 
 ```yaml
-# R-2: hard deadline for the evening job's lock-probe wait (see Cron /
-# Scheduler Setup's "Evening job start gate"). A lock-held (hung-runner)
-# evening job aborts with an alert past this wall-clock time.
-# Sized against the 21:00 ET start, not independently: a deadline at the
-# start time itself would leave no wait at all, and exceeding it costs two
-# days of operation (this run aborts, and tomorrow's Health Gate 1a then
-# aborts on missing session stats), so a transient lock must not reach it.
-evening_wait_hard_deadline: "23:30"   # ET
-
-# Premarket lock-probe deadline: --premarket-open's lock probe gives up at
-# it (finding 28, job='premarket'), and LiveModeRunner's Session Start
-# Gating reads it — before it, a successful open with no premarket
-# batch_runs row is closed and retried; at or after it, the session proceeds
-# as a degraded start, and a runner whose open still fails sends finding 47
-# once (live_mode_runner.md).
-premarket_wait_deadline: "05:00"      # ET
+# The schedule times and the premarket and evening deadlines are the
+# coordination: block's (utils.md's DB Access Coordination):
+# - coordination.schedule.evening.deadline (default "23:30" ET) — the evening
+#   run's wait deadline (Cron / Scheduler Setup's "Evening job start gate"),
+#   sized against the 21:00 ET start: a deadline at the start time itself
+#   would leave no wait at all, and exceeding it costs two days of operation
+#   (this run aborts, and tomorrow's Health Gate 1a then aborts on missing
+#   session stats), so a transient wait must not reach it;
+# - coordination.schedule.premarket.deadline (default "05:00" ET) — the
+#   premarket run's wait deadline and the runner's phase A deadline.
 
 # Nightly Backup's destination directory (see "Nightly Backup"). It may be on
 # another mount; off-host replication is the operator's.
 backup_dir: "data/backups/"
 
-# Wall-clock time of the overnight token refresh (see "Overnight Token
-# Refresh"). America/New_York, like every other time in this system.
-# AFTER MIDNIGHT deliberately: the evening run can overrun past its own
-# deadline above. Early rather than close to the
-# session because refresh cadence and token lifetime are both 24h, so a
-# failed refresh has no previous token to fall back on and its only remedy
-# is retry against a one-per-minute issuance limit — lead time IS recovery
-# capacity.
-token_refresh_time: "03:00"           # ET
+# coordination.schedule.token_refresh.time (default "03:00" ET, utils.md) is
+# the overnight token refresh's time (see "Overnight Token Refresh"). AFTER
+# MIDNIGHT deliberately: the evening run can overrun past its own deadline.
+# Early rather than close to the session because refresh cadence and token
+# lifetime are both 24h, so a failed refresh has no previous token to fall
+# back on and its only remedy is retry against a one-per-minute issuance
+# limit — lead time IS recovery capacity.
 
 # trading_api_quotes_url removed. The bulk today-vs-yesterday price quote
 # that check_corporate_event_anomaly() (P-8) uses is reached through
@@ -1769,7 +1811,12 @@ quarantine:
   single evening run must not change; the premarket refresh is intentionally
   a separate, later, supplementary crawl that session_stats does NOT re-read
 - `populate_trading_calendar()`, `populate_ticker_coverage()`, and `populate_precomputed_session_stats()` sourced from `utils.py`
-- The evening run writes one `batch_runs` row per stage as it progresses:
+- Every `collect_daily.py` invocation writes a stage's `batch_runs` row only
+  when it executes that stage — `status='running'` at its own start,
+  `'success'`/`'failed'` at its own completion, dated by that run's date
+  basis; a stage it does not execute keeps its existing (stage, date) row,
+  and a re-run overwrites the rows of the stages it executes. The full
+  evening run's stages, in order:
   - `stage='evening_ingestion'` (around Steps 3-4 above);
   - `stage='evening_tick_bar_aggregates'` (Tick Bar Aggregates Update);
   - `stage='evening_session_stats'` (Session Stats Update);
@@ -1779,21 +1826,35 @@ quarantine:
   - `stage='evening_detection_gap'` (Detection-Gap Analysis);
   - `stage='evening_halt_comparison'` (Halt Comparison);
   - `stage='evening_execution_param_fit'` (Execution-Parameter Fit);
+  - `stage='evening_fundamentals'` (Fundamentals Incremental Collection);
   - `stage='evening_retention_purge'` (Retention Purge, R-9 — the last data
     stage, being the only destructive one);
   - `stage='evening_backup'` (Nightly Backup, run whatever the earlier
-    stages' status);
+    stages' status, under its run condition);
   - finally `stage='evening_health_report'` (Evening End Report, run
     whatever the earlier stages' status).
 
-  Each row is `status='running'` at its own start, `'success'`/`'failed'`
-  at its own completion, independent of the others. Each also writes its own
-  `SUMMARY` line to the run log (see Output / Logging), since
-  `health_report.md` treats a missing `SUMMARY` for a stage that has a
-  `batch_runs` row as an abnormal-termination signal in its own right. This
-  lets LiveModeRunner's Health Gate 1 (live_mode_runner.md) distinguish
-  exactly which stage of an evening run failed, not just that the run as a
-  whole did.
+  Each also writes its own `SUMMARY` line to the run log (see Output /
+  Logging), since `health_report.md` treats a missing `SUMMARY` for a stage
+  that has a `batch_runs` row as an abnormal-termination signal in its own
+  right. This lets LiveModeRunner's Health Gate 1 (live_mode_runner.md)
+  distinguish exactly which stage of an evening run failed, not just that
+  the run as a whole did.
+- A stage skipped by `--skip-tick-bar-aggregates`, `--skip-session-stats` or
+  `--skip-fundamentals` (`evening_tick_bar_aggregates`,
+  `evening_session_stats`, `evening_fundamentals`):
+  - writes no `batch_runs` row and no `SUMMARY` line;
+  - leaves an existing (stage, date) row as it is;
+  - a later run without the flag writes that stage's row normally;
+  - the `batch_runs.status` values are unchanged.
+- Every flag other than `--premarket-open`, the full evening run,
+  `--token-refresh` and `--dispatch` is a guest (utils.md's DB Access
+  Coordination):
+  - its unit is one stage, with `timeout` 0 — not admitted, it exits with an
+    error;
+  - not admitted at a stage boundary, it ends, the stages not run writing no
+    row;
+  - re-running resumes it.
 - `--premarket-open` (N-1; replaces running `--ticker-rename-only` and
   `--corporate-events-only` as two separate cron processes at 04:00 ET)
   runs `detect_rename_candidates()` → `build_trading_api_symbol_map()` →
@@ -1812,10 +1873,11 @@ quarantine:
   live_mode_runner.md) even though it is now one process, not three.
   `--ticker-rename-only` and `--corporate-events-only` remain available as
   lower-level flags for manual re-run/debugging of one piece in isolation
-  — only the automated cron schedule moves to `--premarket-open`.
+  — only the scheduled launch moves to `--premarket-open`.
 - `--backup-only` is a manual re-run flag beside them (see Nightly Backup):
   - the `evening_backup` stage alone;
-  - one read-write open, an error exit on failure with no lock-probe wait;
+  - a guest unit with `timeout` 0, an error exit when not admitted or on
+    failure;
   - dated by the latest date carrying an `evening_*` `batch_runs` row
 - The 09:20 ET recheck (R-1: now a LiveModeRunner in-process task — see
   live_mode_runner.md's "In-Process Premarket Recheck"; `--premarket-recheck`
@@ -1827,9 +1889,9 @@ quarantine:
   trigger for tickers that gained a new same-day corporate_events row (item
   N, caching_calculator.md). It cannot run concurrently with a still-running
   `--premarket-open`:
-  - that process holds the DB's one writer connection until its process
-    exit;
-  - LiveModeRunner holds no connection before its ownership window.
+  - that process holds `db.lock` until its process exit;
+  - the recheck runs inside LiveModeRunner, which opens the DB only while
+    holding `db.lock`.
 
   The recheck-vs-LiveModeRunner-writer contention that
   motivated moving this in-process in the first place is not merely guarded
@@ -1847,15 +1909,15 @@ quarantine:
   reads; `check_corporate_event_anomaly()`'s UPDATE reflects only that
   run's fresh inputs, not an accumulating count) — re-running the whole
   flag is therefore also safe, though `--premarket-recheck` cannot run
-  concurrently with a still-running `--premarket-open`, which holds the
-  DB's one writer connection until its process exit (lock exclusivity).
+  concurrently with a still-running `--premarket-open`, which holds
+  `db.lock` until its process exit.
 - Log files (`tools/rename_candidates.log`, `tools/quarantine_candidates.log`,
   `tools/metadata_missing.log`) have no rotation/retention policy specified
   — grow unbounded. Low-cost operational gap, not a correctness one; a
   standard log-rotation tool (e.g. `logrotate`) applied externally is
   sufficient, no application-level change needed.
-- On a non-trading day (market holiday, weekend), the two CRAWL crons
-  above still fire and complete quickly as effective no-ops (no tickers
+- On a non-trading weekday (market holiday), the two CRAWL runs the
+  dispatcher launches still run and complete quickly as effective no-ops (no tickers
   to detect renames for, no new bars to crawl against) — each still
   writes its normal `batch_runs` row with `status='success'`. The token
   refresh is the exception and is NOT a no-op: it revokes and reissues on
@@ -1869,22 +1931,24 @@ quarantine:
 - Failed metadata tickers do not block ingestion — two steps are independent
 - No session time filter on ingested data — all periods (040000~200000) stored.
   The bound stays fixed on an early-close day; see the Time range filter note
-- The evening cron must not start before that day's JSON dump has finished.
+- The evening run must not start before that day's JSON dump has finished.
   On an early-close day the dump completes at 17:00 rather than 20:00, so the
-  21:00 slot gains margin instead of losing it. THE CRON IS NOT MOVED EARLIER TO
+  21:00 slot gains margin instead of losing it. THE RUN IS NOT MOVED EARLIER TO
   MATCH: the truncation risk below is one-sided — waiting longer than necessary
   costs nothing, while ingesting before the dump finishes is permanent. This is
   why the exit path and the ingestion path do NOT share one boundary key even
   though both concern the after-market end.
   The ingestion range's upper bound (`200000`) and the dump's completion are
   the same instant by construction, so the 21:00 ET slot is derived from that
-  boundary rather than chosen independently — if the dump moves, this cron
-  moves with it. This is load-bearing because the duplicate-skip rule above
+  boundary rather than chosen independently — if the dump moves,
+  `coordination.schedule.evening.time` moves with it. This is load-bearing
+  because the duplicate-skip rule above
   is keyed on `(ticker, date)`: a date ingested while its after-market window
   was still being written is skipped by every later run, so the truncation is
   permanent rather than self-healing.
-- The evening run may cross midnight while the lock probe waits — with the
-  deadline at 23:30 ET that is an ordinary outcome, not an anomaly. The date
+- The evening run may cross midnight while it waits for the DB under its
+  wait spec — with the deadline at 23:30 ET that is an ordinary outcome, not
+  an anomaly. The date
   basis is therefore fixed once at process start and never re-evaluated:
   `--date today` resolves to the trading day the process began on, for every
   stage and every `batch_runs` row the run writes.

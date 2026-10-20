@@ -18,7 +18,15 @@ class sample counts and computation time before committing to a full pipeline ru
 
 ## CLI Usage
 
-**Session-window exclusion.** This entry point opens `market.duckdb` and so must NOT run while LiveModeRunner holds the connection — see db_schema.md's DB file ownership windows.
+**DB access role.** A guest (db_schema.md's DB File Ownership Windows),
+through utils.md's DB Access Coordination:
+- the entry point runs inside `register('guest', 'detection_benchmark', trigger)`;
+- `market.duckdb` is opened only inside `guest_unit('detection_benchmark', None)`,
+  which waits for admission without limit;
+- the run is one unit, the connection that unit yields passed wherever
+  this entry point takes `db_conn`;
+- while an owner waits past `coordination.guest_max_hold_seconds`, the run
+  ends by self-termination and is re-run.
 
 ```bash
 # Full run: detect + label, report class counts and timing

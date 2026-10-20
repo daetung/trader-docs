@@ -18,7 +18,15 @@ and the best trial or consensus config is selected. Also runnable standalone.
 
 ## Input / Output
 
-**Session-window exclusion.** This entry point opens `market.duckdb` and so must NOT run while LiveModeRunner holds the connection — see db_schema.md's DB file ownership windows.
+**DB access role.** A guest (db_schema.md's DB File Ownership Windows),
+through utils.md's DB Access Coordination:
+- the entry point runs inside `register('guest', 'run_backtest', trigger)`;
+- `market.duckdb` is opened only inside `guest_unit('run_backtest', None)`,
+  which waits for admission without limit;
+- the run is one unit, the connection that unit yields passed wherever
+  this entry point takes `db_conn`;
+- while an owner waits past `coordination.guest_max_hold_seconds`, the run
+  ends by self-termination and is re-run.
 
 **Input:**
 ```python
@@ -46,6 +54,10 @@ model_dir: Path | None  # directory containing trained model artifacts (optional
 
 ```
 1. Load config from pipeline_config.yaml
+1a. Rate resolution — at the CLI entry point only: execution_common.md's
+    resolve_rates() resolves every (rate, order type) pair, overlays the
+    in-memory config (Rate Overlay) and returns the rate_sources map passed to
+    the Backtester; the resolved values and their source are logged
 2. Load test_features.parquet from data/processed/ (or accept in-memory DataFrame)
 3. Determine feature column names (exclude labels, identifiers, metadata columns)
    Metadata columns excluded from features: is_dead_position, dead_position_case, is_ambiguous
@@ -88,6 +100,8 @@ class Backtester:
         config: dict,
         db_conn: duckdb.DuckDBPyConnection,
         optimizer_run_id: str | None = None,
+        *,
+        rate_sources: dict,
     ): ...
 
     def run(
@@ -136,6 +150,9 @@ class Backtester:
                              rule.
 
         optimizer_run_id passed via constructor (None for standalone).
+        rate_sources passed via constructor: the entry point's resolve_rates()
+        map (execution_common.md) — the CLI's own, or PipelineOptimizer's
+        coordinator's.
         """
         ...
 ```
@@ -157,7 +174,8 @@ Options:
 CLI always runs with:
 ```
 optimizer_run_id=None, fold_idx=-1, outer_fold_idx=-1,
-eval_type=None, execution_variant=None (standalone mode)
+eval_type=None, execution_variant=None (standalone mode),
+rate_sources=<its own resolve_rates() map>
 ```
 
 ---
@@ -179,6 +197,11 @@ experiment_log_row = {
     "execution_variant":    execution_variant,   # None = baseline pass
     "entry_fill_rate_disabled": config["backtest"]["entry_fill_rate_disabled"],
     "exit_fill_rate_disabled":  config["backtest"]["exit_fill_rate_disabled"],
+    "record_fill_increments": config["backtest"]["record_fill_increments"],
+    "data_end_date":        data_end_date,       # latest trading_calendar date with
+                                                 # has_data=TRUE at the run's start
+    "effective_config":     json.dumps({"config": config,
+                                        "rate_sources": rate_sources}),
                                                  # run-state, outside the 1:1 rule
     "fold_test_start":      fold_test_start,     # None → derived from test_df.date.min()
     "fold_test_end":        fold_test_end,       # None → derived from test_df.date.max()
@@ -201,6 +224,7 @@ experiment_log_row = {
     "breaker_max_realized_loss_pct":  summary["breaker_max_realized_loss_pct"],
     "breaker_max_consecutive_losses": summary["breaker_max_consecutive_losses"],
     "breaker_peak_entries_per_hour":  summary["breaker_peak_entries_per_hour"],
+    "negative_cash_count":  summary["negative_cash_count"],
     "trades_by_signal":     json.dumps(summary["trades_by_signal"]),
     "trades_by_exit":       json.dumps(summary["trades_by_exit"]),
 }
@@ -221,7 +245,8 @@ BACKTEST RESULTS
 ============================================================
 
 Total trades:        1234        # opened trades only — never-opened rows
-                                 # (entry_canceled / entry_rejected) are
+                                 # (db_schema.md's trade_log.exit_reason
+                                 # values, never-opened family) are
                                  # excluded from this and every rate below
 Winning trades:      567
 Winning rate:        45.9%
@@ -294,10 +319,17 @@ Elapsed: 45.2s
 - `eval_type` default None for standalone; set explicitly by PipelineOptimizer
 - In standalone mode, `fold_test_start`/`fold_test_end`/`fold_test_days` derived from
   test_df — its date range and its count of distinct dates
-- `entry_fill_rate_disabled` and `exit_fill_rate_disabled` are RUN-STATE
-  columns, written from the Backtester's `config["backtest"]` keys of the
-  same names. Like `execution_variant`, they sit outside the `summary_dict`
-  1:1 metric rule below
+- RUN-STATE columns sit outside the `summary_dict` 1:1 metric rule below,
+  like `execution_variant`:
+  - `entry_fill_rate_disabled`, `exit_fill_rate_disabled` and
+    `record_fill_increments`, written from the Backtester's
+    `config["backtest"]` keys of the same names;
+  - `data_end_date`, the latest `trading_calendar` date with
+    `has_data = TRUE` at the run's start;
+  - `effective_config`, the JSON object `{"config", "rate_sources"}` — the
+    Backtester's in-memory config after the rate overlay and
+    `apply_overrides()`, never `secrets.yaml` content, and the constructor's
+    `rate_sources` map
 - `execution_variant` is an IDENTIFIER column, alongside `run_id`,
   `fold_idx`, `outer_fold_idx` and `eval_type` — it sits OUTSIDE the 1:1
   rule below, which binds `summary_dict` keys to METRIC columns only.
@@ -311,8 +343,11 @@ Elapsed: 45.2s
   and every metric column here is sourced from a `summary_dict` key. A name
   on only one side is a defect, not a style choice; this single rule
   replaces enumerating each metric's "must be present" individually as the
-  metric count grows (currently: `suppressed_count`, the five
-  `gate_blocked_*` counters, and the four `breaker_*` metrics)
+  metric set grows. Current members include:
+  - `suppressed_count`;
+  - the `gate_blocked_*` counters;
+  - the `breaker_*` metrics;
+  - `negative_cash_count`
 - The `gate_blocked_*` and `breaker_*` metrics are diagnostic only —
   `PipelineOptimizer.best_config()` ranks on `winning_rate` and never reads
   them. `best_execution_variant()` DOES rank on a metric column
@@ -330,16 +365,21 @@ Elapsed: 45.2s
   "the gate did not run", not "nothing was blocked") and there is no
   equity basis to express a loss as a percentage against (so the latter is
   `None`, not `0.0`, which would misread as "no loss")
-- Never-opened rows (`exit_reason='entry_canceled'`; live also
-  `'entry_rejected'`) are written to `trade_log` but excluded from
-  `total_trades` / `winning_rate` / `avg_pnl_pct` / `total_pnl_abs` —
-  `quantity=0` and `pnl_pct=NULL` mean no position existed, so counting them
-  would dilute the rates with non-events. They stay visible through
-  `trades_by_exit`, which is why no separate summary column is added for
-  them (see 09_backtest_engine.md)
+- Never-opened rows (the never-opened family of db_schema.md's
+  `trade_log.exit_reason` values section) are written to `trade_log` but
+  excluded from `total_trades` / `winning_rate` / `avg_pnl_pct` /
+  `total_pnl_abs` — `quantity=0` and `pnl_pct=NULL` mean no position existed,
+  so counting them would dilute the rates with non-events. They stay visible
+  through `trades_by_exit`, which is why no separate summary column is added
+  for them (see 09_backtest_engine.md)
 - Metadata columns (`is_dead_position`, `dead_position_case`, `is_ambiguous`) must not
   be passed to model.predict() as features
 - `model_dir` resolution order: explicit arg → config["model"]["model_dir"] fallback →
   pre-computed prob_* columns in test_df; path (c) requires prob_* columns to exist
 - PipelineOptimizer calls `backtester.run()` with `model_dir=None` — the config fallback
   path (b) ensures artifacts saved by Trainer are correctly located at inference time
+- Rate resolution runs at the CLI entry point only: `Backtester.run()`
+  called by PipelineOptimizer receives the resolved config and does not
+  resolve
+- An exact replay of a run from its `experiment_log` row assumes the market
+  data and `corporate_events` rows it read are unchanged since the run

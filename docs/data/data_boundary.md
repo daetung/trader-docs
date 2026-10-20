@@ -194,6 +194,11 @@ derived from corporate_events applied at one specific comparison point):
                                                  factor and the net dividend added;
                                                  p_entry is never adjusted
                                                  (05_labeler.md, 09_backtest_engine.md)
+    A carried position's split                — the remaining quantity and the
+      normalisation and net dividend term       per-share cost normalised by the
+                                                 split factor, the net dividend
+                                                 credited (09_backtest_engine.md's
+                                                 Carried position)
     EntryPointDetector filter E's shares_outstanding — point-in-time share count
                                                         (utils.estimate_historical_meta())
 ```

@@ -473,12 +473,18 @@ never available:
   the order type in every engine;
 - BacktestEngine never reaches this layer.
 
-A market entry fills at tick prices in every engine
-(`execution_common.md`'s Fill Simulation Model); the
-remaining asymmetry is the funds check price — live checks a market entry
-at `ask1 × live_mode.market_buy_price_margin`, backtest at `p_entry`, having
-no book — which `execution_common.md` states outright and `open_items.md`
-carries. That sharpens this point rather than weakening it: the backtest
+A simulated market entry (backtest, shadow, pilot counterfactual) passes its
+market-BUY limit price as `limit_price` under the entry limit rule with the
+market rate (`execution_common.md`'s Fill Simulation Model), and a real
+entry's fills come from the broker. The remaining asymmetry is the funds
+check price:
+- live checks a market entry at R — its base price ×
+  `execution.market_buy_price_margin`, rounded down to `tick(price)`
+  (`execution_common.md`'s Session Phase and Order Types);
+- backtest checks it at its market-BUY limit price (`09_backtest_engine.md`),
+  having no book;
+which `execution_common.md` states outright and `open_items.md` carries.
+That sharpens this point rather than weakening it: the backtest
 side needs these semantics and has no way to obtain them from this layer. The
 boundary test forbids
 leaking vendor REPRESENTATIONS; it does not license hiding vendor SEMANTICS

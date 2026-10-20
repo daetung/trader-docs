@@ -23,7 +23,18 @@ Supports three operational phases with distinct objectives:
 
 ## Architecture Position
 
-**Session-window exclusion.** This entry point opens `market.duckdb` and so must NOT run while LiveModeRunner holds the connection — see db_schema.md's DB file ownership windows.
+**DB access role.** A guest (db_schema.md's DB File Ownership Windows),
+through utils.md's DB Access Coordination:
+- the entry point runs inside `register('guest', 'pipeline_optimizer', trigger)`;
+- `market.duckdb` is opened only inside `guest_unit('pipeline_optimizer', None)`,
+  which waits for admission without limit;
+- `db_conn` comes from that unit before `PipelineOptimizer(config, db_conn)`
+  is constructed; the coordinator's flushes use it, and workers open no
+  connection;
+- the run is one unit, the connection that unit yields passed wherever
+  this entry point takes `db_conn`;
+- while an owner waits past `coordination.guest_max_hold_seconds`, the run
+  ends by self-termination and is re-run.
 
 ```
 Training endpoint:  PipelineOptimizer
@@ -203,13 +214,14 @@ optimizer:
 
 ```python
 # Rate resolution, ONCE for the whole optimizer run, here at the coordinator
-# (execution_common.md's get_execution_param()): every (rate, order type)
-# pair is resolved and overlaid on this in-memory `config` before anything
-# below reads it (execution_common.md's Rate Overlay). The config file is
-# never written; the resolved values and their source (fitted_at or seed)
-# are logged, and a bound fallback is logged only. Every apply_overrides()
-# below applies on top of the overlay; workers and Backtesters receive the
-# resolved config, and BacktestEngine does not resolve again.
+# (execution_common.md's resolve_rates()): every (rate, order type) pair is
+# resolved and overlaid on this in-memory `config` before anything below
+# reads it (execution_common.md's Rate Overlay). The config file is never
+# written; the resolved values and their source are logged, and a bound
+# fallback is logged only. Every apply_overrides() below applies on top of
+# the overlay; workers and Backtesters receive the resolved config, every
+# Backtester receives rate_sources, and BacktestEngine does not resolve again.
+config, rate_sources = execution_common.resolve_rates(db_conn, config)
 
 outer_cfg  = config["class_balancer"]["outer_fold"]
 inner_cfg  = config["class_balancer"]["inner_fold"]
@@ -268,10 +280,9 @@ for outer_train_df, _, outer_test_df, outer_fold_meta in balancer.generate_folds
             optimizer_run_id=optimizer_run_id,
         )
 
-        # Coordinator: sequential DB flush (single write connection)
-        with duckdb.connect(config["data_paths"]["db_path"]) as write_conn:
-            for r in round_results:
-                write_conn.execute("INSERT INTO train_log ...", r["train_log_row"])
+        # Coordinator: sequential DB flush on db_conn, the run's one guest unit
+        for r in round_results:
+            db_conn.execute("INSERT INTO train_log ...", r["train_log_row"])
 
         # Update AUC history
         for r in round_results:
@@ -289,14 +300,13 @@ for outer_train_df, _, outer_test_df, outer_fold_meta in balancer.generate_folds
             surviving_idx  = {idx for idx, _ in sorted_trials[:n_survive]}
             pruned_idx     = {idx for idx, _ in sorted_trials[n_survive:]}
 
-            # Mark pruned trial rows
-            with duckdb.connect(config["data_paths"]["db_path"]) as write_conn:
-                for r in round_results:
-                    if r["trial_idx"] in pruned_idx:
-                        write_conn.execute(
-                            "UPDATE train_log SET is_pruned = TRUE WHERE run_id = ?",
-                            [r["run_id"]]
-                        )
+            # Mark pruned trial rows (db_conn)
+            for r in round_results:
+                if r["trial_idx"] in pruned_idx:
+                    db_conn.execute(
+                        "UPDATE train_log SET is_pruned = TRUE WHERE run_id = ?",
+                        [r["run_id"]]
+                    )
 
             active_trials = [(idx, hp) for idx, hp in active_trials if idx in surviving_idx]
 
@@ -308,18 +318,17 @@ for outer_train_df, _, outer_test_df, outer_fold_meta in balancer.generate_folds
     best_trial_idx = max(completed_trial_means, key=completed_trial_means.get)
     best_config    = search_space[best_trial_idx]
 
-    with duckdb.connect(config["data_paths"]["db_path"]) as write_conn:
-        for idx, _ in active_trials:
-            last_run_id = round_run_ids[idx]   # last completed round run_id
-            aucs        = trial_auc_history[idx]
-            write_conn.execute(
-                "UPDATE train_log SET auc_std = ? WHERE run_id = ?",
-                [std(aucs) if len(aucs) > 1 else 0.0, last_run_id]
-            )
-        write_conn.execute(
-            "UPDATE train_log SET best_of_loop = TRUE WHERE run_id = ?",
-            [round_run_ids[best_trial_idx]]
+    for idx, _ in active_trials:   # db_conn, the run's one guest unit
+        last_run_id = round_run_ids[idx]   # last completed round run_id
+        aucs        = trial_auc_history[idx]
+        db_conn.execute(
+            "UPDATE train_log SET auc_std = ? WHERE run_id = ?",
+            [std(aucs) if len(aucs) > 1 else 0.0, last_run_id]
         )
+    db_conn.execute(
+        "UPDATE train_log SET best_of_loop = TRUE WHERE run_id = ?",
+        [round_run_ids[best_trial_idx]]
+    )
 
     # --- Outer eval: train best_config on outer_train, backtest on outer_test ---
     outer_train_split, outer_val_split = utils.temporal_split_simple(
@@ -354,7 +363,8 @@ for outer_train_df, _, outer_test_df, outer_fold_meta in balancer.generate_folds
         dry_run=False,
     )
 
-    backtester = Backtester(config_override, db_conn, optimizer_run_id=optimizer_run_id)
+    backtester = Backtester(config_override, db_conn, optimizer_run_id=optimizer_run_id,
+                            rate_sources=rate_sources)
     outer_summary = backtester.run(
         outer_test_df,
         run_id=outer_run_id,
@@ -393,7 +403,8 @@ for outer_train_df, _, outer_test_df, outer_fold_meta in balancer.generate_folds
         for i, variant in enumerate(combos):
             variant_override = utils.apply_overrides(config_override, variant)
             variant_backtester = Backtester(
-                variant_override, db_conn, optimizer_run_id=optimizer_run_id
+                variant_override, db_conn, optimizer_run_id=optimizer_run_id,
+                rate_sources=rate_sources,
             )
             variant_backtester.run(
                 outer_test_df,
@@ -456,7 +467,8 @@ final_trainer.run(
 # --- Regime holdout robustness check ---
 if holdout_cfg["enabled"] and len(holdout_df) > 0:
     regime_backtester = Backtester(
-        final_config_override, db_conn, optimizer_run_id=optimizer_run_id
+        final_config_override, db_conn, optimizer_run_id=optimizer_run_id,
+        rate_sources=rate_sources,
     )
     # No fold_test_* argument: run_backtest derives them from holdout_df. The
     # date pair is then the ends of a non-contiguous set, whose members are in
@@ -524,6 +536,10 @@ Intended for baseline measurement and debugging.
 ```
 
 ```python
+# Rate resolution, ONCE for this run, at the coordinator — as in the
+# exploitation phase (execution_common.md's resolve_rates())
+config, rate_sources = execution_common.resolve_rates(db_conn, config)
+
 # (full phase fold loop — same structure as selection, with run_reducer=False and max_folds=None)
 for train, val, test, fold_meta in balancer.generate_folds(
     full_labeled_df,
@@ -560,7 +576,8 @@ db_conn.execute(
 )
 
 # Backtest on last fold's test split (baseline measurement)
-backtester = Backtester(config, db_conn, optimizer_run_id=optimizer_run_id)
+backtester = Backtester(config, db_conn, optimizer_run_id=optimizer_run_id,
+                        rate_sources=rate_sources)
 backtester.run(
     test,                    # last fold's test split (loop variable after exit)
     run_id=fold_run_ids[-1],

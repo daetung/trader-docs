@@ -42,12 +42,12 @@ confirmation that it still reads correctly.
    rather than a design blocker, so it is not sequenced against the items
    above either. It is listed because a new item left out of this list is the
    carry-forward defect this file exists to prevent, inverted.
-6. **Carried partially filled exit — engine divergence** is unblocked and not
-   sequenced against the items above.
-7. **No path from a trained model's `run_id` to the live model** is unblocked
+6. **No path from a trained model's `run_id` to the live model** is unblocked
    and not sequenced against the items above.
-8. **Finding 6 divergence — resampling unit and threshold** is not sequenced
+7. **Finding 6 divergence — resampling unit and threshold** is not sequenced
    against the items above.
+8. **Lock measurements** is not sequenced against the items above.
+9. **Crashed runner relaunch** is not sequenced against the items above.
 
 ---
 
@@ -112,6 +112,9 @@ from an undelivered one. The `breach_confirm_window_seconds` bound closes
 the FALSE-FIRING half of that — a frozen pending state can no longer pair
 ticks minutes apart — but not the DETECTION half, which needs the same
 L-vs-M term.
+
+---
+
 ## Manual-intervention CLI
 
 **Problem.** A clean Session Shutdown cancels in-flight exit orders precisely
@@ -159,26 +162,22 @@ neither path is usable until enough history has accumulated.
   bid/ask gate against historical data older than the collection start date.
 
 A further consumer appeared:
-- `market_buy_price_margin` lives under `live_mode:` rather than
-  `execution:` because BacktestEngine has no bid/ask model to mirror it; if
-  backtest is ever extended to replay `bid_ask_snapshots`, it moves
-  alongside the two paths above;
+- `market_buy_price_margin` sits under `execution:`, and backtest's
+  market-BUY limit price reads it (09_backtest_engine.md);
 - the exit ladder's keys sit under `execution:`, read by every engine —
   BacktestEngine prices its ladder from a spread estimate
   (execution_common.md).
 
-- **As entry sizing.** A market entry fills at tick prices in every engine
-  (execution_common.md's Fill Simulation Model), so the remaining asymmetry
-  is the funds check price: the market-BUY funds gate prices against
-  `ask1 * market_buy_price_margin` in live mode, while BacktestEngine checks
-  a market entry at `p_entry`, having no book. The two do not size
-  identically and the gap is unquantified. This is NOT a defect to fix by
+- **As entry sizing.** A simulated market entry (backtest, shadow, pilot
+  counterfactual) fills under the entry limit rule at its market-BUY limit
+  price (execution_common.md's Fill Simulation Model), and the backtest
+  funds check price is the market-BUY limit price (09_backtest_engine.md).
+  The two engines do not size identically. This is NOT a defect to fix by
   making one call the other: the live side uses the better information and
-  should, while the backtest side cannot. What is undesigned is the backtest
-  funds check price itself — what it should be, and how far it sits from
-  the live figure — and that cannot be settled without measurement against
-  accumulated `bid_ask_snapshots`, which is what the two paths above are
-  already waiting on.
+  should, while the backtest side cannot. The remaining question is the
+  measured gap between backtest's base price (last print × (1 + s / 2)) and
+  live `ask1`, against accumulated `bid_ask_snapshots`, which is what the
+  two paths above are already waiting on.
 
 **Not yet designed** — still. Not actionable again until `bid_ask_snapshots`
 has enough history; revisit then, not before.
@@ -285,17 +284,6 @@ its own inline comment reads `# from config` beside the hardcoded default.
 
 ---
 
-## Carried partially filled exit — engine divergence
-
-**Problem.** When an exit fills only partly before session end, live and
-shadow sell the remainder in a later session, while BacktestEngine ends the
-row at D with `dead_position_penalty_pct` on the remainder. The two engines'
-pnl for such a row therefore differ structurally.
-
-Scope: backtest modelling. Not decided.
-
----
-
 ## No path from a trained model's `run_id` to the live model
 
 **Problem.** The live model is the `run_id` set in config by hand
@@ -312,3 +300,21 @@ configured `run_id` at session start; it does not choose one.
 divergence trigger compare live winning rate against a backtest CI. The CI is
 computed by `utils.bootstrap_ci()`, but the trigger's resampling unit and
 its threshold are undecided.
+
+---
+
+## Lock measurements
+
+**Problem.** The DB access coordination (utils.md) relies on lock behaviour
+not yet measured:
+- the time for another process to take a lock after its holder is killed,
+  on Linux and on Windows;
+- that a forked child holds none of its parent's locks;
+- Windows' lock-release delay after a crash.
+
+---
+
+## Crashed runner relaunch
+
+**Problem.** No process relaunches a crashed LiveModeRunner for warm
+restart; the dispatcher does not.

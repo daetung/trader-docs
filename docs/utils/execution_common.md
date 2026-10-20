@@ -305,24 +305,32 @@ def compute_position_size(
                              per-ticker vendor fact, and no account-level
                              rate exists to hold instead.
         t_bar_volume:        ohlcv_1min volume of the t bar
-        ticker_margin_used:  sum(margin_of(entry_price_i, quantity_i,
-                             rate_i)) across this ticker's currently-open
-                             positions, PLUS its submitted-but-unfilled ones
-                             (R-5: positions whose entry logical order is
-                             'open' — priced at the entry request's price,
-                             or p_entry for a market order).
-                             Each row contributes at its OWN PINNED RATE
+        ticker_margin_used:  sum over this ticker's positions of
+                             (filled_i + pending_i) * (rate_i / 100):
+                             - filled_i, its filled part — live
+                               entry_fill_amount, an adopted row
+                               adopted_entry_amount, backtest the Σ of its
+                               entry fill increment amounts;
+                             - pending_i, while its entry logical order is
+                               open (R-5), (requested quantity − filled
+                               quantity) × the price of that order's 'new'
+                               request, or for a market order the
+                               position's p_entry from entry_points joined
+                               on (ticker, date, entry_bar = hour);
+                               requested quantity is live
+                               live_positions.requested_quantity and
+                               backtest the sized quantity;
+                             - rate_i, its rate — live entry_mgnrt, an
+                               adopted row 100, backtest 100.
+                             Each live row contributes at its OWN PINNED RATE
                              (live_positions.entry_mgnrt), never the current
                              one, so an open position's margin cannot move
-                             retroactively — except an adopted row, whose
-                             entry_mgnrt is NULL and is read as 100. Pending
-                             margin is reserved
+                             retroactively. Pending margin is reserved
                              capacity: excluding it lets a burst of
                              simultaneous submissions breach the cap on
                              aggregate fill, which is inert only while
                              per_ticker_share_cap_pct is 0 and becomes real
-                             the moment Pilot sets it. BacktestEngine has no
-                             pending state, so there the two sums coincide.
+                             the moment Pilot sets it.
         total_margin_used:   the same sum across all positions, any ticker,
                              on the same open-plus-pending basis
         position_size_cash_pct:   fraction of balance per trade, MEASURED IN
@@ -360,12 +368,15 @@ def check_funds_available(
 
     backtest: available_cash is remaining_cash — the caller's REVOLVING
               capital: decremented by the amount actually committed when an
-              entry fills, and credited back when the position closes (see
+              entry fills, and credited back on close, timed by
+              backtest.sell_proceeds_settlement_days (see
               09_backtest_engine.md's Chronological Simulation). Not a
               one-way budget; a monotonically-decreasing remaining_cash
               models a single deployment rather than a book that turns
               over, and silently stops trading partway through any run
-              with initial_cash > 0.
+              with initial_cash > 0. available_cash follows
+              backtest.open_buy_cash_hold; under 'none' remaining_cash may
+              be negative, and a negative value blocks the candidate.
     live:     available_cash is COMPUTED, not observed:
 
                   available_cash = AstkOrdAbleAmt * (100 / mgnrt) - @cost
@@ -385,9 +396,14 @@ def check_funds_available(
 
     fill_price is the funds check price, by the entry's permitted order type
     (permitted_order_type()):
-    - live: ask1 × live_mode.market_buy_price_margin for market, the limit
-      price for limit;
-    - backtest: p_entry for market, the limit price for limit.
+    - live: for market, R — the base (ask1 from signal_time_rest when that
+      response has arrived by the funds check, otherwise the latest trade
+      print in the ticker's bar-close superset fetch, signal_time_rest
+      staying un-awaited) × execution.market_buy_price_margin, rounded DOWN
+      to tick(price); the limit price for limit;
+    - backtest: the market-BUY limit price for market (09_backtest_engine.md),
+      whatever the backtest.open_buy_cash_hold value; the limit price for
+      limit.
 
     THE COMPARISON STAYS NOTIONAL AGAINST NOTIONAL. compute_position_size()'s
     margin-unit form does NOT extend here. Its three balance-derived terms
@@ -681,13 +697,11 @@ execution:
                                    # late-detection model branches on it
                                    # (09_backtest_engine.md) and live's scan
                                    # gates on it (live_mode_runner.md).
-                                   # Unlike market_buy_price_margin this
-                                   # belongs here rather than under
-                                   # live_mode: — p_now comes from the
-                                   # rotation slot's second-resolution close
-                                   # in live and from tick_10 in backtest,
-                                   # so there is no bid/ask dependency to
-                                   # keep it out of the shared block
+                                   # It belongs in this shared block: p_now
+                                   # comes from the rotation slot's
+                                   # second-resolution close in live and
+                                   # from tick_10 in backtest, so neither
+                                   # engine needs a bid/ask source for it
   late_entry_min_expected_return_pct: null
                                    # RESOLVED theta — see Late-Entry
                                    # Residual Edge. null = the gate admits
@@ -703,8 +717,21 @@ execution:
                                     # the type an order takes is
                                     # permitted_order_type()'s (Session Phase
                                     # and Order Types, below)
-  # market_buy_price_margin lives under live_mode:, not here — it prices
-  # against ask1, and BacktestEngine has no bid/ask model.
+  market_buy_price_margin:   1.05  # seed value — stage 1 of the market-BUY
+                                    # funds gate prices a market entry at
+                                    # its market-BUY limit price, this times
+                                    # its base price (live R, Session Phase
+                                    # and Order Types; backtest,
+                                    # 09_backtest_engine.md), since the
+                                    # vendor converts a market BUY to a limit
+                                    # at a reference price it does not
+                                    # disclose. Set GENEROUS deliberately, on
+                                    # the one-sided-error posture this spec
+                                    # set takes wherever a bound stands in
+                                    # for an unknown: too high costs an
+                                    # occasionally under-sized entry, too low
+                                    # a vendor rejection the entry-side path
+                                    # already handles
   entry_gap_type:    "percentage"  # "percentage" | "absolute" — limit only
   entry_gap_value:            0.0  # limit only. 0 = limit at p_entry exactly;
                                     # positive = willing to pay up to that much
@@ -778,9 +805,8 @@ execution:
   # Moved from 09_backtest_engine.md's former `backtest:` block — backtest
   # and live must not carry independently-configurable copies of values
   # that are supposed to be identical between them. `backtest:` retains
-  # only backtest-simulation-specific keys (initial_cash, entry_threshold,
-  # suppress_threshold, dead_position_penalty_pct) — see
-  # 09_backtest_engine.md. max_hold_bars (R-6) and entry_cooldown_minutes
+  # only backtest-simulation-specific keys — see 09_backtest_engine.md's
+  # Config Keys. max_hold_bars (R-6) and entry_cooldown_minutes
   # (R-5) moved here too: LiveModeRunner reads both, so neither was ever
   # backtest-simulation-specific.
 
@@ -813,15 +839,17 @@ def get_execution_param(
     place (same single-source-of-truth pattern as resolve_signal(),
     can_enter()).
 
-    Called ONCE PER TOP-LEVEL RUN, by the run's entry point, for every
-    (rate, order type) pair:
+    Called ONCE PER TOP-LEVEL RUN, for every (rate, order type) pair, by
+    resolve_rates() (below), which these entry points call:
     - LiveModeRunner's session start;
-    - run_backtest.py's start;
+    - run_backtest.py's CLI entry point;
     - pipeline_optimizer's coordinator.
     The results overlay the in-memory config's rate values (Rate Overlay,
     below) — the config file is never written. The resolved values and
-    their source (the row's fitted_at, or seed) are logged. apply_overrides
-    applies after the overlay. Workers receive the resolved config, and
+    their source (the row's fitted_at, 'seed' or 'seed_bound_fallback') are
+    logged; a backtest or optimizer run records them in
+    experiment_log.effective_config (db_schema.md). apply_overrides applies
+    after the overlay. Workers receive the resolved config, and
     BacktestEngine does not resolve again.
     The evening_execution_param_fit stage also resolves through it for the
     current value of each pair (shadow_retraining.md).
@@ -853,6 +881,21 @@ def get_execution_param(
          9);
        - backtest and optimizer resolutions log it only.
     4. return value
+    """
+    ...
+```
+
+```python
+def resolve_rates(db_conn, config) -> tuple[dict, dict]:
+    """
+    Resolve every (rate, order type) pair through get_execution_param()
+    once per top-level run, overlay the in-memory config (Rate Overlay,
+    below) and log the resolved values and their sources.
+    Returns (config, rate_sources):
+    - config — the overlaid config;
+    - rate_sources — {param_name: {order_type: {"value": …, "source": …}}},
+      the source being the execution_params row's fitted_at, 'seed', or
+      'seed_bound_fallback'.
     """
     ...
 ```
@@ -970,6 +1013,9 @@ def exit_fill_mode(
   - the cumulative filled quantity;
   - Σ price × quantity;
   - the taker/resting state;
+  - the fill increments, per integer second — (second, filled quantity,
+    Σ price × quantity) — recorded in step and batch form alike;
+- the close-completion instant reads the last exit increment;
 - each call covers one span under a single order (type, price), taking the
   prior state and returning the updated state; the first call (`state` None)
   creates it with the rate, which is fixed for the order and carried in the
@@ -979,7 +1025,7 @@ def exit_fill_mode(
   state's current order — the first call, and each re-quote — while a call
   continuing the same order keeps the state's;
 - step form: a span of one tick; batch form: the span whole — a contract
-  test asserts equal outputs;
+  test asserts equal outputs, the fill increments included;
 - the caller splits spans where its own order path changes:
   - BacktestEngine (09_backtest_engine.md):
     - its exit ladder's re-quote instants;
@@ -1232,15 +1278,20 @@ documentation rather than assumed:
   own undisclosed criterion, so the number cannot be read from the response
   before submission — which leaves the funds check sizing against a quantity
   the spec did not state. It is therefore TWO-STAGE in live mode. Stage 1, local:
-  `check_funds_available()` sizes against the observed `ask1` times
-  `live_mode.market_buy_price_margin`, an observable bound replacing an
-  unquantified one — and it costs no extra API call, since
-  `signal_time_rest` already queries level-1 bid/ask at every entry signal.
-  The fill simulators do not read that key: a market entry fills at tick
-  prices in every engine (Fill Simulation Model). The remaining asymmetry is
-  the funds check price — BacktestEngine checks a market entry at `p_entry`,
-  having no book (Constraints' entry-side call order) — and how far apart
-  the two are is unquantified, an open item alongside the other bid/ask
+  `check_funds_available()` sizes against R, an observable bound replacing
+  an unquantified one: at the sizing step the base is `ask1` from
+  `signal_time_rest` when that response has arrived by the funds check,
+  otherwise the latest trade print in the ticker's bar-close superset fetch
+  (the `signal_time_rest` call stays un-awaited); R = base ×
+  `execution.market_buy_price_margin`, rounded DOWN to `tick(price)`.
+  A simulated market entry (backtest, shadow, pilot counterfactual) passes
+  its market-BUY limit price as `limit_price` under the entry limit rule
+  with the market rate (Fill Simulation Model); a real entry's fills come
+  from the broker. The remaining asymmetry is the funds check price —
+  BacktestEngine checks a market entry at its market-BUY limit price
+  (09_backtest_engine.md), having no book (Constraints' entry-side call
+  order) — and how far apart the two are is unquantified, an open item
+  alongside the other bid/ask
   asymmetries. Stage 2, authority: the vendor's own insufficient-funds refusal is
   the gate's real outcome, which the entry-side rejection path already
   anticipates (`live_mode_runner.md`). The margin is set GENEROUS
@@ -1331,8 +1382,9 @@ re-quoted every `live_mode.position_check_interval_seconds`:
   - `exit_order_stuck_minutes`;
 - live prices against the observed `ask1` / `bid1` (live_mode_runner.md);
 - BacktestEngine has no bid/ask and prices L = m × (1 + s × (½ − k)),
-  rounded up to `tick(price)` — m the last synthetic tick's price before the
-  re-quote instant, s the Exit Spread Estimator's estimate below
+  rounded up to `tick(price)` — m the close of the last bundle sealed
+  (effective end time) before the re-quote instant, s the Exit Spread
+  Estimator's estimate below
   (09_backtest_engine.md).
 
 A limit ladder serves any exit remainder proceeding as limit (Session Phase
@@ -1428,11 +1480,13 @@ Normalisation and fallback:
   `compute_position_size(fill_price=p_entry, ...)`, so the DEFINITION of the
   value passed there changes even though the signature does not.
   `trade_log` already records the real fill and needs nothing
-- Entry-side call order, LiveModeRunner ONLY (N-5 — deliberately not
-  BacktestEngine; see below): `is_tradable()` + the terms gate →
-  `compute_position_size(fill_price=p_entry, mgnrt=<this ticker's>, ...)` →
-  `check_funds_available(quantity, <funds check price>, ...)` →
-  `simulate_entry_fill(quantity=adjusted_quantity, ...)`.
+- Entry-side call order:
+  1. LiveModeRunner only (N-5 — deliberately not BacktestEngine; see
+     below): `is_tradable()` + the terms gate;
+  2. backtest and live: `compute_position_size(fill_price=p_entry,
+     mgnrt=<this ticker's>, ...)` →
+     `check_funds_available(quantity, <funds check price>, ...)` →
+     `simulate_entry_fill(quantity=adjusted_quantity, ...)`.
   Sizing uses `p_entry` (always known immediately, before any fill
   simulation), not the slippage-adjusted fill price —
   `simulate_entry_fill()` is what actually determines the realized fill
@@ -1440,9 +1494,10 @@ Normalisation and fallback:
   This mirrors `data_boundary.md`'s existing use of `p_entry` as the
   "Backtest fill price reference" role. The funds check price follows the
   entry's permitted order type (`permitted_order_type()`):
-  - live: `ask1 × live_mode.market_buy_price_margin` for market, the limit
-    price for limit;
-  - backtest: `p_entry` for market, the limit price for limit.
+  - live: R (Session Phase and Order Types) for market, the limit price for
+    limit;
+  - backtest: the market-BUY limit price (09_backtest_engine.md) for
+    market, the limit price for limit.
 - `is_tradable()` is intentionally NOT part of BacktestEngine's entry-side
   flow (N-5), even though it is Sizing→Funds→Fill's first step for
   LiveModeRunner above. `ticker_cik_map`'s rename_pending/quarantine_reason
