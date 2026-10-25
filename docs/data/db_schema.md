@@ -269,10 +269,19 @@ CREATE TABLE IF NOT EXISTS stock_meta (
 -- company_tickers.json. Backs both ticker-rename auto-detection (a rename
 -- keeps the same CIK; a merger/spin-off does not) and fundamentals_quarterly's
 -- lookup key. first_seen/last_seen let a (cik, ticker) pairing be recognized
--- as historical vs. current without deleting superseded rows.
--- rename_pending/quarantine_reason back LiveModeRunner's is_tradable() gate
--- (see execution_common.md): is_tradable() returns tradable only when
--- BOTH are clear (rename_pending=FALSE AND quarantine_reason IS NULL).
+-- as historical vs. current without deleting superseded rows. A ticker's
+-- CURRENT row is its row with the latest last_seen_date — the one definition
+-- every reader of a ticker's mapping cites.
+-- These columns back LiveModeRunner's is_tradable() gate (see
+-- execution_common.md):
+--   - trading_api_symbol;
+--   - rename_pending;
+--   - quarantine_reason.
+-- is_tradable()
+-- returns tradable only when the ticker's current row has a
+-- trading_api_symbol and rename_pending=FALSE AND quarantine_reason IS NULL;
+-- a ticker with no row, or a row whose trading_api_symbol is NULL, is not
+-- tradable.
 -- N-2 restructure: originally a single status/suspend_reason pair, which
 -- meant the P-8 quarantine write (below) and the rename-detection write
 -- (metadata_crawler.md) could clobber each other's state for a ticker
@@ -314,6 +323,21 @@ CREATE TABLE IF NOT EXISTS ticker_cik_map (
                                           -- trading_api.md's Symbol and Exchange
                                           -- Encoding and is not restated here.
                                           -- NULL until matched.
+    trading_api_name     VARCHAR,         -- the ticker master's KorIsnm, raw; written
+                                          -- with trading_api_symbol.
+    trading_api_seen_date VARCHAR,        -- 'YYYYMMDD': the date of the latest
+                                          -- build_trading_api_symbol_map() run whose
+                                          -- exchange call returned this row's code.
+                                          -- Never cleared:
+                                          --   - trading_api_symbol;
+                                          --   - trading_api_exchange;
+                                          --   - trading_api_name.
+                                          -- A row whose code is returned keeps its
+                                          -- mapping even when not re-matched to a SEC
+                                          -- row in that run.
+    sec_title            VARCHAR,         -- company_tickers.json title, written by
+                                          -- detect_rename_candidates() step 1's
+                                          -- upsert (metadata_crawler.md).
     PRIMARY KEY (cik, ticker)
 );
 
@@ -326,7 +350,9 @@ CREATE TABLE IF NOT EXISTS ticker_cik_map (
 CREATE TABLE IF NOT EXISTS fundamentals_quarterly (
     ticker            VARCHAR NOT NULL,
     cik               VARCHAR NOT NULL,
-    fiscal_period_end VARCHAR NOT NULL,   -- 'YYYYMMDD', reporting period end
+    fiscal_period_end VARCHAR NOT NULL,   -- 'YYYYMMDD', reporting period end; on an
+                                          -- instant-type row (period_months NULL)
+                                          -- the XBRL fact's instant date
     filed_date        VARCHAR NOT NULL,   -- 'YYYYMMDD', filing date — as-of queries
                                           -- must filter on this, not fiscal_period_end,
                                           -- to avoid using pre-disclosure information
@@ -373,7 +399,9 @@ CREATE TABLE IF NOT EXISTS trading_halts (
     ticker        VARCHAR   NOT NULL,
     date          VARCHAR   NOT NULL,   -- 'YYYYMMDD'
     halt_start    VARCHAR   NOT NULL,   -- 'HHMMSS'
-    halt_end      VARCHAR,              -- NULL if halt not yet resumed at crawl time
+    halt_end      VARCHAR,              -- NULL = not resumed within that date; every
+                                        -- consumer treats the interval as covering
+                                        -- every slot of that date from halt_start on
     reason_code   VARCHAR,              -- NYSE halt reason code (e.g. "T1", "T6", "LUDP")
     PRIMARY KEY (ticker, date, halt_start)
 );
@@ -463,8 +491,8 @@ CREATE TABLE IF NOT EXISTS ticker_data_coverage (
 -- - a row is the latest attempt of that stage for that date — a re-run
 --   overwrites the rows of the stages it executes;
 -- - DuckDB access sequencing is not kept here: the session state and
---   run_journal hold it (utils.md's DB Access Coordination; DB File Ownership
---   Windows below).
+--   run_journal hold it (db_coordination.md; DB File Ownership Windows
+--   below).
 -- Retention: purge-registry member — date_column `date`, retention_days: inf
 --   (see metadata_crawler.md's evening purge stage).
 CREATE TABLE IF NOT EXISTS batch_runs (
@@ -474,8 +502,10 @@ CREATE TABLE IF NOT EXISTS batch_runs (
                                       -- 'premarket_quarantine_check' |
                                       -- 'premarket_quarantine_recheck' |
                                       -- 'premarket_recheck_bundle' |
-                                      -- 'evening_ingestion' | 'evening_tick_bar_aggregates' |
+                                      -- 'evening_ingestion' | 'evening_nyse_halts' |
+                                      -- 'evening_tick_bar_aggregates' |
                                       -- 'evening_session_stats' |
+                                      -- 'evening_ticker_master_check' |
                                       -- 'evening_investing_forward_check' |
                                       -- 'evening_feed_coverage' |
                                       -- 'evening_detection_gap' |
@@ -493,8 +523,10 @@ CREATE TABLE IF NOT EXISTS batch_runs (
 );
 -- The overnight token refresh writes no row here: it opens no DB connection
 -- (metadata_crawler.md's Overnight Token Refresh).
--- LiveModeRunner writes no row here: warm-restart detection reads the session
--- state (utils.md's DB Access Coordination; live_mode_runner.md).
+-- LiveModeRunner writes no row for its own session — warm-restart detection
+-- reads today's live_session_state row (live_mode_runner.md); the rows it
+-- writes are those of the stages it hosts (live_mode_runner.md's
+-- runner-written stages).
 -- 'premarket_recheck_bundle': written by the In-Process Premarket Recheck's
 -- bundle itself — 'running' at start, 'failed' when its fetches fail,
 -- 'success' once its per-ticker work is complete. Absent or 'running' means
@@ -510,9 +542,10 @@ CREATE TABLE IF NOT EXISTS batch_runs (
 -- block values (execution_common.md) are seed defaults only — one scalar per
 -- rate, shared by every order type — used until the first row lands here for
 -- a (param_name, order_type) pair. resolve_rates() resolves the latest row
--- per pair through get_execution_param() once per top-level run —
--- LiveModeRunner's session start, run_backtest.py's start,
--- pipeline_optimizer's coordinator — in preference to the config seed,
+-- per pair through get_execution_param() in preference to the config seed:
+-- once per top-level run at LiveModeRunner's session start and at the start
+-- of run_backtest's body as run_guest runs it, and once per work for
+-- pipeline_optimizer, at work creation (the work's rate_snapshot) —
 -- overlaying the in-memory config (execution_common.md);
 -- this table is never written by hand.
 -- Retention: NEVER purged — structurally excluded from the purge registry
@@ -542,13 +575,16 @@ CREATE TABLE IF NOT EXISTS execution_params (
 -- values in place (volume/price scale for splits; gap_pct prev_close for both)
 -- so that baselines remain consistent with current share/price scale — see
 -- utils.md populate_precomputed_session_stats() for the adjustment formulas.
--- Also used by adjust_bars_for_corporate_events() (utils.md) for split-scale
--- correction of raw bars feeding CONTINUOUS/cumulative indicators, by
--- adjust_tick_derived_series_for_corporate_events() (utils.md) for the
--- entry-date-direct correction of tick-derived indicator series, and by
--- gap_percentile() and by dead-position pnl (05_labeler.md's Case A/D,
--- 09_backtest_engine.md) for scalar dividend/split adjustment across
--- overnight boundaries.
+-- Also used by:
+--   - adjust_bars_for_corporate_events() (utils.md), for split-scale
+--     correction of raw bars feeding CONTINUOUS/cumulative indicators;
+--   - adjust_tick_derived_series_for_corporate_events() (utils.md), for the
+--     entry-date-direct correction of tick-derived indicator series;
+--   - gap_percentile() and dead-position pnl (05_labeler.md's Case A/D,
+--     09_backtest_engine.md), for scalar dividend/split adjustment across
+--     overnight boundaries;
+--   - 09_backtest_engine.md's carried split normalisation and carried
+--     dividend.
 -- Retention: NEVER purged — structurally excluded from the purge registry
 --   (historical fact, not reconstructable).
 CREATE TABLE IF NOT EXISTS corporate_events (
@@ -584,11 +620,17 @@ CREATE TABLE IF NOT EXISTS corporate_events (
 -- computes the PRODUCT of every matching row, so a second row for the same
 -- event — e.g. the same 2:1 split reported by both vendors — would yield
 -- 2.0 * 2.0 = 4.0 and silently mis-scale every adjusted price and volume
--- that depends on it (adjust_bars_for_corporate_events(),
--- adjust_tick_derived_series_for_corporate_events(),
--- populate_precomputed_session_stats() section D, gap_percentile(),
--- Labeler Case A, BacktestEngine dead-position, the view live_position_state,
--- live position close). No exception raised, no
+-- that depends on it:
+--   - adjust_bars_for_corporate_events();
+--   - adjust_tick_derived_series_for_corporate_events();
+--   - populate_precomputed_session_stats() section D;
+--   - gap_percentile();
+--   - Labeler Case A;
+--   - BacktestEngine dead-position;
+--   - BacktestEngine's carried split normalisation and carried dividend;
+--   - the view live_position_state;
+--   - live position close.
+-- No exception raised, no
 -- log line — just wrong numbers. Any future vendor added here must respect
 -- this invariant.
 --
@@ -653,7 +695,41 @@ CREATE TABLE IF NOT EXISTS entry_points (
     PRIMARY KEY (ticker, date, hour)
 );
 
--- Labeled samples (output of Labeler)
+-- Derived-table configs — one row per config_hash a derived table's rows
+-- carry (Derived tables, after this DDL region): config_json is the canonical
+-- JSON text the config_hash was taken over (utils.md's Config Hashing).
+-- Written by every derived table's producer with INSERT OR IGNORE in the
+-- transaction of its rows, before them.
+-- Retention: NEVER purged — structurally excluded from the purge registry
+--   (the identity of every derived row).
+CREATE TABLE IF NOT EXISTS derived_configs (
+    config_hash  VARCHAR PRIMARY KEY,
+    config_json  VARCHAR NOT NULL,
+    created_at   VARCHAR NOT NULL
+);
+
+-- Source changes — the journal of writes to the tracked tables (Source
+-- changes, after this DDL region). seq is assigned max(seq) + 1 (1 on an
+-- empty table) inside the appending transaction; there is no sequence object.
+-- Retention: NEVER purged — structurally excluded from the purge registry
+--   (derived-row staleness depends on every row).
+CREATE TABLE IF NOT EXISTS source_changes (
+    seq          BIGINT  PRIMARY KEY,
+    source       VARCHAR NOT NULL,   -- the tracked table
+    ticker       VARCHAR,            -- NULL = every ticker
+    date_from    VARCHAR,            -- 'YYYYMMDD'; NULL = open start
+    date_to      VARCHAR,            -- 'YYYYMMDD'; NULL = open end
+    recorded_at  VARCHAR NOT NULL    -- UTC ISO-8601
+);
+
+-- Labeled samples (output of Labeler) — a derived table (Derived tables,
+-- after this DDL region). Written by the Preprocessor batch
+-- (run_preprocess.md), its producer.
+-- config_hash: the Preprocessor work's config_hash; its config_json in
+--              derived_configs.
+-- is_provisional: dead_position_case = 'C', set by run_preprocess at write —
+--                 the outcome is undetermined because the data ends first.
+-- source_seq: the row's mark (Derived tables).
 -- dead_position_case: "A" (next day has_data=True, ticker found in coverage) |
 --                     "B" (next day has_data=True, ticker missing — possible delisting) |
 --                     "C" (no next day with has_data=True — dataset boundary) |
@@ -668,6 +744,7 @@ CREATE TABLE IF NOT EXISTS entry_points (
 -- Retention: NEVER purged — structurally excluded from the purge registry
 --   (training reproducibility).
 CREATE TABLE IF NOT EXISTS labeled_samples (
+    config_hash         VARCHAR      NOT NULL,
     ticker              VARCHAR      NOT NULL,
     date                VARCHAR      NOT NULL,
     hour                VARCHAR      NOT NULL,
@@ -680,7 +757,9 @@ CREATE TABLE IF NOT EXISTS labeled_samples (
     is_dead_position    BOOLEAN      NOT NULL DEFAULT FALSE,
     dead_position_case  VARCHAR,                -- "A" | "B" | "C" | "D" | NULL
     is_ambiguous        BOOLEAN      NOT NULL DEFAULT FALSE,
-    PRIMARY KEY (ticker, date, hour)
+    is_provisional      BOOLEAN      NOT NULL,
+    source_seq          BIGINT       NOT NULL,
+    PRIMARY KEY (config_hash, ticker, date, hour)
 );
 
 -- Train log (output of run_train.py — one row per training run or fold)
@@ -882,7 +961,8 @@ CREATE TABLE IF NOT EXISTS experiment_log (
                                                  --   trading_calendar date with
                                                  --   has_data = TRUE at the run's start
     -- NO early-close column here, and the absence is DELIBERATE — recorded so
-    -- it is not proposed again. The pair above exists because those switches
+    -- it is not proposed again. entry_fill_rate_disabled and
+    -- exit_fill_rate_disabled exist because those switches
     -- vary per RUN and cannot be reconstructed afterwards. Early-close handling
     -- does not vary per run: live_mode.trade_early_close_days gates the day's
     -- entry pipeline in live, carried positions being managed by the reduced
@@ -896,7 +976,8 @@ CREATE TABLE IF NOT EXISTS experiment_log (
     -- DATA window, not the set of dates actually traded, so a window containing
     -- dateless days over-counts slightly.
     -- The LIVE side is the opposite case and DOES record its setting — see
-    -- live_session_state.session_diagnostics.early_close_participation.
+    -- live_session_state.session_diagnostics.start_outcomes, the Early-Close
+    -- cause's detail.
     -- The two backtest: participation-rate switches, recorded per RUN
     -- (09_backtest_engine.md). Recorded as switch state rather than as the
     -- resolved rate values, for three reasons: a rate would place the
@@ -928,11 +1009,12 @@ CREATE TABLE IF NOT EXISTS experiment_log (
     PRIMARY KEY (run_id)
 );
 
--- Regime holdout date set — one row per holdout date, written once per
--- exploitation run by pipeline_optimizer.md from
--- utils.compute_vol_regime_holdout()'s return value. The set is recomputed per
--- run and shifts as data accumulates, so this is the only record of which
--- dates a run's regime_holdout row tested on and its folds excluded.
+-- Regime holdout date set — one row per holdout date, written once per work
+-- by pipeline_optimizer.md from utils.compute_vol_regime_holdout()'s return
+-- value over the work's pinned date range; the regime holdout step reads the
+-- optimizer_run_id's rows when any exist and otherwise computes and records
+-- them. This is the record of which dates a run's regime_holdout row tested
+-- on and its folds excluded.
 -- Retention: purge-registry member — date_column `optimizer_run_id`
 --   (YYYYMMDD_HHMMSS, the execution time; `date` is a data date),
 --   retention_days: inf (see metadata_crawler.md's evening purge stage).
@@ -964,7 +1046,8 @@ CREATE TABLE IF NOT EXISTS regime_holdout_verdict (
 -- Trade log (output of BacktestEngine — one row per executed trade;
 -- also written by LiveModeRunner at stage 'shadow' — see is_shadow below and
 -- live_mode_runner.md's Position Manager / Watchdog Loop
--- `stage == "shadow"` branches. Written COMPLETE in a single INSERT: the
+-- `stage == "shadow"` branches, the stage being the session's
+-- (live_session_state.stage). Written COMPLETE in a single INSERT: the
 -- predicted_* and *_eligible_volume columns are populated at the position's
 -- close transition (live_mode_runner.md's close pending) alongside the real
 -- values, not appended by a session-end update pass)
@@ -1028,7 +1111,16 @@ CREATE TABLE IF NOT EXISTS trade_log (
     slippage_pct            DOUBLE,
     quantity                DECIMAL(18,6),
     reject_reason           VARCHAR,     -- R-8: the broker's own reason for refusing a
-                                        -- submission. Populated ONLY on
+                                        -- submission — the 'new' request's
+                                        -- live_order_requests.reject_reason: the rsp_msg
+                                        -- of a 'rejected' or 'phase_mismatch' result
+                                        -- (trading_api.md), or the order's
+                                        -- AstkRjtRsnCnts read by order-end resolution
+                                        -- (live_mode_runner.md), verbatim; NULL when
+                                        -- the result and the row carry none; a
+                                        -- result refused before
+                                        -- the call reaches no row's reject_reason.
+                                        -- Populated ONLY on
                                         -- exit_reason='entry_rejected' rows; NULL
                                         -- everywhere else, and ALWAYS NULL in backtest,
                                         -- which has no broker to refuse anything.
@@ -1081,7 +1173,10 @@ CREATE TABLE IF NOT EXISTS trade_log (
                                         -- that ended early is simulated on the window
                                         -- it actually had (shadow_retraining.md). NULL for
                                         -- backtest/shadow rows (no "real" counterpart
-                                        -- to predict against) and for scale-stage rows.
+                                        -- to predict against), for scale-stage rows, and
+                                        -- for an entry whose logical order ended
+                                        -- 'unsent' — it never reached the broker, so it
+                                        -- is not an observation (shadow_retraining.md).
                                         -- The former session-end timing existed because
                                         -- the simulator needed tick data that did not
                                         -- exist yet mid-session; the close transition
@@ -1220,8 +1315,7 @@ CREATE TABLE IF NOT EXISTS inference_log (
                                        --   'freeze'         : a freeze_reason
                                        --                      covering
                                        --                      entry_submission
-                                       --                      (feed_outage or
-                                       --                      restart_warmup)
+                                       --                      (feed_outage)
                                        --   'error'          : the gate sequence
                                        --                      itself raised
                                        --                      (the only
@@ -1248,7 +1342,11 @@ CREATE TABLE IF NOT EXISTS inference_log (
                                        --   'cap_per_ticker' : execution
                                        --                      .max_positions_per_ticker
                                        --   'cooldown'       : can_enter()
-                                       --   'not_tradable'   : is_tradable()
+                                       --   'not_tradable'   : is_tradable() —
+                                       --                      - no
+                                       --                        trading_api_symbol;
+                                       --                      - rename pending;
+                                       --                      - quarantined
                                        --   'bar_integrity'  : this ticker is in
                                        --                      the bar-integrity
                                        --                      exclusion set — a
@@ -1379,14 +1477,26 @@ CREATE TABLE IF NOT EXISTS inference_log (
     -- never re-logs a past bar.
 );
 
--- Precomputed session statistics (REFERENCE_SESSION baselines)
+-- Precomputed session statistics (REFERENCE_SESSION baselines) — a derived
+-- table (Derived tables, after this DDL region).
 -- Per-bar aggregated values from prior N sessions; delta smoothing applied at load time.
+-- config_hash: the config_hash of utils.populate_precomputed_session_stats()'s
+--              Config Keys Used; N is that config's
+--              indicators.reference_session.n_sessions (derived_configs).
 -- as_of_date=D: baselines computed from sessions [D-1, D-2, ..., D-N], intended for use on D.
---              Inserted by collect_daily.py the evening before D (after market close D-1).
---              LiveModeRunner queries WHERE as_of_date = today at session_start.
+--              Written by utils.populate_precomputed_session_stats(), the
+--              table's producer, called by:
+--                - metadata_crawler.md's evening session-stats stage (the
+--                  next trading day's groups and the deployment config's
+--                  stale groups);
+--                - LiveModeRunner (live_mode_runner.md's today stats lines);
+--                - the Preprocessor batch (run_preprocess.md);
+--                - migration_tool.md's population step.
+--              LiveModeRunner queries WHERE config_hash = ? AND as_of_date = today at session start.
 -- Retention: NEVER purged — structurally excluded from the purge registry
 --   (historical baselines).
 CREATE TABLE IF NOT EXISTS precomputed_session_stats (
+    config_hash VARCHAR  NOT NULL,
     ticker      VARCHAR  NOT NULL,
     as_of_date  VARCHAR  NOT NULL,   -- 'YYYYMMDD': baseline for this trading date
     hour        VARCHAR  NOT NULL,   -- 'HHMMSS': time slot; '000000' for day-level metrics
@@ -1404,25 +1514,25 @@ CREATE TABLE IF NOT EXISTS precomputed_session_stats (
     --                            utils.md populate_precomputed_session_stats() D.)
     --   "gap_pct_mean"         : prior N sessions gap mean  (hour='000000')
     --   "gap_pct_std"          : prior N sessions gap std   (hour='000000')
-    n_sessions  INTEGER  NOT NULL,
     avg_value   DOUBLE   NOT NULL,   -- per-bar average over prior N sessions (no delta applied)
     std_value   DOUBLE,              -- standard deviation (optional; used for gap_pct normalization)
     count       INTEGER  NOT NULL,   -- actual sessions contributing to this average.
-                                     -- May be < n_sessions for several reasons:
+                                     -- May be < the config's n_sessions for several reasons:
                                      --   (a) near dataset start (insufficient history)
                                      --   (b) halt bars reduce valid session count at
                                      --       specific hour slots (per-bar metrics only)
-                                     --   (c) halt at that date's last bar (utils.md
-                                     --       last_bar()) or at 093000 reduces
-                                     --       gap_pct count
+                                     --   (c) gap_pct count drops when D-k has no
+                                     --       non-halt regular-session bar, or its
+                                     --       093000 bar is halted or missing
                                      --   (d) an early-close session is excluded
                                      --       WHOLESALE from the cumulative metrics
                                      --       (rvol_baseline, rel_dvol_baseline) —
                                      --       see utils.md
                                      --       populate_precomputed_session_stats() A
-                                     -- Granularity: per (ticker, as_of_date, hour, metric)
+                                     -- Granularity: per (config_hash, ticker, as_of_date, hour, metric)
                                      -- count may differ by hour slot within same ticker/date.
-    PRIMARY KEY (ticker, as_of_date, hour, metric, n_sessions)
+    source_seq  BIGINT   NOT NULL,   -- the group's mark (Derived tables)
+    PRIMARY KEY (config_hash, ticker, as_of_date, hour, metric)
 );
 -- Note: delta_minutes smoothing is applied in-memory at load time
 -- (build_session_stats_dict() or load_session_stats()) — not stored in this table.
@@ -1431,10 +1541,10 @@ CREATE TABLE IF NOT EXISTS precomputed_session_stats (
 -- Indicator cache for live mode. Primary runtime store when
 -- indicator_cache_mode = "db" (see below). Also written REGARDLESS of mode
 -- as a crash-recovery backup (R-2) — persist_to_db() is called per ticker
--- right after each Eager-Pool worker finishes, so a warm restart can
+-- right after each Eager-Pool worker finishes, so a later start can
 -- restore via load_from_db() instead of recomputing historical_bars; in
 -- "memory" mode the RAM copy stays authoritative for the running session
--- and this backup is read only on a warm restart.
+-- and this backup is read only at a later start's Eager Pool step.
 -- Holds, per ticker, the seed computed on the current corporate_events —
 -- session_start_compute()'s result, before any of today's bars are replayed.
 -- Populated by CachingIndicatorCalculator.persist_to_db(): per Eager-Pool
@@ -1442,15 +1552,17 @@ CREATE TABLE IF NOT EXISTS precomputed_session_stats (
 -- (caching_calculator.md); persist_to_db() replaces the ticker's rows for the
 -- same session_date.
 -- Loaded per-ticker on its first appearance in the watchdog working set via
--- load_from_db() ("db" mode), or by a warm restart (any mode — R-2, see
--- live_mode_runner.md) for a ticker whose rows for today are present; a
--- ticker without them is recomputed by session_start_compute() alone.
+-- load_from_db() ("db" mode). At every start's Eager Pool step
+-- (live_mode_runner.md), cold start and warm restart alike: a ticker whose
+-- rows for today are present is restored through load_from_db() in "memory"
+-- mode, and at its first appearance in "db" mode; a ticker without them is
+-- computed by session_start_compute() and persisted.
 -- session_stats are NOT stored here — sourced from precomputed_session_stats separately.
 -- Retention: session-scoped, its own mechanism — NOT in the purge registry.
--- Current session_date only, purged per ticker inside persist_to_db() at COLD
--- session_start. On a WARM RESTART (crash recovery, R-2 — see
--- live_mode_runner.md) the purge is SKIPPED — today's backup must survive so a
--- re-crash during recovery can re-restore from it.
+-- Current session_date only, purged per ticker inside persist_to_db(), which
+-- runs for a ticker computed at the Eager Pool step: a ticker restored from
+-- today's rows is not purged, so today's backup survives a re-crash during
+-- recovery.
 CREATE TABLE IF NOT EXISTS indicator_cache (
     session_date  VARCHAR  NOT NULL,   -- 'YYYYMMDD'
     ticker        VARCHAR  NOT NULL,
@@ -1470,9 +1582,10 @@ CREATE TABLE IF NOT EXISTS indicator_cache (
 -- Written BEFORE the entry submission, in the same write as the entry
 -- logical order and its 'intent' request (live_mode_runner.md's intent before
 -- send), so a submission that landed but whose response was lost is still
--- recorded. A structural refusal transitions the row to
--- lifecycle='canceled' with trade_log exit_reason='entry_rejected', through
--- the single canceled-transition point.
+-- recorded. A refusal — structural, or found by order-end resolution
+-- (live_mode_runner.md) — transitions the row to lifecycle='canceled' with
+-- trade_log exit_reason='entry_rejected', through the single
+-- canceled-transition point.
 -- Retention: purge-registry member — date_column `date`, retention_days: inf
 --   (see metadata_crawler.md's evening purge stage).
 CREATE TABLE IF NOT EXISTS live_positions (
@@ -1516,8 +1629,9 @@ CREATE TABLE IF NOT EXISTS live_positions (
                                            --   which is exactly when the duplication
                                            --   looks removable and is not.
     is_shadow          BOOLEAN NOT NULL DEFAULT FALSE,
-                                           -- fixed at row creation from
-                                           --   live_mode.stage == 'shadow'. Same
+                                           -- fixed at row creation from the
+                                           --   session's stage == 'shadow'
+                                           --   (live_session_state.stage). Same
                                            --   meaning and same name as
                                            --   trade_log.is_shadow.
     origin             VARCHAR NOT NULL,   -- 'signal' | 'adopted'. 'adopted' = a
@@ -1587,7 +1701,8 @@ CREATE TABLE IF NOT EXISTS live_orders (
                                                    --   transition: 'shutdown' | 'timeout' |
                                                    --   'escalation' | 'vanished' |
                                                    --   'exit_opened' | 'carried_live_canceled' |
-                                                   --   'expired_at_boundary', among others
+                                                   --   'expired_at_boundary' | 'unmapped' |
+                                                   --   'phase_refused', among others
     predicted_fill_price              DOUBLE,      -- pilot stage, a position carried with
     predicted_weighted_avg_exit_price DOUBLE,      --   this exit order: computed at Session
     predicted_partial_fills_count     INTEGER,     --   Shutdown stage 1 when it cancels the
@@ -1634,8 +1749,12 @@ CREATE TABLE IF NOT EXISTS live_order_requests (
     reported_cum_qty DECIMAL(18,6),      -- broker cumulative for this order number;
                                          --   cross-check only
     remaining_qty    DECIMAL(18,6),      -- AstkOrdRmqty / Sastkunercqty, last seen
-    reject_code      VARCHAR,
-    reject_reason    VARCHAR,
+    reject_code      VARCHAR,            -- a 'rejected' / 'phase_mismatch' result's
+                                         --   rsp_cd, or the order's AstkRjtCode
+                                         --   (live_mode_runner.md's order-end
+                                         --   resolution); verbatim
+    reject_reason    VARCHAR,            -- the matching rsp_msg or AstkRjtRsnCnts;
+                                         --   verbatim
     intent_at        VARCHAR NOT NULL,   -- 'YYYYMMDD_HHMMSS'
     sent_at          VARCHAR,
     confirmed_at     VARCHAR,
@@ -1910,9 +2029,13 @@ CREATE TABLE IF NOT EXISTS live_session_state (
                                           -- (shadow_retraining.md's own
                                           -- names). Records what
                                           -- live_mode.stage declared at
-                                          -- session start; Warm Restart
-                                          -- compares the two and aborts on
-                                          -- a mismatch, so a stage edited
+                                          -- session start; it is the
+                                          -- session's stage, every runtime
+                                          -- branch reading it after step 1c.
+                                          -- Every start compares this
+                                          -- value with live_mode.stage,
+                                          -- and a mismatch blocks
+                                          -- participation, so a stage edited
                                           -- between a crash and a restart
                                           -- cannot silently switch the
                                           -- session's mode. Pilot and scale
@@ -1923,10 +2046,24 @@ CREATE TABLE IF NOT EXISTS live_session_state (
                                           -- indistinguishable in the data.
                                           -- Session start/end TIMES are not
                                           -- duplicated here — the runner's
-                                          -- run_journal rows hold them, and
-                                          -- Warm Restart detection reads the
-                                          -- session state (utils.md's DB
-                                          -- Access Coordination).
+                                          -- run_journal rows hold them.
+                                          -- Warm-restart detection is this
+                                          -- row's existence (live_mode_runner.md).
+    all_tickers        VARCHAR[],         -- Step 1's ticker list, written by
+                                          -- 1c's INSERT; restored by a warm
+                                          -- restart (live_mode_runner.md).
+                                          -- NULL reads as that baseline
+                                          -- absent from the row.
+    rate_overlay       JSON,              -- {param_name: {order_type: {value,
+                                          -- source}}}, source one of:
+                                          --   - the resolved row's fitted_at;
+                                          --   - 'seed';
+                                          --   - 'seed_bound_fallback';
+                                          -- written by
+                                          -- 1e's update of the row and
+                                          -- restored by a warm restart. NULL
+                                          -- reads as that baseline absent
+                                          -- from the row.
     breaker_tripped_at VARCHAR,           -- R-4/Warm Restart: NULL until the
                                           -- circuit breaker trips this
                                           -- session, then the trip
@@ -1970,15 +2107,17 @@ CREATE TABLE IF NOT EXISTS live_session_state (
                                           -- mostly-normal checks — putting them
                                           -- there would dissolve the
                                           -- distinction it is built on.
-                                          -- Keys: early_close_participation
-                                          -- (present only when the Early-Close
-                                          -- Participation Gate blocked the
-                                          -- session — carries that date's
-                                          -- session_close AND the value of
-                                          -- live_mode.trade_early_close_days at
-                                          -- that run. The DATE is recoverable
-                                          -- from trading_calendar; the SETTING
-                                          -- is not, once participation is
+                                          -- Keys: start_outcomes (one entry
+                                          -- per start, {kind, at, causes:
+                                          -- [{gate, detail}]} — the Early-
+                                          -- Close cause's detail carrying
+                                          -- that date's session_close AND
+                                          -- the value of
+                                          -- live_mode.trade_early_close_days
+                                          -- at that run. The DATE is
+                                          -- recoverable from
+                                          -- trading_calendar; the SETTING is
+                                          -- not, once participation is
                                           -- enabled, which is the same ground
                                           -- entry_fill_rate_disabled is stored
                                           -- on), clock_offset_start,
@@ -2027,10 +2166,12 @@ CREATE TABLE IF NOT EXISTS live_session_state (
                                           -- replacement, never read-modify-
                                           -- write — see live_mode_runner.md's
                                           -- "session_diagnostics write
-                                          -- protocol" for the four write points
-                                          -- and the warm-restart rule
-                                          -- (probe values overwritten, counters
-                                          -- resumed).
+                                          -- protocol" for its write points
+                                          -- and the warm-restart rule:
+                                          --   - probe values overwritten;
+                                          --   - counters resumed;
+                                          --   - start_outcomes carried
+                                          --     forward and appended.
     PRIMARY KEY (date)
 );
 
@@ -2368,7 +2509,9 @@ CREATE TABLE IF NOT EXISTS live_scan_daily (
 -- [halt_start, unbounded); closing it at `now` instead would make stateless
 -- recomputation return different answers for the same inputs. A restart
 -- resolves it by replaying the tick-rate heuristic over the gap-fill ticks
--- (live_mode_runner.md's Warm Restart step b2) rather than by assuming
+-- (live_mode_runner.md's Session Lifecycle: the halt replay of the per-ticker
+-- recovery a warm restart runs as the Position Manager loop starts) rather
+-- than by assuming
 -- either outcome, because the STATE self-corrects either way but the
 -- DURATION does not, and the duration is why this table exists.
 -- source distinguishes provenance so metadata_crawler.md's evening
@@ -2542,13 +2685,24 @@ CREATE TABLE IF NOT EXISTS exit_trigger_agreement_daily (
 -- legitimate here once growth has been observed. The DB health observation
 -- (health_report.md) reports its row count for exactly that purpose.
 -- SCOPE, deliberately wider than today's use: the schema accepts any
--- event-shaped finding. Findings 12, 14, 18, 24, 25 and 27 write here (R-9),
--- and finding 29 does too, as do fill_ledger_mismatch, intent_match_ambiguous,
--- exit_rejection_streak, reconcile_deferred, event_settlement_stalled,
--- summary_vocabulary_candidate, dividend_withholding_mismatch,
--- regime_holdout_gate_failed, regime_holdout_verdict,
--- tick_alignment_failed, auxiliary_loop_stopped (finding 48), and finding
--- 9's execution_param_fit_rejected and execution_param_bound_fallback.
+-- event-shaped finding. Writers here:
+--   - findings 12, 14, 18, 24, 25 and 27 (R-9);
+--   - finding 29;
+--   - fill_ledger_mismatch;
+--   - intent_match_ambiguous;
+--   - exit_rejection_streak;
+--   - reconcile_deferred;
+--   - event_settlement_stalled;
+--   - summary_vocabulary_candidate;
+--   - dividend_withholding_mismatch;
+--   - regime_holdout_gate_failed;
+--   - regime_holdout_verdict;
+--   - tick_alignment_failed;
+--   - auxiliary_loop_stopped (finding 48);
+--   - session_phase_mismatch;
+--   - order_unmapped;
+--   - finding 9's execution_param_fit_rejected and
+--     execution_param_bound_fallback.
 -- Findings 13 and 15 deliberately do NOT: each already writes its own
 -- trade_log row (finding 13: exit_reason='restart_gap_exit'; finding 15:
 -- rows with exit_date > date OR exit_reason='overnight_exit', and
@@ -2614,8 +2768,10 @@ CREATE TABLE IF NOT EXISTS alert_log (
     date             VARCHAR NOT NULL,   -- 'YYYYMMDD', writing process's start day
     alert_key        VARCHAR NOT NULL,   -- the INVOCATION PATH, not the finding:
                                          --   'session_start' | 'session_end' |
-                                         --   'breaker_trip' | 'clock_check_abort' |
+                                         --   'breaker_trip' | 'session_start_abort' |
                                          --   'bar_close_premise_violation' |
+                                         --   'scheduled_work_deferred' |
+                                         --   'order_unmapped' |
                                          --   'evening_liveness_probe' |
                                          --   'evening_end' |
                                          --   'log_write_failed' |
@@ -2640,7 +2796,7 @@ CREATE TABLE IF NOT EXISTS alert_log (
                                          --   to the log_dir log
                                          --   (alert_delivery.md)
     channel          VARCHAR NOT NULL,   -- 'discord' | 'email'
-    severity         VARCHAR NOT NULL,   -- 'ok' | 'warn' | 'abort' — the MAXIMUM
+    severity         VARCHAR NOT NULL,   -- 'ok' | 'info' | 'warn' | 'abort' — the MAXIMUM
                                          --   severity across the findings this
                                          --   alert carried. A transport grade
                                          --   only; it implies no operational
@@ -2727,14 +2883,146 @@ Overnight Policy."
 
 ---
 
+## Derived tables
+
+Members — the tables whose row values are computed from tracked tables (Source
+changes, below) under a config and shared across runs:
+- `labeled_samples`;
+- `precomputed_session_stats`;
+- every such table added later.
+
+Outside:
+- tables keyed by a run (`run_id`, `optimizer_run_id`) — `train_log`,
+  `experiment_log`, `trade_log`, `regime_holdout_dates` among them;
+- `entry_points`;
+- `tick_bar_aggregates`.
+
+Key and config:
+- a derived table's key starts with `config_hash`, utils.md's `config_hash()`
+  of the config keys its producer lists:
+  - `labeled_samples` — the Preprocessor work's config_hash;
+  - `precomputed_session_stats` — `populate_precomputed_session_stats()`'s
+    Config Keys Used;
+- every producer writes its config's `derived_configs` row with INSERT OR
+  IGNORE in the transaction of its rows, before them.
+
+Mark:
+- a derived row carries `source_seq`: the highest `source_changes` seq when
+  its computation started, after the derived rows it reads were ensured;
+- a Preprocessor batch file's parquet metadata carries its mark
+  `(seq, recorded_at)` of that `source_changes` row (run_preprocess.md);
+- a mark is valid when its seq is 0 or that row exists with the same
+  `recorded_at`.
+
+Stale:
+- a derived row or batch file is stale when its mark is invalid, or when
+  `source_changes` holds a row with a higher seq:
+  - whose source is in its footprint;
+  - whose ticker is in its footprint or NULL;
+  - whose date range intersects its footprint dates;
+- a computation reading derived rows includes their footprints in its own;
+- a footprint may cover more than its computation depends on, never less:
+  it intersects every `source_changes` row that can alter the
+  computation's result, a change `source_changes` records under dates other
+  than the changed row's included (a written split's rows at the event
+  dates of the dividends it restates, Source changes below).
+
+Footprints:
+- `precomputed_session_stats` of (T, as_of D):
+  - T and its `ticker_history` predecessors;
+  - `corporate_events` from the earliest of D's n_sessions prior trading days
+    through D;
+  - from that day through D−1:
+    - `ohlcv_1min`;
+    - `tick_10`;
+    - `ticker_data_coverage`;
+    - `trading_calendar`;
+    - `trading_halts`;
+    - `ticker_history`;
+- `labeled_samples` of (T, D):
+  - T and its `ticker_history` predecessors;
+  - D through the next trading day with `has_data`, open end when none;
+  - every tracked table but `fundamentals_quarterly`;
+- a Preprocessor batch file — run_preprocess.md.
+
+Provisional:
+- a derived row is provisional (`is_provisional = TRUE`, set by its writer)
+  when its market outcome is undetermined because the data ends before that
+  outcome;
+- `is_provisional` exists on a derived table whose computation reads past the
+  key's date (`labeled_samples`).
+
+Replacement — a later computation of a derived row's key under the same
+config_hash replaces the stored row only when it is provisional or stale, the
+new row's `is_provisional` and `source_seq` following its own computation; any
+other row is never replaced.
+
+Production:
+- each derived table has one producer:
+  - `labeled_samples` — the Preprocessor batch (run_preprocess.md);
+  - `precomputed_session_stats` —
+    `populate_precomputed_session_stats(config, dates, tickers)` (utils.md),
+    per (ticker, as_of_date) group;
+- a producer, for a given config and scope:
+  - computes absent rows;
+  - recomputes stale rows, replacing them in one transaction per group or
+    key set;
+  - skips current rows;
+- a consumer of derived rows ensures, under its own config, the rows it reads
+  through the table's producer before reading them, except the runner, which
+  for today's `precomputed_session_stats` (live_mode_runner.md):
+  - recomputes stale groups;
+  - computes the groups of tickers whose `ticker_history` row is effective
+    today;
+  - leaves any other absent today group to Health Gate 1a.
+
+---
+
+## Source changes
+
+Tracked tables:
+- `ohlcv_1min`;
+- `tick_10`;
+- `ticker_data_coverage`;
+- `trading_calendar`;
+- `trading_halts`;
+- `corporate_events`;
+- `ticker_history`;
+- `fundamentals_quarterly`.
+
+Write rule:
+- a write that inserts a row of a tracked table or changes a stored value
+  appends its `source_changes` rows in the same transaction;
+- a write that changes nothing appends none;
+- a derived table's writes append none.
+
+Rows per writer:
+- ingestion — per imported (table, ticker, date), that date;
+- `populate_ticker_coverage()` — none, its rows covered by the ingestion rows
+  of the same (ticker, date);
+- `crawl_nyse_halts()` — per (ticker, date) whose `trading_halts` rows were
+  inserted or changed, that date;
+- `populate_trading_calendar()` — per inserted or changed date, ticker NULL;
+- `upsert_corporate_event()` returning True — the row's `event_date` and, for
+  a written split or reverse_split, the `event_date` of each dividend of that
+  ticker, whatever its source, whose (event_date, basis_date] contains the
+  split's `event_date`;
+- `ticker_history`:
+  - a registered rename — current_ticker, every date before effective_date;
+  - an effective_date correction — current_ticker, from the earlier date to
+    the day before the later;
+- `fundamentals_quarterly` — per inserted or changed (ticker, filed_date),
+  from filed_date, open end.
+
+---
+
 ## DB File Ownership Windows
 
 A WRITER on `market.duckdb` is exclusive. Measured: DuckDB refuses a second
 open of the same file under a different configuration within one process, and
 its file lock blocks every other open across processes while a writer holds
 it — read-only included. Access is therefore serialized by `db.lock`:
-- utils.md's DB Access Coordination owns the mechanism, and is the only place
-  stating it:
+- db_coordination.md owns the mechanism, and is the only place stating it:
   - the coordination store — its tables, states and journal events;
   - the lock files;
   - the fact classes;
@@ -2752,6 +3040,7 @@ Roles:
 - aux — a process registered with the helper that never opens
   `market.duckdb`:
   - the dispatcher;
+  - the resume sweep `resume_guests` (guest_supervisor.md);
   - the overnight token refresh;
 - guest — every other process that opens `market.duckdb`:
   - every other `collect_daily.py` flag;
@@ -2766,25 +3055,27 @@ Roles:
   - the DuckDB recovery (`restore_db()`).
 
 Precedence: runner > premarket > evening > guest. The evening run yields at
-stage boundaries to a waiting premarket or runner (utils.md's Precedence and
-yield; metadata_crawler.md); the runner and the premarket never yield.
+stage boundaries to a waiting premarket or runner (db_coordination.md's
+Precedence and yield; metadata_crawler.md); the runner and the premarket never
+yield.
 
 Wait specs — phase A is the role's precondition, read from the coordination
-store; phase B takes `db.lock` by non-blocking attempts (utils.md's acquire
-loop):
+store; phase B takes `db.lock` by non-blocking attempts (db_coordination.md's
+acquire loop):
 
 | Role | Phase A | Phase B | Deadline |
 |---|---|---|---|
 | premarket | none | attempts until `db.lock` is taken | `coordination.schedule.premarket.deadline` → abort |
 | runner | today's premarket state `done` or `failed`, or that run crashed → phase B; `session_expected` false → end `not_expected` without opening the DB; the premarket in a non-terminal state with its run lock held, or not yet run today → wait | attempts continue past the phase A deadline; one notification at that instant | phase A: `coordination.schedule.premarket.deadline` → phase B degraded; the hard cap → end without a session |
 | evening | today's session state terminal (`done`, `failed`, `not_expected`) → phase B; non-terminal with the runner alive → wait; the runner crashed → `predecessor_crashed`, phase B; no session state today and no runner run today → phase B | attempts until `db.lock` is taken | `coordination.schedule.evening.deadline` → abort, in either phase |
-| guest | the admission test (utils.md's Guest admission and units) | within the admitted unit | `timeout` → `timed_out` |
+| guest | the admission test (db_coordination.md's Guest admission and units) | within the admitted unit | `timeout` → `timed_out` |
 
 An owner run started after its deadline instant aborts at its first failed
 attempt.
 
 Referencing this section:
-- `utils.md`'s DB Access Coordination;
+- `db_coordination.md`;
+- `guest_supervisor.md`;
 - `live_mode_runner.md`'s DB Connection Management (P-5) and Session Start
   Gating;
 - `metadata_crawler.md`'s evening job start gate, premarket start gate and
@@ -2843,31 +3134,34 @@ next_day = con.execute("""
     ORDER BY date LIMIT 1
 """, ["20250714"]).fetchone()
 
+# cfg_hash: utils.md's config_hash() of the stats Config Keys Used under the
+# reading config (Derived tables)
 # Load REFERENCE_SESSION baselines for a ticker on a given trading day
 session_stats_raw = con.execute("""
     SELECT hour, metric, avg_value, std_value, count
     FROM precomputed_session_stats
-    WHERE ticker = ? AND as_of_date = ? AND n_sessions = ?
+    WHERE config_hash = ? AND ticker = ? AND as_of_date = ?
     ORDER BY metric, hour
-""", ["AAPL", "20250715", 20]).df()
+""", [cfg_hash, "AAPL", "20250715"]).df()
 # After loading, apply delta_minutes smoothing in memory via load_session_stats()
 
-# Bulk load session_stats for ALL tickers — live Phase 1 (single date)
+# Bulk load session_stats for ALL tickers — live_mode_runner.md's Session
+# Lifecycle Step 2 (single date)
 session_stats_bulk = con.execute("""
     SELECT ticker, as_of_date, hour, metric, avg_value, std_value, count
     FROM precomputed_session_stats
-    WHERE as_of_date = ? AND n_sessions = ?
+    WHERE config_hash = ? AND as_of_date = ?
     ORDER BY ticker, metric, hour
-""", ["20250715", 20]).df()
+""", [cfg_hash, "20250715"]).df()
 # Pass to build_session_stats_dict(); access result[today_date] for ticker-keyed dict
 
 # Bulk load session_stats for ALL tickers and dates — training (all dates)
 session_stats_all = con.execute("""
     SELECT ticker, as_of_date, hour, metric, avg_value, std_value, count
     FROM precomputed_session_stats
-    WHERE n_sessions = ?
+    WHERE config_hash = ?
     ORDER BY as_of_date, ticker, metric, hour
-""", [20]).df()
+""", [cfg_hash]).df()
 # Pass to build_session_stats_dict(); access result[date][ticker] per entry point
 
 # Check for corporate events (splits, reverse splits, dividends) for a ticker.
@@ -2933,7 +3227,8 @@ robustness = con.execute("""
       AND eval_type = 'regime_holdout'
 """, ["20250519_143022"]).df()
 
-# Ambiguous sample rate in labeled_samples
+# Ambiguous sample rate in labeled_samples, under one bound config_hash
+# (a Preprocessor work's)
 ambig_rate = con.execute("""
     SELECT
         COUNT(*) FILTER (WHERE is_ambiguous)       AS ambiguous_count,
@@ -2941,16 +3236,17 @@ ambig_rate = con.execute("""
         COUNT(*) FILTER (WHERE is_ambiguous) * 1.0
             / COUNT(*)                              AS ambiguous_rate
     FROM labeled_samples
-""").df()
+    WHERE config_hash = ?
+""", [work_config_hash]).df()
 
 # Dead position case distribution
 dead_dist = con.execute("""
     SELECT dead_position_case, COUNT(*) AS count
     FROM labeled_samples
-    WHERE is_dead_position = TRUE
+    WHERE config_hash = ? AND is_dead_position = TRUE
     GROUP BY dead_position_case
     ORDER BY dead_position_case
-""").df()
+""", [work_config_hash]).df()
 
 # Partial fill analysis — unfilled position rate
 # (rows with unfilled_quantity > 0 are positions carried past their first exit date)
@@ -3014,5 +3310,9 @@ exp_results = con.execute("""
 - entry_points table: INSERT OR IGNORE — written by both Preprocessor (training) and Inferencer (live)
 - After ingestion: `trading_calendar` and `ticker_data_coverage` updated via
   `utils.populate_trading_calendar()` and `utils.populate_ticker_coverage()`
+- Each import appends its `source_changes` rows per imported (table, ticker,
+  date) in the import's transaction (Source changes)
 - After calendar/coverage update: `precomputed_session_stats` updated via
-  `utils.populate_precomputed_session_stats()` for the next trading day
+  `utils.populate_precomputed_session_stats()` — the next trading day's groups
+  and the deployment config's stale groups (metadata_crawler.md's evening
+  session-stats stage)

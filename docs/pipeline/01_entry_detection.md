@@ -80,10 +80,10 @@ the label is dominated by session-close exit logic rather than genuine
 price movement — creating a systematic bias.
 
 ```
-max_entry_offset_minutes: minutes before the session's last bar (default: null)
+max_entry_offset_minutes: minutes before the session's close (default: null)
 
     null  → no cutoff applied
-    N     → max_entry_hour(date) = last_bar(date) - N minutes
+    N     → max_entry_hour(date) = session_close(date) - N minutes
             entry points with t bar open time > max_entry_hour(date) are
             excluded from scan() output.
 
@@ -345,7 +345,7 @@ class EntryPointDetector:
         HOW THE BOUNDARY ARRIVES. Both exclusions below need it and they need
         DIFFERENT derivations of it: the after-market exclusion reads
         last_bar(date), the late-day exclusion reads max_entry_hour(date),
-        which is last_bar(date) minus the offset. So the map arrives, not a
+        which is session_close(date) minus the offset. So the map arrives, not a
         pre-resolved cutoff — a cutoff would also vanish when
         max_entry_offset_minutes is null, while the after-market exclusion
         still applies. Passed explicitly, never fetched: bars cannot supply it,
@@ -457,7 +457,7 @@ entry_detector:
   volume_base_hour: "040000"     # base hour for D, E, F conditions
 
   # Late-day exclusion
-  max_entry_offset_minutes: null # minutes before last_bar(date); null = no cutoff.
+  max_entry_offset_minutes: null # minutes before session_close(date); null = no cutoff.
                                  # REPLACES max_entry_hour: "150000", which was an
                                  # ABSOLUTE time and so could not follow an
                                  # early-close day. Same offset form as
@@ -502,7 +502,7 @@ entry_detector:
 - Filter F returns `False` (not an error) when no prior bars exist for the day (first bar of session edge case)
 - After-market entry points (hour > last_bar(date)) must never be returned from `scan()`
 - Late-day entry points (hour > max_entry_hour(date)) excluded in `scan()` when max_entry_offset_minutes is not null
-- `max_entry_hour(date)` resolves as last_bar(date) - max_entry_offset_minutes; the cutoff moves with the calendar
+- `max_entry_hour(date)` resolves as session_close(date) - max_entry_offset_minutes; the cutoff moves with the calendar
 - Late-day exclusion applied before session_mode filter — both are independent constraints
 - `volume_base_hour` applied to conditions D, E, F only — condition G uses rolling window, no base hour filter
 - Condition A is the only NON-MONOTONE condition (see Monotonicity of the

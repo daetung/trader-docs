@@ -8,7 +8,8 @@
 
 Abstract base class for model trainers. Defines the common interface that all model
 implementations must implement (train, evaluate, predict, save, load, feature_importance).
-Provides shared artifact management (JSON metadata + pickle model binary).
+Provides shared artifact management: JSON metadata plus a model binary in a
+format the subclass defines.
 
 ---
 

@@ -244,6 +244,8 @@ ticks_td = db_conn.execute("""
 halts_td = db_conn.execute("""
     SELECT * FROM trading_halts WHERE ticker = ? AND date = ?
 """, [ticker, date]).df()
+# a row whose halt_end is NULL covers every slot of that date from its
+# halt_start on (db_schema.md's trading_halts.halt_end)
 
 # halts_td passed explicitly to all internal methods
 synthetic, effective_end = utils.expand_synthetic_ticks(ticks_td, halts_td)
@@ -426,8 +428,7 @@ Procedure:
         # total_filled may be < quantity (order canceled at the window's end
         # or stopped by a breach) — trade proceeds sized down to
         # total_filled, no penalty (see execution_common.md Constraints:
-        # entry-side unfilled remainder is canceled, not penalized, unlike
-        # exit-side).
+        # an entry-side unfilled remainder is canceled).
         quantity = total_filled
         # breach found → Exit Logic's take-profit / stop-loss exit at that
         # tick; none → Exit Logic's continuation after the window
@@ -706,7 +707,7 @@ if direction is not None:
 
     weighted_avg_exit_price, total_filled, unfilled_qty = simulate_exit(
         anchor=effective_second, reference_price=effective_price,
-        quantity=quantity, exit_reason=exit_reason,
+        quantity=quantity, exit_reason=exit_reason, carried=False,
     )                                   # Exit fill simulation, below
     # ohlcv_exit is gone — it had no reader, and the slice passed here was
     # filtered on `hour` alone across a MULTI-DATE frame while the exit ticks were
@@ -756,7 +757,7 @@ if current bar hour == exit_deadline(date):     # utils.md — PER DATE
         fallback: first tick_10 row with hour > exit_deadline(date)
         if none: → dead position          # no ticks at all → no simulator call
     mode, _ = execution_common.exit_fill_mode(
-        config, "session_end", the exit's permitted order type)
+        config, "session_end", the exit's permitted order type, carried=False)
     if mode == "reference":   # simulate_nondirectional_exit_fill false
         exit_price = the reference price (that bar's close, or the
                      after-market tick fallback above)
@@ -764,7 +765,8 @@ if current bar hour == exit_deadline(date):     # utils.md — PER DATE
         anchor    = exit_deadline(date)
         reference = the price of the last synthetic tick whose time's
                     integer part is less than the anchor (no fallback)
-        → simulate_exit(anchor, reference, quantity, "session_end")
+        → simulate_exit(anchor, reference, quantity, "session_end",
+                        carried=False)
 ```
 
 The dead-position test stays AHEAD of the simulator because it is a
@@ -783,14 +785,15 @@ if config["execution"]["max_hold_bars"] valid bars elapsed since entry
     exit unreachable whenever the key exceeds 60):
     exit_reason = "time_limit"
     mode, _ = execution_common.exit_fill_mode(
-        config, "time_limit", the exit's permitted order type)
+        config, "time_limit", the exit's permitted order type, carried=False)
     if mode == "reference":   # simulate_nondirectional_exit_fill false
         exit_price = close of last valid bar
     else:
         anchor    = the instant that count was reached
         reference = the price of the last synthetic tick whose time's
                     integer part is less than the anchor (no fallback)
-        → simulate_exit(anchor, reference, quantity, "time_limit")
+        → simulate_exit(anchor, reference, quantity, "time_limit",
+                        carried=False)
 ```
 
 Note that once an exit reason is assigned, filling may continue past the
@@ -801,10 +804,12 @@ in-progress fill is re-triggered.
 ### Exit fill simulation
 
 ```
-simulate_exit(anchor, reference_price, quantity, exit_reason):
+simulate_exit(anchor, reference_price, quantity, exit_reason, carried):
+    # carried: true on a Carried date exit, false otherwise
     order_type = execution_common.permitted_order_type(
         "sell", config["execution"]["exit_order_type"], phase at the anchor)
-    mode, rate = execution_common.exit_fill_mode(config, exit_reason, order_type)
+    mode, rate = execution_common.exit_fill_mode(config, exit_reason,
+                                                 order_type, carried)
     if config["backtest"]["exit_fill_rate_disabled"]:
         rate = 1                # all volume after the anchor; a switch, not a rate
     ticks = synthetic ticks whose second is greater than the anchor, through
@@ -881,7 +886,8 @@ date].
   excluded from `fill_price`, the per-share cost and `trade_log.quantity`,
   sold with the remainder, its proceeds in pnl.
 
-**Carried date exit:**
+**Carried date exit** — `simulate_exit(..., carried=True)`, its rate selected
+with carried (execution_common.md's `exit_fill_mode()`):
 - the exit simulation starts at that date's first session boundary
   (pre-market), the order type per `permitted_order_type()` at that phase;
 - on a split or reverse split `event_date` of the ticker it starts at the
@@ -1243,8 +1249,9 @@ backtest:
                                       # not read it, and shadow must not either,
                                       # shadow existing to reproduce live.
                                       # SWITCHES, not `rate: 1.0`:
-                                      # run_backtest.py's get_execution_param()
-                                      # resolution overlays fitted values on the
+                                      # execution_common.md's resolve_rates(), at
+                                      # the start of run_backtest's body as
+                                      # run_guest runs it, overlays fitted values on the
                                       # configured rates (execution_common.md's
                                       # Rate Overlay), so a configured 1.0 can be
                                       # replaced by a fitted value. A switch
@@ -1358,10 +1365,11 @@ fill_increments          VARCHAR,   -- JSON, when backtest.record_fill_increment
   - here, synthetic ticks expanded from `tick_10` (utils.md's
     `expand_synthetic_ticks()`)
   - in live, the REST portion of the held-ticker tape (live_mode_runner.md)
-- BacktestEngine reads rates from the config run_backtest.py resolved and
-  overlaid (execution_common.md's `get_execution_param()`), selecting them
-  through `entry_fill_rate()` / `exit_fill_mode()`; it does not resolve
-  again
+- BacktestEngine reads rates from the config its caller resolved and
+  overlaid through execution_common.md's `resolve_rates()` — at the start of
+  run_backtest's body as run_guest runs it, or at pipeline_optimizer's work
+  creation — selecting them through `entry_fill_rate()` /
+  `exit_fill_mode()`; it does not resolve again
 - `db_conn` injected via constructor for testability (mock DB in tests)
 - OHLCV loaded once per ticker for all its entry and carried dates
 - Tick data loaded once per ticker/date (full day); filtered in memory by range
@@ -1452,10 +1460,14 @@ fill_increments          VARCHAR,   -- JSON, when backtest.record_fill_increment
   - `entry_fill_rate()`
   - `exit_fill_mode()`
 - `is_tradable()` is deliberately NOT called here (N-5), unlike every other
-  function in the bullet above. `ticker_cik_map`'s rename_pending /
-  quarantine_reason (see db_schema.md) reflect data-pipeline/vendor-latency
-  state as of right now, with no date-scoping — calling it here would check
-  TODAY's suspension state against whatever historical date a given backtest
+  function in the bullet above. Its `ticker_cik_map` inputs (see
+  db_schema.md) reflect data-pipeline/vendor-latency state as of right now,
+  with no date-scoping; the inputs (execution_common.md's Tradability Gate):
+  - `trading_api_symbol`;
+  - `rename_pending`;
+  - `quarantine_reason`.
+  Calling it here would check
+  TODAY's state against whatever historical date a given backtest
   run happens to be simulating, which is both non-deterministic (re-running
   the "same" backtest on a different day can change results) and, more
   fundamentally, the wrong question: both suspend reasons exist to hedge
@@ -1467,8 +1479,9 @@ fill_increments          VARCHAR,   -- JSON, when backtest.record_fill_increment
 - `trading_halts` (used above for `halts_td`) is populated by the daily NYSE
   crawl (see metadata_crawler.md) and is training/backtest-only — LiveModeRunner
   never queries this table for real-time decisions; its live-mode halt signal
-  is a separate tick-rate heuristic scoped to open positions (see
-  live_mode_runner.md's Position Manager Loop)
+  is the Halt-Status Poller's snapshot through utils.query_halt_status(),
+  with the tick-rate heuristic as fallback (live_mode_runner.md's Position
+  Manager Loop)
 - Backtest-vs-live exit asymmetry (R-2) — THREE distinct kinds, do not
   conflate. (1) ORDERING WITHIN A BUNDLE, irreducible — backtest reads
   10-tick `tick_10` bundles, and after the entry window and its

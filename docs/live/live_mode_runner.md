@@ -114,7 +114,8 @@ form belongs to which.
   - `STAGE`;
 - every line carries `run_id`;
 - each runner-written work stage (`premarket_recheck_bundle`,
-  `premarket_quarantine_recheck`) writes a `STAGE` line (`stage`, `date`,
+  `premarket_quarantine_recheck`, `premarket_trading_api_symbol_map`)
+  writes a `STAGE` line (`stage`, `date`,
   `run_id`) at its start;
 - a warm restart appends to that date's file;
 - a function logs into the structured log of the process hosting it, each
@@ -142,7 +143,7 @@ under a different configuration in the same process, and its file lock is
 exclusive across processes, so a read-only handle beside the writer is not
 available either way. Per-thread and per-component handles derive from the
 single connection with `.cursor()`. LiveModeRunner is an owner: it opens
-its connection through utils.md's DB Access Coordination under its wait
+its connection through db_coordination.md under its wait
 spec (db_schema.md's DB File Ownership Windows) — this section and Session
 Start Gating below reference it rather than restating it. Its process entry
 runs inside `register('owner', 'live_mode_runner', trigger, owner='runner')`.
@@ -158,7 +159,7 @@ write_lock = Lock()
                  # mode), and, as of R-2, live_positions and
                  # live_session_state (see "Session Restart (Warm Start)"
                  # below; the session state itself is the coordination
-                 # store's, written through utils.md's helper, not here),
+                 # store's, written through db_coordination.md's helper, not here),
                  # the order and fill ledger
                  # (live_orders, live_order_requests, live_fills,
                  # live_position_adjustments) plus the In-Process
@@ -186,32 +187,38 @@ def db_write(sql, params):   # contract: Callable[[str, tuple], None] —
 
 ## Early-Close Participation Gate
 
-Evaluated immediately after Session Start Gating (below), on the connection
-it obtained, and before Session Start Probes.
+Evaluated right after Session Lifecycle step 1c, beside stage consistency
+(Session Lifecycle's participation gates), on the connection Session Start
+Gating obtained, and before Session Start Probes.
 
 ```
 closes, ends = load_session_boundaries(db_conn)     # utils.md, once per process
-                                                    # DuckDB is already open here:
-                                                    # this block writes
-                                                    # live_session_state below.
 today_close = session_close(today)                  # utils.md, per date
 if today_close != the ordinary close
        and not config["live_mode"]["trade_early_close_days"]:   # default false
-    write live_session_state.session_diagnostics: participation blocked,
-        today's session_close, and the KEY'S VALUE AT THIS RUN
-    run Session Start Probes, then Session Lifecycle steps 1a–1d (token
-        coverage gate, balance query, session-state persistence,
-        Broker Reconcile) and step 1e's rate resolution
+    participation is blocked: the start's outcome 'blocked', cause
+        {gate: 'early_close', detail: {session_close: today's session_close,
+        trade_early_close_days: the KEY'S VALUE AT THIS RUN}}, recorded in
+        session_diagnostics.start_outcomes (Session Lifecycle)
+    these run:
+        - Session Start Probes;
+        - step 1d;
+        - step 1e's rate resolution;
+    at the outcome's point, after 1e, the session-start health report goes out
+        through the scheduled session_start path when this is the only
+        cause (Session Lifecycle)
     no lifecycle='live' position (shadow included) and no 'open' logical
         order left → Session Shutdown, and exit
     otherwise → continue as the REDUCED SESSION (below)
 ```
 
-**The reduced session** manages carried positions on a non-participation
-day:
-- runs:
-  - Session Start Probes;
-  - the session-start health report;
+**The reduced session** is the mode of every 'blocked' start, whatever the
+cause (Session Lifecycle's start outcome) — stated here once for every cause.
+From the outcome on, the start runs what these lists name, the steps run
+before the block standing. It manages the positions and 'open' logical
+orders left at the block — carried, or opened by an earlier start of the day:
+- runs, beside the steps already run before the block (Session Start Probes
+  and the session-start health report among them):
   - the SDK clients (loop P, loop A) and held-ticker WS;
   - the Halt-Status Poller;
   - the Position Manager loop in full:
@@ -228,7 +235,7 @@ day:
   - Inferencer;
   - the Watchdog loop;
   - the In-Process Premarket Recheck;
-  - late-start branch 4b;
+  - the late recheck (Session Lifecycle step 4b);
 - on its tape:
   - these do not run:
     - derived-bundle alignment;
@@ -239,15 +246,11 @@ day:
 - ends by Session Shutdown at the earlier of no lifecycle='live' position
   and no 'open' logical order remaining, or the process hard cap; positions
   left at the hard cap carry as in an ordinary session;
-- a process start re-evaluates the gate and so re-enters the reduced
-  session; its Warm Restart:
-  - skips:
-    - the recheck-bundle run;
-    - the indicator-cache restore;
-    - the Watchdog steps;
-  - runs as usual:
-    - position and order recovery;
-    - the per-ticker recovery.
+- a later start evaluates every participation gate anew; a start blocked
+  again runs the reduced session again, its warm restart running:
+  - the position and order recovery (Broker Reconcile at step 1d);
+  - the per-ticker recovery ("Session Restart (Warm Start)");
+  and none of the steps the skip list names.
 
 **A session-start gate, not an entry gate**, and the distinction is what leaves
 `gate_result`'s value list (db_schema.md) untouched. `freeze_reasons` is
@@ -262,8 +265,10 @@ needed a separate correction. A twelfth value would buy a repetition of "this
 day was not traded".
 
 **Why `live_mode:` and not `execution:`.** `execution:` is the shared block, and
-R-7 moved `session_close_exit_time` INTO it precisely because both engines had
-to agree on that value. This key is the opposite case — BacktestEngine must
+R-7 moved the session-close exit offset
+(`execution.session_close_exit_offset_minutes`) INTO it precisely because
+BacktestEngine and LiveModeRunner had to agree on that value. This key is the
+opposite case — BacktestEngine must
 ignore it and always replay early-close dates, since measuring whether those
 days are worth trading is the whole reason they are labelled and kept in the
 corpus. Opposite rationale, opposite side.
@@ -287,7 +292,7 @@ evaluation.
 The dispatcher launches LiveModeRunner at `coordination.schedule.runner.time`
 on its `days` (metadata_crawler.md's Cron / Scheduler Setup). Before opening
 the DB connection above, LiveModeRunner waits under its wait spec through
-utils.md's `acquire()` (db_schema.md's DB File Ownership Windows):
+db_coordination.md's `acquire()` (db_schema.md's DB File Ownership Windows):
 - this is a *timing* concern — don't open a connection while the premarket
   job might still be writing;
 - it is distinct from Health Gate 1's premarket-marker check, a
@@ -312,17 +317,19 @@ Wait spec:
     finding 28 phase `waiting`;
   - still failing at `coordination.schedule.premarket.deadline` → one
     notification, finding 28 phase `deadline` (`owner='runner'`), and the
-    attempts continue; the first acquisition proceeds, Session Lifecycle
-    Step 4b's late-start branch applying past `premarket_recheck_time`;
+    attempts continue; the first acquisition proceeds, the late recheck
+    (Session Lifecycle step 4b) applying past `premarket_recheck_time`;
 - the hard cap (after_hours_end − session_hard_exit_offset_minutes, taken
   before the DB is held from the boundaries entry in owner state —
-  utils.md's Session expectation and boundaries) → the run ends `hard_cap`
+  db_coordination.md's Session expectation and boundaries) → the run ends `hard_cap`
   without a session, draining delivery up to
   `alerting.abort_drain_timeout_seconds` (alert_delivery.md) before exit.
 
 Once the DB is held:
 - a non-trading day per `trading_calendar` → the run ends `not_expected`
   without a session;
+- today's `live_session_state` row is read: present → a warm restart,
+  absent → a cold start (Session Lifecycle);
 - the boundaries used are compared with `trading_calendar` for today, the
   DB values taken on a difference, and the outcome recorded in
   `session_diagnostics.boundary_source` (write point (a)) —
@@ -335,8 +342,10 @@ connection.
 
 ## Session Start Probes (R-7 / R-8)
 
-Two cheap, one-shot checks run after Session Start Gating and before the
-Watchdog loop opens. Each is a single call; none is on a hot path.
+Cheap, one-shot checks — Clock offset and Retention boundary, below — run
+after Session Lifecycle step 1c's participation gates and before step 1d.
+Each is a single call; none is on a hot path. clock_check is a capability
+gate: its abort is the start's outcome 'ended' (Session Lifecycle).
 
 The margin ratio was a third until it became PER TICKER. It is acquired at
 watchdog first listing instead — see "Per-Ticker Trading Terms" below — which
@@ -372,12 +381,12 @@ the pilot counterfactual (`predicted_*`) and the eligible volume
 `buy_rate`/`sell_rate` with no error anywhere. Refusing to start beats
 running with silently corrupted calibration.
 
-An `abort` here fires strictly before health_report.py's own session-start
-invocation, so without a deliberate exception the operator learns nothing —
-"no positions today because of a clock fault" and "an ordinary quiet day"
-look identical from outside. On abort, send health_report immediately (at
-`abort` severity) before terminating — the same mid-session trigger
-mechanism Circuit Breaker uses below, reused rather than duplicated.
+An `abort` here ends the start before the scheduled session-start report
+would run, and "no positions today because of a clock fault" and "an
+ordinary quiet day" would look identical from outside. So the start's
+outcome 'ended' is reported at this gate, through `session_start_abort` at
+`abort` severity (Session Lifecycle's start outcome), before the process
+terminates.
 
 **Retention boundary (R-7).** Config `retention_probe`: `enabled`,
 `lookback_days` (ask from further back than retention is expected to reach),
@@ -433,6 +442,9 @@ Write points:
       two places under a length-agreement constraint
 (d) at Session Shutdown
       fills clock_offset_end (finding 21)
+(e) at the start outcome's point (Session Lifecycle)
+      appends this start's entry to start_outcomes — none for a start
+      ended before 1c's row exists
 ```
 (a) must precede Gate 2 rather than being folded into (b): `clock_check`
 with `on_exceed: "abort"` terminates the session before Gate 2 is reached,
@@ -451,7 +463,8 @@ measured ones and `restart_count` increments. They are current operating
 settings, not a session baseline — unlike `session_start_cash`, which R-2
 restores rather than re-queries precisely because it IS the baseline. The
 counters at (c) RESUME from the persisted values instead of resetting to
-zero; they are session totals.
+zero; they are session totals. `start_outcomes` is carried forward the same
+way, the persisted list kept and this start's entry appended at (e).
 
 ## Session Shutdown
 
@@ -460,8 +473,8 @@ whichever of these comes first:
 ```
 (a) all positions are flat AND now >= exit_deadline(today)
 (b) now >= after_hours_end(today) - session_hard_exit_offset_minutes  # cap
-(c) in the reduced session (Early-Close Participation Gate): no
-    lifecycle='live' position and no 'open' logical order remaining
+(c) in the reduced session: no lifecycle='live' position and no 'open'
+    logical order remaining
 ```
 Stage 1 performs:
 - final liquidation;
@@ -472,8 +485,12 @@ Stage 1 performs:
   close, Position Manager Loop);
 - the `live_session_state` write;
 - closing any open `live_halt_episodes` interval;
+- the `bar_latency_daily` final flush;
+- the `live_scan_daily` write;
+- the session-end report and its drain (health_report.md's Shutdown Order
+  and Drain);
 - `handle.close('done')` — the session state `done`, then the DuckDB close
-  and the `db.lock` release (utils.md's DB Access Coordination);
+  and the `db.lock` release (db_coordination.md);
 - stopping loop P.
 
 Stage 2, at stage 1 plus `auxiliary_stream.tail_minutes`, stops
@@ -524,8 +541,11 @@ before the session state turns `done` (`terminal_cause='shutdown'`).
 Whether an order left resting after the process dies survives the
 session-close boundary is
 unverified (api_contract_checklist.md T-19); the cancel does not depend on
-the answer. An order whose cancel is still unconfirmed at process end stays
-'open' for the next start, whose startup procedure classifies it — live and
+the answer. An order stays 'open' for the next start when:
+- its cancel is still unconfirmed at process end;
+- its ticker is held by a pre-call 'unmapped' refusal;
+- it awaits order-end resolution (Order and fill ledger).
+The next start's startup procedure classifies it — live and
 prior-day → canceled with `carried_live_canceled`, gone → 'expired' with
 `expired_at_boundary` (Broker Reconcile).
 
@@ -550,24 +570,136 @@ Session Shutdown has neither.
 
 Stage 1's `handle.close('done')` is the session state's terminal write; a
 crash leaves the state non-terminal with the run lock free, which is what
-warm-restart detection and the evening run's crash path key on (see
-"Session Restart (Warm Start)" below; metadata_crawler.md's Evening job
-start gate).
+the evening run's crash path keys on (metadata_crawler.md's Evening job
+start gate). Warm-restart detection reads today's `live_session_state` row
+instead (Session Lifecycle).
 
 ---
 
 ## Session Lifecycle
 
+Every runner start runs this procedure. A start is a warm restart when
+today's `live_session_state` row exists, whatever the previous run's state,
+and a cold start otherwise; the row is read once Session Start Gating holds
+the DB.
+
+Loop P starts with the LiveModeRunner process, before Session Start Gating,
+as loop A does (auxiliary_stream.md's Startup), and stops at Session Shutdown
+stage 1.
+
+Order:
+- Session Start Gating;
+- 1a, the token coverage gate;
+- Step 1, the ticker-master fetch;
+- on a cold start, the symbol-map refresh when today's
+  `premarket_trading_api_symbol_map` row is not 'success';
+- the 'tradable' index build;
+- the Halt-Status Poller start;
+- 1b, the balance query;
+- 1c, the `live_session_state` INSERT with `stage`;
+- stage consistency and the Early-Close Participation Gate;
+- Session Start Probes;
+- 1d, then 1e;
+- the Position Manager loop start;
+- Step 2;
+- Step 3;
+- Step 4;
+- 4b;
+- 4c;
+- Step 5;
+- Step 6;
+- Step 7;
+- the start outcome (below);
+- Step 8 on a participating start.
+Every live_session_state write after 1c updates that row.
+
+Step classes:
+- baseline steps, each with its column of today's `live_session_state` row:
+  - Step 1 (`all_tickers`);
+  - 1b (`session_start_cash`);
+  - 1c (`stage`);
+  - 1e (`rate_overlay`);
+- for each baseline step:
+  - it writes its output to today's `live_session_state` row when computed;
+  - a warm restart restores it from the row and neither re-queries nor
+    re-resolves it;
+  - absent from the row (its column NULL), it is computed then;
+- derived steps — recomputed from the DB on a cold start and a warm restart
+  alike:
+  - the 'tradable' index and the poller start;
+  - Session Start Probes (a warm restart overwriting the row's probe values
+    and incrementing `restart_count`, the probe counters resuming from their
+    persisted values);
+  - the breaker counters (recomputed from trade_log, `breaker_tripped_at`
+    read);
+  - Step 2;
+  - Step 3;
+  - 4c (`today_dividends`);
+  - the read-back of today's `live_ticker_terms`;
+  - the market-withheld state — today's `session_phase_mismatch` health
+    event row (Order and fill ledger), read before the Position Manager
+    loop starts;
+- the Eager Pool (Step 5) — restore-or-compute per ticker.
+
+Gates:
+- capability gates — each runs before the Position Manager loop starts, and
+  a failure ends the session:
+  - clock_check (Session Start Probes);
+  - 1a;
+  - the API gates of Step 1 and 1b, which run only when those baselines are
+    computed;
+- participation gates — evaluated anew at each start, cold start and warm
+  restart alike:
+  - stage consistency (`live_mode.stage` differing from the row's `stage`)
+    and the Early-Close Participation Gate, each evaluated right after 1c
+    whatever the other's result;
+  - Health Gate 1 (Gate 1d included) at Step 4;
+  - the regime holdout gate at Step 7.
+
+Start outcome — one per start:
+- kinds:
+  - 'ended' — a capability gate fails;
+  - 'blocked' — a participation gate fails and no capability gate fails
+    before 1e;
+  - 'participating' — Step 7 passes;
+- decided, recorded and reported at one point:
+  - 'ended' — at the failing capability gate;
+  - 'blocked' — after the later of 1e and the blocking gate;
+  - 'participating' — after Step 7 and before Step 8;
+- recorded as this start's entry of
+  `live_session_state.session_diagnostics.start_outcomes`,
+  `{kind, at, causes: [{gate, detail}]}` (session_diagnostics write
+  protocol):
+  - the Early-Close cause's detail — today's `session_close` and
+    `live_mode.trade_early_close_days`' value at this run;
+  - the stage cause's detail — the row's `stage` and `live_mode.stage`;
+  - Gate 1d's cause detail:
+    - the table;
+    - the model's config_hash;
+    - the deployment config's config_hash;
+  - a start ended before 1c's row exists records no entry;
+- reported — the session-start health report is invoked once per start, at
+  the outcome's point, its detail carrying the start outcome
+  (health_report.md's Invocation Contract):
+  - through `session_start_abort` at abort severity — 'ended', and
+    'blocked' with a cause other than the Early-Close gate;
+  - through the scheduled `session_start` path — 'blocked' by the
+    Early-Close gate alone, and 'participating';
+  - the report reads guest_supervisor.md's report functions, the runner's
+    only use of that module;
+- then:
+  - 'blocked' — the reduced session (defined under Early-Close
+    Participation Gate) while a
+    lifecycle='live' position or an 'open' logical order remains, else
+    Session Shutdown;
+  - 'participating' — Step 8.
+
+A warm restart's step behaviour is stated at each step below; "Session
+Restart (Warm Start)" holds the per-ticker recovery the Position Manager loop
+runs first on a warm restart.
+
 ```
 LiveModeRunner.start_session(today_date):
-
-  1. Fetch today's tradable ticker list from the trading API — its
-     ticker-master endpoint, reached through TradingAPI (see
-     docs/api/trading_api.md). NOT the watchdog: that module returns the
-     entry-point working set, a different thing at a different scale.
-         all_tickers: list[str]
-         (tickers with prior-day data but no trading access today
-          are automatically excluded by the API response)
 
   1a. Token coverage gate. Read BOTH accounts' cached access token expiry
       — production's and the demo account's, the latter now held in this
@@ -575,7 +707,8 @@ LiveModeRunner.start_session(today_date):
       TODAY's, not a fixed 20:00:
       demanding coverage to 20:00 on a 13:00-close day would abort a session
       whose own cap is 17:00.
-      Insufficient coverage on EITHER ABORTS the session; nothing here
+      Insufficient coverage on a token ends the session — a capability
+      gate, the start's outcome 'ended'; nothing here
       refreshes either token. The demo account is treated symmetrically
       with production rather than degraded-through: its refresh has its own
       scheduled run, and a failed refresh is already surfaced by the DB-less
@@ -595,7 +728,35 @@ LiveModeRunner.start_session(today_date):
       connection to disturb, but here an uncoordinated revoke would drop
       both WS connections mid-session.
 
-  1b. Query account balance from trading API — `inquiry/balance-margin`'s
+  1. [Baseline; API gate] Fetch today's tradable ticker list from the
+     trading API — its
+     ticker-master endpoint, reached through TradingAPI (see
+     docs/api/trading_api.md). NOT the watchdog: that module returns the
+     entry-point working set, a different thing at a different scale.
+         all_tickers: list[str]
+         (tickers with prior-day data but no trading access today
+          are automatically excluded by the API response)
+     API gate: on failure it re-queries every
+     live_mode.session_start_retry_seconds (default 60) until
+     live_mode.session_start_deadline (default "09:00", America/New_York),
+     then the session ends — the start's outcome 'ended', delivered
+     through session_start_abort, its detail naming the gate; on a cold
+     start no live_session_state row exists yet.
+     Baseline: all_tickers is written to the row by 1c's INSERT; a warm
+     restart restores it from the row and makes no call (a NULL column
+     reads as the baseline absent, and the call is made).
+     Then, before 1b:
+       - on a cold start (reduced session included), when today's
+         premarket_trading_api_symbol_map row is not 'success', the same
+         symbol-map refresh metadata_crawler.md's --premarket-open runs, on
+         this step's ticker-master response, overwriting that stage's row;
+         a warm restart runs no refresh;
+       - the 'tradable' index build (utils.md's build_symbol_index()) —
+         from the DB, after the refresh on a cold start;
+       - the Halt-Status Poller start, handed that index (Halt-Status
+         Poller).
+
+  1b. [Baseline; API gate] Query account balance from trading API — `inquiry/balance-margin`'s
       `AstkOrdAbleAmt`, the UNCORRECTED DEPOSIT:
          session_start_cash: float
       Deliberately the pre-leverage figure rather than buying power. The
@@ -617,28 +778,44 @@ LiveModeRunner.start_session(today_date):
       value). The funds-availability gate
       (`execution_common.check_funds_available()`) is what uses a
       real-time queried balance instead — see that call site.
+      API gate: as Step 1's, its detail naming this gate.
+      Baseline: written to the row by 1c's INSERT; a warm restart restores
+      it from the row and does not query.
 
-  1c. Persist session start (R-2):
+  1c. [Baseline] Persist session start (R-2):
          db_write INSERT live_session_state (date, run_id,
-             session_start_cash, started_at).
+             session_start_cash, started_at, stage, all_tickers).
+      stage is live_mode.stage at this INSERT and is the session's stage:
+      after 1c every runtime branch reads the row's stage, never
+      live_mode.stage. A warm restart makes no INSERT: the row's values are
+      restored.
       This is the authoritative sizing basis for the session — a warm
-      restart (see "Session Restart (Warm Start)" below) restores it
-      rather than re-querying the balance, which would reflect a
-      post-fills value, not the session's original basis.
+      restart restores it rather than re-querying the balance, which would
+      reflect a post-fills value, not the session's original basis.
+
+  Participation gates at the 1c point, each evaluated whatever the other's
+  result:
+      - stage consistency — live_mode.stage differing from the row's stage
+        blocks participation, cause {gate: 'stage', detail: {row_stage,
+        config_stage}};
+      - the Early-Close Participation Gate (above).
+
+  Session Start Probes (above) — clock_check a capability gate.
 
   1d. Broker Reconcile (shared procedure — R-3, see "Broker Reconcile
       (shared procedure)" below): its startup procedure, then its Orders
-      and Positions branches, run at EVERY session start, cold start
-      included. The startup procedure is identical here, at Warm Restart
-      step 1 and at Feed Outage step 4. At cold start, any broker holding
+      and Positions branches, run at EVERY session start, cold start and
+      warm restart alike. The startup procedure is identical here and at
+      Feed Outage step 4. At cold start, any broker holding
       the ledger does not explain is by definition carried — nothing has
       opened yet today. This is the standing guard against a prior-day
       position that never appeared in a warm restart (e.g. a
       cleanly-shut-down session that left a halt-through-close position).
-      Warm restart already reconciles in its own step 1 and does not
-      double-run this.
+      On a warm restart nothing is rebuilt from a runtime cache: the ledger
+      is durable, so the reconcile sees exits that filled during the downtime
+      as fills rather than as missing shares.
 
-  1e. Rate resolution: execution_common.md's resolve_rates() resolves every
+  1e. [Baseline] Rate resolution: execution_common.md's resolve_rates() resolves every
       (rate, order type) pair once through get_execution_param(), and the
       results overlay this process's in-memory config (execution_common.md's
       Rate Overlay) — the config file is never written. The resolved values
@@ -650,13 +827,27 @@ LiveModeRunner.start_session(today_date):
       counterfactual, Session Shutdown's carried case — selects its rate
       from the overlaid config through entry_fill_rate() /
       exit_fill_mode().
+      Baseline: the resolved values and their source are written to the
+      row's rate_overlay; a warm restart restores the overlay from the row
+      and does not re-resolve (a NULL rate_overlay is resolved then).
 
-  2. Bulk load session_stats for ALL tickers from DuckDB
+  Position Manager loop start (coroutine on loop P — Architecture), on a
+  cold start and a warm restart alike; on a warm restart it first runs the
+  per-ticker recovery ("Session Restart (Warm Start)").
+
+  2. [Derived] Bulk load session_stats for ALL tickers from DuckDB, after
+     ensuring today's groups under the deployment config
+     (db_schema.md's Derived tables):
+         - today's stale groups are recomputed through
+           utils.populate_precomputed_session_stats();
+         - a ticker whose ticker_history row is effective today has its
+           today group computed; any other absent today group stays
+           Health Gate 1a's concern;
          session_stats_raw = SELECT * FROM precomputed_session_stats
-                             WHERE as_of_date = today_date
-                               AND n_sessions = config_n_sessions
-         # as_of_date = today was inserted by collect_daily.py the previous evening
-         # and contains baselines from the prior N sessions.
+                             WHERE config_hash = deployment_stats_config_hash
+                               AND as_of_date = today_date
+         # today's groups were computed by the evening session-stats stage
+         # (metadata_crawler.md) and contain baselines from the prior N sessions.
 
          all_stats_nested = build_session_stats_dict(
              session_stats_raw,
@@ -665,7 +856,7 @@ LiveModeRunner.start_session(today_date):
              closes=closes,
          )
          # closes has been in scope since the early-close gate, which runs
-         # before this Lifecycle.
+         # after 1c.
          # all_stats_nested: {today_date: {ticker: {metric: {hour: smoothed_avg_value}}}}
          session_stats_bulk = all_stats_nested[today_date]
          # session_stats_bulk: {ticker: {metric: {hour: smoothed_avg_value}}}
@@ -714,7 +905,7 @@ LiveModeRunner.start_session(today_date):
             coverage_rate = |{t in eligible ∩ all_tickers
                               : session_stats_bulk[t] not empty}|
                             / |eligible ∩ all_tickers|
-            coverage_rate < 0.90 → ABORT SESSION (hard gate; P-0-class failure)
+            coverage_rate < 0.90 → BLOCK PARTICIPATION (hard gate; P-0-class failure)
 
      b. stock_meta coverage (per field, then aggregated):
             for field in [market_cap, shares_outstanding, price_52h,
@@ -730,7 +921,7 @@ LiveModeRunner.start_session(today_date):
                                        real value present today}|
                             / Σ_field |eligible(field) ∩ all_tickers|
             coverage_rate < 0.80 → WARN
-            coverage_rate < 0.50 → ABORT SESSION
+            coverage_rate < 0.50 → BLOCK PARTICIPATION
 
      c. premarket completion marker:
             SELECT status FROM batch_runs
@@ -765,7 +956,15 @@ LiveModeRunner.start_session(today_date):
             extractor_features = set(FeatureExtractor(config).get_feature_names())
             mismatch = model_features.symmetric_difference(extractor_features)
             mismatch is non-empty
-                → ABORT SESSION (hard gate)
+                → BLOCK PARTICIPATION (hard gate)
+            and, for each derived table the runner reads
+            (precomputed_session_stats), the config_hash computed from the
+            deployed model's meta.json config snapshot against the one
+            computed from the deployment config (utils.md's Config Hashing):
+            a mismatch → BLOCK PARTICIPATION, its cause detail naming:
+                - the table;
+                - the model's config_hash;
+                - the deployment config's config_hash
             # No warn-and-proceed variant considered — a mismatch means
             # every inference this session would either KeyError on a
             # missing feature or silently ignore one the model never
@@ -779,29 +978,36 @@ LiveModeRunner.start_session(today_date):
             # forward from there to before Step 5's cost, same rationale
             # as the other three checks in this gate).
 
-     Any ABORT SESSION outcome stops here — Eager Pool (Step 5) never runs.
+     Any BLOCK PARTICIPATION outcome blocks participation here — the start's
+     outcome 'blocked' (above) — and Eager Pool (Step 5) never runs.
 
-  4b. [Late-start freshness branch — R-1] Evaluate once, here, before Eager
-      Pool. Session Start Gating's wait spec reaches phase B by
-      coordination.schedule.premarket.deadline at the latest, so this branch
-      matters only when a start lands past recheck_time — a manual restart
-      (e.g. after a Health Gate 1 abort elsewhere in the morning), or a
-      runner whose acquisition of db.lock came late; it also correctly
-      no-ops for an Eager Pool that is merely running late on a normal
-      start.
+  4b. [Late recheck — R-1] Evaluate once, here, before Eager Pool, on a cold
+      start and a warm restart alike. Session Start Gating's wait spec
+      reaches phase B by coordination.schedule.premarket.deadline at the
+      latest, so this step matters only when a start lands past
+      recheck_time:
+        - a manual start;
+        - a warm restart;
+        - a runner whose acquisition of db.lock came late.
+      It also correctly no-ops for an Eager Pool that is merely running late
+      on a normal start.
 
          if now >= config["live_mode"]["premarket_recheck_time"]
                 and the recheck bundle is not done:   # its batch_runs row,
                     # stage='premarket_recheck_bundle', date=today, absent
                     # or 'running' (In-Process Premarket Recheck)
              # Past recheck_time already — run the FULL fresh-check bundle
-             # NOW, BEFORE Eager Pool, so Step 0 computes on correct data
-             # and no scoped recompute (caching_calculator.md, item N) is
-             # needed on this path:
+             # NOW, BEFORE Eager Pool, so Step 5 computes on correct data:
              #   quotes/halt fetch
              #   + check_corporate_event_anomaly (full universe, fresh)
              #   + yfinance narrow crawl for newly-quarantined tickers
              #   + crawl_corporate_events_investing("this_week")   (item N)
+             # In this run step 5's target is every ticker holding today's
+             # indicator_cache rows and a corporate_events row dated today
+             # (not only tickers gaining a row in steps 3-4), each re-seeded
+             # and persisted with quarantine_reason cleared in the same
+             # transaction; a ticker without today's rows is computed by
+             # Step 5 on the fresh rows.
              run_premarket_recheck_bundle()   # its 'success' or 'failed'
                                               # row makes the scheduled
                                               # task skip today — see below
@@ -818,13 +1024,26 @@ LiveModeRunner.start_session(today_date):
       A ticker absent from the map has 0.0. Its consumer is
       on_regular_session_open() (Watchdog Polling Loop Step 3, and
       scoped_recompute()). Kept current by the In-Process Premarket
-      Recheck's step 5 (below), and rebuilt the same way at Warm Restart
-      step 4.
+      Recheck's step 5 (below). Derived: built on every start, cold start
+      and warm restart alike.
 
-  5. [Eager Pool] Parallel session_start_compute() for all tickers:
+  5. [Eager Pool] Restore-or-compute per ticker of all_tickers, on a cold
+     start and a warm restart alike:
+         - today's indicator_cache rows present → restore:
+           - "memory" mode — CachingIndicatorCalculator.load_from_db(),
+             then set_session_stats(session_stats_bulk.get(ticker, {})),
+             retained as calculators[ticker];
+           - "db" mode — nothing here: the ticker is restored at its first
+             appearance in the watchdog working set (Watchdog Polling
+             Loop's Phase 2);
+           the Watchdog Polling Loop's Step 3 then replays today's bars
+           through on_bar_close(), running on_regular_session_open() with
+           the ticker's today_dividends value when it passes the 093000 bar
+           ("Session Restart (Warm Start)" for the restore's idempotency);
+         - absent → session_start_compute() and persist_to_db(), below.
          Using worker pool (config: live_mode.session_start_workers)
 
-         For each ticker in all_tickers (parallelized):
+         For each ticker without today's rows (parallelized):
              historical_bars = utils.load_ohlcv_with_history(
                  ticker, lookback_start_date, today_date, db_conn
              )
@@ -871,24 +1090,27 @@ LiveModeRunner.start_session(today_date):
                  calc.persist_to_db(db_conn, today_date, ticker)
              # R-2: written in BOTH modes now, as a crash-recovery backup —
              # each worker persists its own ticker as soon as it finishes,
-             # not batched at the end. A warm restart (see "Session Restart
-             # (Warm Start)") reads this via load_from_db() to skip the
-             # expensive historical_bars recompute.
+             # not batched at the end. A later start reads this via
+             # load_from_db() — "memory" mode at its Eager Pool, "db" mode
+             # at the ticker's first appearance — to skip the expensive
+             # historical_bars recompute.
              if config["live_mode"]["indicator_cache_mode"] == "db":
                  pass   # RAM released; calc discarded after persist (unchanged)
              else:  # "memory" (default)
                  calculators[ticker] = calc  # retain RAM copy — authoritative
                                              # for this running session; the
-                                             # backup above is read only on a
-                                             # warm restart, never in normal
-                                             # operation.
+                                             # backup above is read only at a
+                                             # later start's Eager Pool, never
+                                             # in normal operation.
 
              worker returns (ticker, tier_used) alongside the calc/persist result
 
          del session_stats_bulk   # RAM released after all tickers done
 
   6. [Health Gate 2] Post-Eager-Pool health check — tick_bar_aggregates
-     Tier-2/3 fallback rate. Depends on Step 5's tier_used results, which is
+     Tier-2/3 fallback rate, aggregated over the tickers Step 5 computed (a
+     restored ticker reports no tier_used; none computed → the check
+     trivially passes). Depends on Step 5's tier_used results, which is
      why this cannot be folded into Health Gate 1 (Step 4):
 
          tier_tally = Counter()
@@ -908,14 +1130,21 @@ LiveModeRunner.start_session(today_date):
          Before Inferencer init, read the regime_holdout_verdict row whose
              final_run_id is the configured run_id (db_schema.md;
              pipeline_optimizer.md's Regime Holdout Report and Verdict):
-           - record health event regime_holdout_verdict (health_report.md
-             finding 44, severity ok), detail {run_id, verdict, report} —
+           - record health event regime_holdout_verdict, detail {run_id,
+             verdict, report} —
              the row's verdict and report items, or that no row exists;
+             its severity (health_report.md finding 44):
+               - 'ok' on 'pass';
+               - 'info' on:
+                 - 'pass_with_warning';
+                 - 'fail';
+                 - no row;
            - when optimizer.regime_holdout.gate.enabled: no row → the
              verdict is optimizer.regime_holdout.gate.missing_result's
              value; 'fail' → record health event regime_holdout_gate_failed
              (finding 43, severity abort), detail {run_id,
-             optimizer_run_id, verdict}, and STOP session start here.
+             optimizer_run_id, verdict}, and participation is blocked here
+             — the start's outcome 'blocked' (above).
              'pass' and 'pass_with_warning' proceed.
            - Enforced here only — nowhere else reads the verdict as a
              gate. inferencer.md is unchanged: it has no db_conn, and the
@@ -929,8 +1158,11 @@ LiveModeRunner.start_session(today_date):
              configured source list, and CLOSES any interval whose
              halt_end IS NULL to `now` at supply time, so the consumer only
              ever sees closed intervals (the consumers' predicate is "slot
-             overlaps a halt interval" with no rule for an open one, and
-             training data contains none). The live_halt_episodes row
+             overlaps a halt interval", and trading_halts' NULL-ended rows
+             carry its defined rule — the interval covers every slot of
+             that date from halt_start on (db_schema.md) — which would read
+             a halt still running as halted for the rest of today). The
+             live_halt_episodes row
              itself stays open. This process is the single owner of
              interval construction, holding both last_halt_state and the
              table; trading_halts is structurally empty for today's date
@@ -942,8 +1174,11 @@ LiveModeRunner.start_session(today_date):
          calculate_required_history() → self.required_bars
          Load model artifacts (run_id from config)
 
+  The start outcome is 'participating' here (above): the session-start
+  health report is invoked, then Step 8.
+
   8. Start watchdog polling loop (synchronous, main thread — Architecture)
-  9. Start position manager loop (coroutine on loop P — Architecture)
+     — only once Step 7 passes; the Position Manager loop started after 1e.
 ```
 
 **Bulk Load Memory Profile** (Steps 2-3, 5 — renamed from "Phase 1" now that
@@ -979,8 +1214,8 @@ Completion test — the bundle's own `batch_runs` row,
 `stage='premarket_recheck_bundle'`, date=today:
 - absent or 'running': not done;
 - 'success' or 'failed': done, a failed recheck not retried;
-- the scheduled task and Step 4b's late-start branch use it, so a bundle
-  already run by the late-start branch skips the scheduled run.
+- the scheduled task and the late recheck (Session Lifecycle step 4b) use
+  it, so a bundle already run by the late recheck skips the scheduled run.
 
 Replaces the former standalone `--premarket-recheck`
 cron, which could not open the DB read-write while this process holds it
@@ -988,8 +1223,9 @@ cron, which could not open the DB read-write while this process holds it
 would have failed silently every session. Running it in-process, through
 this process's own writer, fixes that.
 
-Task body (`run_premarket_recheck_bundle()` — shared with Step 4b's
-late-start path; all fetches as a non-blocking background task so the 1s
+Task body (`run_premarket_recheck_bundle()` — shared with the late recheck,
+Session Lifecycle step 4b; all fetches as a non-blocking background task so
+the 1s
 watchdog and 5s position loops are not stalled):
 - it writes its own `batch_runs` row, `stage='premarket_recheck_bundle'`:
   - 'running' at start;
@@ -1003,8 +1239,12 @@ watchdog and 5s position loops are not stalled):
   Logging).
 
 ```
-1. quotes      = bulk_fetch_today_first_price(...)   # trading API, chunked
-   halt_status = utils.query_halt_status(...)          # NOT a dbsec call
+1. quotes      = bulk_fetch_today_first_price(...)   # trading API, chunked;
+                                                     # the runner's 'tradable'
+                                                     # index (Session Lifecycle)
+   halt_status = utils.query_halt_status(...)          # NOT a dbsec call; reads
+                                                     # the running Halt-Status
+                                                     # Poller's snapshot
    # sequential, same as the 04:00 pass (see metadata_crawler.md)
 
 2. check_corporate_event_anomaly(db_conn, config, quotes, halt_status)
@@ -1013,39 +1253,51 @@ watchdog and 5s position loops are not stalled):
    # mechanism needed). batch_runs stage='premarket_quarantine_recheck',
    # written by this function alone, for its own run.
 
-3. crawl_corporate_events_investing("this_week", db_conn)   # item N bulk vendor
-   # investing.com, unconditional every recheck. Writes via db_write().
+3. crawl_corporate_events_investing("this_week", tradable_index, db_conn)
+   # item N bulk vendor investing.com, unconditional every recheck. Writes
+   # via db_write(). tradable_index: the runner's 'tradable' index (Session
+   # Lifecycle), matched with no exchange_hint (metadata_crawler.md).
 
-4. For any ticker whose quarantine_reason was NEWLY set in step 2, run a
-   single-ticker yfinance narrow crawl:
+4. For any ticker of the runner's 'tradable' index whose quarantine_reason
+   was NEWLY set in step 2, run a single-ticker yfinance narrow crawl:
        crawl_corporate_events(ticker, db_conn)
    (already a single-ticker function — no new function needed.)
 
-5. Re-seed (item N): first, for any ticker that gained a new same-day
-   'dividend' row in steps 3-4, re-read its today_dividends entry (Session
-   Lifecycle Step 4c). Then, for each ticker that gained a new same-day
-   corporate_events row in steps 3-4, once Eager Pool has run (always true
-   for this scheduled path):
+5. Re-seed (item N): first, today's stale precomputed_session_stats groups
+   of the tickers steps 3-4 wrote corporate_events for are recomputed under
+   the deployment config through utils.populate_precomputed_session_stats()
+   (db_schema.md's Derived tables). Then, for any ticker that gained a new
+   same-day 'dividend' row in steps 3-4, re-read its today_dividends entry
+   (Session Lifecycle Step 4c). Then, for each ticker that gained a new
+   same-day corporate_events row in steps 3-4, once Eager Pool has run
+   (always true for this scheduled path):
    - calculator exists, either indicator_cache_mode: build a new
-     CachingIndicatorCalculator for that ticker (set_session_stats() first)
-     and call its scoped_recompute(..., dividend_amount=
-     today_dividends.get(ticker, 0.0)) (caching_calculator.md) over a
-     snapshot of today's bars, as a background task; the instance in
+     CachingIndicatorCalculator for that ticker (set_session_stats() first,
+     with the recomputed stats) and call its scoped_recompute(...,
+     dividend_amount=today_dividends.get(ticker, 0.0)) (caching_calculator.md)
+     over a snapshot of today's bars, as a background task; the instance in
      calculators[ticker] keeps serving meanwhile. The new instance persists
      its step-1 seed (persist_to_db(), replacing that ticker's rows for
      today's session_date); then, on completion, it is swapped into
      calculators[ticker] at a Watchdog Polling Loop cycle boundary — it has
      absorbed bars through the snapshot's last bar, and the Watchdog
-     Polling Loop's Step 3 multi-bar replay covers the bars after it — and
-     then its quarantine_reason is cleared if set;
+     Polling Loop's Step 3 multi-bar replay covers the bars after it — its
+     recomputed stats taking effect at that same boundary, and then its
+     quarantine_reason is cleared if set;
    - no calculator ("db" mode, ticker not yet restored): the seed is
      recomputed and persisted, with quarantine_reason cleared in the same
-     transaction.
+     transaction; the recomputed stats are read at its restore
+     (load_session_stats(), Watchdog Polling Loop).
    Each ticker's write is its own transaction under one write_lock hold,
    issued as that ticker's seed is ready; no batching across tickers.
-   On Step 4b's late-start path (Eager Pool not yet run): the ticker's
-   quarantine_reason is cleared at once if set, and Eager Pool computes on
-   the fresh rows — Step 0 picks them up naturally, so no re-seed applies.
+   On the late recheck (Session Lifecycle step 4b; Eager Pool not yet run):
+   the recomputed stats replace those tickers' session_stats_bulk entries
+   at once; the re-seed target is every ticker holding today's
+   indicator_cache rows and a corporate_events row dated today, each seed
+   recomputed and persisted with quarantine_reason cleared in the same
+   transaction; any other ticker that gained a same-day row has its
+   quarantine_reason cleared at once if set, and Eager Pool computes on the
+   fresh rows — Step 0 picks them up naturally.
 ```
 
 All writes in steps 2-5 go through `db_write()`; no lock-handoff or
@@ -1064,8 +1316,8 @@ session-critical — `is_tradable()` keeps using 04:00-pass state. Same
 degraded philosophy as Health Gate 1c.
 
 Manual-run caveat: `--premarket-recheck` (see metadata_crawler.md) survives
-only as a manual/debug flag; run against a live session it will fail to
-open RW. Manual use is for non-session contexts.
+only as a manual/debug flag; it is a guest and is not admitted in the runner
+window. Manual use is for non-session contexts.
 
 ---
 
@@ -1511,10 +1763,11 @@ loop every poll_interval_seconds:
             finding 19 reads these rows directly, so no in-session tally has
             to be threaded through to it.
         i.  is_tradable(ticker, db_conn) — execution_common.md gate.
-            False (ticker_cik_map.rename_pending = TRUE OR
-            quarantine_reason IS NOT NULL — N-2 replaced the old single
-            `status` column with these two, and the gate needs BOTH clear)
-            → skip, no order.
+            False (no trading_api_symbol — no ticker_cik_map row, or a row
+            whose trading_api_symbol is NULL; or
+            ticker_cik_map.rename_pending = TRUE OR quarantine_reason IS
+            NOT NULL — N-2 replaced the old single `status` column with
+            these two, and the gate needs BOTH clear) → skip, no order.
             Then, in the same step because it is the other per-ticker
             eligibility verdict: skip if this ticker is in the
             bar_integrity exclusion set (see Bar-Close Authority's
@@ -1621,7 +1874,8 @@ loop every poll_interval_seconds:
              # for BOTH order types, so a submission that landed but whose
              # response was lost is still recorded, and the startup
              # procedure resolves it (Broker Reconcile).
-             if config["live_mode"]["stage"] == "shadow":
+             if session_stage == "shadow":   # the session's stage, the
+                                             # row's (Session Lifecycle 1c)
                  # STEP-WISE, as on the exit side (Position Manager Loop
                  # Step 3): the ticks after the anchor do not exist yet at
                  # this instant, so this branch OPENS the entry and its
@@ -1716,18 +1970,27 @@ loop every poll_interval_seconds:
                      onward). Skipped if already subscribed (a second
                      position opening on an already-tracked ticker shares
                      the existing subscription, unchanged from before).
-                 if submission rejected structurally:
+                 if the result is a structural refusal ('rejected' or
+                 'phase_mismatch'):
                      the request becomes 'rejected' and the entry logical
                      order 'rejected'; the position transitions to
                      lifecycle='canceled' through the single
                      canceled-transition point, with a trade_log row:
                      exit_reason='entry_rejected', quantity=0,
                      fill_price=p_entry, exit_bar=entry_bar, and
-                     reject_reason = the broker's own refusal text, stored
+                     reject_reason = the result's rsp_msg, stored
                      verbatim (see db_schema.md's never-opened family).
                      Counts as a cooldown attempt via step 5c.0's
                      last_entry_hour; excluded from fit_execution_params()
                      (see shadow_retraining.md).
+                 elif the request was refused before the call ('unmapped'
+                 or 'phase_refused'):
+                     the request becomes 'unsent' and the entry logical
+                     order ends 'unsent', terminal_cause = the result kind;
+                     the position takes the 'unsent' path, exit_reason=
+                     'entry_canceled' (Position Manager Loop's entry
+                     logical orders).
+                 else:
                  else:
                      the entry logical order is tracked in open_orders to
                      fill/reject/cancel by Position Manager Loop's Order and
@@ -2145,10 +2408,9 @@ other freeze reason rather than something this pinning introduces.
    freeze_reasons is a SET of active reasons, each carrying its own scope
    — not a single session-wide boolean. A boolean cannot represent two
    overlapping causes, and clearing it on recovery from one would silently
-   release the others (e.g. a feed outage during a warm restart's cache
-   reload would unfreeze entries the restart still needs held):
+   release the others (e.g. a feed outage after a breaker trip would, on
+   recovery, unfreeze entries the breaker still holds):
      'feed_outage'    → blocks entry_submission AND exit_submission
-     'restart_warmup' → blocks entry_submission only (Warm Restart step 4)
      'breaker_trip'   → blocks entry_submission only (Circuit Breaker, R-4)
    A gate blocks whenever ANY active reason covers its scope, so releasing
    one reason leaves the others in force. Watchdog Polling Loop step 5c.0
@@ -2156,7 +2418,8 @@ other freeze reason rather than something this pinning introduces.
    logical order is created from ordinary evaluation — Exit Architecture's
    confirmed-breach handling and Position Manager Loop step 2 (the Unified
    Overnight Policy's liquidation included). The explicit recovery paths,
-   step 5 below and Warm Restart step 3c, open their exit logical orders
+   step 5 below and the warm-restart per-ticker recovery's (c), open their
+   exit logical orders
    outside the gate; without that exemption the freeze would block the
    recovery it depends on. Exit *evaluation* is never frozen — it keeps running
    and accumulating bars/ticks; only order *submission* is held.
@@ -2190,8 +2453,8 @@ other freeze reason rather than something this pinning introduces.
 
 4. Reconcile: run the Broker Reconcile shared procedure (R-3 — see
    "Broker Reconcile (shared procedure)" below), its startup procedure
-   included — identical to the one at Session Lifecycle 1d and Warm Restart
-   step 1. Its fill folding matters most at THIS call site: an exit
+   included — identical to the one at Session Lifecycle step 1d. Its fill
+   folding matters most at THIS call site: an exit
    submitted just before the outage may have filled during it, with the
    fill reports for it arriving on a channel that was down. The
    transaction-history query folds those fills into live_fills ahead of
@@ -2203,19 +2466,21 @@ other freeze reason rather than something this pinning introduces.
 5. Re-evaluate exits: for each position that remained open through the
    outage — Unified Overnight Policy targets excluded, their liquidation
    being already decided — apply the 2-PRINT GUARD over the now-caught-up TICKS once before
-   unfreezing — the same form Warm Restart step 3c already uses for the
+   unfreezing — the same form the warm-restart per-ticker recovery's (c)
+   already uses for the
    identical question. NOT track_price_breach(), which is backtest-only as
    of R-2: the call named here was the stale side of that change, against
    two declarations in this file saying so. Any position whose exit condition
    would have triggered *during* the gap — including a confirmed breach the
-   exit_submission gate discarded, which is why discarding it is safe: exit at market immediately (not
+   exit_submission gate discarded, which is why discarding it is safe: exit
+   immediately at the order type permitted now — market where permitted (not
    at the historical breach point — that price is stale by now), logged
    with `exit_reason='feed_gap_exit'` (see db_schema.md's trade_log) so
    this trade is excluded from ordinary strategy PnL attribution — it
    reflects outage handling, not strategy performance.
 
 6. Unfreeze: remove 'feed_outage' from freeze_reasons — only this reason.
-   If another reason is still active (e.g. 'restart_warmup'), its own
+   If another reason is still active (e.g. 'breaker_trip'), its own
    scope stays in force and normal operation resumes only for what it
    does not cover.
 ```
@@ -2291,17 +2556,18 @@ event.
 
 ## Broker Reconcile (shared procedure) — R-3
 
-One implementation, these call sites: (a) every Session Lifecycle start,
-cold start included (Session Lifecycle Step 1d), (b) Feed Outage Recovery
-step 4, (c) Warm Restart step 1 (R-2, below). It brings the ledger
+One implementation, these call sites: (a) every start at Session Lifecycle
+step 1d, cold start and warm restart alike (`call_site` 'session_start' and
+'warm_restart' respectively), (b) Feed Outage Recovery step 4. It brings the
+ledger
 (db_schema.md's `live_orders`, `live_order_requests`, `live_fills` and
 `live_position_adjustments`, read through `live_position_state`) into
 agreement with the broker, in this order: the startup procedure, the Orders
 branch, the Positions branch. The Positions branch also runs alone for one
 ticker at the event-day exit gate's release (Position Manager Loop step 2).
 
-**Startup procedure** — identical at Session Lifecycle 1d (cold start), Warm
-Restart step 1 and Feed Outage step 4:
+**Startup procedure** — identical at Session Lifecycle step 1d and Feed
+Outage step 4:
 1. Load the 'open' logical orders (`open_orders`).
 2. Query `inquiry/transaction-history` from their earliest `order_date`
    through today, continuation pages included; each returned order's
@@ -2320,8 +2586,10 @@ Restart step 1 and Feed Outage step 4:
 5. Classify each 'open' logical order:
    - live at the broker and dated today → keep tracking;
    - live and dated a prior day → cancel, `terminal_cause='carried_live_canceled'`;
-   - gone and not fully filled → 'expired', with
-     `terminal_cause='expired_at_boundary'` when prior-day.
+   - gone and not fully filled → by its row from step 2's query: a
+     rejection (`AstkRjtCode` set) → 'rejected', the request's `reject_code`
+     and `reject_reason` from the row (Order-end resolution); otherwise
+     'expired', with `terminal_cause='expired_at_boundary'` when prior-day.
 6. Then the Orders branch, the Positions branch, and the Unified Overnight
    Policy's liquidation through the ordinary exit path.
 
@@ -2395,8 +2663,9 @@ number (health_report.md finding 12). A broker execution whose
   row never had a broker counterpart, so an open shadow row with no broker
   holding is its EXPECTED state; without the exclusion this branch would
   destroy open shadow positions at Feed Outage step 4 MID-SESSION and at
-  Warm Restart step 1. The BROKER-side outcomes are NOT suppressed in
-  shadow: a broker order or holding found while `stage == "shadow"` is a
+  Session Lifecycle step 1d. The BROKER-side outcomes are NOT suppressed in
+  shadow: a broker order or holding found while the session's stage is
+  'shadow' is a
   genuine anomaly (a config error, or residue from a prior real session)
   and finding 12 stays its correct outcome.
 
@@ -2554,9 +2823,10 @@ such write is swallowed and must not abort the reconcile.
   `origin='adopted'`. `settlement_pending` positions are not targets.
 - Mechanism: at the head of Position Manager step 2, which a halted position
   does not reach, a target with no 'open' exit logical order opens one with
-  `purpose='overnight_liquidation'`, at whichever order type the current
-  session phase permits (execution_common.md's `permitted_order_type()` —
-  market is regular-session-only); the double-submission guard and the
+  `purpose='overnight_liquidation'`, at whichever order type is permitted
+  now (execution_common.md's `permitted_order_type()` — market is
+  regular-session-only, and withheld while the date has a
+  `session_phase_mismatch` row); the double-submission guard and the
   `exit_submission` freeze gate apply.
 - Label: a target that already has an exit logical order continues that
   chain — `replaces_logical_order_id` is its latest exit logical order —
@@ -2571,8 +2841,8 @@ such write is swallowed and must not abort the reconcile.
   date) — they may differ by more than one day across a weekend, holiday,
   or multi-day halt. See db_schema.md's `trade_log.exit_date`.
 - Targets are excluded from tp/sl breach evaluation at Exit Architecture's
-  tick evaluation and at Feed Outage step 5. Warm Restart step 3c applies
-  to same-day positions only.
+  tick evaluation and at Feed Outage step 5. The warm-restart per-ticker
+  recovery's (c) applies to same-day positions only.
 - Shadow carried positions liquidate through the ordinary shadow exit
   simulation (Position Manager Loop step 3) under the same labelling; no
   real order is placed for them.
@@ -2582,40 +2852,46 @@ such write is swallowed and must not abort the reconcile.
 
 ## Session Restart (Warm Start) — R-2
 
-Detected at startup: today's previous session row (`owner_status('runner')`,
-utils.md), read before registration, is in a non-terminal or `crashed`
-state, and now is within session hours on a trading day. (Else: ordinary
-cold start.) Distinct from Feed Outage
+A warm restart is a start that finds today's `live_session_state` row, read
+once Session Start Gating holds the DB — after a crash, or any later start
+the same day, whatever the previous run's state. Distinct from Feed Outage
 Recovery above — that handles connectivity loss within a still-running
-process; this handles the process itself having died and restarted.
+process; this handles a new process taking over today's session.
 
-The procedure is idempotent from step 1 — a crash during recovery leaves it
-safely re-runnable. Throughout, the session state stays non-terminal (only
-Session Shutdown's `handle.close('done')` ends it), so a re-crash during
-recovery re-enters warm restart on the same test.
+It has no procedure of its own: it runs Session Lifecycle, each step's
+warm-restart behaviour stated at the step:
+- the baseline steps (Session Lifecycle's step classes) are restored from
+  the row, neither re-queried nor re-resolved; a baseline absent from the
+  row is computed then;
+- the derived steps are recomputed — Session Start Probes under their
+  warm-restart rule, the per-ticker trading terms read back (below);
+- Broker Reconcile runs at step 1d, as on a cold start;
+- every gate is evaluated anew and the start's outcome recorded and reported
+  (Session Lifecycle's start outcome);
+- the Position Manager loop starts after step 1e and first runs the
+  per-ticker recovery below;
+- the late recheck (step 4b) re-seeds the tickers holding today's
+  indicator_cache rows and a corporate_events row dated today;
+- the Eager Pool (step 5) restores, in "memory" mode, each ticker whose rows
+  for today are present, a "db"-mode ticker loading them at its first
+  appearance — indicator_cache not being purged for it (db_schema.md).
+
+The recovery is idempotent — a crash during it leaves it safely re-runnable.
+Throughout, the session state stays non-terminal (only Session Shutdown's
+`handle.close('done')` ends it), and the next start finds today's row and is
+a warm restart again.
 
 ```
-1. Broker Reconcile (shared procedure — see R-3's "Broker Reconcile"),
-   its startup procedure first: load `open_orders` by the same one query a
-   cold start uses, resolve 'intent' requests, fold the fills that landed
-   while the process was down, classify each 'open' logical order — then
-   the Orders and Positions branches. Nothing here is rebuilt from a
-   runtime cache: the ledger is durable, so the reconcile sees exits that
-   filled during the downtime as fills rather than as missing shares.
-   The procedure is R-3's and is not restated here, so there is one site to
-   keep correct.
+Per-ticker trading terms are NOT re-acquired: today's `live_ticker_terms`
+   rows are read back as they stand, and each open position's own rate
+   comes from its `live_positions` row rather than from either that table
+   or the vendor (see "Per-Ticker Trading Terms"). A restart is the WORST
+   burst case — many tickers wanted at once against a 2 TPS endpoint — so
+   persistence is load-bearing here rather than incidental. The in-memory
+   give-up set does NOT survive, by design.
 
-2. Restore session_start_cash from live_session_state (NOT re-queried —
-   see Session Lifecycle Step 1c). Per-ticker trading terms are NOT
-   re-acquired either: today's `live_ticker_terms` rows are read back as
-   they stand, and each open position's own rate comes from its
-   `live_positions` row rather than from either that table or the vendor
-   (see "Per-Ticker Trading Terms"). A restart is the WORST burst case —
-   many tickers wanted at once against a 2 TPS endpoint — so persistence is
-   load-bearing here rather than incidental. The in-memory give-up set does
-   NOT survive, by design.
-
-3. Start the Position Manager loop immediately — exits are
+Per-ticker recovery — the Position Manager loop, starting after Session
+   Lifecycle step 1e on a warm restart, first runs it. Exits are
    indicator-independent (WS/REST tick driven; no Eager-Pool state needed
    to manage an exit). Each held ticker is IN RECOVERY from the restart
    until its (b) first fetch, (b2) halt replay, derived-bundle alignment
@@ -2687,40 +2963,15 @@ recovery re-enters warm restart on the same test.
         With no entry fill: no reference price yet, so no breach
         evaluation — same as the ordinary (non-restart) guard in Exit
         Architecture. Gap-filled ticks are retained by the tape
-        only; the order's own fill state is resolved by Step 1's Broker
-        Reconcile, independently of this tick catch-up.
+        only; the order's own fill state is resolved by Session Lifecycle
+        step 1d's Broker Reconcile, independently of this tick catch-up.
 
-3d. Premarket recheck on restart: when now >= premarket_recheck_time
-   and the recheck bundle is not done (its batch_runs row absent or
-   'running' — In-Process Premarket Recheck), it runs here, before step
-   4's indicator-cache restore. In that run step 5's target is every
-   ticker with a corporate_events row dated today (not only tickers
-   gaining a row in steps 3-4), each re-seeded and persisted with
-   quarantine_reason cleared in the same transaction.
-
-   A position whose close condition held but whose close step had not run
+A position whose close condition held but whose close step had not run
    before the crash (close pending, Position Manager Loop) stays unclosed;
    its close condition is re-evaluated after its ticker's recovery.
 
-   In the reduced session (Early-Close Participation Gate) step 3d, step 4's
-   indicator-cache restore and the Watchdog steps are skipped; position and
-   order recovery and the per-ticker recovery run as usual.
-
-4. Entries stay frozen — add 'restart_warmup' to freeze_reasons
-   (entry_submission scope only, so step 3's exit-only management above
-   keeps submitting exits) — while the indicator cache reloads. First rebuild
-   today_dividends exactly as Session Lifecycle Step 4c does (it is
-   in-memory and did not survive the crash). Then, per ticker: today's
-   indicator_cache rows present → restore via load_from_db() (skipping the
-   historical_bars recompute); absent → session_start_compute() for that
-   ticker alone. Either way,
-   today's bars are then replayed via on_bar_close() by the Watchdog
-   Polling Loop's Step 3 loop over the bars the scan backfills (step 5a),
-   which runs on_regular_session_open() with the ticker's today_dividends
-   value when it passes the 093000 bar. Health Gate 1 re-runs unchanged (its
-   premarket inputs are unchanged since morning). indicator_cache is NOT
-   purged on this path (see db_schema.md).
-   Idempotency of this step specifically (re-crash during recovery):
+Indicator-cache restore (Session Lifecycle step 5) — idempotency under a
+   re-crash during recovery:
    load_from_db()'s result is the fixed seed snapshot — Eager Pool's, or a
    recheck re-seed's (In-Process Premarket Recheck); the
    on_bar_close() replay that brings it current happens entirely in
@@ -2728,13 +2979,12 @@ recovery re-enters warm restart on the same test.
    re-crash mid-replay loses only that in-memory progress, not the
    backup it started from — the next restart attempt reloads the SAME
    snapshot and replays from scratch again, reaching the same end state.
-   This makes step 4 all-or-nothing per ticker with no partial-state
+   This makes the restore all-or-nothing per ticker with no partial-state
    corruption possible, and needs no transactional handling beyond that.
 
-5. On cache reload complete: clear 'restart_warmup'; entries resume.
-
-5a. Scan state is deliberately NOT restored, and the omission is safe
-   rather than overlooked. `last_bar_hour`, `last_fetch_time` and the
+Scan state is deliberately NOT restored, and the omission is safe
+   rather than overlooked: the Watchdog loop starts after Session
+   Lifecycle step 7 with it empty. `last_bar_hour`, `last_fetch_time` and the
    rotation cursor all start empty: Bar-Close Authority's per-minute window
    simply leaves an unfetched ticker unclassified rather than counting it
    missed, the cursor restarts at position 0 and covers the list within a
@@ -2744,7 +2994,7 @@ recovery re-enters warm restart on the same test.
    slot — the same path a cold ticker takes after open, at a moment when
    the scan has nothing else to do for those tickers anyway.
 
-6. Cooldown restore: per ticker, last entry-attempt time = max over
+Cooldown restore, at every start: per ticker, last entry-attempt time = max over
    today's live_positions rows with origin='signal', REGARDLESS of lifecycle (read
    from the row — the SSoT — not any in-memory cache). This is WIDER than the
    former `{pending, open, canceled, closed}`, deliberately: that set omitted
@@ -2756,7 +3006,7 @@ recovery re-enters warm restart on the same test.
    capacity needs no rebuild: it is live_position_state.reserved, read from
    the ledger like everything else.
 
-7. Circuit breaker restore (R-4): recompute the counters,
+Circuit breaker restore (R-4), at every start: recompute the counters,
    `is_shadow = FALSE` only (a shadow evaluation's counters, if this
    process also ran shadow, are recomputed the same way but restricted to
    `is_shadow = TRUE` and kept separate — see Circuit Breaker): realised
@@ -2800,7 +3050,7 @@ after any gap):
       calc_X.load_from_db(db_conn, today_date, ticker_X)
       stats_X = load_session_stats(
           db_conn, ticker_X, today_date,
-          n_sessions=config_n_sessions,
+          config_hash=deployment_stats_config_hash,
           delta_minutes=config_delta_minutes,
           session_mode=config_session_mode,
           closes=closes,
@@ -3022,7 +3272,8 @@ Exit Architecture's subscription derives from.
 - On leaving the set: the ticker returns to Step 2b, resuming from its last
   held bundle; the tape is dropped.
 - The buffer is held at every stage.
-- In the reduced session (Early-Close Participation Gate) each held ticker
+- In the reduced session (the mode of every 'blocked' start, defined under
+  Early-Close Participation Gate) each held ticker
   keeps the REST 1-tick tape only:
   - these do not run:
     - derived-bundle alignment;
@@ -3182,16 +3433,18 @@ Exit Architecture's subscription derives from.
   - a Warm Restart recovery fetch, immediate.
 
 **Warm Restart.** Every ticker in the set opens a new held interval:
-- the 1-tick first fetch, at the maximum `dataCnt` and paging back to the
-  earlier of Retention's term (a) and the crash gap's start, replaces
-  step 3b's crash-gap gap-fill for those tickers, and steps 3b2 and 3c run
-  over the whole crash gap from it (Session Restart (Warm Start));
+- the 1-tick first fetch — the warm-restart per-ticker recovery's (b) — at
+  the maximum `dataCnt` and paging back to the earlier of Retention's term
+  (a) and the crash gap's start, replaces the crash-gap gap-fill for those
+  tickers, and the recovery's (b2) and (c) run over the whole crash gap from
+  it (Session Restart (Warm Start));
 - the alignment procedure (Derived bundles, above) supplies the alignment
   overlap, in place of a per-ticker Step 2b-form vendor fetch;
 - pre-restart `ticks_for_bar` beyond the 1-tick reach comes from vendor
   10-tick;
 - these are recovery fetches at the immediate deadline, issued while the
-  caller loops run (Session Restart (Warm Start) step 3).
+  caller loops run (the per-ticker recovery, Session Restart (Warm
+  Start)).
 
 ---
 
@@ -3237,7 +3490,8 @@ Evaluation of the breach comparisons above:
 - a shadow position's first fill is its first shadow `live_fills` row as
   observed;
 - Unified Overnight Policy targets are not evaluated here at all;
-- a ticker in Warm Restart recovery is not evaluated until its step 3c.
+- a ticker in Warm Restart recovery is not evaluated until its per-ticker
+  recovery's (c).
 
 **Inline scope of this callback.** Pure computation and in-memory state
 mutation are permitted inline; I/O of any kind is not. Inline, therefore:
@@ -3313,7 +3567,7 @@ there is NO accuracy/filter asymmetry between them — only latency differs
 (push-immediate vs. up-to-one-poll delay). A poll may return several
 buffered ticks at once; they are evaluated in sequence, so detection
 accuracy matches WS — only detection TIME lags. `utils.track_price_breach()`
-is NOT used on this path; it is backtest-only as of this patch. The poll is
+is NOT used on this path; it is backtest-only as of R-2. The poll is
 the Per-Ticker Tick Buffer's held-ticker 1-tick fetch — the same call —
 polled every Position Manager cycle, outside the polling cap, while the
 ticker's WS stream is down.
@@ -3381,7 +3635,7 @@ trading_api.md), so ledger writes serialize naturally; the guard — at
 most one 'open' logical order per (position, side), checked in the same
 transaction that inserts a new one — is what stops WS, this periodic loop
 and Broker Reconcile, all on loop P, from double-submitting (e.g. a
-simultaneous price breach and `session_close` — see Position Manager Loop
+simultaneous price breach and `session_end` — see Position Manager Loop
 step 2 for the tp/sl-wins ordering rule).
 
 **Config-driven, not hardcoded.** `execution.max_tickers` (the
@@ -3410,7 +3664,8 @@ as `get_execution_param()`'s hard bounds.
 ## Halt-Status Poller
 
 Owns the live halt source. `utils.query_halt_status()` reads the snapshot
-this keeps; nothing else fetches halt state.
+this keeps — the running poller's, or, in a process without the runner, the
+one its single-fetch entry (below) fills; nothing else fetches halt state.
 
 **Source.** The Nasdaq Trader trade-halt RSS feed,
 `http://www.nasdaqtrader.com/rss.aspx?feed=tradehalts`. It carries
@@ -3426,9 +3681,31 @@ observations rather than a source checked against itself.
 **Cadence.** Polls every `live_mode.halt_poll_interval_seconds`, FLOORED AT
 60. The floor is not tuning: the publisher's terms cap querying at once a
 minute, so a configuration must not be able to violate it. No polling
-outside the session — the 04:00 and 09:20 premarket call sites each take a
-single poll, since neither runs a loop and the heuristic that would
-otherwise cover them is disabled outside the regular session anyway.
+outside the runner process: there, only the single-fetch entry (below)
+fetches the live halt source, called once before `utils.query_halt_status()`
+by:
+- the 04:00 `--premarket-open` pass (step 2);
+- the manual `--premarket-recheck`.
+Each runs no loop and has no tick-rate fallback (utils.md's
+`query_halt_status()`). The 09:20 recheck reads the running poller's
+snapshot.
+
+**Start and stop.** The poller starts as soon as the runner has built the
+'tradable' index (Session Lifecycle), which is handed to it at its start:
+- on a cold start, reduced session included, after Step 1 and the
+  symbol-map refresh, before Step 1b;
+- on a warm restart, after 1a and Step 1's restore.
+It stops with loop P.
+
+**Single-fetch entry.** One fetch of the Source, parsed and matched as a poll
+is, filling the calling process's in-process snapshot, which
+`utils.query_halt_status()` then reads; usable without the runner. Its
+caller passes the 'tradable' index. Called once, before
+`utils.query_halt_status()`, by:
+- metadata_crawler.md's `--premarket-open` step 2;
+- metadata_crawler.md's manual `--premarket-recheck`.
+It writes its `RESIDUE` line to its hosting process's log, as
+`crawl_corporate_events_investing()` does.
 
 **Freshness.** A snapshot older than
 `live_mode.halt_snapshot_max_age_seconds` — a multiple of the poll interval
@@ -3441,7 +3718,8 @@ produce.
 It is external HTTP, off the trading path, and belongs on the pool that
 already serves caller offload rather than on the SDK's, whose threads are
 held by rate-limit waits. It holds no database handle: the snapshot is
-in-process and the tickers it is asked about arrive as arguments.
+in-process, the 'tradable' index is handed to it at its start, and the
+tickers it is asked about arrive as arguments.
 
 **Parsing.** The `ndaq:`-namespaced elements: `HaltDate`, `HaltTime`,
 `IssueSymbol`, `IssueName`, `Mkt`, `ReasonCode`, `PauseThresholdPrice`,
@@ -3451,19 +3729,31 @@ parsed — one representation is enough and the elements are the structured
 one. `HaltDate` and `HaltTime` are ET; `HaltTime` arrives with or without
 milliseconds and the parser accepts both.
 
-**Symbol matching.** Feed symbols are folded by
-`utils.normalize_vendor_symbol()` before being matched against the tickers
-asked about — the feed renders a warrant as `ACHR.W` where another source
-renders it `UCFIW`. Matching is best-effort: a feed item that folds to
-nothing we hold is simply not ours, and the residual rate is
-health_report.md's per-source symbol-mismatch finding (finding 10). Each poll
-writes one `RESIDUE` line to the runner log (Architecture's Runner log),
-with fields:
-- `source`;
-- `items`;
-- `unmatched`.
+**Symbol matching.** Feed symbols are resolved by
+`utils.match_vendor_symbol()` against the 'tradable' index, with
+`exchange_hint` from the item's `Mkt` (NASDAQ → NASDAQ; Non-NASDAQ → NYSE or
+AMEX), before being matched against the tickers asked about — the feed
+renders a warrant as `ACHR.W` where another source renders it `UCFIW`.
+Matching is best-effort: a feed item unmatched after every stage is simply
+not ours, and the residual rate is health_report.md's per-source
+symbol-mismatch finding (finding 10).
 
-Finding 10 sums them per source.
+Residue counting — each process counts a feed item once per day, on first
+sight:
+- keyed by (`IssueSymbol`, `HaltDate`, `HaltTime`), `HaltTime` normalized
+  and `ReasonCode` outside the key;
+- against the set of keys seen that day, not the previous snapshot.
+
+Each poll writes one `RESIDUE` line to the runner log (Architecture's Runner
+log), and the single-fetch entry one to its hosting process's log, over the
+items first seen in that fetch, with fields:
+- `source`;
+- `items` — the items matched at any stage;
+- `fallback` — the items matched only at the loose or name stage;
+- `excluded` — the items unmatched after every stage.
+
+Finding 10 sums them per source: `fallback` over `items`, `excluded`
+counted apart.
 
 **Deriving `is_halted` for one ticker.**
 
@@ -3585,12 +3875,19 @@ reaches a terminal state.
   API call; for a new logical order the guard check, the `live_orders`
   INSERT and the `live_order_requests` INSERT are one transaction under
   `write_lock`. On response the request records `broker_order_no` and
-  becomes 'sent'; on structural refusal it becomes 'rejected', and its
-  logical order 'rejected' when the request is 'new'.
+  becomes 'sent'; on structural refusal — a 'rejected' or 'phase_mismatch'
+  result — it becomes 'rejected', recording the result's `rsp_cd` and
+  `rsp_msg` as its `reject_code` and `reject_reason`, and its logical order
+  'rejected' when the request is 'new'.
+  A request refused before the call — an 'unmapped' or
+  'phase_refused' result — becomes 'unsent', and, when the request is
+  'new', its logical order ends 'unsent' with `terminal_cause` = the result
+  kind.
 - **Guard.** At most one 'open' logical order per (position, side) — the
   double-submission guard at every exit-opening site: Position Manager step
-  2, Exit Architecture's confirmed breach, Feed Outage step 5, Warm Restart
-  step 3c, the Unified Overnight Policy's liquidation. The `exit_submission`
+  2, Exit Architecture's confirmed breach, Feed Outage step 5, the
+  warm-restart per-ticker recovery's (c), the Unified Overnight Policy's
+  liquidation. The `exit_submission`
   freeze gate is checked where the exit logical order is created.
 - **Event-day exit gate.** While the Positions branch's deferral (i) holds for
   a ticker (Position Manager step 2), no exit logical order is opened for its
@@ -3602,19 +3899,56 @@ reaches a terminal state.
   by one query identically at cold start and warm restart. A runtime view
   of the ledger, never a second record of it.
 - Every terminal transition of a logical order records `terminal_cause`;
-  named causes include `shutdown`, `timeout`, `escalation`, `vanished`,
-  `exit_opened`, `carried_live_canceled`, `expired_at_boundary`.
+  named causes include:
+  - `shutdown`;
+  - `timeout`;
+  - `escalation`;
+  - `vanished`;
+  - `exit_opened`;
+  - `carried_live_canceled`;
+  - `expired_at_boundary`;
+  - `unmapped`;
+  - `phase_refused`.
 - Opening an exit logical order cancels the position's 'open' entry logical
   order (`terminal_cause='exit_opened'`); entry fills landing afterwards
   still raise `held_qty`, and a later exit covers them.
-- A structurally rejected exit logical order ends 'rejected' and frees the
-  guard. Config key `live_mode.exit_reject_retry_seconds`, default 30, sets
+- A rejected exit logical order — a structural refusal, or order-end
+  resolution — ends 'rejected' and frees the guard.
+  Config key `live_mode.exit_reject_retry_seconds`, default 30, sets
   the minimum interval before the next exit logical order for that
   position; consecutive rejections reaching
   `live_mode.exit_reject_streak_threshold`, default 3, record health event
   `exit_rejection_streak` (health_report.md finding 38, severity warn),
   detail `{ticker, logical_order_id, streak_count, reject_code,
-  reject_reason}`, once per streak per position.
+  reject_reason}` from the rejected request, once per streak per position.
+- **Pre-call refusals.** A logical order ended 'unsent' by a refusal before
+  the call:
+  - 'phase_refused' — an exit frees the guard, the next cycle opening the
+    position's exit at the order type permitted then;
+  - 'unmapped' — the ticker is held for the rest of the start:
+    - no request is sent for it at ANY site:
+      - no new logical order;
+      - no amend;
+      - no cancel;
+    - its 'open' logical orders stay tracked and their fills fold;
+    - the next start evaluates anew;
+  - an entry so ended takes the 'unsent' path (exit_reason
+    'entry_canceled').
+- `trade_log.reject_reason` is the 'new' request's `reject_reason`: the
+  `rsp_msg` of a 'rejected' or 'phase_mismatch' result, or the order's
+  `AstkRjtRsnCnts` (order-end resolution), verbatim; a result refused
+  before the call reaches no row's `reject_reason`.
+- The first 'phase_mismatch' result of a date records health event
+  `session_phase_mismatch`, detail `{ticker, side, order_type,
+  local_phase, rsp_cd, rsp_msg}`.
+- While the date has a `session_phase_mismatch` health event row, market is
+  not permitted at every submission site, the shadow's synthetic requests
+  and the stuck-exit escalation included. Every start reads that row, cold
+  start and warm restart alike, and the runner sets the state in process
+  when it records the row.
+- A request refused 'unmapped' records health event `order_unmapped` once
+  per (ticker, date), detail `{ticker, side, purpose}`, and the runner
+  invokes health_report.md's event-driven report on recording it.
 - Health event details that name a broker order carry `order_date` beside
   `order_id`, `order_id` being the broker order number.
 
@@ -3623,12 +3957,52 @@ Unresolved amend / cancel events attach to their 'intent' request by
 `Sorgordno` + `Sordtrdtpcode`; unresolved new-order events by ticker, side,
 quantity and price type. An unresolved fill (11) is stored unattributed
 (`request_id` NULL) and attached later. 13 (cancel confirmed) closes the
-logical order 'canceled' after its final fills fold. 14 (rejected) marks the
-request 'rejected' and, for a 'new' request, the logical order 'rejected'; a
-rejected amend / cancel leaves the logical order 'open'. 12 (amend
+logical order 'canceled' after its final fills fold. 14 (rejected) starts
+the order-end resolution of its request (below); a rejected amend / cancel
+leaves the logical order 'open'. 12 (amend
 confirmed) sets `current_request_id` to whichever of the original and amend
 order numbers OUTSTANDING lists. Each event's reported `Sastkordprc` is
 recorded on its request as `broker_order_price`.
+
+**Order-end resolution.** A real request whose end is seen without its
+full fill is resolved from its own row before any transition:
+- seen by:
+  - IS2 14 on the request;
+  - for an order's live request, all of:
+    - its order number absent from OUTSTANDING;
+    - not fully filled;
+    - no cancel of ours pending;
+- the row — `inquiry/transaction-history` (trading_api.md):
+  - for the request's `order_date` and ticker;
+  - all orders, aggregated per order;
+  - newest first, continuation pages read until the row matching
+    `broker_order_no`;
+  - queried at the next Position Manager cycle — at once for a halt-clear
+    re-query — one query per ticker serving its requests pending
+    resolution;
+- a ticker held by a pre-call 'unmapped' refusal is not queried, its
+  requests staying pending for the start;
+- when the row's `AstkExecQty` exceeds the quantity folded for the order,
+  its executions are first read from that ticker's itemised filled rows for
+  the `order_date`, newest first, continuation pages read until they sum to
+  `AstkExecQty`, and folded (fill folding);
+- after IS2 14 → the request 'rejected', `reject_code` = the row's
+  `AstkRjtCode` and `reject_reason` = its `AstkRjtRsnCnts`, verbatim, each
+  NULL when the row carries none or no row is returned; a 'new' request's
+  logical order 'rejected';
+- after an absence, by the row:
+  - `AstkRjtCode` set → as after IS2 14;
+  - `AstkExecQty` equal to `AstkOrdQty` → no transition beyond fill
+    folding, which ends it 'filled';
+  - otherwise, or no row → the vanished-order rule (exit-side loop);
+- the query failing → still pending, queried again at the next cycle;
+- a request pending resolution keeps its logical order 'open', and the
+  logical order is sent no amend or cancel meanwhile;
+- at resolution time, a request is not resolved when:
+  - it is already 'rejected';
+  - it is already 'unsent';
+  - its logical order is terminal;
+- shadow requests are never resolved here.
 
 **WS connections.** TWO connections, both opened at session start and
 held for the whole session: one carrying the quote stream (Exit
@@ -3657,7 +4031,8 @@ subscription list when its receive loop exits.
 
 **Handoff to loop A.** After every committed `lifecycle` write — row
 insert, `closed`, `canceled` — and once unconditionally after Broker
-Reconcile and the warm-restart procedure complete, this loop derives the
+Reconcile and, on a warm restart, the per-ticker recovery complete, this
+loop derives the
 full set (`lifecycle='live'`, distinct ticker) and publishes it to a single
 lock-protected slot that loop A reads. The full set every time, never a
 delta, so a write that leaves the set unchanged still publishes and no
@@ -3665,11 +4040,11 @@ sequencing is needed. Loop A never reads `live_positions` itself: the
 derivation is owned here, and the auxiliary component opens no database
 connection (auxiliary_stream.md).
 
-**Reconnect.** The vendor caps connection attempts per minute but counts
-in a one-second window, so an opening burst is legal provided attempts are
-spaced above one second; the schedule is a burst followed by a fixed 10s
-interval, and it is OURS rather than the SDK's (docs/api/sdk_dependency.md
-explains why the SDK's own pacer is replaced). After
+**Reconnect.** The schedule is OURS rather than the SDK's
+(docs/api/sdk_dependency.md explains why the SDK's own pacer is replaced):
+- a burst followed by a fixed 10s interval;
+- running under trading_api.md's connect limiter.
+After
 `live_mode.ws_reconnect_max_attempts` consecutive failures the ladder
 escalates; there is NO permanent give-up within a session, the only bound
 being the process itself at the R-9 hard cap — the same
@@ -3790,22 +4165,22 @@ loop every position_check_interval_seconds (config, default: 5s):
     Position close's condition holds (below), not when this order fills:
     entry fills landing after it opened raise held_qty, and a later exit
     covers them.
-    If this order's live order number is absent from OUTSTANDING, it is not
-    fully filled, and no cancel of ours is pending: it ends
-    terminal_cause='vanished', and a new exit logical order follows with
+    If order-end resolution (Order and fill ledger) finds it vanished: it
+    ends terminal_cause='vanished', and a new exit logical order follows with
     purpose='vanished_replacement' and replaces_logical_order_id, at the
-    current phase's permitted type and the current k.
+    order type permitted now and the current k.
     # Vanished-order rule — applies every cycle, not only at a halt
     # clear. One mechanism, these causes: cancellation during a halt
     # (api_contract_checklist.md T-12), cancellation by the venue at a
     # session-phase boundary (T-19), a cancel whose follow-up failed, and
     # arbitrary broker cancellation.
     # DELIBERATELY ASYMMETRIC: absence from OUTSTANDING alone never
-    # triggers a replacement while the FILLED call might still account for
-    # it. A replacement is irreversible and would land on a possibly-closed
-    # position, whereas a delayed one is recovered on a later cycle — fill
-    # folding is keyed per execution, so a fill missed by one page folds in
-    # unchanged when it appears on the next.
+    # triggers a replacement — the order's own row decides, its
+    # executions folded first. A replacement is irreversible and would
+    # land on a possibly-closed position, whereas a delayed one is
+    # recovered on a later cycle — fill folding is keyed per execution, so
+    # a fill missed by one page folds in unchanged when it appears on the
+    # next.
 
     Otherwise the order stays 'open' — NO give-up timeout WITHIN the
     session. An entry may abandon its unfilled remainder and settle for a
@@ -3839,9 +4214,10 @@ loop every position_check_interval_seconds (config, default: 5s):
             # its existing point-in-time snapshot of orders still
             # outstanding at report time — the event answers "how
             # often", the snapshot "what is open right now".
-        if market orders are permitted in the CURRENT session phase
-           (execution_common.md — regular session only) and this
-           order's own type != "market":
+        if market orders are permitted now — the CURRENT session phase
+           permitting them (execution_common.md — regular session only)
+           and the date holding no session_phase_mismatch row (Order and
+           fill ledger) — and this order's own type != "market":
             escalation: send a cancel request for the live order; only
                 after cancel confirmation (IS2 13, or OUTSTANDING absence
                 with no fill growth) — the logical order ending
@@ -3850,26 +4226,29 @@ loop every position_check_interval_seconds (config, default: 5s):
                 replaces_logical_order_id, sized to the floor of held_qty.
                 Never back-to-back cancel-and-submit: a submission ahead of
                 the cancel's confirmation could double-sell.
-            # Final backstop inside regular hours, regardless of
+            # Final backstop while market is permitted, regardless of
             # exit_order_type (execution_common.md) — an escalation,
             # not a reset: exiting_since is untouched, so stuck_age
             # keeps accumulating against the original clock.
-        elif market orders are NOT permitted in the current phase
-             and this order's own type == "limit":
+        elif market orders are NOT permitted now (the current session
+             phase not permitting them, or the date holding a
+             session_phase_mismatch row) and this order's own type == "limit":
             k = min(k + config["execution"]["exit_ladder_increment"],
                     config["execution"]["exit_ladder_cap"])
             # The ladder applies to a limit exit order only: a market exit
-            # order still live outside regular hours is tracked unchanged
+            # order still live while market is not permitted is tracked
+            # unchanged
             # (the venue's boundary cancel, if any, reaches the
             # vanished-order rule — api_contract_checklist.md T-19).
-            # Outside regular hours a market order is refused by the
-            # venue, so the escalation is a LADDER on k rather than a
-            # single step. It converges to market-order equivalence as
-            # k grows — a sell limit fills against resting buyers at
-            # THEIR prices — so the final-backstop property survives
-            # the after-hours window. The cap bounds a runaway on
+            # While market is not permitted — refused by the venue
+            # outside regular hours, withheld while the date has a
+            # session_phase_mismatch row — the escalation is a LADDER on
+            # k rather than a single step. It converges to market-order
+            # equivalence as k grows — a sell limit fills against resting
+            # buyers at THEIR prices — so the final-backstop property
+            # survives without market. The cap bounds a runaway on
             # malformed or empty book data, not fill risk.
-        # else: already market inside regular hours — nothing left to
+        # else: already market — nothing left to
         # escalate to. Stays tracked exactly as before; finding 18
         # keeps surfacing it.
 
@@ -3931,19 +4310,19 @@ loop every position_check_interval_seconds (config, default: 5s):
   For each 'open' entry logical order in open_orders:
     fills fold per fill folding — the WS account stream primary, the REST
         backstop on this cadence
-    if rejected (IS2 14 on its 'new' request — including a market order's
+    if order-end resolution finds its 'new' request rejected (IS2 14 or an
+        OUTSTANDING absence — including a market order's
         insufficient-funds-at-actual-price rejection, and any limit
         rejection): the logical order ends 'rejected'. With no entry fill,
         the position transitions to lifecycle='canceled' through the single
         canceled-transition point, with a trade_log row:
             exit_reason='entry_rejected', quantity=0, fill_price=p_entry,
-            exit_bar=entry_bar, reject_reason = the broker's refusal text
-            verbatim. Never-opened family (db_schema.md): excluded from
+            exit_bar=entry_bar, reject_reason = the request's
+            reject_reason. Never-opened family (db_schema.md): excluded from
             fit_execution_params(), counted as a cooldown attempt.
     elif its fills reach requested_qty: the logical order ends 'filled'; the
         position proceeds into the open-position handling below.
-    elif its live order number is absent from OUTSTANDING, it is not fully
-        filled, and no cancel of ours is pending: it ends
+    elif order-end resolution finds it vanished: it ends
         terminal_cause='vanished' — the same vanished-order rule as the exit
         side, with no replacement on the entry side.
     elif filled in part: no transition — the order stays 'open', and the
@@ -4175,16 +4554,18 @@ loop every position_check_interval_seconds (config, default: 5s):
                 # not waiting for the next position_check_interval_seconds
                 # cycle's ordinary fill-tracking pass
                 run the exit-side loop's OUTSTANDING/FILLED pair for
-                    this order immediately, rather than waiting for the
-                    next position_check_interval_seconds cycle
-                if the vanished-order rule finds it gone:
+                    this order immediately, and its order-end resolution
+                    (Order and fill ledger) at once when it is absent,
+                    rather than waiting for the next
+                    position_check_interval_seconds cycle
+                if order-end resolution finds it vanished:
                     # broker canceled it during the halt — T-12's "auto-
                     # canceled" branch confirmed for this event
                     the replacement is opened by that rule (Order and fill
                         ledger's exit-side loop) with purpose='halt_clear'
                         rather than 'vanished_replacement', and
-                        replaces_logical_order_id, at the current phase's
-                        permitted type and the current k — this site adds
+                        replaces_logical_order_id, at the order type
+                        permitted now and the current k — this site adds
                         no separate resubmission path, only the immediate
                         re-query that shortens the delay
                     record_health_event(finding_name=
@@ -4250,7 +4631,7 @@ loop every position_check_interval_seconds (config, default: 5s):
            exit_reason = "session_end"       # wall-clock — this loop, not WS
        else:
            continue to next position (no exit yet)
-       # Ordering when a tp/sl breach and session_close both become true in
+       # Ordering when a tp/sl breach and session_end both become true in
        # the same iteration: tp/sl wins. The double-submission guard (no
        # 'open' exit logical order for the position) guarantees a single
        # submission either way.
@@ -4283,7 +4664,8 @@ loop every position_check_interval_seconds (config, default: 5s):
            "sell", config["execution"]["exit_order_type"], the phase now)
            # the first request's actual type (execution_common.md's Session
            # Phase and Order Types)
-       if config["live_mode"]["stage"] == "shadow":
+       if session_stage == "shadow":   # the session's stage, the row's
+                                       # (Session Lifecycle step 1c)
            # STEP-WISE: simulate_exit_fill()'s step form over the REST
            # portion of the held-ticker tape, inline on loop P after each
            # poll's append (execution_common.md's Fill Simulation Model).
@@ -4292,12 +4674,12 @@ loop every position_check_interval_seconds (config, default: 5s):
            # caps, cash, cooldown, the circuit breaker and slot recycling
            # all need terminal outcomes in-session.
            mode, rate = execution_common.exit_fill_mode(config, exit_reason,
-                                                        order_type)
-           # take_profit → sell_rate_tp, stop_loss → sell_rate_sl, every
-           # other exit_reason → sell_rate_neutral; ('reference', None) for
-           # time_limit and session_end while
-           # execution.simulate_nondirectional_exit_fill is false. The rate
-           # holds for the whole order, through escalation and replacement.
+                                                        order_type, carried)
+           # carried: the exit logical order's chain's first request
+           # order_date is before today
+           # the mode and rate by exit_reason and carried — execution_common.md's
+           # exit_fill_mode(). The rate holds for the whole order, through
+           # escalation and replacement.
            anchor    = the time part (HHMMSS) of the exit logical order's
                        reference_at ('YYYYMMDD_HHMMSS')       # a TIME
            reference = its reference_price
@@ -4358,8 +4740,11 @@ loop every position_check_interval_seconds (config, default: 5s):
                    limit_price=`ask - k * (ask - bid)` rounded up to the
                    tick(price) grid (execution_common.md)
            on response the request records broker_order_no and becomes
-               'sent'; on structural refusal the exit logical order ends
-               'rejected' (Order and fill ledger's rejected-exit rule)
+               'sent'; on a structural refusal ('rejected' or
+               'phase_mismatch') the exit logical order ends 'rejected'
+               (Order and fill ledger's rejected-exit rule); refused before
+               the call it ends 'unsent' (Order and fill ledger's pre-call
+               refusals)
            # The logical order is in open_orders from its INSERT, so the
            # exit-side loop above tracks it and fill folding reaches its
            # fills — no separate registration step exists to be missed.
@@ -4367,9 +4752,10 @@ loop every position_check_interval_seconds (config, default: 5s):
            # thereafter while still outstanding (limit case only) — see
            # the exit-side loop above, which also advances k past
            # execution.exit_order_stuck_minutes. The escalation is a market
-           # order INSIDE regular hours and a k ladder outside them, since
-           # the venue refuses a market order outside the regular session
-           # (execution_common.md).
+           # order while market is permitted and a k ladder otherwise — the
+           # venue refuses a market order outside the regular session
+           # (execution_common.md), and a session_phase_mismatch row
+           # withholds it for the date (Order and fill ledger).
 
     4. Log exit to inference_log
 ```
@@ -4502,7 +4888,7 @@ Model) — no incremental steps and no Warm Restart replay:
     order;
   - quantity `entry_qty`;
   - the fill mode and rate by `trade_log.exit_reason` through
-    `exit_fill_mode()`;
+    `exit_fill_mode()`, `carried` as at Position Manager Loop step 3;
   - the order-type and price path: the requests of all the position's exit
     logical orders in `sent_at` order, each request's type and price
     applying from its `sent_at`, with no fill between a logical order's
@@ -4512,11 +4898,14 @@ Model) — no incremental steps and no Warm Restart replay:
     remainder kept;
 - `predicted_partial_fills_count` is the number of the exit side's fill
   increments (execution_common.md's `FillState`);
+- the entry side is NULL for an entry whose logical order ended 'unsent' —
+  not an observation (shadow_retraining.md);
 - the exit side is NULL:
   - for an exit_reason outside the strategy-trigger family (db_schema.md's
     `trade_log.exit_reason` values section);
   - for a close completed by an adjustment;
-  - on an 'entry_canceled' row, whose entry side is still computed;
+  - on an 'entry_canceled' row, whose entry side is still computed unless
+    its entry logical order ended 'unsent';
 - Session Shutdown's carried case uses the same inputs, the entry's limit
   price by the same rule from the stored request row, the exit steps ending
   at the stage 1 cancel instant, stored on `live_orders`.
@@ -4608,6 +4997,13 @@ live_mode:
   # task runs at the later of this and Eager Pool's completion.
   premarket_recheck_time:         "09:20"
 
+  # Session-start API gates (Session Lifecycle Step 1 and 1b): a failed
+  # query is retried every session_start_retry_seconds until
+  # session_start_deadline, wall-clock America/New_York; past it the
+  # session ends (Session Lifecycle's capability gates).
+  session_start_retry_seconds:    60
+  session_start_deadline:         "09:00"
+
   # R-3: periodic-loop session_end trigger (Position Manager Loop Step 2)
   # — deliberately NOT on the WS path, see Exit Architecture's
   # "Time-based triggers" note. Matches backtest's close-exit
@@ -4686,10 +5082,12 @@ live_mode:
                                              # worth doing. Same evaluate-but-
                                              # don't-enforce posture as R-4's
                                              # breaker and shadow mode. It
-                                             # blocks the day's entry pipeline;
-                                             # carried positions are managed by
-                                             # the reduced session
-                                             # (Early-Close Participation Gate).
+                                             # blocks participation (a
+                                             # 'blocked' start); the positions
+                                             # and 'open' logical orders left
+                                             # are managed by the reduced
+                                             # session (Early-Close
+                                             # Participation Gate).
   session_hard_exit_offset_minutes: 0        # R-9: process hard cap — see
                                              # "Session Shutdown". RENAMED AND
                                              # RE-MEANT from the former
@@ -4826,16 +5224,18 @@ live_mode:
   # shadow_retraining.md for the comparison methodology). REPLACES the
   # former `shadow_mode` boolean rather than sitting beside it: one fact
   # behind two independently editable keys is what the shared `execution:`
-  # section exists to prevent, so this is the single declaration and every
-  # branch reads `stage == "shadow"`.
+  # section exists to prevent, so this is the single declaration, and every
+  # branch reads the session's stage — this key as recorded to
+  # live_session_state at Session Lifecycle step 1c, the row's.
   stage:                          shadow  # 'shadow' | 'pilot' | 'scale'
                                           # Recorded to live_session_state
-                                          # at session start; Warm Restart
-                                          # compares the two and ABORTS on
-                                          # a mismatch, so a stage edited
-                                          # between a crash and a restart
-                                          # cannot silently switch the
-                                          # session's mode.
+                                          # at step 1c; each start compares
+                                          # this key with the row's stage,
+                                          # and a mismatch blocks
+                                          # participation, so a stage
+                                          # edited between a crash and a
+                                          # restart cannot silently switch
+                                          # the session's mode.
                                           # Starting at 'pilot' or 'scale'
                                           # while intraday_loss_limit_pct,
                                           # consecutive_loss_limit and
@@ -4864,7 +5264,7 @@ trading:
                                              # (trading_api.md)
 
 # session_start_cash is not a config key — queried once from the trading
-# API at Session Lifecycle Step 1 and held fixed for the session (the
+# API at Session Lifecycle Step 1b and held fixed for the session (the
 # `balance` argument to execution_common.compute_position_size(), mirroring
 # backtest's initial_cash — see 09_backtest_engine.md's Position Sizing).
 
@@ -4950,7 +5350,8 @@ trading:
   shutdown is closed there, at the same layer as the `live_scan_daily`
   write above. After a crash with no restart the row stays open, which
   reads correctly as unresolved — no party observed a resumption. A crash
-  followed by a restart resolves it instead by replay (Warm Restart step b2)
+  followed by a restart resolves it instead by replay (the warm-restart
+  per-ticker recovery's (b2))
 - `exit_trigger_agreement_daily` is written at each position's close
   transition rather than at shutdown — the one shutdown write being, for
   each exit logical order Session Shutdown cancels, the contribution from
@@ -4964,14 +5365,17 @@ trading:
   window — which is also why the entry-side counterpart can live in the
   evening batch and this cannot
 - Every submission site takes its order type from execution_common.md's
-  `permitted_order_type()`; every simulator call site selects its rate
+  `permitted_order_type()`, market not permitted while the date has a
+  `session_phase_mismatch` health event row; every simulator call site
+  selects its rate
   through `entry_fill_rate()` / `exit_fill_mode()` from the config overlaid
   at Session Lifecycle step 1e, the only rate resolution this process runs
 - A non-shadow position closes only through close pending: its close step
   waits until the ticker's tape covers the end of T_end's second (Position
   close)
-- On a non-participation early-close day with carried positions or 'open'
-  logical orders, the reduced session (Early-Close Participation Gate) runs
+- A 'blocked' start with lifecycle='live' positions or 'open' logical
+  orders left runs the reduced session (defined under Early-Close
+  Participation Gate) —
   the position-management path only, never the entry pipeline
 - Execution quantities and prices come only from `live_fills`; position
   quantities only from `live_fills` and `live_position_adjustments`, read
@@ -4994,8 +5398,18 @@ trading:
 - Trade execution (buy/sell API calls) is LiveModeRunner's responsibility —
   Inferencer only returns InferenceResult
 - All inference_log writes include the active run_id
-- LiveModeRunner does not modify DuckDB historical data — only reads for session init
-  (exception: entry_points INSERT via Inferencer; inference_log, below)
+- LiveModeRunner does not modify DuckDB historical data — only reads for
+  session init. Exceptions:
+  - entry_points INSERT via Inferencer; inference_log, below;
+  - the In-Process Premarket Recheck's writes:
+    - corporate_events;
+    - ticker_cik_map;
+    - batch_runs;
+    - the source_changes rows of its corporate_events writes;
+  - today's precomputed_session_stats groups with their derived_configs
+    row;
+  - the session-start symbol-map refresh's ticker_cik_map writes and its
+    premarket_trading_api_symbol_map batch_runs row
 - inference_log has SPLIT ownership by event, not one writer: Inferencer
   INSERTs the inference-stage events (no_detection, preload_fail,
   bars_trimmed, no_signal, suppressed); LiveModeRunner INSERTs

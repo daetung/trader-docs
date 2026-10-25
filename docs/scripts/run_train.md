@@ -16,15 +16,19 @@ Called per fold by PipelineOptimizer (rolling walk-forward) or standalone via CL
 
 ## Class Interface
 
-**DB access role.** A guest (db_schema.md's DB File Ownership Windows),
-through utils.md's DB Access Coordination:
-- the entry point runs inside `register('guest', 'run_train', trigger)`;
-- `market.duckdb` is opened only inside `guest_unit('run_train', None)`,
-  which waits for admission without limit;
-- the run is one unit, the connection that unit yields passed wherever
-  this entry point takes `db_conn`;
+**DB access role.** A per-run guest (db_schema.md's DB File Ownership Windows;
+db_coordination.md's Unit scope), run through guest_supervisor.md's
+`run_guest`:
+- `run_guest run_train` enters
+  `register('guest', 'run_train', trigger)` and opens one
+  `guest_unit('run_train', None)` around the body, which waits for admission
+  without limit;
+- the body is handed that unit's connection, passed wherever this tool
+  takes `db_conn`, and calls neither `register()` nor `guest_unit()`;
+- `scripts/run_train.py` run directly hands over to
+  `run_guest run_train`;
 - while an owner waits past `coordination.guest_max_hold_seconds`, the run
-  ends by self-termination and is re-run.
+  ends by self-termination and is re-run from scratch.
 
 ```python
 class Trainer:
@@ -124,7 +128,8 @@ class Trainer:
 ## CLI Interface
 
 ```bash
-python scripts/run_train.py [OPTIONS]
+run_guest run_train [OPTIONS]
+# python scripts/run_train.py <args> hands over to run_guest run_train <args>
 
 Options:
     --config, -c    Path to pipeline_config.yaml (default: configs/pipeline_config.yaml)
@@ -236,3 +241,7 @@ trainer:
 - `is_ambiguous` column used for weight assignment only — never appears in feature_names
 - `dry_run=True`: db_conn may be None; no INSERT, no artifact save; train_log_row in result
 - `dry_run=False`: db_conn must be valid; performs INSERT and artifact save
+- Calls neither `register()` nor `guest_unit()` — `run_guest` opens its unit
+- Built by PipelineOptimizer per step on that step's connection; Trainer issues
+  no commit of its own, its INSERT committed with the step
+  (pipeline_optimizer.md's Work)

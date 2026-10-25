@@ -12,7 +12,7 @@ Hosts WebSocket subscriptions that are **not part of trading** and cannot fit
 inside the live session's own budget. Delayed-quote capture, for feed-coverage
 measurement, is its first consumer — not its definition.
 
-The defining property is where the subscriptions live: a separate 모의투자
+The defining property is where the subscriptions live: a separate demo
 account with its own app key, its own token cache, and its own session
 allowance. Production keeps its two
 sessions for V60 and IS2, which `api_contract_checklist.md` T-6 measured as
@@ -214,8 +214,8 @@ about an hour.
 
 ## Startup
 
-No cron entry: loop A starts with LiveModeRunner and stops at shutdown
-stage 2. The former `0 4 * * 1-5` entry existed to have the client
+No scheduled run of its own: loop A starts with LiveModeRunner and stops at
+shutdown stage 2. The former `0 4 * * 1-5` entry existed to have the client
 initialised, its token held and its WS session established before the first
 entry — not to collect anything, since the subscription set derives from
 `live_positions WHERE lifecycle='live'` and is empty until the first entry
@@ -249,7 +249,7 @@ auxiliary_stream:
 
 - Runs on its own event loop (loop A) on a dedicated thread inside
   LiveModeRunner — never on production's loop
-- Uses a 모의투자 account distinct from production's, with its own app key,
+- Uses a demo account distinct from production's, with its own app key,
   SDK config path and token cache path
 - Trades nothing, holds nothing, and submits no orders. It is not
   multi-account trading, which `sdk_dependency.md` keeps out of scope

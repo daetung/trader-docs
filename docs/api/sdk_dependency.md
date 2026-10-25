@@ -93,14 +93,17 @@ Three alternatives were rejected before modifying:
   ticker, and this universe is made of those
 - Accepting it — the affected guarantee is a position's tp/sl coverage
 
-**2. WebSocket connect pacer.** The SDK paces connections with a
-minimum-interval limiter derived from the per-minute connection cap. Its own
+**2. WebSocket connect limiter, made injectable.** `DBSecWebSocket`'s connect
+limiter is made injectable, and this project injects its own
+(`trading_api.md`'s WebSocket connect limiter). The SDK's own is a
+minimum-interval limiter derived from the per-minute connection cap. Its
 documented reason for preferring minimum-interval over a window is the
 server's one-second counting window — an argument that holds for per-second
 limits and cannot apply to a per-minute one. Measurement confirms an opening
 burst is accepted. The reconnect schedule is ours to own
-(`live_mode_runner.md`), and the pacer is instance-internal to the SDK's
-WebSocket object, so it cannot be bypassed from above.
+(`live_mode_runner.md`), and the limiter is instance-internal to the SDK's
+WebSocket object, so it cannot be replaced from above without this
+modification.
 
 **3. Token-manager injection.** `_SyncCore.__init__` gains a `token_manager`
 keyword defaulting to `None` and falling back to

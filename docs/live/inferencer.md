@@ -103,7 +103,7 @@ InferenceResult(
     prob_dn5:   float,
     suppressed: bool,
     run_id:     str,
-) | None   # None on preload_fail, no_detection, session filter
+) | None   # None — its cause 'preload_fail' | 'filtered' | 'no_detection'
 ```
 
 ---
@@ -136,33 +136,35 @@ _prepare_bars(bars, entry) -> pd.DataFrame | None:
 infer(bars, ticks, meta, entry, session_stats=None):
 
 step 0: bars = self._prepare_bars(bars, entry)
-        if bars is None: return None    # preload_fail logged in _prepare_bars
+        if bars is None: return None    # cause 'preload_fail', logged in _prepare_bars
 
 1. Session mode filter:
        session_mode = config["entry_detector"]["session_mode"]
        hour = entry["hour"]
 
        last = last_bar(entry["date"])           # utils.md — PER DATE
-       if hour > last: return None              # after-market always excluded
+       if hour > last: return None              # after-market always excluded; cause 'filtered'
 
        if session_mode == "regular" and not ("093000" <= hour <= last):
-           return None
+           return None                          # cause 'filtered'
        if session_mode == "pre" and not ("040000" <= hour <= "092900"):
-           return None
+           return None                          # cause 'filtered'
        # "combined" passes both pre-market and regular
 
 2. Late-day filter:
        off = config["entry_detector"]["max_entry_offset_minutes"]
        if off is not None:                     # null = no cutoff
-           max_entry_hour = last - off minutes # PER DATE, follows the calendar
+           max_entry_hour = session_close(entry["date"]) - off minutes
+                                # PER DATE, follows the calendar (utils.md)
            if hour > max_entry_hour:
-               return None      # > operator, consistent with scan() exclusion
+               return None      # > operator, consistent with scan() exclusion;
+                                # cause 'filtered'
 
 3. EntryPointDetector.detect(bars, date=entry["date"],
                               shares_outstanding=meta["shares_outstanding"])
        if not detected:
            log inference_log (event="no_detection")
-           return None
+           return None      # cause 'no_detection'
 
 4. Insert entry point to DuckDB:
        write_fn("INSERT OR IGNORE INTO entry_points (ticker, date, hour,
@@ -240,14 +242,18 @@ def infer_batch(
             "fired":        int,   # signals emitted (up5 or up3)
             "preload_fail": int,   # insufficient history
             "no_detection": int,   # detect() returned False
+            "filtered":     int,   # a filter: after-market | session mode | late day
             "suppressed":   int,   # suppressed by suppress_threshold
             "no_signal":    int,   # inference completed, no signal
         }
+        The keys other than "total" partition it: each candidate counts in
+        exactly one of them.
     """
     halts_cache: dict[tuple[str, str], pd.DataFrame] = {}
     results = []
     stats = {"total": 0, "fired": 0, "preload_fail": 0,
-             "no_detection": 0, "suppressed": 0, "no_signal": 0}
+             "no_detection": 0, "filtered": 0, "suppressed": 0,
+             "no_signal": 0}
 
     for entry in candidates:
         stats["total"] += 1
@@ -255,12 +261,14 @@ def infer_batch(
         cache_key = (ticker, date)
         if cache_key not in halts_cache:
             halts_cache[cache_key] = halt_accessor(ticker, date)
-        result = self._infer_single(
+        result, cause = self._infer_single(
             bars_by_ticker[ticker], ticks_by_ticker[ticker],
             meta_by_ticker[ticker], entry,
             halts_cache[cache_key], session_stats,
         )
-        if result is not None:
+        if result is None:
+            stats[cause] += 1    # 'preload_fail' | 'filtered' | 'no_detection'
+        else:
             results.append(result)
             if result.signal:
                 stats["fired"] += 1
@@ -272,7 +280,10 @@ def infer_batch(
     return results, stats
 ```
 
-`_infer_single()` performs steps 0–10 of `infer()` with pre-loaded `halts_df`.
+`_infer_single()` performs steps 0–10 of `infer()` with pre-loaded `halts_df`
+and returns `(InferenceResult | None, cause)`, `cause` the reason for a None
+result (`'preload_fail'` | `'filtered'` | `'no_detection'`) and None otherwise;
+`infer()` returns the InferenceResult or None.
 `infer()` calls the halt accessor and passes the result to `_infer_single()`.
 
 ---
@@ -281,7 +292,7 @@ def infer_batch(
 
 ```
 max_entry_offset_minutes: if not null, signals with t bar open time later than
-    last_bar(date) - max_entry_offset_minutes are not fired,
+    session_close(date) - max_entry_offset_minutes are not fired,
                 consistent with scan() exclusion logic (> operator, boundary inclusive)
 ```
 
@@ -390,8 +401,9 @@ class Inferencer:
   (hour > last_bar(date))
 - Session mode and late-day filters applied by Inferencer before detect()
 - `max_entry_offset_minutes`: when not null, signals with t bar open time >
-  max_entry_hour(date) are not fired, where max_entry_hour(date) = last_bar(date)
-  - max_entry_offset_minutes (> operator consistent with scan() exclusion logic;
+  max_entry_hour(date) are not fired, where max_entry_hour(date) =
+  session_close(date) - max_entry_offset_minutes (> operator consistent with
+  scan() exclusion logic;
   boundary is inclusive). null disables the cutoff entirely
 - `halts_df` is SUPPLIED by LiveModeRunner through `halt_accessor` and is
   never queried here; it is passed explicitly to FeatureExtractor.extract().
@@ -407,7 +419,8 @@ class Inferencer:
   candidate — for that call only
 - `session_stats` is supplied by LiveModeRunner at session start; None is allowed (graceful degradation)
 - Model artifacts loaded from `run_id` at init — not reloaded per call
-- `feature_names` and `categorical_cols` derived from FeatureExtractor at init
+- `feature_names` and `categorical_cols` come from the model artifact meta
+  (Model Loading), not from FeatureExtractor at init
 
 ---
 

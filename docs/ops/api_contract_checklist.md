@@ -97,6 +97,8 @@ outranks a shaky one that degrades gracefully.
 | T-32 | Whether the order API accepts `AstkOrdQty` and `AstkOrdPrc` as JSON numbers carrying up to 6 decimal places, and as strings | `trading_api.md`'s order request numeric format | **C** | Submit orders in each format; fallback: the 'number' default | `trading.order_numeric_format` | |
 | T-33 | The dividend withholding rate applied to this account, and the `SmryNm` of dividend cash and tax rows | `utils.md`'s dividend amount function; `live_mode_runner.md`'s dividend withholding check | **C** | Self-measuring — `health_report.md`'s `dividend_withholding_mismatch` and `summary_vocabulary_candidate` findings | `corporate_events.dividend_withholding_rate`, `corporate_events.dividend_cash_summary_names`, `corporate_events.dividend_tax_summary_names` | **Partial** — `inquiry/trade-history` shows '배당금입금(외화)' and '배당세출금(외화)' |
 | T-34 | Whether an open BUY order reduces `AstkOrdAbleAmt` before it fills, at what price, and when a canceled remainder's hold is released; and whether a market BUY's IS2 `Sastkordprc` reports the vendor's converted limit price | `09_backtest_engine.md`'s cash ledger and market-BUY limit price; `live_mode_runner.md`'s `broker_order_price` | **C** | Place a limit BUY below the market and query `AstkOrdAbleAmt` before submission, right after submission and right after cancel; submit a market BUY and compare its IS2 `Sastkordprc` with the recorded `market_buy_limit_price`; fallback: the `'none'` default | `backtest.open_buy_cash_hold`, `backtest.open_buy_hold_release_seconds`, `execution.market_buy_price_margin` | |
+| T-35 | A rejected order's `inquiry/transaction-history` row carries `AstkRjtCode` and `AstkRjtRsnCnts` and a venue-canceled one carries neither | `live_mode_runner.md`'s order-end resolution | **B** | Self-measuring — `live_order_requests`' `reject_code` and `broker_status` across resolved requests | — | |
+| T-36 | The aggregated `inquiry/transaction-history` row's `AstkExecQty` is the order's cumulative executed quantity | `live_mode_runner.md`'s order-end resolution — fill folding ahead of the vanished-order rule | **A** | Fill one order across several executions; compare the aggregated row's `AstkExecQty` with the sum of its itemised filled rows | — | |
 
 **T-3 is RETIRED, not verified.** Its premise was that a real-world
 throughput ceiling had to be measured because none was published. `api_doc/`
@@ -234,9 +236,9 @@ number. The fill inquiry is account-wide rather than per-order, which is why
 `live_mode_runner.md`'s exit backstop is one pair of scoped calls per cycle
 rather than one call per outstanding order.
 
-**T-1, T-21 and T-25 are the grade A rows.** Each backs a stated correctness
-guarantee rather than a tunable value — a wrong answer means the design
-itself is wrong, not just a config default. T-14 and T-15 were graded A while
+**The grade A rows are those the Grade column marks A.** Each backs a stated
+correctness guarantee rather than a tunable value — a wrong answer means the
+design itself is wrong, not just a config default. T-14 and T-15 were graded A while
 open, but both retired within the session that raised them.
 
 **T-1**: Exit Architecture states that WS and REST share one parser and one
@@ -244,6 +246,13 @@ open, but both retired within the session that raised them.
 asymmetry. If the granularities differ, that claim is false as written — a
 normalisation layer is needed and the guard has to be re-derived for each
 path. Verify this first.
+
+**T-36**: order-end resolution's vanished-order rule states that absence
+alone never triggers a replacement — the order's own row decides, its
+executions folded first (live_mode_runner.md). If the aggregated row's
+`AstkExecQty` is not the order's cumulative, a filled order whose fills
+were not all folded reads as vanished, and its replacement lands on a
+position already closed — the outcome that rule exists to prevent.
 
 **T-4 and T-5 WERE one question in two parts, and are no longer.** They were
 one only while the balance figure's meaning was unknown: full deployment being
@@ -273,13 +282,13 @@ reading the other's result.
 | # | Assumption | Consumed by | Grade | How to verify | Config key | Measured |
 |---|---|---|---|---|---|---|
 | I-1 | Scraping the corporate-events calendar pages is permitted by the terms of service | `metadata_crawler.md` forward check | **C** | Read the ToS | — | |
-| I-2 | The crawler's symbol extraction from the calendar's company cell, followed by `normalize_vendor_symbol()` folding, reaches an acceptable match rate against `active_ticker_universe` | Forward-check row matching | **C** | Self-measuring — `health_report.md`'s investing.com match-rate finding | — | |
+| I-2 | The crawler's symbol extraction from the calendar's company cell, matched through `match_vendor_symbol()` (`utils.md`'s single path), reaches an acceptable match rate against the 'tradable' index | Forward-check row matching | **C** | Self-measuring — `health_report.md`'s investing.com match-rate finding | — | |
 | I-3 | Which vendor is right where investing.com and yfinance disagree about an event whose effective date has passed | `metadata_crawler.md`'s `upsert_corporate_event()` disagreement branch | **C** | Self-measuring — `corporate_event_conflicts` holds both values with `observed_at`, surfaced by `health_report.md` | — | |
 
 **I-2 is deliberately observable rather than solved.** Matching now applies
 query-time normalization (`metadata_crawler.md`'s
 `crawl_corporate_events_investing()`, through `utils.md`'s
-`normalize_vendor_symbol()`) rather than a naive exact match, but the
+`match_vendor_symbol()`) rather than a naive exact match, but the
 mismatch-rate finding stays in place — normalization is best-effort, not a
 guarantee, so the residual gap remains worth tracking. That finding
 (`health_report.md` finding 10) now reports PER SOURCE; the branch that
@@ -299,9 +308,8 @@ since a halt-feed mismatch says nothing about forward-check row matching.
 - Where a row names a config key, the measured value belongs in
   `pipeline_config.yaml` under that key — recording it only in this table
   leaves the code running on its default
-- The self-measuring rows (T-2, T-10, T-12, T-13, T-17, T-18, T-19, T-27, T-33, I-2,
-  I-3) are
-  filled in during ordinary operation and do not need a separate measurement
+- The self-measuring rows — those whose How to verify reads Self-measuring —
+  are filled in during ordinary operation and do not need a separate measurement
   exercise. Most accumulate through `health_report.md` findings; T-17
   accumulates in `live_scan_daily` instead, by way of the evening
   detection-gap stage, which `health_report.md` then reads. T-2 and T-13 are

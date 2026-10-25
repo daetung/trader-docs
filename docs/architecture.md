@@ -46,7 +46,7 @@ Raw JSON (1min / 10tick, all sessions)
                            │  train / validation / test
                            ▼
                    PipelineOptimizer            Training endpoint
-                     ├── Preprocessor           run once → full_labeled_df (return_data=True)
+                     ├── Preprocessor work      input work (guest_supervisor.md) — its sealed result read
                      ├── Trainer                per-fold train
                      │     └── LightGBM Pipeline    5 independent binary classifiers
                      │     └── DimensionalityReducer  ImportanceProvider-based (model-agnostic)
@@ -66,7 +66,7 @@ Raw JSON (1min / 10tick, all sessions)
 
 ```
 Training endpoint:   PipelineOptimizer
-                         └── Preprocessor (once) → Trainer (per fold) → Backtester
+                         └── Preprocessor work's sealed result → Trainer (per fold) → Backtester
 
 Live inference endpoint: LiveModeRunner (execution orchestrator)
                          │
@@ -133,13 +133,16 @@ Standalone scripts:
 | `optimization/pipeline_optimizer.md` | Training endpoint, nested validation, successive halving, regime holdout, execution_eval (paired execution-variant evaluation at outer folds) |
 | `ops/api_contract_checklist.md` | Vendor-contract assumption inventory (trading API, yfinance, investing.com), graded by blast radius, tracked to verification before Pilot. Accumulates: a verified row keeps its measured value rather than being deleted |
 | `ops/shadow_retraining.md` | Shadow mode design, execution-parameter fitting (fit_execution_params()), retraining cadence |
-| `scripts/run_preprocess.md` | Preprocessor class, return_data, training pipeline only |
+| `scripts/run_preprocess.md` | Preprocessor class — batched steps run as a guest_supervisor work whose sealed result the optimizer reads; training pipeline only |
 | `scripts/run_train.md` | Trainer class, session_mode filter, train_log |
 | `scripts/run_backtest.md` | Backtester class, sole experiment_log writer |
 | `api/trading_api.md` | TradingAPI — the single caller-facing layer over the vendored trading-API SDK. Result contract (a rejected order returns HTTP 200), symbol/exchange encoding, async boundary. No other module imports the SDK |
 | `api/sdk_dependency.md` | The vendored SDK as an external artifact — adoption form, the three fork modifications and why none could be avoided, and the costs accepted with it |
 | `utils/execution_common.md` | Execution-time decisions shared between BacktestEngine and LiveModeRunner — signal resolution, cooldown guard, entry/exit fill simulation over a time-valued anchor, position sizing, late-entry residual-edge gate |
-| `utils/utils.md` | Shared utilities: bar sequence, signal resolution, slippage/fill simulation, label breach detection, encoding maps, trading calendar, REFERENCE_SESSION stats (populate + load), corporate-event adjustment (cum_split_ratio, adjust_bars_for_corporate_events, adjust_tick_derived_series_for_corporate_events, estimate_historical_meta, ticker rename stitching) |
+| `utils/utils.md` | Shared utilities, in these groups: bar-sequence and session-boundary primitives; trading calendar; ticker-identity and corporate-event adjustment; REFERENCE_SESSION stats; config hashing; numeric rules; health-event recording |
+| `utils/alert_delivery.md` | Delivery of findings — log record, channel queues, suppression, senders, drain |
+| `utils/db_coordination.md` | DB access coordination — roles, coordination store, locks, admission and units, precedence, recovery — through which every process reaches market.duckdb |
+| `utils/guest_supervisor.md` | The common guest entry point and its tool registry; resumable guest works — work records, resume, relaunch sweep |
 | `live/inferencer.md` | Live inference service object — _prepare_bars, infer/infer_batch, inference_log |
 | `live/live_mode_runner.md` | Live mode execution orchestrator — prefix-scan watchdog loop, recovery lane, position manager loop, session lifecycle, ticker-scoped 1-tick acquisition, shadow fills on the held-ticker REST tape |
 | `live/caching_calculator.md` | CachingIndicatorCalculator — Layer 1/2 cache, fibonacci deque, sr_levels per-entry-point |
@@ -148,7 +151,7 @@ Standalone scripts:
 | `tools/migration_tool.md` | JSON → DuckDB migration, trading_calendar/coverage init, precomputed_session_stats population |
 | `tools/detection_benchmark.md` | Entry detection threshold tuning + timing benchmark, plus the diagnostic delayed-entry decay sweep |
 | `tools/metadata_crawler.md` | Daily metadata fetch, new data ingestion, session stats daily update, evening detection-gap stage |
-| `tools/health_report.md` | Findings gathering, log/Discord/email alert delivery, alert-level config |
+| `tools/health_report.md` | Findings gathering and the invocation paths that deliver them |
 | `visualization/viz_connector.md` | Abstract base class for visualization backends |
 
 ---
@@ -197,7 +200,10 @@ stock-scalping/
 │   │   └── sdk_dependency.md
 │   ├── utils/
 │   │   ├── utils.md
-│   │   └── execution_common.md
+│   │   ├── execution_common.md
+│   │   ├── alert_delivery.md
+│   │   ├── db_coordination.md
+│   │   └── guest_supervisor.md
 │   ├── live/
 │   │   ├── inferencer.md
 │   │   ├── live_mode_runner.md
@@ -248,7 +254,10 @@ stock-scalping/
 │   │   └── trading_api.py
 │   ├── utils/
 │   │   ├── utils.py
-│   │   └── execution_common.py
+│   │   ├── execution_common.py
+│   │   ├── alert_delivery.py
+│   │   ├── db_coordination.py
+│   │   └── guest_supervisor.py
 │   └── visualization/
 │       └── viz_connector.py
 ├── scripts/

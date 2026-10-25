@@ -54,7 +54,8 @@ class FeatureExtractor:
 
         Init validates config constraints:
             lookback_bars = config["indicators"]["lookback_days"] * 390
-            max_window = max(sr_levels.window_bars, fibonacci.window_bars)
+            max_window = max(sr_levels.window_bars, fibonacci.window_bars,
+                             H_max)   # 02_indicator_calculator.md's I4
             if lookback_bars < max_window:
                 raise ConfigurationError(
                     f"lookback_days*390={lookback_bars} < max indicator window={max_window}. "
@@ -110,7 +111,7 @@ bars (t-N ... t-1)
 Different strategies apply per indicator category:
 
 ```
-Strategy A — ticker당 1회 계산 (CONTINUOUS indicators):
+Strategy A — once per ticker (CONTINUOUS indicators):
 
     Bar-derived (adj_bars; anchored to reference_date):
         0. Corporate-event bar adjustment (before indicator computation):
@@ -161,7 +162,7 @@ Strategy A — ticker당 1회 계산 (CONTINUOUS indicators):
     not apply — see 02_indicator_calculator.md's Tick-Derived Indicator Scale
     Sensitivity registry and data_boundary.md):
         1. Compute per-bar values once for the full ticker's raw ticks
-           (same "ticker당 1회" efficiency as bar-derived, but no adj_bars step)
+           (same "once per ticker" efficiency as bar-derived, but no adj_bars step)
            → dict[str, pd.DataFrame]
         2. For each entry point in entry_points:
            a. Slice to t-1 bar (by hour index)
@@ -200,13 +201,13 @@ Strategy A — ticker당 1회 계산 (CONTINUOUS indicators):
                     there is sufficient to route it through this dispatch;
                     no FeatureExtractor code change needed per new indicator.
 
-Strategy B — ticker당 1회 (monotonic deque):
+Strategy B — once per ticker (monotonic deque):
     fibonacci_retracement: computed in a single O(N) pass over all ticker bars
     via monotonic deque for sliding window max/min.
     Result: time series with one fib level set per bar.
     Sliced per entry point at t-1 (same as Strategy A).
 
-Strategy C — date당 1회 (sr_levels only):
+Strategy C — once per date (sr_levels only):
     sr_levels uses scipy prominence — incremental computation not possible.
     Computed once per date using bars up to that date's last entry point t-1.
     All entry points within the same date share the same sr_levels (price_rN,
@@ -216,9 +217,9 @@ Strategy C — date당 1회 (sr_levels only):
     if config["indicators"]["sr_levels"].get("exact_per_entry", False):
         → per-entry-point: sr_levels(bars[:t-1_window], ...) per entry point
     else (default):
-        → date당 1회 with bars_since recomputation
+        → once per date with bars_since recomputation
 
-Strategy D — date당 1회 스칼라 (gap_percentile only):
+Strategy D — once per date, scalar (gap_percentile only):
     gap_percentile returns float — not a time series.
     Computed once per date (same value for all entry points of the same date).
     session_stats dict provides the baseline.
@@ -368,7 +369,7 @@ class FeatureExtractor:
                 "min_trading_days": int,   # lookback_days
             }
 
-        Simplified: lookback_days * 390 is guaranteed >= max(window_bars)
+        Simplified: lookback_days * 390 is guaranteed >= max(window_bars, H_max)
         by init constraint. n_sessions is independent (baselines from
         precomputed_session_stats, not from bars window).
 
@@ -443,6 +444,8 @@ shares_t   = most recent fundamentals_quarterly shares_outstanding as-of
 shares_t_1 = the PRIOR quarter's filed shares_outstanding value
 ratio      = cum_split_ratio(ticker, shares_t_1's fiscal_period_end,
                              shares_t's fiscal_period_end, db_conn)
+             # between the compared rows' instant dates (their
+             # fiscal_period_end), not their filing dates
 dilution_rate = (shares_t / (shares_t_1 * ratio)) - 1
 ```
 The `cum_split_ratio()` correction is required for the same reason as
@@ -616,9 +619,9 @@ They are used by ClassBalancer for pre-balance filtering.
   indicators is origin-invariant, which is what makes the training and live
   accumulation origins agree
 - Feature column names must be deterministic and stable across runs
-- `extract_batch()` uses Strategy A/B (ticker당 1회) for CONTINUOUS indicators and fibonacci
-- `extract_batch()` uses Strategy C (date당 1회) for sr_levels by default
-- `extract_batch()` uses Strategy D (date당 1회 scalar) for gap_percentile
+- `extract_batch()` uses Strategy A/B (once per ticker) for CONTINUOUS indicators and fibonacci
+- `extract_batch()` uses Strategy C (once per date) for sr_levels by default
+- `extract_batch()` uses Strategy D (once per date, scalar) for gap_percentile
 - `extract_batch()` internally dispatches session_stats[entry_date] per entry point before
   passing flat {metric: {hour: value}} to IndicatorCalculator REFERENCE_SESSION methods
 - Disabled feature groups (per config) produce no columns
@@ -653,7 +656,7 @@ They are used by ClassBalancer for pre-balance filtering.
   REFERENCE_SESSION indicators return NaN in that case (not an error)
 - `calculator` DI: IndicatorCalculator for training (stateless); CachingIndicatorCalculator
   for live mode (injected by LiveModeRunner)
-- Init ConfigurationError if `lookback_days * 390 < max(sr_levels.window_bars, fibonacci.window_bars)`
+- Init ConfigurationError if `lookback_days * 390 < max(sr_levels.window_bars, fibonacci.window_bars, H_max)` (02_indicator_calculator.md's I4)
 - `n_sessions` and `lookback_days` are independent — no constraint between them
   (REFERENCE_SESSION baselines come from precomputed_session_stats, not from bars window)
 - Strategy A bars are corporate-event-adjusted (`utils.adjust_bars_for_corporate_events()`,
@@ -681,7 +684,8 @@ They are used by ClassBalancer for pre-balance filtering.
   `fiscal_period_end` — see `data_boundary.md`'s point-in-time principle;
   NaN (not an error) if no eligible filing exists as of `entry_date`
 - `dilution_rate`'s two-quarter shares_outstanding comparison must apply
-  `cum_split_ratio()` between the two filing dates before computing the QoQ
+  `cum_split_ratio()` between the compared rows' instant dates (their
+  `fiscal_period_end`) before computing the QoQ
   ratio — a real split between quarters must not read as spurious dilution
   (same correction principle as Strategy A's `f_e` rescale, applied here to
   a fundamentals feature rather than a bar-derived indicator)

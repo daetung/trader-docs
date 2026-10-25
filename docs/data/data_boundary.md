@@ -294,7 +294,7 @@ Example: {"Hour": "093000", "Date": "20250714", ...}
 
 tick_10 `hour` field represents the **last tick** timestamp of each 10-tick bundle (second precision).
 
-10-tick data is used for three purposes:
+10-tick data is used for these purposes:
 
 1. **Auxiliary indicator input** — TPM, avg_vol_per_tick, and other tick-derived
    indicators (see 02_indicator_calculator.md's Tick-Derived Indicator Scale
@@ -421,11 +421,14 @@ Before submitting any module, verify:
        `adjust_tick_derived_series_for_corporate_events()` output
 - [ ] FeatureExtractor/IndicatorCalculator and `populate_precomputed_session_stats()`
        always operate on corporate-event-adjusted bars/tick-derived series, never raw
-- [ ] gap_percentile's `dividend_amount`, dead position Case A's split factor
-       and dividend term, and filter E's `shares_outstanding` are scalar
-       corrections applied at
-       their one specific comparison point — not a substitute for, and not
-       satisfied by, bar-level or tick-derived-series adjustment elsewhere
-       in the same module
+- [ ] These are scalar corrections applied at their one specific
+       comparison point — not a substitute for, and not satisfied by,
+       bar-level or tick-derived-series adjustment elsewhere in the same
+       module:
+       - gap_percentile's `dividend_amount`;
+       - dead position Case A's split factor and dividend term;
+       - 09_backtest_engine.md's carried split normalisation and carried
+         dividend;
+       - filter E's `shares_outstanding`
 - [ ] `fundamentals_quarterly` lookups filter on `filed_date`, never
        `fiscal_period_end`, for any as-of query

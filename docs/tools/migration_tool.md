@@ -1,7 +1,7 @@
 # Tool: JSON → DuckDB Migration
 
 **File:** `tools/migrate_json_to_duckdb.py`
-**Standalone CLI tool — no pipeline dependencies required**
+**Standalone CLI tool — a per-run guest run through guest_supervisor.md's `run_guest`; no pipeline dependencies beyond `src/utils`**
 
 ---
 
@@ -20,14 +20,18 @@ workflow is `init_db.py` first, then this tool. The two are peers with the
 same DB access role below — neither imports the other, and this
 tool does not defensively re-create anything.
 
-**DB access role**: a guest (db_schema.md's DB File Ownership Windows),
-through utils.md's DB Access Coordination. This tool is run manually and
-rarely, never on an automated schedule:
-- the entry point runs inside `register('guest', 'migration_tool', trigger)`;
-- `market.duckdb` is opened only inside `guest_unit('migration_tool', None)`,
-  which waits for admission without limit;
-- the run is one unit, the connection that unit yields passed wherever
-  this tool takes `db_conn`;
+**DB access role**: a per-run guest (db_schema.md's DB File Ownership
+Windows; db_coordination.md's Unit scope), run through guest_supervisor.md's
+`run_guest`. This tool is run manually and rarely, never on an automated
+schedule:
+- `run_guest migration_tool` enters
+  `register('guest', 'migration_tool', trigger)` and opens one
+  `guest_unit('migration_tool', None)` around the body, which waits for
+  admission without limit;
+- the body is handed that unit's connection, passed wherever this tool
+  takes `db_conn`, and calls neither `register()` nor `guest_unit()`;
+- `tools/migrate_json_to_duckdb.py` run directly hands over to
+  `run_guest migration_tool`;
 - while an owner waits past `coordination.guest_max_hold_seconds`, the run
   ends by self-termination and is re-run.
 
@@ -56,33 +60,35 @@ pattern = r"^(?P<ticker>.+)_(?P<date>\d{8})_(?P<resolution>min|tick)\.json$"
 
 ```bash
 # Migrate all data under a root directory
-python tools/migrate_json_to_duckdb.py \
+run_guest migration_tool \
     --data-root /path/to/json/data \
     --db-path data/market.duckdb
 
 # Migrate a specific date only
-python tools/migrate_json_to_duckdb.py \
+run_guest migration_tool \
     --data-root /path/to/json/data \
     --db-path data/market.duckdb \
     --date 20250714
 
 # Dry run — count files and estimate rows without writing
-python tools/migrate_json_to_duckdb.py \
+run_guest migration_tool \
     --data-root /path/to/json/data \
     --db-path data/market.duckdb \
     --dry-run
 
 # Show progress bar
-python tools/migrate_json_to_duckdb.py \
+run_guest migration_tool \
     --data-root /path/to/json/data \
     --db-path data/market.duckdb \
     --verbose
 
 # Skip session stats computation (for large migrations where stats will be run separately)
-python tools/migrate_json_to_duckdb.py \
+run_guest migration_tool \
     --data-root /path/to/json/data \
     --db-path data/market.duckdb \
     --skip-session-stats
+
+# python tools/migrate_json_to_duckdb.py <args> hands over to run_guest migration_tool <args>
 ```
 
 ---
@@ -100,7 +106,9 @@ python tools/migrate_json_to_duckdb.py \
      d. Filter to valid trading hours: hour >= '040000' AND hour <= '200000'
         (pre-market, regular session, after-market; overnight excluded)
      e. For tick data: assign seq_id within each (ticker, date, hour) group
-     f. Bulk insert into DuckDB (INSERT OR IGNORE)
+     f. Bulk insert into DuckDB (INSERT OR IGNORE), appending source_changes
+        rows per imported (table, ticker, date) in the import's transaction
+        (db_schema.md's Source changes)
 4. Log: files processed / skipped / failed
 
 5. Post-migration: initialize calendar and coverage tables
@@ -110,7 +118,8 @@ python tools/migrate_json_to_duckdb.py \
 
 5b. Post-migration: crawl corporate events for all ingested tickers
      a. crawl_corporate_events(ticker, db_conn) for each ticker in
-        all_ingested_tickers (function sourced from metadata_crawler.md;
+        all_ingested_tickers (function sourced from tools/collect_daily.py,
+        metadata_crawler.md;
         splits, reverse splits, and dividends — see Item 1+2+3 design)
      This step MUST run before Step 6 — populate_precomputed_session_stats()
      reads corporate_events to adjust prior-session baselines for splits and
@@ -118,14 +127,27 @@ python tools/migrate_json_to_duckdb.py \
      at that point would silently produce unadjusted baselines for the
      entire historical backfill, not merely a partial gap.
 
+5c. Post-migration: trading_halts backfill
+     a. crawl_nyse_halts(date, db_conn) for every date in all_ingested_dates
+        (function sourced from tools/collect_daily.py, metadata_crawler.md)
+     A date whose crawl fails is listed as failed and the step continues.
+     Runs before Step 6.
+
 6. Post-migration: compute REFERENCE_SESSION baselines
-     a. populate_precomputed_session_stats(db_conn, all_ingested_dates,
-                                           n_sessions=20)
+     a. populate_precomputed_session_stats(db_conn, config, all_ingested_dates)
+        under the deployment config (pipeline_config.yaml)
      (function sourced from utils.py)
      Computes per-bar prior-session averages for all tickers and dates.
-     Includes: rvol_baseline, rel_dvol_baseline, intra_vol_baseline,
-               intra_return_baseline, intra_tpm_baseline, buy_ratio_baseline,
-               gap_pct_mean, gap_pct_std.
+     Includes:
+       - rvol_baseline;
+       - rel_dvol_baseline;
+       - intra_vol_baseline;
+       - intra_return_baseline;
+       - intra_tpm_baseline;
+       - buy_ratio_baseline;
+       - intra_avg_vol_per_tick_baseline;
+       - gap_pct_mean;
+       - gap_pct_std.
      Halt handling applied per metric type (see utils.md for details):
        - Cumulative metrics: halt bars contribute volume=0; full-day no-data sessions excluded
        - Per-bar metrics: halt slots excluded per hour slot; count may differ by hour
@@ -133,7 +155,10 @@ python tools/migrate_json_to_duckdb.py \
      Corporate-event adjustment (from Step 5b's data) applied per metric type
      before aggregation — see utils.md populate_precomputed_session_stats() D.
      buy_ratio_baseline requires tick_10 data (lee_ready classification).
-     Safe to re-run (INSERT OR IGNORE).
+     Re-running, per group (db_schema.md's Derived tables):
+       - an absent group is computed;
+       - a stale group is recomputed;
+       - a current group is skipped.
      Note: Step 6 is skipped if --skip-session-stats flag is passed (Step 5b
      still runs in that case, since it is cheap and other consumers may need it).
 ```
@@ -190,7 +215,7 @@ Must run before Precomputed Session Stats (below) — see rationale in Processin
 Logic Step 5b.
 
 ```python
-from metadata_crawler import crawl_corporate_events
+from collect_daily import crawl_corporate_events   # tools/collect_daily.py
 
 all_ingested_tickers = con.execute(
     "SELECT DISTINCT ticker FROM ohlcv_1min"
@@ -206,18 +231,9 @@ for ticker in all_ingested_tickers:
   helper (item N) — safe to re-run, not a bare INSERT OR IGNORE
 - See `metadata_crawler.md` for the full function definition
 
-**Re-run note:** if `corporate_events` is populated or updated (e.g. a new
-split discovered) *after* `precomputed_session_stats` already exists for the
-affected ticker/date range, those rows are now stale (unadjusted, or adjusted
-against an incomplete corporate_events snapshot). Re-running
-`populate_precomputed_session_stats()` alone will NOT correct them —
-`INSERT OR IGNORE` skips rows that already exist. Correcting stale rows
-requires:
-```sql
-DELETE FROM precomputed_session_stats WHERE ticker IN (affected_tickers)
-```
-followed by re-invoking `populate_precomputed_session_stats()` for those
-tickers' full date range.
+A `corporate_events` or `ticker_history` change after
+`precomputed_session_stats` exists turns the groups it reaches stale
+(db_schema.md's Derived tables); their producer's next run recomputes them.
 
 **Ticker rename note:** `ticker_history` (used by `utils.load_ohlcv_with_history()`
 for pre-rename bar continuity) is normally populated by an automated
@@ -227,23 +243,23 @@ backfill only, before that mechanism was live — retroactive rename discovery
 for the backfilled period is NOT automated (the CIK-mapping detector only
 observes the *current* mapping state, not historical mapping changes), so
 any renames within the backfilled date range must still be identified and
-registered manually via `metadata_crawler.py --register-rename OLD NEW
+registered manually via `tools/collect_daily.py --register-rename OLD NEW
 EFFECTIVE_DATE` — a known, accepted limitation of the migration path
 specifically, not of the ongoing daily mechanism.
 
-**Stale session_stats from a corrected rename:** the same staleness problem
-described in the Re-run note above (corporate_events discovered late) applies
-when a `ticker_history.effective_date` is self-corrected by the evening
-mechanism (see `metadata_crawler.md`) — any `precomputed_session_stats` rows
-already computed for that ticker using the pre-correction (wrong)
-`effective_date` were built from an incomplete or misaligned bar-loading
-window and are now stale. Correct them the same way as the corporate_events
-case:
-```sql
-DELETE FROM precomputed_session_stats WHERE ticker = affected_ticker
+---
+
+## Post-Migration: Trading Halts
+
+Must run before Precomputed Session Stats (below) — Processing Logic Step 5c.
+
+```python
+from collect_daily import crawl_nyse_halts   # tools/collect_daily.py
+
+for date in ingested_dates:
+    crawl_nyse_halts(date, db_conn=con)   # a failed date is listed as failed;
+                                          # the step continues
 ```
-followed by re-invoking `populate_precomputed_session_stats()` for that
-ticker's full date range.
 
 ---
 
@@ -267,7 +283,11 @@ for ticker in all_ingested_tickers:
 # fundamentals_quarterly backfill, via SEC EDGAR XBRL companyfacts,
 # keyed through ticker_cik_map (see db_schema.md, Open Item 2 design)
 for ticker in all_ingested_tickers:
-    fetch_and_upsert_companyfacts(ticker, db_conn)   # rate-limited 10 req/s
+    fetch_and_upsert_companyfacts(ticker, db_conn)   # rate-limited 10 req/s;
+                                                     # each inserted or changed
+                                                     # (ticker, filed_date) appends
+                                                     # a source_changes row
+                                                     # (db_schema.md)
 ```
 
 Both are large one-time backfills (tick_bar_aggregates over the full
@@ -286,8 +306,10 @@ from utils import populate_precomputed_session_stats
 
 populate_precomputed_session_stats(
     db_conn=con,
+    config=config,      # the deployment config (pipeline_config.yaml);
+                        # indicators.reference_session.n_sessions sets the
+                        # prior session count
     dates=ingested_dates,
-    n_sessions=20,      # prior session count for baseline
 )
 ```
 
@@ -295,16 +317,22 @@ populate_precomputed_session_stats(
 - For each (ticker, as_of_date): computes per-bar average over prior n_sessions
 - Metrics computed from ohlcv_1min: rvol_baseline, rel_dvol_baseline,
   intra_vol_baseline, intra_return_baseline
-- Metrics computed from tick_10 (lee_ready): buy_ratio_baseline, intra_tpm_baseline
+- Metrics computed from tick_10 (lee_ready):
+  - buy_ratio_baseline;
+  - intra_tpm_baseline;
+  - intra_avg_vol_per_tick_baseline
 - Day-level metrics (hour='000000'): gap_pct_mean, gap_pct_std
 - Halt handling applied per metric type (see utils.md — populate_precomputed_session_stats)
 - Corporate-event (split/dividend) adjustment applied per metric type before
   aggregation, using the `corporate_events` table populated in the prior step
   (see utils.md — populate_precomputed_session_stats() section D.)
-- Stores avg_value, std_value, count per (ticker, as_of_date, hour, metric, n_sessions)
+- Stores avg_value, std_value, count per (config_hash, ticker, as_of_date, hour, metric)
 - Delta smoothing is NOT applied here — applied at load time via load_session_stats()
   or build_session_stats_dict()
-- Safe to re-run (INSERT OR IGNORE)
+- Re-running, per group:
+  - an absent group is computed;
+  - a stale group is recomputed, its rows replaced;
+  - a current group is skipped
 - First n_sessions dates in the dataset will have count < n_sessions (uses available data)
 
 ---
@@ -328,23 +356,21 @@ python tools/collect_daily.py \
     --data-root /path/to/json/data \
     --date {last_ingested_date}
 
-# Option B: Manually populate session_stats for the first live date
-# (a guest through utils.md's DB Access Coordination)
-python - <<'EOF'
-from utils import (register, guest_unit, populate_precomputed_session_stats,
-                   get_next_trading_day)
-with register("guest", "migration_tool", "manual"):
-    with guest_unit("migration_tool", None) as con:
-        last_date = con.execute("SELECT MAX(date) FROM ohlcv_1min").fetchone()[0]
-        first_live_date = get_next_trading_day(last_date, con)
-        populate_precomputed_session_stats(con, dates=[first_live_date], n_sessions=20)
-        print(f"Session stats populated for {first_live_date}")
-EOF
+# Option B: the ingest-only partial run for the last ingested date — a guest
+# (metadata_crawler.md's CLI); its session stats update computes the next
+# trading day's groups, the first live date's, under the deployment config;
+# an already-ingested date's files are skipped
+python tools/collect_daily.py \
+    --db-path data/market.duckdb \
+    --data-root /path/to/json/data \
+    --ingest-only \
+    --date {last_ingested_date}
 ```
 
-Failure to run this step will cause LiveModeRunner Phase 1 bulk load to return
-an empty DataFrame for `as_of_date = first_live_date`, resulting in all
-REFERENCE_SESSION indicators returning NaN for the first live session.
+Failure to run this step leaves LiveModeRunner's Session Lifecycle Step 2
+load with no group for `as_of_date = first_live_date`; Health Gate 1a's
+session_stats coverage check then blocks participation for the first live
+session (live_mode_runner.md).
 
 ---
 
@@ -362,7 +388,7 @@ Migration summary:
 Post-migration:
   trading_calendar        : 1,260 dates populated
   ticker_data_coverage    : 11,847 tickers × dates populated
-  precomputed_session_stats: 11,847 tickers × 1,240 dates × 390 bars × 8 metrics populated
+  precomputed_session_stats: 11,847 tickers × 1,240 dates × 390 bars × 9 metrics populated
                              (390 = an ordinary session; a capacity estimate)
   Duration (session stats): 8m 14s
 ```
@@ -373,7 +399,10 @@ Failed files are logged to `tools/migration_errors.log` with filename and except
 
 ## Constraints
 
-- Must be runnable independently from the pipeline (no src/ imports required, except utils.py)
+- Must be runnable independently from the pipeline: no `src/` imports beyond
+  `src/utils` (utils, and guest_supervisor for the hand-over to `run_guest`)
+- Calls neither `register()` nor `guest_unit()` — `run_guest` opens its unit
+  and hands the body its connection
 - Issues no DDL — `tools/init_db.py` (see `init_db.md`) must have created the
   schema first; this tool only INSERTs and populates
 - Duplicate skip is at `(ticker, date)` granularity per table — entire file skipped if any row exists
@@ -387,10 +416,14 @@ Failed files are logged to `tools/migration_errors.log` with filename and except
   and always runs before session stats computation regardless of
   --skip-session-stats (cheap, and other consumers besides session_stats
   depend on corporate_events being populated)
+- Post-migration trading_halts backfill (Step 5c) runs before session stats
+  computation; a date whose crawl fails is listed as failed and the step
+  continues
 - Post-migration session stats computation is mandatory unless --skip-session-stats passed
 - `populate_trading_calendar()`, `populate_ticker_coverage()`, and `populate_precomputed_session_stats()` sourced from `utils.py`
-- `crawl_corporate_events()` sourced from `metadata_crawler.py`, not `utils.py` —
-  imported across tool boundaries for this one step
+- `crawl_corporate_events()` and `crawl_nyse_halts()` sourced from
+  `tools/collect_daily.py`, not `utils.py` — imported across tool boundaries
+  for these steps
 
 ---
 

@@ -1,7 +1,7 @@
 # Tool: Database Initialization
 
 **File:** `tools/init_db.py`
-**Standalone CLI tool — no pipeline dependencies required**
+**Standalone CLI tool — a per-run guest run through guest_supervisor.md's `run_guest`; no pipeline dependencies beyond `src/utils`**
 
 ---
 
@@ -26,16 +26,18 @@ separate means the destructive-looking one (schema creation) is always an
 explicit, deliberate invocation rather than something that can happen as a
 side effect of a data job.
 
-**DB access role**: a guest (db_schema.md's DB File Ownership Windows),
-through utils.md's DB Access Coordination. Run manually and rarely — in the
-ordinary case exactly once, when a database is first created — never on an
-automated schedule:
-- the entry point runs inside `register('guest', 'init_db', trigger)`;
-- `market.duckdb` is opened only inside `guest_unit('init_db', None)`, which
-  waits for admission without limit;
-- the run is one unit;
+**DB access role**: a per-run guest (db_schema.md's DB File Ownership Windows;
+db_coordination.md's Unit scope), run through guest_supervisor.md's
+`run_guest`. Run manually and rarely — in the ordinary case exactly once, when
+a database is first created — never on an automated schedule:
+- `run_guest init_db` enters `register('guest', 'init_db', trigger)` and opens
+  one `guest_unit('init_db', None)` around the body, which waits for admission
+  without limit;
+- the body is handed that unit's connection and calls neither `register()`
+  nor `guest_unit()`;
+- `tools/init_db.py` run directly hands over to `run_guest init_db`;
 - while an owner waits past `coordination.guest_max_hold_seconds`, the run
-  ends by self-termination and is re-run.
+  ends by self-termination and is re-run from scratch.
 
 ---
 
@@ -59,7 +61,51 @@ Statements are already written `CREATE TABLE IF NOT EXISTS` (and the one view
 this tool decides or adds.
 
 **When `db_schema.md` changes, `SCHEMA_STATEMENTS` is re-transcribed from it.**
-The most recent occasion is the carried-exit records, the market-BUY limit
+The most recent occasion is one DDL set decided together, moving the table
+count 40 -> 42, for:
+- the derived-data contract with its source journal;
+- the trading-API symbol columns;
+- the session baselines.
+Its DDL:
+- New tables (class 1): `derived_configs`, `source_changes`.
+- `ticker_cik_map` (class 2): nullable columns, added by `ADD COLUMN` alone:
+  - `trading_api_name` (`VARCHAR`);
+  - `trading_api_seen_date` (`VARCHAR`);
+  - `sec_title` (`VARCHAR`);
+  then an existing-row step: `trading_api_seen_date` set to the application
+  date on rows whose `trading_api_symbol` is NOT NULL.
+- `live_session_state` (class 2): nullable columns, added by `ADD COLUMN`
+  alone:
+  - `all_tickers` (`VARCHAR[]`);
+  - `rate_overlay` (`JSON`).
+- `labeled_samples` (REBUILD, without row copy):
+  - added:
+    - `config_hash`;
+    - `is_provisional`;
+    - `source_seq`;
+  - the primary key becomes `(config_hash, ticker, date, hour)`.
+  An existing row's config_hash is
+  unknowable, so no row is copied; the Preprocessor batch's ensure
+  repopulates the table.
+- `precomputed_session_stats` (REBUILD, without row copy):
+  - added: `config_hash`, `source_seq`;
+  - dropped: `n_sessions`;
+  - the primary key becomes `(config_hash, ticker, as_of_date, hour, metric)`.
+  No row is copied; the
+  evening session-stats stage repopulates the next trading day's groups and
+  the Preprocessor batch's ensure the history.
+- The set is applied before the evening run whose session-stats stage
+  computes the next session's groups.
+- No DDL change — value lists in comments:
+  - `batch_runs` stages;
+  - `alert_log` alert_key and severity;
+  - `health_events` finding_name;
+  - `live_orders` terminal_cause;
+  - `trading_halts.halt_end`;
+  - `fundamentals_quarterly.fiscal_period_end`;
+  - `live_session_state.session_diagnostics` keys.
+
+The occasion before it was the carried-exit records, the market-BUY limit
 record and the run-state records, one DDL set decided together, adding no
 table and applied while no database holds rows, so with no existing-row step:
 - `trade_log` (class 2): nullable columns, added by `ADD COLUMN` alone:
@@ -205,11 +251,13 @@ applying a schema change — see "Applying a schema change" below.
 
 ```bash
 # Create the database and all tables (the ordinary case)
-python tools/init_db.py --db-path data/market.duckdb
+run_guest init_db --db-path data/market.duckdb
 
 # Report drift between the live database and SCHEMA_STATEMENTS.
 # Read-only: opens the DB, prints findings, changes nothing.
-python tools/init_db.py --db-path data/market.duckdb --verify
+run_guest init_db --db-path data/market.duckdb --verify
+
+# python tools/init_db.py <args> hands over to run_guest init_db <args>
 ```
 
 ---
@@ -217,7 +265,8 @@ python tools/init_db.py --db-path data/market.duckdb --verify
 ## Processing Logic
 
 ```
-1. Open data/market.duckdb read-write (creates the file if absent).
+1. Take the connection run_guest's unit hands over — data/market.duckdb,
+   read-write, the file created when absent.
 
 2. Execute every statement in SCHEMA_STATEMENTS, in order, inside a
    SINGLE TRANSACTION.
@@ -312,27 +361,26 @@ re-transcribing and before assuming the change has landed.
 ## Output / Logging
 
 Plain stdout; no log file and no `batch_runs` row (its DB access is the
-guest role above; the helper writes its `UNIT` lines, utils.md's DB Access
-Coordination).
+guest role above; the helper writes its `UNIT` lines, db_coordination.md).
 
 ```
-init:   created 40 tables, 0 already present    # fresh database
-init:   created 1 table, 39 already present     # after a new table was added
-verify: 40 tables checked, 0 differences
-verify: 40 tables checked, 1 difference
+init:   created 42 tables, 0 already present    # fresh database
+init:   created 1 table, 41 already present     # after a new table was added
+verify: 42 tables checked, 0 differences
+verify: 42 tables checked, 1 difference
         corporate_events: column 'basis_date' missing — ALTER needed
-verify: 40 tables checked, 1 difference          # a constraint, not a column
+verify: 42 tables checked, 1 difference          # a constraint, not a column
         trade_log: column 'signal' nullability differs — ALTER needed
-verify: 40 tables checked, 1 difference          # a table constraint
+verify: 42 tables checked, 1 difference          # a table constraint
         trade_log: CHECK constraint differs — REBUILD
-verify: 40 tables checked, 2 differences         # two columns, one table
+verify: 42 tables checked, 2 differences         # two columns, one table
         trading_calendar: column 'session_close' missing — ALTER needed
         trading_calendar: column 'after_hours_end' missing — ALTER needed
-verify: 40 tables checked, 2 differences         # a rename, seen from both sides
+verify: 42 tables checked, 2 differences         # a rename, seen from both sides
         live_positions: column 'lifecycle' missing — ALTER needed
         live_positions: column 'status' not in statements — reported
         # a rename seen from both sides; one RENAME COLUMN settles both
-verify: 40 tables checked, 1 difference          # the view
+verify: 42 tables checked, 1 difference          # the view
         live_position_state: view missing — re-run init
 ```
 
@@ -340,7 +388,11 @@ verify: 40 tables checked, 1 difference          # the view
 
 ## Constraints
 
-- Must be runnable independently from the pipeline (no `src/` imports required)
+- Must be runnable independently from the pipeline: no `src/` imports beyond
+  `src/utils` (utils, and guest_supervisor for the hand-over to `run_guest`),
+  as in migration_tool.md
+- Calls neither `register()` nor `guest_unit()` — `run_guest` opens its unit
+  and hands the body its connection
 - Issues the ONLY DDL in the system — no other component may create, alter,
   or drop a table
 - `SCHEMA_STATEMENTS` is transcribed verbatim from `db_schema.md`'s canonical
@@ -350,5 +402,5 @@ verify: 40 tables checked, 1 difference          # the view
   behind
 - Never alters or drops an existing table, under any flag
 - `--verify` is strictly read-only
-- No `batch_runs` marker and no scheduled invocation; a guest whose run is
-  one unit (DB access role above)
+- No `batch_runs` marker and no scheduled invocation; a per-run guest whose
+  run is one unit (DB access role above)

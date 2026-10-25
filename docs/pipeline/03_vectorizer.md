@@ -183,7 +183,7 @@ Configured in `pipeline_config.yaml`. Default mapping:
 | **rel_dvol** | **statistical_summary** | **window_comparison** |
 | **relative_avg_vol_per_tick** | **statistical_summary** | **window_comparison** |
 | **intra_season_{metric}** | **statistical_summary** | **window_comparison** |
-| **gap_pct** | **(Vectorizer 미사용 — FeatureExtractor inline 처리)** | — |
+| **gap_pct** | **(Vectorizer unused — computed inline by FeatureExtractor)** | — |
 | **obv, ad** | **linear_trend** | **window_comparison (delta only — see note)** |
 
 `gap_percentile` is excluded from Vectorizer dispatch. FeatureExtractor inserts
@@ -216,7 +216,7 @@ to the series, and `window_delta` is a difference. That is what makes the two
 paths agree. Both vectorize the same `lookback_days * 390` window
 (`data_boundary.md`'s `bars t-N ... t-1`); what differs is the accumulation
 ORIGIN carried into it, because the cumulative sum is computed before the
-slice — training accumulates from the ticker's full history, live from the
+slice — training accumulates from the batch's lookback start, live from the
 `lookback_days` seed window (`caching_calculator.md`). No re-accumulation
 after slicing: it would break Strategy A's once-per-ticker computation and
 the calculator's O(1) incremental discipline for no gain.

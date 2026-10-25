@@ -196,27 +196,33 @@ def is_tradable(ticker: str, db_conn) -> bool:
     now". Checked once, at the point EntryPointDetector confirms a
     candidate, before sizing/order submission.
 
-    Checks ticker_cik_map.rename_pending (rename-pending-confirmation case)
-    and .quarantine_reason (P-8's same-day corporate-event anomaly case —
-    see metadata_crawler.md's check_corporate_event_anomaly()) — tradable
-    only when BOTH are clear. The two are independent columns (N-2 — see
-    db_schema.md's ticker_cik_map) specifically so this OR-of-two-blockers
-    check can be a flat condition with no cross-reason interaction to
-    reason about. Deliberately does NOT check tick-rate/staleness/halt —
+    Reads the ticker's current ticker_cik_map row (db_schema.md's
+    current-row rule — its row with the latest last_seen_date); tradable
+    only when all of these hold:
+        - trading_api_symbol is set — no row, or a NULL trading_api_symbol,
+          leaves the ticker unaddressable by the trading API;
+        - rename_pending is FALSE (rename-pending-confirmation case);
+        - quarantine_reason IS NULL (P-8's same-day corporate-event anomaly
+          case — see metadata_crawler.md's check_corporate_event_anomaly()).
+    rename_pending and quarantine_reason are independent columns (N-2 — see
+    db_schema.md's ticker_cik_map) specifically so this check can be a flat
+    condition with no cross-reason interaction to reason about.
+    Deliberately does NOT check tick-rate/staleness/halt —
     EntryPointDetector's own volume-gated filters (B/C/D — see
     01_entry_detection.md) already fail on a genuinely stale or halted
     ticker, so a separate check here would be redundant.
 
     Returns:
-        True if the ticker is tradable (rename_pending=FALSE AND
-        quarantine_reason IS NULL, or no ticker_cik_map row exists at all
-        — an unmapped ticker is not a rename-ambiguity or quarantine case).
+        True if the ticker is tradable — the conditions above; False
+        otherwise, the entry gate result being 'not_tradable'.
     """
-    row = db_conn.execute(
-        "SELECT rename_pending, quarantine_reason FROM ticker_cik_map "
+    row = db_conn.execute(                           # the current row
+        "SELECT trading_api_symbol, rename_pending, quarantine_reason "
+        "FROM ticker_cik_map "
         "WHERE ticker = ? ORDER BY last_seen_date DESC LIMIT 1", [ticker]
     ).fetchone()
-    return row is None or (row[0] is False and row[1] is None)
+    return (row is not None and row[0] is not None
+            and row[1] is False and row[2] is None)
 ```
 
 ---
@@ -611,12 +617,11 @@ execution:
   sell_rate_tp:               0.30 # fraction of per-tick volume, take-profit exits
   sell_rate_sl:               0.15 # fraction of per-tick volume, stop-loss exits
   sell_rate_neutral:          0.15 # fraction of per-tick volume, DIRECTION-FREE
-                                    # exits — every exit_reason other than
-                                    # take_profit and stop_loss (exit_fill_mode(),
-                                    # below): time_limit, session_end,
-                                    # restart_gap_exit, overnight_exit,
-                                    # dead_position, and a label inherited along
-                                    # a chain. The other
+                                    # exits — a carried exit, and every
+                                    # trade_log.exit_reason registry value
+                                    # (db_schema.md) other than take_profit
+                                    # and stop_loss (exit_fill_mode(), below).
+                                    # The other
                                     # two rates are indexed on direction — a
                                     # take-profit exit sells into a rising market
                                     # with more buyers, a stop-loss into a falling
@@ -839,11 +844,12 @@ def get_execution_param(
     place (same single-source-of-truth pattern as resolve_signal(),
     can_enter()).
 
-    Called ONCE PER TOP-LEVEL RUN, for every (rate, order type) pair, by
-    resolve_rates() (below), which these entry points call:
+    Called ONCE PER TOP-LEVEL RUN — for pipeline_optimizer once per work,
+    at work creation (the work's rate_snapshot) — for every (rate, order
+    type) pair, by resolve_rates() (below), which these call:
     - LiveModeRunner's session start;
-    - run_backtest.py's CLI entry point;
-    - pipeline_optimizer's coordinator.
+    - the start of run_backtest's body as run_guest runs it;
+    - pipeline_optimizer's coordinator, at work creation.
     The results overlay the in-memory config's rate values (Rate Overlay,
     below) — the config file is never written. The resolved values and
     their source (the row's fitted_at, 'seed' or 'seed_bound_fallback') are
@@ -889,8 +895,9 @@ def get_execution_param(
 def resolve_rates(db_conn, config) -> tuple[dict, dict]:
     """
     Resolve every (rate, order type) pair through get_execution_param()
-    once per top-level run, overlay the in-memory config (Rate Overlay,
-    below) and log the resolved values and their sources.
+    once per top-level run — for pipeline_optimizer once per work, at work
+    creation (the work's rate_snapshot) — overlay the in-memory config
+    (Rate Overlay, below) and log the resolved values and their sources.
     Returns (config, rate_sources):
     - config — the overlaid config;
     - rate_sources — {param_name: {order_type: {"value": …, "source": …}}},
@@ -937,19 +944,22 @@ def exit_fill_mode(
     config: dict,
     exit_reason: str,
     order_type: str,
+    carried: bool,
 ) -> tuple[str, float | None]:
     """
-    How an exit fills, by exit_reason, from the overlaid config:
+    How an exit fills, by exit_reason and carried, from the overlaid config:
     - ('reference', None) for time_limit and session_end while
       execution.simulate_nondirectional_exit_fill is false — a full fill at
       the reference price;
     - otherwise ('simulate', rate):
-      - take_profit → sell_rate_tp;
-      - stop_loss → sell_rate_sl;
-      - every other exit_reason → sell_rate_neutral — time_limit and
-        session_end (the switch on), restart_gap_exit, overnight_exit,
-        dead_position, and a label inherited along a chain; the reasons
-        other than time_limit and session_end always simulate.
+      - take_profit → sell_rate_tp, when not carried;
+      - stop_loss → sell_rate_sl, when not carried;
+      - sell_rate_neutral for a carried exit and for every other value of
+        db_schema.md's trade_log.exit_reason registry; the reasons other
+        than time_limit and session_end always simulate.
+    carried — the call site's: live_mode_runner.md's (the exit logical
+    order's chain's first request order_date before today) and
+    09_backtest_engine.md's (a Carried date exit).
     """
     ...
 ```
@@ -1214,6 +1224,10 @@ with per-date boundaries.** Every submission site uses it:
   - the vanished and halt-clear replacements;
   - the Unified Overnight Policy's liquidation;
 - BacktestEngine's and the shadow's simulators, at order start.
+
+In live, the market-withheld state (live_mode_runner.md's Order and fill
+ledger — the date holding a `session_phase_mismatch` health event row) makes
+market not permitted at every live site above, on top of this table.
 
 The vendor permits order types by session phase:
 
@@ -1500,10 +1514,15 @@ Normalisation and fallback:
     market, the limit price for limit.
 - `is_tradable()` is intentionally NOT part of BacktestEngine's entry-side
   flow (N-5), even though it is Sizing→Funds→Fill's first step for
-  LiveModeRunner above. `ticker_cik_map`'s rename_pending/quarantine_reason
-  reflect data-pipeline/vendor-latency state AS OF NOW, not as of whatever
+  LiveModeRunner above. Its `ticker_cik_map` inputs reflect
+  data-pipeline/vendor-latency state AS OF NOW, not as of whatever
   historical date a backtest run happens to be simulating — there is no
-  date-scoping on that table (see db_schema.md's ticker_cik_map). Calling
+  date-scoping on that table (see db_schema.md's ticker_cik_map); the
+  inputs (Tradability Gate):
+  - `trading_api_symbol`;
+  - `rename_pending`;
+  - `quarantine_reason`.
+  Calling
   `is_tradable()` from BacktestEngine would therefore make backtest results
   depend on the CURRENT contents of a table unrelated to the dates being
   simulated (non-deterministic re-runs of the "same" backtest, and
@@ -1529,16 +1548,17 @@ Normalisation and fallback:
   Rate selection by exit reason is `exit_fill_mode()`'s (Fill-Rate
   Selection)
 - `simulate_entry_fill()` mirrors `simulate_exit_fill()`'s cumulative tick
-  structure; unlike the exit side, an unfilled remainder is canceled (order
-  timeout) rather than penalized
+  structure; an unfilled remainder is canceled (order timeout)
 - The fill simulators' callers:
   - `simulate_exit_fill()`:
     - BacktestEngine's Exit Logic
-    - live mode's `stage == "shadow"` branch
+    - live mode's shadow branch (the session's stage,
+      `live_session_state.stage`, being 'shadow')
     - the pilot counterfactual, Session Shutdown's carried case included
   - `simulate_entry_fill()`:
     - BacktestEngine's Entry Slippage Model
-    - live mode's `stage == "shadow"` branch
+    - live mode's shadow branch (the session's stage,
+      `live_session_state.stage`, being 'shadow')
     - the pilot counterfactual
 
   In live, the shadow's calls are step-form calls over the REST portion of
@@ -1557,8 +1577,8 @@ Normalisation and fallback:
   `status` is therefore not subdivided by shortfall cause (volume vs
   price) — a single `"canceled"` covers both
 - `get_execution_param()` (N-7) is the sole resolver of these rates, per
-  order type, run once per top-level run, its results overlaying the
-  in-memory config:
+  order type, run once per top-level run — for pipeline_optimizer once per
+  work, at work creation — its results overlaying the in-memory config:
   - buy_rate
   - sell_rate_tp
   - sell_rate_sl

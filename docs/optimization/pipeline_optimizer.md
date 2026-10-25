@@ -23,26 +23,32 @@ Supports three operational phases with distinct objectives:
 
 ## Architecture Position
 
-**DB access role.** A guest (db_schema.md's DB File Ownership Windows),
-through utils.md's DB Access Coordination:
-- the entry point runs inside `register('guest', 'pipeline_optimizer', trigger)`;
-- `market.duckdb` is opened only inside `guest_unit('pipeline_optimizer', None)`,
-  which waits for admission without limit;
-- `db_conn` comes from that unit before `PipelineOptimizer(config, db_conn)`
-  is constructed; the coordinator's flushes use it, and workers open no
-  connection;
-- the run is one unit, the connection that unit yields passed wherever
-  this entry point takes `db_conn`;
-- while an owner waits past `coordination.guest_max_hold_seconds`, the run
-  ends by self-termination and is re-run.
+**DB access role.** A step guest (db_schema.md's DB File Ownership Windows;
+db_coordination.md's Unit scope), run through guest_supervisor.md's
+`run_guest`, and a dependent of the Preprocessor work it uses (Work, below):
+- `run_guest pipeline_optimizer` (CLI, below) enters
+  `register('guest', 'pipeline_optimizer', trigger)` and hands the body a
+  work opener and a unit opener;
+- every unit the unit opener opens is a
+  `guest_unit('pipeline_optimizer', None)`, waiting for admission without
+  limit;
+- the coordinator holds one unit per step, computing each step — its
+  workers included — inside its unit and releasing the unit when the step
+  commits (Work, below);
+- a step's DB writes form one transaction committed at the step's end, on
+  the connection that step's unit opens; Trainer and Backtester instances
+  are built per step on that connection, and workers open no connection;
+- the body calls neither `register()` nor `guest_unit()`;
+- a run ended by self-termination leaves its work to resume through
+  guest_supervisor.md.
 
 ```
 Training endpoint:  PipelineOptimizer
-    └── Preprocessor.run(return_data=True)    ← returns full_labeled_df (unsplit), called once
-    └── utils.compute_vol_regime_holdout()    ← regime holdout dates
+    └── its input work's sealed result        ← Preprocessor.load_result() → full_labeled_df (unsplit)
+    └── utils.compute_vol_regime_holdout()    ← regime holdout dates, over the pinned range
     └── ClassBalancer.generate_folds()        ← outer and inner rolling folds
     └── Trainer.run(...)                      ← per-fold train (dry_run in workers)
-    └── Coordinator DB flush                  ← sequential train_log INSERT
+    └── Coordinator DB flush                  ← train_log INSERT in the step's transaction
     └── Backtester.run(...)                   ← writes experiment_log
 
 Live inference endpoint: Inferencer (separate module)
@@ -51,8 +57,120 @@ Live inference endpoint: Inferencer (separate module)
     └── model.load() → resolve_signal()
 ```
 
-PipelineOptimizer imports and calls `Preprocessor`, `Trainer`, `Backtester` directly.
-It does not invoke run scripts as subprocesses.
+PipelineOptimizer reads its input work's sealed result through
+`Preprocessor.load_result()` (run_preprocess.md's Result Loader) and imports
+and calls `Trainer` and `Backtester` directly. It constructs no
+Preprocessor and invokes no run script as a subprocess.
+
+---
+
+## Work
+
+The optimizer runs as a guest_supervisor.md work — a step tool without a
+sealed result — and is a dependent of its input work, the Preprocessor work
+it uses.
+
+Config hash and fixed inputs (guest_supervisor.md's Config Hash and Fixed
+Inputs):
+- `config_hash` covers the full config with the dispatched phase, not
+  `'refresh'`, and the content of the variant's input files —
+  `optimizer.selected_features_path` for `'full'` and `'exploitation'`;
+- variant — the dispatched phase;
+- `work_id` = `optimizer_run_id`, generated at work creation and reused by a
+  resumed work;
+- pin — its input work's pin;
+- `rate_snapshot` (its tool snapshot) — the rates resolved once at work
+  creation by execution_common.md's `resolve_rates()`, with their
+  `rate_sources`;
+- `input_works` — its input work, the seal hash recorded at first
+  consumption;
+- every execution of the work reads its fixed inputs, never the current
+  config or input files: the config is the work's config snapshot overlaid
+  with its `rate_snapshot` (execution_common.md's Rate Overlay), and
+  `selected_features` is the snapshot's content of
+  `optimizer.selected_features_path`.
+
+Opening — a new run's first unit (a `--resume-work` run is handed its work
+already opened):
+- computes the input work's pin (run_preprocess.md's Work) and resolves the
+  rates (`resolve_rates()`);
+- resolves its own work, then its input work, by guest_supervisor.md's
+  New-Run Resolution with the run's trigger:
+  - `--supersede` applies to its own work and its input work;
+  - the rows to create are created together, and any refusal creates none;
+  - the input's config_hash is computed from the preprocess keys of this
+    config (run_preprocess.md's Config Keys Used, inside config_hash);
+  - the reuse case's stale-batch check is run_preprocess.md's;
+  - a created work takes the computed pin and the resolved rates; a resumed
+    work keeps its fixed inputs;
+- a created input work is executed by the `run_guest run_preprocess`
+  process the sweep launches (guest_supervisor.md);
+- the unit is released before any wait for the input work (Data
+  preparation, below).
+
+Data preparation, in every phase, holding no unit:
+- waits until its input work is `'done'` with a valid seal
+  (guest_supervisor.md's Dependency):
+  - an input work turning `'halted'` ends the run `'blocked'`;
+  - this work turns superseded when its input work:
+    - turns superseded;
+    - is found with an invalid seal;
+    - is found with a seal hash differing from the one recorded;
+- loads the result:
+  `full_labeled_df = Preprocessor.load_result(input work_id, its recorded seal hash)`.
+
+Steps — the coordinator holds one unit per step:
+- selection — each fold; the closing vote;
+- full — each fold; the closing backtest;
+- exploitation:
+  - the regime holdout computation and record;
+  - each (outer fold, Successive Halving round), the final round also
+    carrying `auc_std` and `best_of_loop`;
+  - each outer eval;
+  - each execution variant;
+  - the closing step, producing:
+    - the consensus;
+    - the final model;
+    - the regime holdout report.
+
+In the code below, `with step(done) as conn:` opens one unit from the unit
+opener; when `done(conn)` holds it releases the unit without running the
+body, otherwise it runs the body on `conn` and commits at the body's end,
+recording progress (`work_progress()`).
+
+Resume — a run resuming the work:
+- a step whose run_ids exist in `train_log` / `experiment_log` is skipped;
+  each step's completion is judged from its DB rows, never from the work
+  record;
+- the regime holdout is read from the work's `regime_holdout_dates` rows
+  when any exist, otherwise computed over the pinned range and recorded;
+  no separate completion record;
+- rates come from `rate_snapshot`, not re-resolved;
+- the search space is regenerated from `random_state`;
+- Successive Halving state (per-trial AUC history, pruning) is rebuilt from
+  completed rounds' `train_log` rows (`auc_mean`, `is_pruned`).
+
+Refresh run — `optimizer.phase: "refresh"`, launched as
+`run_guest pipeline_optimizer --trigger scheduled` (shadow_retraining.md); it
+decides the dispatched phase (`'full'` or `'exploitation'`) before opening
+its work:
+- it first looks for the tool's unfinished work:
+  - one exists → that work's config_hash is compared with the hashes of the
+    current config under `'full'` and under `'exploitation'`; a match
+    resolves it by New-Run Resolution under the matching phase; no match →
+    the run is refused, the triggers not evaluated;
+  - none → the calendar and divergence triggers (shadow_retraining.md's
+    Retraining Cadence) are evaluated in one unit; no trigger firing → the
+    run ends `'normal'` without a work; otherwise it resolves its work under the
+    dispatched phase;
+- the calendar trigger's last refit is the `updated_at` of the latest
+  pipeline_optimizer work row closed `'done'` whose variant is `'full'` or
+  `'exploitation'` (guest_supervisor.md's work records; a closed row is not
+  updated again); these do not satisfy the cadence:
+  - a refused run;
+  - a superseded work;
+  - a halted work;
+- a `--resume-work` run skips the trigger evaluation.
 
 ---
 
@@ -76,19 +194,18 @@ enabled, then aggregating results via frequency voting.
 ```
 
 ```python
-optimizer_run_id = utils.generate_run_id()
-
-preprocessor    = Preprocessor(config, db_conn)
-full_labeled_df = preprocessor.run(return_data=True)
+optimizer_run_id = work.work_id                  # Work, above
+full_labeled_df  = <Data preparation, Work above>
 
 balancer = ClassBalancer(config)
-trainer  = Trainer(config, db_conn, optimizer_run_id=optimizer_run_id)
 
 inner_cfg = config["class_balancer"]["inner_fold"]
 
-fold_run_ids      = []
-fold_aucs         = []
-reduction_reports = []
+fold_run_ids = []
+fold_idxs    = []
+
+def report_path(fold_idx):                       # the fold step's reduction report
+    return f"data/processed/resume/{optimizer_run_id}/reduction_f{fold_idx}.json"
 
 for train, val, test, fold_meta in balancer.generate_folds(
     full_labeled_df,
@@ -103,34 +220,45 @@ for train, val, test, fold_meta in balancer.generate_folds(
 ):
     fold_idx = fold_meta["fold_idx"]
     run_id   = f"{optimizer_run_id}_f{fold_idx}"   # structured ID — no collision risk
-    result   = trainer.run(
-        train, val, test,
-        run_id=run_id,
-        fold_idx=fold_idx,
-        outer_fold_idx=-1,
-        fold_train_start=fold_meta["fold_train_start"],
-        fold_train_end=fold_meta["fold_train_end"],
-        fold_train_days=fold_meta["fold_train_days"],
-        run_reducer=True,
-        phase="selection",
-        trial_idx=0,
-    )
     fold_run_ids.append(run_id)
-    fold_aucs.append(result["auc_mean"])
-    reduction_reports.append(result["reduction_report"])
+    fold_idxs.append(fold_idx)
+    # Step: this fold — done when its run_id is in train_log
+    with step(done=lambda conn: in_train_log(conn, run_id)) as conn:
+        trainer = Trainer(config, conn, optimizer_run_id=optimizer_run_id)
+        result  = trainer.run(
+            train, val, test,
+            run_id=run_id,
+            fold_idx=fold_idx,
+            outer_fold_idx=-1,
+            fold_train_start=fold_meta["fold_train_start"],
+            fold_train_end=fold_meta["fold_train_end"],
+            fold_train_days=fold_meta["fold_train_days"],
+            run_reducer=True,
+            phase="selection",
+            trial_idx=0,
+        )
+        # written through temp + rename BEFORE the step's commit, so a
+        # committed fold always has its report
+        save_json(result["reduction_report"], report_path(fold_idx))
 
-auc_std = std(fold_aucs) if len(fold_aucs) > 1 else 0.0
-db_conn.execute(
-    "UPDATE train_log SET auc_std = ? WHERE run_id = ?",
-    [auc_std, fold_run_ids[-1]]
-)
+# Step: the closing vote — done when auc_std is set on fold_run_ids[-1]
+with step(done=lambda conn: auc_std_set(conn, fold_run_ids[-1])) as conn:
+    fold_aucs         = [<train_log.auc_mean of run_id> for run_id in fold_run_ids]
+    reduction_reports = [load_json(report_path(i)) for i in fold_idxs]
 
-# Frequency voting across folds
-selected_features = frequency_vote(reduction_reports,
-    threshold=config["dimensionality_reducer"]["vote_threshold"])
-save_json(selected_features, config["optimizer"]["selected_features_path"])
-save_json({"fold_reports": reduction_reports},
-          "configs/feature_selection_log.json")
+    # Frequency voting across folds — each file through temp + rename,
+    # before the commit
+    selected_features = frequency_vote(reduction_reports,
+        threshold=config["dimensionality_reducer"]["vote_threshold"])
+    save_json(selected_features, config["optimizer"]["selected_features_path"])
+    save_json({"fold_reports": reduction_reports},
+              "configs/feature_selection_log.json")
+
+    auc_std = std(fold_aucs) if len(fold_aucs) > 1 else 0.0
+    conn.execute(
+        "UPDATE train_log SET auc_std = ? WHERE run_id = ?",
+        [auc_std, fold_run_ids[-1]]
+    )
 ```
 
 **Post-selection follow-up (manual, not automated by this phase):** review
@@ -154,12 +282,11 @@ Outer fold evaluation is unbiased — never seen during inner trial search.
 #### Data Preparation
 
 ```python
-optimizer_run_id = utils.generate_run_id()
+optimizer_run_id = work.work_id                  # Work, above
+full_labeled_df  = <Data preparation, Work above>
 
-preprocessor    = Preprocessor(config, db_conn)
-full_labeled_df = preprocessor.run(return_data=True)
-
-selected_features = load_json(config["optimizer"]["selected_features_path"])
+selected_features = <the work's config snapshot: the content of
+                     optimizer.selected_features_path>   # fixed input, never the file
 
 # Regime holdout — remove high-volatility dates before any fold generation.
 # Consequence worth stating: every outer and inner fold below is generated
@@ -168,23 +295,31 @@ selected_features = load_json(config["optimizer"]["selected_features_path"])
 # on a different population from the final evaluation, and an
 # eval_type='outer_validation' score is not an estimate over the whole
 # distribution (db_schema.md's experiment_log).
-holdout_cfg   = config["optimizer"]["regime_holdout"]
-holdout_vol   = utils.compute_vol_regime_holdout(
-    db_conn,
-    vol_percentile=holdout_cfg["vol_holdout_percentile"],
-    window_days=holdout_cfg["vol_window_days"],
-    vol_metric=holdout_cfg["vol_metric"],
-) if holdout_cfg["enabled"] else {}
-holdout_dates = set(holdout_vol)
+holdout_cfg = config["optimizer"]["regime_holdout"]
+start_date, end_date = <the work's pinned trading-date range>
 
-# The holdout set is recomputed per run and shifts as data accumulates, so it
-# is recorded once here: every row of this optimizer_run_id that excludes or
-# tests on it reads the same set back from regime_holdout_dates (db_schema.md).
-if holdout_vol:
-    db_conn.executemany(
-        "INSERT INTO regime_holdout_dates (optimizer_run_id, date, rolling_vol) VALUES (?, ?, ?)",
-        [(optimizer_run_id, d, v) for d, v in sorted(holdout_vol.items())],
-    )
+# Step: the regime holdout computation and record. The set is computed once
+# per work over the pinned range and recorded: the work's
+# regime_holdout_dates rows when any exist, otherwise computed and recorded —
+# no separate completion record. Every row of this optimizer_run_id that
+# excludes or tests on it reads the same set (db_schema.md).
+with step(done=lambda conn: False) as conn:
+    holdout_vol = <regime_holdout_dates rows of optimizer_run_id: {date: rolling_vol}>
+    if not holdout_vol and holdout_cfg["enabled"]:
+        holdout_vol = utils.compute_vol_regime_holdout(
+            conn,
+            start_date,
+            end_date,
+            vol_percentile=holdout_cfg["vol_holdout_percentile"],
+            window_days=holdout_cfg["vol_window_days"],
+            vol_metric=holdout_cfg["vol_metric"],
+        )
+        if holdout_vol:
+            conn.executemany(
+                "INSERT INTO regime_holdout_dates (optimizer_run_id, date, rolling_vol) VALUES (?, ?, ?)",
+                [(optimizer_run_id, d, v) for d, v in sorted(holdout_vol.items())],
+            )
+holdout_dates = set(holdout_vol)
 
 remaining_df = full_labeled_df[~full_labeled_df["date"].isin(holdout_dates)]
 holdout_df   = full_labeled_df[full_labeled_df["date"].isin(holdout_dates)]
@@ -213,15 +348,15 @@ optimizer:
 #### Nested Validation — Outer Fold Loop
 
 ```python
-# Rate resolution, ONCE for the whole optimizer run, here at the coordinator
-# (execution_common.md's resolve_rates()): every (rate, order type) pair is
-# resolved and overlaid on this in-memory `config` before anything below
-# reads it (execution_common.md's Rate Overlay). The config file is never
-# written; the resolved values and their source are logged, and a bound
-# fallback is logged only. Every apply_overrides() below applies on top of
-# the overlay; workers and Backtesters receive the resolved config, every
-# Backtester receives rate_sources, and BacktestEngine does not resolve again.
-config, rate_sources = execution_common.resolve_rates(db_conn, config)
+# Rates: the work's rate_snapshot (Work, above) — resolved once at work
+# creation by execution_common.md's resolve_rates() and overlaid on this
+# in-memory `config` (execution_common.md's Rate Overlay); a resumed work
+# overlays the same snapshot and never re-resolves. The config file is never
+# written. Every apply_overrides() below applies on top of the overlay:
+#   - workers and Backtesters receive the resolved config;
+#   - every Backtester receives rate_sources;
+#   - BacktestEngine does not resolve again.
+rate_sources = <the work's rate_snapshot rate_sources>
 
 outer_cfg  = config["class_balancer"]["outer_fold"]
 inner_cfg  = config["class_balancer"]["inner_fold"]
@@ -254,7 +389,8 @@ for outer_train_df, _, outer_test_df, outer_fold_meta in balancer.generate_folds
     best_inner_auc = 0.0
 
     # --- Successive Halving across inner trial loop ---
-    search_space   = sample_hyperparams(config, max_trials)
+    search_space   = sample_hyperparams(config, max_trials)   # from random_state —
+                                                            # the same on resume
     active_trials  = list(enumerate(search_space))
     trial_auc_history: dict[int, list[float]] = {i: [] for i in range(len(active_trials))}
     max_inner_folds = inner_cfg.get("max_folds", 4)
@@ -267,68 +403,79 @@ for outer_train_df, _, outer_test_df, outer_fold_meta in balancer.generate_folds
             for trial_idx, _ in active_trials
         }
 
-        # Dispatch parallel workers
-        round_results = _run_round_parallel(
-            active_trials=active_trials,
-            round_idx=round_idx,
-            outer_train_df=outer_train_df,
-            outer_fold_idx=outer_fold_idx,
-            round_run_ids=round_run_ids,
-            selected_features=selected_features,
-            config=config,
-            effective_num_threads=effective_num_threads,
-            optimizer_run_id=optimizer_run_id,
-        )
+        final_round = round_idx == max_inner_folds - 1
 
-        # Coordinator: sequential DB flush on db_conn, the run's one guest unit
-        for r in round_results:
-            db_conn.execute("INSERT INTO train_log ...", r["train_log_row"])
+        # Step: this (outer fold, round) — done when its run_ids are in
+        # train_log; the final round also carries auc_std and best_of_loop
+        with step(done=lambda conn: in_train_log(conn, *round_run_ids.values())) as conn:
+            # Dispatch parallel workers — inside the step's unit
+            round_results = _run_round_parallel(
+                active_trials=active_trials,
+                round_idx=round_idx,
+                outer_train_df=outer_train_df,
+                outer_fold_idx=outer_fold_idx,
+                round_run_ids=round_run_ids,
+                selected_features=selected_features,
+                config=config,
+                effective_num_threads=effective_num_threads,
+                optimizer_run_id=optimizer_run_id,
+            )
 
-        # Update AUC history
-        for r in round_results:
-            trial_auc_history[r["trial_idx"]].append(r["auc_mean"])
-
-        # Successive Halving pruning (not on final round)
-        if round_idx < max_inner_folds - 1 and len(active_trials) > 1:
-            trial_means = {
-                idx: mean(trial_auc_history[idx])
-                for idx, _ in active_trials
-                if trial_auc_history[idx]
-            }
-            sorted_trials  = sorted(trial_means.items(), key=lambda x: x[1], reverse=True)
-            n_survive      = max(1, len(sorted_trials) // eta)
-            surviving_idx  = {idx for idx, _ in sorted_trials[:n_survive]}
-            pruned_idx     = {idx for idx, _ in sorted_trials[n_survive:]}
-
-            # Mark pruned trial rows (db_conn)
+            # Coordinator: DB flush on the step's connection
             for r in round_results:
-                if r["trial_idx"] in pruned_idx:
-                    db_conn.execute(
-                        "UPDATE train_log SET is_pruned = TRUE WHERE run_id = ?",
-                        [r["run_id"]]
+                conn.execute("INSERT INTO train_log ...", r["train_log_row"])
+
+            history = {r["trial_idx"]: trial_auc_history[r["trial_idx"]] + [r["auc_mean"]]
+                       for r in round_results}
+
+            # Successive Halving pruning (not on final round)
+            if not final_round and len(active_trials) > 1:
+                trial_means = {
+                    idx: mean(history[idx])
+                    for idx, _ in active_trials
+                    if history.get(idx)
+                }
+                sorted_trials  = sorted(trial_means.items(), key=lambda x: x[1], reverse=True)
+                n_survive      = max(1, len(sorted_trials) // eta)
+                pruned_idx     = {idx for idx, _ in sorted_trials[n_survive:]}
+
+                # Mark pruned trial rows
+                for r in round_results:
+                    if r["trial_idx"] in pruned_idx:
+                        conn.execute(
+                            "UPDATE train_log SET is_pruned = TRUE WHERE run_id = ?",
+                            [r["run_id"]]
+                        )
+
+            # Final round: set auc_std and best_of_loop for completed trials
+            if final_round:
+                completed_trial_means = {
+                    idx: mean(history[idx])
+                    for idx, _ in active_trials
+                }
+                best_trial_idx = max(completed_trial_means, key=completed_trial_means.get)
+
+                for idx, _ in active_trials:
+                    aucs = history[idx]
+                    conn.execute(
+                        "UPDATE train_log SET auc_std = ? WHERE run_id = ?",
+                        [std(aucs) if len(aucs) > 1 else 0.0, round_run_ids[idx]]
                     )
+                conn.execute(
+                    "UPDATE train_log SET best_of_loop = TRUE WHERE run_id = ?",
+                    [round_run_ids[best_trial_idx]]
+                )
 
-            active_trials = [(idx, hp) for idx, hp in active_trials if idx in surviving_idx]
+        # Rebuilt from this round's train_log rows (auc_mean, is_pruned) —
+        # the same on a computed and on a skipped round
+        rows = <train_log rows of round_run_ids>
+        for row in rows:
+            trial_auc_history[row.trial_idx].append(row.auc_mean)
+        active_trials = [(idx, hp) for idx, hp in active_trials
+                         if idx in {row.trial_idx for row in rows if not row.is_pruned}]
 
-    # Final round: set auc_std and best_of_loop for completed trials
-    completed_trial_means = {
-        idx: mean(trial_auc_history[idx])
-        for idx, _ in active_trials
-    }
-    best_trial_idx = max(completed_trial_means, key=completed_trial_means.get)
+    best_trial_idx = <trial_idx of the best_of_loop row among the final round's rows>
     best_config    = search_space[best_trial_idx]
-
-    for idx, _ in active_trials:   # db_conn, the run's one guest unit
-        last_run_id = round_run_ids[idx]   # last completed round run_id
-        aucs        = trial_auc_history[idx]
-        db_conn.execute(
-            "UPDATE train_log SET auc_std = ? WHERE run_id = ?",
-            [std(aucs) if len(aucs) > 1 else 0.0, last_run_id]
-        )
-    db_conn.execute(
-        "UPDATE train_log SET best_of_loop = TRUE WHERE run_id = ?",
-        [round_run_ids[best_trial_idx]]
-    )
 
     # --- Outer eval: train best_config on outer_train, backtest on outer_test ---
     outer_train_split, outer_val_split = utils.temporal_split_simple(
@@ -346,35 +493,37 @@ for outer_train_df, _, outer_test_df, outer_fold_meta in balancer.generate_folds
     config_override = utils.apply_overrides(config, best_config)
     config_override["lgbm_params"]["num_threads"] = effective_num_threads
 
-    outer_trainer = Trainer(config_override, db_conn, optimizer_run_id=optimizer_run_id)
-    outer_trainer.run(
-        outer_train_split, outer_val_split, outer_test_df,
-        run_id=outer_run_id,
-        fold_idx=-1,
-        outer_fold_idx=outer_fold_idx,
-        fold_train_start=outer_train_dates.min(),
-        fold_train_end=outer_train_dates.max(),
-        fold_train_days=outer_train_dates.nunique(),
-        feature_config=best_config,
-        feature_names=selected_features,
-        run_reducer=False,
-        phase="exploitation",
-        trial_idx=-1,          # outer eval row — not part of inner trial loop
-        dry_run=False,
-    )
+    # Step: this outer eval — done when outer_run_id is in experiment_log
+    with step(done=lambda conn: in_experiment_log(conn, outer_run_id)) as conn:
+        outer_trainer = Trainer(config_override, conn, optimizer_run_id=optimizer_run_id)
+        outer_trainer.run(
+            outer_train_split, outer_val_split, outer_test_df,
+            run_id=outer_run_id,
+            fold_idx=-1,
+            outer_fold_idx=outer_fold_idx,
+            fold_train_start=outer_train_dates.min(),
+            fold_train_end=outer_train_dates.max(),
+            fold_train_days=outer_train_dates.nunique(),
+            feature_config=best_config,
+            feature_names=selected_features,
+            run_reducer=False,
+            phase="exploitation",
+            trial_idx=-1,          # outer eval row — not part of inner trial loop
+            dry_run=False,
+        )
 
-    backtester = Backtester(config_override, db_conn, optimizer_run_id=optimizer_run_id,
-                            rate_sources=rate_sources)
-    outer_summary = backtester.run(
-        outer_test_df,
-        run_id=outer_run_id,
-        fold_idx=-1,
-        outer_fold_idx=outer_fold_idx,
-        fold_test_start=outer_fold_meta["fold_test_start"],
-        fold_test_end=outer_fold_meta["fold_test_end"],
-        fold_test_days=outer_fold_meta["fold_test_days"],
-        eval_type="outer_validation",
-    )
+        backtester = Backtester(config_override, conn, optimizer_run_id=optimizer_run_id,
+                                rate_sources=rate_sources)
+        backtester.run(
+            outer_test_df,
+            run_id=outer_run_id,
+            fold_idx=-1,
+            outer_fold_idx=outer_fold_idx,
+            fold_test_start=outer_fold_meta["fold_test_start"],
+            fold_test_end=outer_fold_meta["fold_test_end"],
+            fold_test_days=outer_fold_meta["fold_test_days"],
+            eval_type="outer_validation",
+        )
 
     # --- Execution-variant evaluation (optimizer.execution_eval) ---
     # Same model, same fold, same data — only execution keys differ, so the
@@ -401,89 +550,102 @@ for outer_train_df, _, outer_test_df, outer_fold_meta in balancer.generate_folds
         combos = combos[: config["optimizer"]["execution_eval"]["max_combinations"]]
 
         for i, variant in enumerate(combos):
-            variant_override = utils.apply_overrides(config_override, variant)
-            variant_backtester = Backtester(
-                variant_override, db_conn, optimizer_run_id=optimizer_run_id,
-                rate_sources=rate_sources,
-            )
-            variant_backtester.run(
-                outer_test_df,
-                run_id=f"{outer_run_id}_x{i}",
-                fold_idx=-1,
-                outer_fold_idx=outer_fold_idx,
-                fold_test_start=outer_fold_meta["fold_test_start"],
-                fold_test_end=outer_fold_meta["fold_test_end"],
-                fold_test_days=outer_fold_meta["fold_test_days"],
-                eval_type="outer_validation",
-                execution_variant=json.dumps(variant),
-            )
+            variant_run_id = f"{outer_run_id}_x{i}"
+            # Step: this execution variant — done when variant_run_id is in
+            # experiment_log; steps run in combos order on resume as well
+            with step(done=lambda conn: in_experiment_log(conn, variant_run_id)) as conn:
+                variant_override = utils.apply_overrides(config_override, variant)
+                variant_backtester = Backtester(
+                    variant_override, conn, optimizer_run_id=optimizer_run_id,
+                    rate_sources=rate_sources,
+                )
+                variant_backtester.run(
+                    outer_test_df,
+                    run_id=variant_run_id,
+                    fold_idx=-1,
+                    outer_fold_idx=outer_fold_idx,
+                    fold_test_start=outer_fold_meta["fold_test_start"],
+                    fold_test_end=outer_fold_meta["fold_test_end"],
+                    fold_test_days=outer_fold_meta["fold_test_days"],
+                    eval_type="outer_validation",
+                    execution_variant=json.dumps(variant),
+                )
 
     outer_best_configs.append(best_config)
     # each fold's winning_rate is already persisted as an
     # eval_type='outer_validation' experiment_log row; no second copy here
 
-# --- Consensus config → final model ---
-consensus_config = utils.compute_consensus_config(
-    outer_best_configs,
-    config["optimizer"]["hyperparameter_search"]["search_space"],
-)
-final_config_override = utils.apply_overrides(config, consensus_config)
-
-final_train_split, final_val_split = utils.temporal_split_simple(
-    remaining_df,
-    session_mode=consensus_config.get("entry_detector.session_mode"),
-    val_fraction=0.15,
-    embargo_days=outer_cfg["embargo_days"],
-)
-final_run_id = utils.generate_run_id()
-final_train_dates = final_train_split["date"]   # as outer_train_dates above
-final_trainer = Trainer(final_config_override, db_conn, optimizer_run_id=optimizer_run_id)
-
-# test_df: holdout_df (completely unseen, preferred) when holdout is enabled and non-empty;
-#          final_val_split as fallback when holdout is disabled (val is next-best available).
-#          Note: val_split is used by LightGBM early stopping but does not overlap with train.
-final_test_df = (
-    holdout_df
-    if holdout_cfg["enabled"] and len(holdout_df) > 0
-    else final_val_split
-)
-
-final_trainer.run(
-    final_train_split, final_val_split, final_test_df,
-    run_id=final_run_id,
-    fold_idx=-1,
-    outer_fold_idx=-1,
-    fold_train_start=final_train_dates.min(),
-    fold_train_end=final_train_dates.max(),
-    fold_train_days=final_train_dates.nunique(),
-    feature_config=consensus_config,
-    feature_names=selected_features,
-    run_reducer=False,
-    phase="exploitation",
-    trial_idx=0,
-    dry_run=False,
-)
-
-# --- Regime holdout robustness check ---
-if holdout_cfg["enabled"] and len(holdout_df) > 0:
-    regime_backtester = Backtester(
-        final_config_override, db_conn, optimizer_run_id=optimizer_run_id,
-        rate_sources=rate_sources,
+# Step: the closing step, producing:
+#   - the consensus;
+#   - the final model;
+#   - the regime holdout report;
+# done when this optimizer_run_id's final model train_log row exists (phase
+# 'exploitation', outer_fold_idx -1, fold_idx -1, trial_idx 0); final_run_id
+# is generated in the step, so its completion is judged by that row
+with step(done=lambda conn: final_model_row_exists(conn, optimizer_run_id)) as conn:
+    # --- Consensus config → final model ---
+    consensus_config = utils.compute_consensus_config(
+        outer_best_configs,
+        config["optimizer"]["hyperparameter_search"]["search_space"],
     )
-    # No fold_test_* argument: run_backtest derives them from holdout_df. The
-    # date pair is then the ends of a non-contiguous set, whose members are in
-    # regime_holdout_dates.
-    regime_backtester.run(
-        holdout_df,
+    final_config_override = utils.apply_overrides(config, consensus_config)
+
+    final_train_split, final_val_split = utils.temporal_split_simple(
+        remaining_df,
+        session_mode=consensus_config.get("entry_detector.session_mode"),
+        val_fraction=0.15,
+        embargo_days=outer_cfg["embargo_days"],
+    )
+    final_run_id = utils.generate_run_id()
+    final_train_dates = final_train_split["date"]   # as outer_train_dates above
+    final_trainer = Trainer(final_config_override, conn, optimizer_run_id=optimizer_run_id)
+
+    # test_df: holdout_df (completely unseen, preferred) when holdout is enabled and non-empty;
+    #          final_val_split as fallback when holdout is disabled (val is next-best available).
+    #          Note: val_split is used by LightGBM early stopping but does not overlap with train.
+    final_test_df = (
+        holdout_df
+        if holdout_cfg["enabled"] and len(holdout_df) > 0
+        else final_val_split
+    )
+
+    final_trainer.run(
+        final_train_split, final_val_split, final_test_df,
         run_id=final_run_id,
         fold_idx=-1,
         outer_fold_idx=-1,
-        eval_type="regime_holdout",
+        fold_train_start=final_train_dates.min(),
+        fold_train_end=final_train_dates.max(),
+        fold_train_days=final_train_dates.nunique(),
+        feature_config=consensus_config,
+        feature_names=selected_features,
+        run_reducer=False,
+        phase="exploitation",
+        trial_idx=0,
+        dry_run=False,
     )
 
-    # Report and verdict — see "Regime Holdout Report and Verdict" below.
-    # Always computed; whether the verdict blocks anything is decided at
-    # session start, before Inferencer init (live_mode_runner.md), not here.
+    # --- Regime holdout robustness check ---
+    if holdout_cfg["enabled"] and len(holdout_df) > 0:
+        regime_backtester = Backtester(
+            final_config_override, conn, optimizer_run_id=optimizer_run_id,
+            rate_sources=rate_sources,
+        )
+        # No fold_test_* argument: run_backtest derives them from holdout_df. The
+        # date pair is then the ends of a non-contiguous set, whose members are in
+        # regime_holdout_dates.
+        regime_backtester.run(
+            holdout_df,
+            run_id=final_run_id,
+            fold_idx=-1,
+            outer_fold_idx=-1,
+            eval_type="regime_holdout",
+        )
+
+        # Report and verdict — see "Regime Holdout Report and Verdict" below.
+        # Always computed, in this step; whether the verdict blocks anything is
+        # decided at session start, before Inferencer init (live_mode_runner.md),
+        # not here.
 ```
 
 #### Regime Holdout Report and Verdict
@@ -536,9 +698,14 @@ Intended for baseline measurement and debugging.
 ```
 
 ```python
-# Rate resolution, ONCE for this run, at the coordinator — as in the
-# exploitation phase (execution_common.md's resolve_rates())
-config, rate_sources = execution_common.resolve_rates(db_conn, config)
+# Rates: the work's rate_snapshot — as in the exploitation phase
+rate_sources = <the work's rate_snapshot rate_sources>
+
+optimizer_run_id = work.work_id                  # Work, above
+full_labeled_df  = <Data preparation, Work above>
+balancer  = ClassBalancer(config)
+inner_cfg = config["class_balancer"]["inner_fold"]
+fold_run_ids = []
 
 # (full phase fold loop — same structure as selection, with run_reducer=False and max_folds=None)
 for train, val, test, fold_meta in balancer.generate_folds(
@@ -554,37 +721,42 @@ for train, val, test, fold_meta in balancer.generate_folds(
 ):
     fold_idx = fold_meta["fold_idx"]
     run_id   = f"{optimizer_run_id}_f{fold_idx}"   # structured ID — no collision risk
-    result   = trainer.run(
-        train, val, test,
-        run_id=run_id,
-        fold_idx=fold_idx,
-        outer_fold_idx=-1,
-        fold_train_start=fold_meta["fold_train_start"],
-        fold_train_end=fold_meta["fold_train_end"],
-        fold_train_days=fold_meta["fold_train_days"],
-        run_reducer=False,
-        phase="full",
-        trial_idx=0,
-    )
     fold_run_ids.append(run_id)
-    fold_aucs.append(result["auc_mean"])
+    # Step: this fold — done when its run_id is in train_log
+    with step(done=lambda conn: in_train_log(conn, run_id)) as conn:
+        trainer = Trainer(config, conn, optimizer_run_id=optimizer_run_id)
+        trainer.run(
+            train, val, test,
+            run_id=run_id,
+            fold_idx=fold_idx,
+            outer_fold_idx=-1,
+            fold_train_start=fold_meta["fold_train_start"],
+            fold_train_end=fold_meta["fold_train_end"],
+            fold_train_days=fold_meta["fold_train_days"],
+            run_reducer=False,
+            phase="full",
+            trial_idx=0,
+        )
 
-auc_std = std(fold_aucs) if len(fold_aucs) > 1 else 0.0
-db_conn.execute(
-    "UPDATE train_log SET auc_std = ? WHERE run_id = ?",
-    [auc_std, fold_run_ids[-1]]
-)
+# Step: the closing backtest — done when fold_run_ids[-1] is in experiment_log
+with step(done=lambda conn: in_experiment_log(conn, fold_run_ids[-1])) as conn:
+    fold_aucs = [<train_log.auc_mean of run_id> for run_id in fold_run_ids]
+    auc_std = std(fold_aucs) if len(fold_aucs) > 1 else 0.0
+    conn.execute(
+        "UPDATE train_log SET auc_std = ? WHERE run_id = ?",
+        [auc_std, fold_run_ids[-1]]
+    )
 
-# Backtest on last fold's test split (baseline measurement)
-backtester = Backtester(config, db_conn, optimizer_run_id=optimizer_run_id,
-                        rate_sources=rate_sources)
-backtester.run(
-    test,                    # last fold's test split (loop variable after exit)
-    run_id=fold_run_ids[-1],
-    fold_idx=-1,
-    outer_fold_idx=-1,
-    eval_type=None,
-)
+    # Backtest on last fold's test split (baseline measurement)
+    backtester = Backtester(config, conn, optimizer_run_id=optimizer_run_id,
+                            rate_sources=rate_sources)
+    backtester.run(
+        test,                    # last fold's test split (loop variable after exit)
+        run_id=fold_run_ids[-1],
+        fold_idx=-1,
+        outer_fold_idx=-1,
+        eval_type=None,
+    )
 ```
 
 ---
@@ -612,9 +784,8 @@ def run_trial_round(
     Returns result dict — train_log INSERT deferred to coordinator.
     A worker opens NO database connection and takes no `db_path`: it passes
     `db_conn=None` to Trainer under `dry_run=True`, so nothing here reads
-    one. That also removes the only overlap this file had with its own
-    coordinator, which opens read-write between rounds and would be blocked
-    by a live worker's read-only handle.
+    one. The coordinator holds a guest unit per step, and the round's
+    workers run inside that step's unit, opening no connection of their own.
     """
     import sys
 
@@ -715,8 +886,8 @@ effective_num_threads = max(
 ```
 Completed trials (all Successive Halving rounds finished):
     auc_std = std(trial_auc_history[trial_idx]) if len > 1 else 0.0
-    db_conn.execute("UPDATE train_log SET auc_std = ? WHERE run_id = ?",
-                    [auc_std, fold_run_ids[-1]])
+    conn.execute("UPDATE train_log SET auc_std = ? WHERE run_id = ?",
+                 [auc_std, fold_run_ids[-1]])     # in the final round's step
     fold_run_ids[-1] = last completed round's run_id for that trial
 
 Pruned trials:
@@ -733,8 +904,9 @@ Nested/parallel mode: fold_run_ids[-1] = last Successive Halving round completed
 
 ## optimizer_run_id Usage
 
-- Generated once per `PipelineOptimizer.run()` call via `utils.generate_run_id()`
-- Passed to all `Trainer` and `Backtester` instances within the same run
+- Generated at work creation via `utils.generate_run_id()` — the work's
+  `work_id` — and reused by a resumed work
+- Passed to all `Trainer` and `Backtester` instances within the same work
 - Stored in `train_log.optimizer_run_id` and `experiment_log.optimizer_run_id`
 - Enables grouping of all folds belonging to the same optimizer execution
 
@@ -746,13 +918,13 @@ Nested/parallel mode: fold_run_ids[-1] = last Successive Halving round completed
 class PipelineOptimizer:
     def __init__(
         self,
-        config: dict,
-        db_conn: duckdb.DuckDBPyConnection,
+        config: dict,       # the work's config snapshot with its rate_snapshot
+        unit_opener,        # run_guest's; each step's unit opened from it
     ): ...
 
-    def run(self) -> pd.DataFrame:
+    def run(self, work) -> pd.DataFrame:
         """
-        Execute phase-appropriate cycle:
+        Execute the opened work's phase-appropriate cycle (Work, above):
           - "selection":    one fold pass, frequency voting, save selected_features
                             returns empty DataFrame (no backtest)
           - "exploitation": nested validation with Successive Halving,
@@ -768,8 +940,9 @@ class PipelineOptimizer:
                             specified in docs/ops/shadow_retraining.md's
                             "Retraining Cadence" section, not in this file —
                             this phase has no dedicated algorithm of its
-                            own; it dispatches to "full" or "exploitation"
-                            depending on which trigger fired (see
+                            own; the refresh run (Work, above) decides
+                            "full" or "exploitation" before opening its
+                            work, and the work runs that phase (see
                             `optimizer.refresh` config block below).
         """
         ...
@@ -837,6 +1010,18 @@ class PipelineOptimizer:
         """
         ...
 ```
+
+---
+
+## CLI
+
+```bash
+run_guest pipeline_optimizer [--trigger scheduled] [--supersede] [--config CONFIG]
+run_guest pipeline_optimizer --resume-work <work_id>   # the sweep's command
+```
+
+The phase is `optimizer.phase`. The scheduled 'refresh' run is
+`run_guest pipeline_optimizer --trigger scheduled` (Work, above).
 
 ---
 
@@ -977,8 +1162,9 @@ class_balancer:
   holdout_df used for both final model test_df (train_log AUC) and regime_holdout backtest
 - final model test_df: holdout_df (primary, completely unseen) when holdout enabled and
   non-empty; final_val_split (fallback) when holdout disabled
-- The holdout date set is written to `regime_holdout_dates` once per exploitation run,
-  with each date's rolling_vol; the regime_holdout backtest passes no fold_test_* argument
+- The holdout date set is written to `regime_holdout_dates` once per exploitation work,
+  computed over the work's pinned range, with each date's rolling_vol; the
+  regime_holdout backtest passes no fold_test_* argument
 - `fold_train_start` / `fold_train_end` / `fold_train_days`: from fold_meta at the inner
   fold call sites; from the temporal_split_simple() train split for the outer eval and
   the final model — never outer_fold_meta's train window
@@ -993,5 +1179,15 @@ class_balancer:
   no balancing applied; embargo_days=outer_cfg["embargo_days"] always passed explicitly
 - `best_train`, `best_val`, `best_fold_test` patterns from non-nested exploitation removed;
   outer eval uses outer_train_split / outer_val_split / outer_test_df directly
-- optimizer_run_id format: YYYYMMDD_HHMMSS (generated once per optimizer run)
+- optimizer_run_id format: YYYYMMDD_HHMMSS (its generation: optimizer_run_id
+  Usage, above)
+- Calls neither `register()` nor `guest_unit()` — `run_guest` opens its units
+- A step's DB writes are one transaction committed at the step's end;
+  Trainer and Backtester issue no commit of their own inside a step
+- Every execution of the work reads its fixed inputs, never the current config
+  or input files
+- `selected_features.json` is written through temp + rename (the selection
+  phase's closing vote) — an input file of the 'full' and 'exploitation'
+  variants (guest_supervisor.md's Tool Registry)
+- The wait for the input work holds no unit
 - "random" strategy uses random_state for reproducible non-replacement sampling

@@ -55,7 +55,10 @@ class ImportanceProvider(ABC):
         Averaging strategy controlled by:
             config["dimensionality_reducer"]["importance_averaging"]
             "uniform"        — simple mean across classifiers
-            "sample_weighted" — weighted by training sample count per classifier
+            "sample_weighted" — weighted by training sample count per classifier;
+                                equal to "uniform" while every classifier is
+                                trained on the shared train split, and kept as
+                                the slot for a later weighting basis
 
         Returns:
             pd.Series: index=feature_name, values=importance score (float)
@@ -94,10 +97,10 @@ class LGBMImportanceProvider(ImportanceProvider):
     def __init__(
         self,
         models: dict[str, lgb.Booster],    # {"up5", "up3", "sw", "dn3", "dn5"}
+        config: dict,
         train_labels: dict[str, pd.Series] | None = None,
                                             # required for sample_weighted averaging
                                             # key = label name, value = y_train Series
-        config: dict,
     ): ...
 ```
 
@@ -241,7 +244,7 @@ Subsampling rationale:
     Full sample SHAP is recommended for final model analysis.
 
 Default: disabled
-Enabled automatically when feature count > shap_trigger_threshold (configurable)
+Enabled automatically when feature count > shap_filter.trigger_threshold (configurable)
 ```
 
 ---
@@ -426,7 +429,9 @@ Exploitation phase (PipelineOptimizer):
 ```yaml
 dimensionality_reducer:
   importance_averaging: "uniform"   # "uniform" | "sample_weighted"
-                                    # searchable by PipelineOptimizer
+                                    # a selection-phase setting, not searched;
+                                    # searching it needs a selection-phase
+                                    # search step (open_items.md)
   vote_threshold: 0.5               # fraction of folds a feature must appear in
                                     # to be included in selected_features
                                     # used by PipelineOptimizer frequency_vote()

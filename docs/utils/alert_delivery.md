@@ -10,8 +10,10 @@ Delivery of findings to the operator: the log record, the channel queues,
 suppression, the senders and the drain. Its callers:
 - health_report.md's `run_health_report()`, for every path in its
   Invocation Contract;
-- utils.md's DB Access Coordination helper, for its own deliveries
-  (`owner_error_end`, `guest_db_open_failed` — utils.md's Helper deliveries).
+- db_coordination.md's helper, for its own deliveries (`owner_error_end`,
+  `guest_db_open_failed` — db_coordination.md's Helper deliveries);
+- guest_supervisor.md, for `scheduled_work_deferred` on every refusal of a
+  scheduled run by its new-run resolution.
 
 What a path delivers, its arguments and whether it needs the DB are
 health_report.md's Invocation Contract; this file holds how a delivery is
@@ -22,17 +24,19 @@ logged, queued, sent and drained, whatever the path.
 ## Log Writing (always, regardless of delivery)
 
 ```python
-def write_to_log(findings: dict, log_path: Path) -> None:
+def write_to_log(findings: dict, alert_key: str, scope: str,
+                 log_path: Path) -> None:
     """
     Appends ONE JSONL record per invocation:
 
       {"ts":"<UTC ISO-8601>","alert_key":"<the invoking path's alert_key>",
-       "scope":"whole"|"partial","severity":"ok"|"warn"|"abort",
+       "scope":"whole"|"partial","severity":"ok"|"info"|"warn"|"abort",
        "finding_count":<int>,"findings":{...}}
 
-    `scope` is what marks a subset invocation, so a reader cannot mistake
-    one for a whole report. `severity` is the highest among that
-    invocation's findings, and `findings` is the findings dict the caller
+    `alert_key` and `scope` are deliver()'s arguments. `scope` is what marks a
+    subset invocation, so a reader cannot mistake one for a whole report.
+    `severity` is derived from the findings — the highest among that
+    invocation's, by max_severity() — and `findings` is the findings dict the caller
     passed to deliver(), verbatim. The scalar fields lead so the head of a
     line is readable without parsing the body, and health_report.md's CLI's
     in-window mode selects on them.
@@ -54,7 +58,7 @@ def write_to_log(findings: dict, log_path: Path) -> None:
     accepted terminal case, not a handled one.
 
     `log_write_failed` also covers a failed coordination-store write
-    (utils.md's DB Access Coordination):
+    (db_coordination.md):
     - an owner injects it into its next delivery;
     - a guest or aux run writes it to stderr.
 
@@ -76,14 +80,17 @@ def deliver(alert_key: str, findings: dict, config: dict, log_dir: Path,
     """Log, filter by alert_level, then enqueue per channel. A None db_conn
     takes the DB-less handling below. `alert_key` is required when
     suppressible."""
-    today_date = utils.current_run()["date_basis"]   # the calling run's
-                                                   # registration date
-    write_to_log(findings, log_dir / f"health_report_{today_date}.log")
+    today_date = db_coordination.current_run()["date_basis"]   # the calling
+                                                   # run's registration date
+    write_to_log(findings, alert_key, scope,
+                 log_dir / f"health_report_{today_date}.log")
 
     if config["alerting"]["alert_level"] == "abort_only":
         send_findings = {k: v for k, v in findings.items() if v["severity"] == "abort"}
-    elif config["alerting"]["alert_level"] == "warn_and_above":
+    elif config["alerting"]["alert_level"] == "warn_and_above":   # info excluded
         send_findings = {k: v for k, v in findings.items() if v["severity"] in ("warn", "abort")}
+    elif config["alerting"]["alert_level"] == "info_and_above":   # ok dropped
+        send_findings = {k: v for k, v in findings.items() if v["severity"] in ("info", "warn", "abort")}
     else:  # "all" (default)
         send_findings = findings
 
@@ -101,6 +108,9 @@ def deliver(alert_key: str, findings: dict, config: dict, log_dir: Path,
         # window and suppress the next one that would have been.
         enqueue(channel, alert_key, severity, send_findings, mode, config, db_conn)
 ```
+
+`max_severity()` (module-internal) returns the highest severity among the
+findings it is given, in the order ok < info < warn < abort.
 
 `enqueue()` (module-internal) returns once the `alert_log` row is written
 (db_schema.md) with `dispatched_at` set and `outcome` NULL, or immediately
@@ -138,9 +148,9 @@ preserving "logging always happens, first".
 **Suppression** (`mode`, per severity; `event_alert_timeout_seconds`, per
 channel) applies ONLY to suppressible paths:
 - `always` — no suppression. Debug/escape-hatch setting; also the default
-  for `warn`/`ok`, which are currently unreachable here because every
-  event-driven path is `abort` today. Provisioned for the case finding 27 is
-  later downgraded while keeping its trigger.
+  for every severity below `abort`, which are currently unreachable here
+  because every suppressible path is `abort` today. Provisioned for the case
+  finding 27 is later downgraded while keeping its trigger.
 - `once_per_session` — first occurrence only. Runtime state, like
   `last_halt_state`: a warm restart may cost one extra alert, which is not a
   correctness defect.
@@ -206,9 +216,10 @@ import requests
 from datetime import datetime, timezone
 
 def send_discord_alert(webhook_url: str, title: str, severity: str, fields: dict) -> bool:
-    """severity: 'ok' | 'warn' | 'abort'. Returns False on any failure —
-    caller logs the failure per deliver() above."""
-    color = {'ok': 0x2ECC71, 'warn': 0xF1C40F, 'abort': 0xE74C3C}[severity]
+    """severity: 'ok' | 'info' | 'warn' | 'abort'. Returns False on any
+    failure — caller logs the failure per deliver() above."""
+    color = {'ok': 0x2ECC71, 'info': 0x3498DB, 'warn': 0xF1C40F,
+             'abort': 0xE74C3C}[severity]
     embed = {
         "title": title,
         "color": color,
@@ -225,19 +236,25 @@ def send_discord_alert(webhook_url: str, title: str, severity: str, fields: dict
 ### Email
 
 ```python
+import os
 import smtplib
 from email.mime.text import MIMEText
 
 def send_email_alert(smtp_config: dict, title: str, severity: str, fields: dict) -> bool:
+    """smtp_config: the `alerting.email` block — host and port from
+    smtp_host / smtp_port, credentials from the environment variables
+    username_env / password_env name."""
     body = "\n".join(f"{k}: {v}" for k, v in fields.items())
     msg = MIMEText(body, "plain")
     msg["Subject"] = f"[{severity.upper()}] {title}"
     msg["From"] = smtp_config["from_addr"]
     msg["To"] = smtp_config["to_addr"]
     try:
-        with smtplib.SMTP(smtp_config["host"], smtp_config["port"], timeout=10) as server:
+        with smtplib.SMTP(smtp_config["smtp_host"], smtp_config["smtp_port"],
+                          timeout=10) as server:
             server.starttls()
-            server.login(smtp_config["username"], smtp_config["password"])
+            server.login(os.environ[smtp_config["username_env"]],
+                         os.environ[smtp_config["password_env"]])
             server.send_message(msg)
         return True
     except (smtplib.SMTPException, OSError):
@@ -250,12 +267,14 @@ def send_email_alert(smtp_config: dict, title: str, severity: str, fields: dict)
 
 ```yaml
 alerting:
-  alert_level: "all"                       # "all" | "warn_and_above" | "abort_only"
+  alert_level: "all"                       # "all" | "info_and_above" |
+                                           # "warn_and_above" | "abort_only"
   channels: ["discord", "email"]           # empty list = log-only, no delivery attempted
   event_alert_suppression:                 # event-driven, single-report
     abort: { mode: "rate_limited" }        #   deliveries only — scheduled
     warn:  { mode: "always" }              #   batch reports are never
-    ok:    { mode: "always" }              #   suppressed (see Constraints)
+    info:  { mode: "always" }              #   suppressed (see
+    ok:    { mode: "always" }              #   Constraints)
   max_pending_alert_keys: 10               # per channel; distinct alert_keys,
                                            # latest entry per key retained
   drain_timeout_seconds: 600               # normal shutdown: wait for pending
@@ -301,8 +320,11 @@ alerting:
   invocations send every finding in one batched message, which suppression's
   per-`alert_key` model does not address, and at one call per scheduled point
   they could not reach a rate limit anyway. This is a consequence of the
-  DELIVERY UNIT, not of severity — which is why the `warn`/`ok` entries in
-  `event_alert_suppression` are inert today rather than wrong
+  DELIVERY UNIT, not of severity — which is why these entries in
+  `event_alert_suppression` are inert today rather than wrong:
+  - `info`;
+  - `warn`;
+  - `ok`
 - Delivery is best-effort per channel — a failure on one configured channel
   does not block attempting the others
 - Delivery failure itself is logged (as `event=alert_delivery_failed`) so a

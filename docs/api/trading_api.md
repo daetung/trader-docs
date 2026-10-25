@@ -65,6 +65,26 @@ failed — a different event from a legitimate business refusal.
 The family-to-HTTP-status correlation is read off `api_doc/`'s grouping and
 should be confirmed against live responses.
 
+**An order request's failed result carries its kind:**
+- refused before the call, nothing sent, the result carrying neither
+  `rsp_cd` nor `rsp_msg`:
+  - `'unmapped'` — the ticker has no `trading_api_symbol`;
+  - `'phase_refused'` — an order type the current session phase does not
+    permit (Layer Responsibility Split's validation);
+- sent and refused, the result carrying `rsp_cd` and `rsp_msg` verbatim:
+  - `'rejected'` — a vendor business code;
+  - `'phase_mismatch'` — a vendor session-phase code (the session-phase
+    codes above).
+
+**A ticker with no `trading_api_symbol` is never sent.** `'unmapped'` is a
+pre-call refusal, surfaced distinctly from vendor rejections like the
+session-phase validation:
+- a single-ticker call returns a failed result of kind `'unmapped'`;
+- a multi-ticker call leaves the unmapped tickers out of the request and
+  absent from its result, under the partial-failure representation (Layer
+  Responsibility Split);
+- neither raises.
+
 ---
 
 ## Symbol and Exchange Encoding
@@ -78,7 +98,9 @@ encodings the vendor uses can both be built from one stored form:
   (`FY`/`FN`/`FA` for NYSE/NASDAQ/AMEX)
 - REST — exchange and symbol as separate request fields
 
-Callers pass a ticker. They do not construct either form.
+Callers pass a ticker. They do not construct either form. The lookup reads
+the ticker's current `ticker_cik_map` row (`db_schema.md`'s current-row
+rule): its `trading_api_symbol` and `trading_api_exchange`.
 
 ---
 
@@ -144,6 +166,16 @@ The SDK logs and swallows a callback exception rather than propagating it,
 so the callback owns its own error path; a raised exception is otherwise
 visible only in the SDK's log.
 
+**WebSocket connect limiter.** Supplied to the SDK (`sdk_dependency.md`'s
+fork modification 2):
+- at most 6 connect attempts per wall-clock-minute bucket;
+- an attempt within `clock_check.max_offset_seconds` of a minute boundary
+  counts in each bucket adjacent to that boundary;
+- a connection the vendor disconnects at subscribe for the limit counts as
+  an attempt.
+Recorded vendor behaviour: the limit is counted per fixed 1-minute bucket and
+enforced by disconnecting at subscribe.
+
 **This module stays one file, and the REST/WS distinction above is why the
 question was worth asking rather than an answer to it.** The seam does not
 hold: `POST /api/v1/websocket/disconnectSession` is a REST call on the
@@ -164,7 +196,7 @@ the single caller-facing layer and Constraints as the only importer of
 
 Endpoints reached through this module are limited to those with an actual
 consumer in this system, not the vendor's full surface. The orderbook
-(호가) call is included regardless of an immediate consumer, so that a
+call is included regardless of an immediate consumer, so that a
 bid/ask need can be served without reopening this layer.
 
 WebSocket subscription of the realtime orderbook stream (V61) is deliberately
@@ -196,7 +228,7 @@ future call sites rather than an input to an unresolved allocation. Held-ticker
 
 | Need | Call site | Endpoint | TPS |
 |---|---|---|---|
-| Tradable ticker list | Session Lifecycle Step 1; `build_trading_api_symbol_map()` (three per-exchange calls) | `quote/…/inquiry/stock-ticker` | 2 |
+| Tradable ticker list | Session Lifecycle Step 1; `build_trading_api_symbol_map()`; the evening ticker-master check (`evening_ticker_master_check`) — each one call per exchange | `quote/…/inquiry/stock-ticker` | 2 |
 | Balance and deposit | Step 1b; the funds gate; Broker Reconcile (the query `live_mode.balance_query_mode` selects) | `trading/…/inquiry/balance-margin` | 3 |
 | Per-ticker margin rate and order cost | watchdog first listing, once per ticker per session; and the post-dispatch entry observation | `trading/…/inquiry/able-orderqty` | 2 |
 | Bars, minute OR second resolution | Watchdog Step 2a (prefix scan, rotation window, backfill) | `quote/…/chart/min` | 4 |
@@ -204,7 +236,7 @@ future call sites rather than an input to an unresolved allocation. Held-ticker
 | Bulk price snapshot | `bulk_fetch_today_first_price()` | `quote/…/inquiry/multiprice` | 2 |
 | Level-1 orderbook | the exit ladder; `signal_time_rest` | `quote/…/inquiry/orderbook` | 2 |
 | Order submit, amend, cancel | Step 5c; Position Manager; Shutdown; Broker Reconcile | `trading/…/order` | 10 |
-| Filled and outstanding orders | the exit-side backstop; the startup procedure | `trading/…/inquiry/transaction-history` | 2 |
+| Filled and outstanding orders | the exit-side backstop; the startup procedure; order-end resolution | `trading/…/inquiry/transaction-history` | 2 |
 | Account cash and movement rows | Broker Reconcile | `trading/…/inquiry/trade-history` | 2 |
 | Executed sells for cash in lieu | Broker Reconcile | `trading/…/inquiry/trading-history` | 2 |
 | WebSocket session reset | the reconnect path | `ws_common/ws_session_disconnect` | 1 |
@@ -639,7 +671,6 @@ Applying it:
   (50). That is an SDK-side constant rather than a vendor-documented one, so
   it is a re-sync surface: an upstream change to it silently changes our
   ceiling
-- WebSocket connect is paced at 6 TPM by the SDK's own instance-level limiter,
-  i.e. one connect per 10s. The reconnect schedule `live_mode_runner.md` owns
-  is read against that floor — a burst faster than 6/min is absorbed by the
-  SDK rather than reaching the server
+- WebSocket connects go through this module's connect limiter (Async
+  Boundary's WebSocket connect limiter), supplied to the SDK; the reconnect
+  schedule `live_mode_runner.md` owns runs under it

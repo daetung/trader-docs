@@ -146,7 +146,8 @@ COMPLETE in a single INSERT rather than inserted and updated later:
       order;
     - quantity the entry quantity;
     - fill mode and rate by `trade_log.exit_reason` through
-      `exit_fill_mode()`;
+      `exit_fill_mode()`, `carried` = false — the counterfactual covers the
+      first exit session only;
     - the order-type and price path: the requests of all the position's
       exit logical orders in `sent_at` order, each request's type and price
       applying from its `sent_at`, with no fill between a logical order's
@@ -159,6 +160,9 @@ COMPLETE in a single INSERT rather than inserted and updated later:
       `trade_log.exit_reason` values section);
     - for a close completed by an adjustment;
     - on an 'entry_canceled' row, whose entry side is still computed;
+  - the entry side — the entry columns of `predicted_*` and
+    `entry_eligible_volume` — is NULL for an entry whose logical order ended
+    'unsent': it is not an observation;
 - the eligible volume `entry_eligible_volume` / `exit_eligible_volume` —
   the fit's Σ Vᵢ terms (below) — over the same span split, before the
   tape's release; on the entry side, the ticks the entry limit price above
@@ -250,10 +254,14 @@ A carried position with no exit logical order carrying `predicted_*` is
 excluded from both, its gate counts included. Every other row compares
 `trade_log`'s own columns.
 
-**Entries that ended early.** An entry logical order ended early when it
-ended in a status other than 'filled' or 'rejected' and not with
-`terminal_cause='timeout'`, whether or not anything filled. Its end
-instant is the earlier of the anchor + `cancel_after_seconds` and the
+**Entries that ended early.** An entry logical order ended early when,
+whether or not anything filled, it ended:
+- in none of these statuses:
+  - 'filled';
+  - 'rejected';
+  - 'unsent';
+- not with `terminal_cause='timeout'`.
+Its end instant is the earlier of the anchor + `cancel_after_seconds` and the
 `sent_at` of its first 'cancel' request, or its `terminal_at` when it has
 none — computed on time parts of the same session date, through
 `utils.hour_add_seconds()`. Ending at that instant, each seeing the window
@@ -265,7 +273,11 @@ the real order had:
 `exit_reason='entry_canceled'` rows (see db_schema.md) are included in the
 `buy_rate` sample and its gate count — an entry left unfilled is itself a
 direct, relevant observation of participation (qᵢ = 0 against its Vᵢ), not
-noise to exclude; one that ended early counts on its matched window.
+noise to exclude; one that ended early counts on its matched window. An
+entry whose logical order ended 'unsent' is the exception:
+- it never reached the broker;
+- it is not an observation;
+- it is outside the sample and its gate count.
 
 `exit_reason='entry_rejected'` rows (R-7) are **excluded** from the
 `buy_rate` sample — the opposite treatment, for the opposite reason. A
@@ -335,11 +347,12 @@ gets a new row in `execution_params` — see db_schema.md:
   - the cumulative `sample_size` used;
   - the triggering `week_start`;
 - `get_execution_param()` (execution_common.md) resolves the latest row per
-  pair once per top-level run, in preference to the `execution:` config
-  seed:
+  pair once per top-level run — once per work for the optimizer — through
+  `resolve_rates()`, in preference to the `execution:` config seed:
   - LiveModeRunner's session start;
-  - run_backtest.py's start;
-  - pipeline_optimizer's coordinator;
+  - the start of run_backtest's body as run_guest runs it;
+  - pipeline_optimizer's coordinator at work creation, kept as the work's
+    `rate_snapshot`;
 - the config value is the pre-pilot seed only.
 
 *Divergence alert*: `health_report.py` gets a new finding, separate from
@@ -408,6 +421,26 @@ treated as grounds for a fresh hyperparameter search, not just a data
 refresh, on the theory that the existing hyperparameters may no longer fit
 the current market regime.
 
+**The refresh run** — `optimizer.phase: "refresh"`, launched as
+`run_guest pipeline_optimizer --trigger scheduled` (pipeline_optimizer.md's
+Work):
+- it decides the dispatched phase (`'full'` or `'exploitation'`) before
+  opening its work;
+- it first looks for the tool's unfinished work: one whose config_hash
+  matches the current config's under `'full'` or under `'exploitation'` is
+  resolved by guest_supervisor.md's new-run resolution under that phase; one
+  matching no phase's hash refuses the run, the triggers not evaluated;
+- with no unfinished work, it evaluates the calendar and divergence triggers
+  in one unit; no trigger firing ends the run `'normal'` without a work;
+- the calendar trigger's last refit is the `updated_at` of the latest
+  pipeline_optimizer work row closed `'done'` whose variant is `'full'` or
+  `'exploitation'` (guest_supervisor.md's work records; a closed row is not
+  updated again); these do not satisfy the cadence:
+  - a refused run;
+  - a superseded work;
+  - a halted work;
+- a `--resume-work` run skips the trigger evaluation.
+
 ---
 
 ## Constraints
@@ -470,6 +503,10 @@ wall-clock America/New_York times, which observe DST:
 - 04:00 ET LiveModeRunner, `coordination.schedule.runner.time`;
 - 05:00 ET `coordination.schedule.premarket.deadline` — the deadline of the
   premarket's and the runner's waits;
+- 05:00 ET `trading_api_symbol_map.retry_deadline` — the symbol-map
+  re-attempt deadline;
+- 09:00 ET `live_mode.session_start_deadline` — the deadline of the
+  session-start API gates;
 - 09:20 ET `--premarket-recheck` — R-1: the 09:20 pass is now a
   LiveModeRunner in-process task, not a cron entry — see
   metadata_crawler.md's "Dual Schedule", N-1/N-3;
@@ -537,27 +574,35 @@ comparison described above — an entry is compared against its authority:
   `evening_backup` (metadata_crawler.md's Nightly Backup), its DB access the
   evening run's as an owner (db_schema.md's DB File Ownership Windows). It
   also copies `coordination.sqlite` to `backup_dir` as
-  `coordination_YYYYMMDD.sqlite` (utils.md's `backup_store()`).
+  `coordination_YYYYMMDD.sqlite` (db_coordination.md's `backup_store()`),
+  and beside it `resume.sqlite` as `resume_YYYYMMDD.sqlite`
+  (guest_supervisor.md's `backup_resume_store()`).
 - Retention: follows the posture the table purge registry takes — nightly
   copies are kept without limit until an operator sets a window against
   observed disk growth, so nothing is deleted by default and the growth is
   the operator's to watch.
-- Recovery — the operator procedure, the helper functions being utils.md's
-  Recovery:
-  - the DuckDB file:
-    1. with the coordination store unreadable, the store's rebuild (below)
-       runs first;
-    2. an owner waiting on the damaged file is ended by the operator, its
-       run then found crashed;
-    3. `restore_db(backup_path)` is called — a guest run that removes
-       `market.duckdb.wal` and replaces `market.duckdb` with the backup copy;
+- Recovery — the operator procedure, the helper functions being
+  db_coordination.md's Recovery:
+  - in this order:
+    1. every live owner and every live guest is ended by the operator, its
+       run later found crashed;
+    2. with the coordination store unreadable, `rebuild_store(backup_path)`
+       from a `coordination_YYYYMMDD.sqlite` copy, under
+       `maintenance.lock`; known results:
+       - today's state is empty, the runner's phase A then waiting to the
+         premarket deadline;
+       - runs between the backup and the rebuild may be reported by
+         `missed_scheduled_run()`;
+    3. `restore_db(backup_path)` — a guest run that, after its own
+       `register()`:
+       - takes `maintenance.lock`;
+       - refuses while any other guest run lock is held;
+       - removes `market.duckdb.wal`;
+       - replaces `market.duckdb` with the backup copy;
        no WAL/point-in-time replay involved;
-  - the coordination store — `rebuild_store(backup_path)` from a
-    `coordination_YYYYMMDD.sqlite` copy:
-    - the dispatcher's crontab entry is paused before the call and restored
-      after;
-    - known results:
-      - today's state is empty, the runner's phase A then waiting to the
-        premarket deadline;
-      - runs between the backup and the rebuild may be reported by
-        `missed_scheduled_run()`.
+  - the resume store — guest_supervisor.md's `restore_store(backup_path)`
+    from a `resume_YYYYMMDD.sqlite` copy, under `resume.lock`, refused while
+    any work's run is alive: it moves the unreadable store aside and copies
+    the backup in; known results:
+    - a 'self_terminated' end of a run that opened a work after the backup
+      may be reported by health_report.md's finding 11.

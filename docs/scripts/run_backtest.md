@@ -18,15 +18,19 @@ and the best trial or consensus config is selected. Also runnable standalone.
 
 ## Input / Output
 
-**DB access role.** A guest (db_schema.md's DB File Ownership Windows),
-through utils.md's DB Access Coordination:
-- the entry point runs inside `register('guest', 'run_backtest', trigger)`;
-- `market.duckdb` is opened only inside `guest_unit('run_backtest', None)`,
-  which waits for admission without limit;
-- the run is one unit, the connection that unit yields passed wherever
-  this entry point takes `db_conn`;
+**DB access role.** A per-run guest (db_schema.md's DB File Ownership Windows;
+db_coordination.md's Unit scope), run through guest_supervisor.md's
+`run_guest`:
+- `run_guest run_backtest` enters
+  `register('guest', 'run_backtest', trigger)` and opens one
+  `guest_unit('run_backtest', None)` around the body, which waits for admission
+  without limit;
+- the body is handed that unit's connection, passed wherever this tool
+  takes `db_conn`, and calls neither `register()` nor `guest_unit()`;
+- `scripts/run_backtest.py` run directly hands over to
+  `run_guest run_backtest`;
 - while an owner waits past `coordination.guest_max_hold_seconds`, the run
-  ends by self-termination and is re-run.
+  ends by self-termination and is re-run from scratch.
 
 **Input:**
 ```python
@@ -54,10 +58,12 @@ model_dir: Path | None  # directory containing trained model artifacts (optional
 
 ```
 1. Load config from pipeline_config.yaml
-1a. Rate resolution — at the CLI entry point only: execution_common.md's
-    resolve_rates() resolves every (rate, order type) pair, overlays the
-    in-memory config (Rate Overlay) and returns the rate_sources map passed to
-    the Backtester; the resolved values and their source are logged
+1a. Rate resolution — at the start of run_backtest's body as run_guest runs
+    it: execution_common.md's resolve_rates() resolves every (rate, order
+    type) pair, overlays the in-memory config (Rate Overlay) and returns the
+    rate_sources map passed to the Backtester; the resolved values and their
+    source are logged. A Backtester PipelineOptimizer builds receives its
+    work's rates, resolved at work creation (pipeline_optimizer.md's Work)
 2. Load test_features.parquet from data/processed/ (or accept in-memory DataFrame)
 3. Determine feature column names (exclude labels, identifiers, metadata columns)
    Metadata columns excluded from features: is_dead_position, dead_position_case, is_ambiguous
@@ -150,9 +156,9 @@ class Backtester:
                              rule.
 
         optimizer_run_id passed via constructor (None for standalone).
-        rate_sources passed via constructor: the entry point's resolve_rates()
-        map (execution_common.md) — the CLI's own, or PipelineOptimizer's
-        coordinator's.
+        rate_sources passed via constructor: a resolve_rates() map
+        (execution_common.md) — run_backtest's body's own, or the
+        PipelineOptimizer work's rate_snapshot.
         """
         ...
 ```
@@ -162,7 +168,8 @@ class Backtester:
 ## CLI Interface
 
 ```bash
-python scripts/run_backtest.py [OPTIONS]
+run_guest run_backtest [OPTIONS]
+# python scripts/run_backtest.py <args> hands over to run_guest run_backtest <args>
 
 Options:
     --config, -c        Path to pipeline_config.yaml (default: configs/pipeline_config.yaml)
@@ -378,8 +385,12 @@ Elapsed: 45.2s
   pre-computed prob_* columns in test_df; path (c) requires prob_* columns to exist
 - PipelineOptimizer calls `backtester.run()` with `model_dir=None` — the config fallback
   path (b) ensures artifacts saved by Trainer are correctly located at inference time
-- Rate resolution runs at the CLI entry point only: `Backtester.run()`
-  called by PipelineOptimizer receives the resolved config and does not
-  resolve
+- Rate resolution runs at the start of run_backtest's body only:
+  `Backtester.run()` called by PipelineOptimizer receives its work's
+  resolved config and does not resolve
+- Calls neither `register()` nor `guest_unit()` — `run_guest` opens its unit
+- Built by PipelineOptimizer per step on that step's connection; Backtester
+  issues no commit of its own, its INSERTs committed with the step
+  (pipeline_optimizer.md's Work)
 - An exact replay of a run from its `experiment_log` row assumes the market
   data and `corporate_events` rows it read are unchanged since the run

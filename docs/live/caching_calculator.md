@@ -330,7 +330,8 @@ def persist_to_db(
     After this call:
     - "db" mode: the instance may be released from RAM;
     - "memory" mode: it stays the authoritative copy for the running
-      session, and the stored rows are read only by a warm restart.
+      session, and the stored rows are read only at a later start's Eager
+      Pool step.
     Purges prior session_date entries for this ticker before inserting, and
     replaces the ticker's existing rows for the same session_date.
     """
@@ -341,10 +342,10 @@ def persist_to_db(
 Restore Layer 1 and Layer 2 from the `indicator_cache` table.
 Called:
 - in "db" mode, on a ticker's first appearance in the watchdog working set;
-- in either mode, at Warm Restart, for a ticker whose rows for today are
-  present — a ticker without them is recomputed by
-  `session_start_compute()` alone (live_mode_runner.md's Session Restart
-  (Warm Start)).
+- in "memory" mode, at every start's Eager Pool step, cold start and warm
+  restart alike, for a ticker whose rows for today are present — a ticker
+  without them is computed by `session_start_compute()` and persisted
+  (live_mode_runner.md's Session Lifecycle step 5).
 
 ```python
 def load_from_db(
@@ -367,9 +368,9 @@ def load_from_db(
         calc.set_session_stats(stats)
         # then replay today's intraday bars via on_bar_close()
 
-    A warm restart restores a ticker through this method in either
-    indicator_cache_mode when today's rows for it are present
-    (live_mode_runner.md).
+    A start restores a ticker through this method when today's rows for it
+    are present — "memory" mode at its Eager Pool step, "db" mode at the
+    ticker's first appearance (live_mode_runner.md).
     """
 ```
 
@@ -538,8 +539,8 @@ def scoped_recompute(
   recheck re-seed (a Scoped Mid-Session Recompute's step-1 seed, or a
   ticker with no calculator)
 - `load_from_db()` is called on a ticker's first appearance in "db" mode and
-  at Warm Restart in either mode, for a ticker whose rows for today are
-  present
+  at every start's Eager Pool step in "memory" mode, for a ticker whose rows
+  for today are present
 - `persist_to_db()` does not persist `_session_stats`;
   `load_from_db()` does not restore `_session_stats`
 - After `persist_to_db()`:

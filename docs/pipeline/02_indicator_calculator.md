@@ -208,7 +208,7 @@ fibonacci_retracement(bars, window_bars)
         When called on the full ticker bars DataFrame, fibonacci_retracement()
         uses a monotonic deque internally to compute sliding window max/min
         in O(N) total time (N = total bars), not O(N × window_bars).
-        This enables the "ticker당 1회 계산" strategy in extract_batch():
+        This enables the "once per ticker" strategy in extract_batch():
         the output is a time series with one fib level set per bar,
         sliced per entry point at t-1. NaN for warm-up period (first
         window_bars-1 bars).
@@ -529,9 +529,18 @@ Applies to:
   `ad`) is rebased by exact subtraction to the first non-NaN value of the
   window being vectorized, before conversion to float.
 - **I4 — recursive filters.** A recursive filter on estimates (`ema`, Wilder
-  smoothing, `parabolic_sar`) keeps batch-incremental parity through I1. The
-  difference between training's origin (full history) and live's origin (the
-  `lookback_days` seed) stays bounded by `lookback_days`.
+  smoothing, `parabolic_sar`) keeps batch-incremental parity through I1. With
+  `lookback_days` meeting H_max (Config Keys' constraint), its output does
+  not depend on its origin:
+  - H_max — the largest, over enabled recursive-filter chains, of the chain's
+    summed per-stage horizon H = 53·ln2 / −ln(1−α), with ema α = 2/(span+1)
+    and Wilder α = 1/n;
+  - a contract test asserts bitwise equality of batch-path and full-history
+    outputs;
+  - `parabolic_sar` is in that test; where it fails, a bounded difference is
+    allowed for `parabolic_sar` alone;
+  - a ticker with a split between the batch path's and the full-history
+    path's reference dates is compared within a rounding tolerance.
 - **I5a — zero-range denominators.**
   - A ratio output whose denominator is a zero range — a flat bar, a flat
     window, zero variance, zero mean deviation — is NaN: `stochastic`'s %K,
@@ -821,7 +830,10 @@ class IndicatorCalculator:
 ```yaml
 indicators:
   lookback_days: 5              # CONTINUOUS indicators lookback (days)
-                                # Constraint: lookback_days * 390 >= max(window_bars)
+                                # Constraint: lookback_days * 390 >=
+                                # max(window_bars, H_max) (I4's H_max);
+                                # checked at config load, a violation
+                                # refusing start
   ma_windows: [5, 10, 20]
   ema_windows: [9, 20]
   macd: {fast: 12, slow: 26, signal: 9}
@@ -854,7 +866,7 @@ indicators:
     n_levels: 3
     window_bars: 480
     precalculate_bars: 0        # per-entry-point recomputation in live mode;
-                                # date당 1회 per-entry-point in training
+                                # once per date per entry point in training
   tpm:
     precalculate_bars: 0        # default: session-only; "lookback" also valid (see above)
   avg_vol_per_tick:

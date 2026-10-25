@@ -327,9 +327,12 @@ class ClassBalancer:
           1. session_mode filter on full df (skipped if session_mode is None)
           2. Compute fold date boundaries using resolved parameters
           3. Slice train/val/test
-          4. Apply pre-balance filters to train (Case C, Case D, ambiguous)
-          5. Apply downsampling to train if balance=True
-          6. Yield (train_balanced, val, test, fold_meta)
+          4. Apply embargo gap (trading days) at each boundary the window has
+          5. Apply pre-balance filters to train (Case C, Case D, ambiguous)
+          6. Apply downsampling to train if balance=True
+          7. Count the trading days each split holds as of step 4, carried
+             in fold_meta (fold_train_days, fold_test_days) — Mode 2's step 6
+          8. Yield (train_balanced, val, test, fold_meta)
         """
         ...
 ```

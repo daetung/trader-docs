@@ -8,8 +8,9 @@ can only be in-process. The former ground for this — findings handed
 LiveModeRunner's in-memory aggregates directly, which a separate process
 could not receive — no longer holds: R-9 moved every one of them to the DB
 axis and `live_aggregates` is EMPTY.
-A CLI entry point still exists for manual runs. It is a guest (utils.md's DB
-Access Coordination) and TWO-MODE, the mode chosen by `in_runner_window()` —
+A CLI entry point still exists for manual runs. It is a guest
+(db_coordination.md) with an in-window mode and an out-of-window mode, the
+mode chosen by `in_runner_window()` —
 the runner window of the guest admission test, an unreadable coordination
 store counting as in-window:
 - in-window it opens no unit and reads the most recent `scope="whole"`
@@ -17,7 +18,7 @@ store counting as in-window:
   its `ts`;
 - outside it, it opens units with `timeout` 0 and gathers normally;
 - both modes yield the same findings set;
-- `--runs [since]` prints `journal_view()` (utils.md).
+- `--runs [since]` prints `journal_view()` (db_coordination.md).
 **Call paths** are the Invocation Contract's rows (below):
 - scheduled:
   - session start;
@@ -30,7 +31,8 @@ store counting as in-window:
   - Owner lock wait;
   - Token refresh failure;
   - Owner error end;
-  - Guest DB open failure.
+  - Guest DB open failure;
+  - Scheduled work deferred.
 
 ---
 
@@ -50,17 +52,21 @@ Scheduled invocations:
   whatever the earlier stages' status:
   - findings 1 and 4 over that run's stages;
   - finding 9 when that run's `evening_execution_param_fit` stage executed
-    the fit.
+    the fit;
+  - finding 11;
+  - finding 52 over that run's `evening_ticker_master_check` stage;
+  - findings 53 and 54 over the span since the previous report.
 
 EVENT-DRIVEN invocations fire outside that schedule. These triggers exist:
 - A circuit-breaker trip (R-4) — entries are frozen for the rest of the
   session at that point, worth knowing immediately rather than at session
   end.
-- A `clock_check` abort (R-8) at session start — this one fires BEFORE the
-  scheduled session-start invocation above (the clock fault stops the
-  session before it opens), so without it a clock-fault day and an
-  ordinary quiet day would be indistinguishable to the operator from
-  outside.
+- A start ended, or blocked by a cause other than the Early-Close gate
+  (`session_start_abort`, R-8) — reported at the start outcome's point
+  (live_mode_runner.md's Session Lifecycle), in place of the scheduled
+  session-start invocation above, so a start that never reached
+  participation and an ordinary quiet day stay distinguishable to the
+  operator from outside.
 - A negative bar-latency sample (finding 27) — the premise Bar-Close
   Authority rests on has been contradicted, so waiting for session end
   would mean a full day of judgements made on a broken assumption.
@@ -71,22 +77,28 @@ EVENT-DRIVEN invocations fire outside that schedule. These triggers exist:
   (finding 28);
 - A failed overnight token refresh (finding 46);
 - An owner run ending 'error' (finding 11, `owner_error_end`), delivered by
-  the DB access coordination helper (utils.md);
+  the DB access coordination helper (db_coordination.md);
 - A guest's DuckDB open failure while holding `db.lock` (finding 49),
-  delivered by the same helper.
+  delivered by the same helper;
+- A request refused 'unmapped' (finding 51, `order_unmapped`), on the
+  runner's recording of its health event (live_mode_runner.md);
+- A scheduled run refused by guest_supervisor.md's new-run resolution
+  (finding 54, `scheduled_work_deferred`), delivered by guest_supervisor.md
+  on every refusal.
 
-Findings 11, 28, 46 and 49, on these event paths, are produced without a
-session's in-memory aggregates, at these sites:
+These findings, on these event paths, are produced without a session's
+in-memory aggregates, at these sites:
 - 11 — the evening run's wait (`predecessor_crashed`), and the helper on an
   owner's 'error' end;
 - 28 — an owner's wait before it holds the DB;
 - 46 — the token refresh;
-- 49 — the helper on a guest's DuckDB open failure.
+- 49 — the helper on a guest's DuckDB open failure;
+- 54 — guest_supervisor.md on a refusal.
 The paths whose Invocation Contract DB column reads **no** do not reach the
 DB.
 
 Report scope:
-- the breaker trip and the `clock_check` abort send the WHOLE report;
+- the breaker trip and `session_start_abort` send the WHOLE report;
 - the others are TARGETED, scoped to the finding that triggered them.
 
 A breaker trip is worth its full context, whereas a finding that can fire
@@ -125,7 +137,7 @@ def gather_findings(db_conn, today_date, log_dir,
          day's evening_* stages join only when that evening_health_report
          row is not 'success' (absent, 'running' or 'failed') — the
          evening end report's crash test;
-       - session end, breaker trip, clock_check abort: the session-start
+       - session end, breaker trip, session_start_abort: the session-start
          set plus the runner-written work stages
          (premarket_quarantine_recheck, premarket_recheck_bundle) whose
          scheduled instant (live_mode_runner.md) has passed — none on a
@@ -141,19 +153,21 @@ def gather_findings(db_conn, today_date, log_dir,
        - a non-trading day per trading_calendar: empty.
        A stage of the expected set with no row at all (not even 'running')
        is reported distinctly from a 'failed' row, with its cause, from
-       run_info() (utils.md) and the crawler log's RUN line:
+       run_info() (db_coordination.md) and the crawler log's RUN line:
        - yielded;
        - crashed;
        - ended by error or self-termination;
        - skipped by flag;
-       - not executed by a partial run.
+       - not executed by a partial run;
+       - unknown — run_info() returning None, a run_id the store does not
+         know.
        With the coordination store unreadable, the cause reads run history
        unavailable.
     2. ticker_cik_map — entry-blocked ticker count and detail (rewritten:
        the original `status`/`suspend_reason` columns this finding named
        were removed by N-2's restructure into two independent columns,
        `rename_pending` and `quarantine_reason` — see db_schema.md).
-       Predicate is is_tradable()'s own gate, inverted:
+       Predicate:
        `WHERE rename_pending = TRUE OR quarantine_reason IS NOT NULL`.
        (`rename_pending IS NOT NULL` — the naive column-rename translation
        — is always true, since the column is `NOT NULL DEFAULT FALSE`, and
@@ -184,7 +198,7 @@ def gather_findings(db_conn, today_date, log_dir,
        and matched by stage name and run_id (see metadata_crawler.md's
        Output / Logging). A stage whose STAGE line exists in its process log
        with no matching SUMMARY line, in a run ended 'normal' (run_info(),
-       utils.md), is flagged as a logging-mismatch finding on its own —
+       db_coordination.md), is flagged as a logging-mismatch finding on its own —
        distinct from the batch's own status.
     5. tick_bar_aggregates Tier-2/3 fallback rate — LiveModeRunner's Health
        Gate 2 result for the current session, not recomputed here (see
@@ -208,7 +222,9 @@ def gather_findings(db_conn, today_date, log_dir,
        columns; a carried position with no exit logical order carrying
        them is excluded; for every other row, trade_log's
        own columns. An entry that ended early is compared against its
-       simulation on the window it actually had (shadow_retraining.md).
+       simulation on the window it actually had (shadow_retraining.md); an
+       entry whose logical order ended 'unsent' is not an observation and is
+       not compared.
        Independent of finding 6 — a model divergence and an
        execution-parameter divergence are different failure modes (retrain
        vs. recalibrate) and must not be merged into one signal. Threshold
@@ -271,34 +287,51 @@ def gather_findings(db_conn, today_date, log_dir,
        gap are different failure modes. Never merged with finding 7 or
        with each other for the same reason findings 6 and 7 stay separate.
     10. Residual symbol-mismatch rate, PER SOURCE — for each vendor source
-        whose symbol strings are folded by utils.md's
-        normalize_vendor_symbol() AND whose residue has no manual
-        resolution path, the fraction of that source's rows which FAILED to
-        match after folding, reported as one tally per source rather than
-        pooled. That qualifier is what leaves out
-        metadata_crawler.md's build_trading_api_symbol_map(): its unmatched
-        rows go to a candidates log that manual registration works off, so
-        they are a backlog to clear rather than a rate to watch. The
-        sources are investing.com's calendar rows
-        against active_ticker_universe (item N), and the halt feed's items
-        against the held-ticker set (live_mode_runner.md's halt-status
-        poller). A rising rate for a source signals symbology drift in that
-        source beyond what normalization resolves — kept in place after
+        matched through utils.md's match_vendor_symbol() whose residue has
+        no manual resolution path, one tally per source rather than pooled:
+        - denominator — the source's items matched at any stage;
+        - numerator — the items matched only at the loose or name stage;
+        - the items unmatched after every stage are excluded from the rate
+          and counted.
+        That qualifier is what leaves out
+        metadata_crawler.md's build_trading_api_symbol_map(): its loose and
+        name matches go to a candidates log that manual registration works
+        off, so they are a backlog to clear rather than a rate to watch. The
+        sources are investing.com's calendar rows against the 'tradable'
+        index (item N), and the halt feed's items against the 'tradable'
+        index (live_mode_runner.md's halt-status poller and its single-fetch
+        entry). A rising rate for a source signals symbology drift in that
+        source beyond what the rule stage resolves — kept in place after
         normalization was added, since best-effort matching does not
         guarantee zero residual mismatches. Pooling the sources would hide
         which one drifted, which is the only actionable part. Threshold
         TBD, same deferral status as finding 8's warn cutoff.
-        Source: RESIDUE lines (fields source, items, unmatched) in the
-        file-log format — the halt-status poller writes one per poll to the
-        runner log; crawl_corporate_events_investing() writes one per call
-        to its hosting process's log. Finding 10 sums items and unmatched
-        per source over today_date.
-    11. Abnormal process end — from utils.md's abnormal_runs() and
+        Source: RESIDUE lines in the file-log format (metadata_crawler.md's
+        Output / Logging, which lists their fields):
+        - the halt-status poller writes one per poll to the runner log, and
+          its single-fetch entry one per fetch to its hosting process's log,
+          each process counting a feed item once per day, on first sight,
+          keyed by (symbol, HaltDate, HaltTime) (live_mode_runner.md);
+        - crawl_corporate_events_investing() writes one per call to its
+          hosting process's log.
+        Finding 10 sums, per source over today_date:
+        - items;
+        - fallback;
+        - excluded.
+    11. Abnormal process end — from db_coordination.md's abnormal_runs() and
         missed_scheduled_run():
         - a crashed run of any role, the runner crash included;
         - a run ended 'error', 'self_terminated' or 'yielded' — 'aborted' and
           'hard_cap' ends are reported by finding 28, and 'timed_out' and
           'not_expected' ends are not reported;
+        - not reported either:
+          - 'blocked' and 'superseded' ends;
+          - the 'self_terminated' end of a run that opened a work —
+            guest_supervisor.md's `work_opened_by()` returning a work;
+        - a 'self_terminated' end is reported:
+          - when `work_opened_by()` returns None — a run that opened no work;
+          - while `resume.sqlite` is unreadable, every one, its detail naming
+            the store unreadable;
         - a scheduled run missing at its checkpoint:
           - premarket — at the runner's phase-A deadline, with no scheduled
             premarket run today;
@@ -306,17 +339,17 @@ def gather_findings(db_conn, today_date, log_dir,
             no scheduled runner run today;
           - evening — at session start, with no scheduled evening run on the
             previous trading day;
-          - token refresh — at session start, before the token coverage gate,
-            with no scheduled refresh run today;
+          - token refresh — at session start, with no scheduled refresh run
+            today;
         - each listed run given with the stages its process log shows started
           without a SUMMARY.
         Reported at session start and at evening end over the span since the
         previous report. Also delivered for one run alone by the DB access
         coordination helper when an owner run ends 'error' (`owner_error_end`,
-        utils.md's Helper deliveries).
+        db_coordination.md's Helper deliveries).
         With the coordination store unreadable — the report functions raising
-        (utils.md) — it reports the store unreadable, severity 'abort', in
-        place of its run list.
+        (db_coordination.md) — it reports the store unreadable, severity
+        'abort', in place of its run list.
     12. Unknown broker order/position at reconcile (R-2/R-3) — at any Broker
         Reconcile call site (session start, warm restart, feed outage, and the
         Positions branch run at the event-day exit gate's release):
@@ -410,11 +443,13 @@ def gather_findings(db_conn, today_date, log_dir,
         (fit_execution_params() consumes it); the other count is neither —
         those entries were cut short before cancel_after_seconds could
         decide them, and fit_execution_params() reads them for buy_rate on
-        the window they actually had; a rising entry_rejected count
+        the window they actually had, except one whose logical order ended
+        'unsent', which it does not read; a rising entry_rejected count
         points at the account or the broker and is not — it is excluded
         from that calibration (see shadow_retraining.md). The
         entry_rejected tally is broken out by trade_log.reject_reason
-        (R-8), stored as the broker returned it: insufficient margin, a
+        (R-8), stored as the broker returned it, a NULL reject_reason broken
+        out as unknown: insufficient margin, a
         non-permitted ticker and a malformed order call for three
         different responses, and under the risk-based intraday margin
         regime that replaced the PDT rule in June 2026 a rejection count
@@ -565,7 +600,8 @@ def gather_findings(db_conn, today_date, log_dir,
         swallowed and does NOT increment this counter — otherwise a persistent
         write fault would feed itself.
     23. Broker rejections without a recognised reason (R-8) — entry_rejected
-        rows whose reject_reason has not been seen before. reject_reason is
+        rows whose non-NULL reject_reason has not been seen before; a NULL
+        reason is finding 17's unknown, not a vocabulary item. reject_reason is
         stored verbatim because the broker's vocabulary is an unverified
         contract (api_contract_checklist.md); this finding is how that
         vocabulary is actually discovered, so it feeds the checklist rather
@@ -656,7 +692,7 @@ def gather_findings(db_conn, today_date, log_dir,
         accepted exposure, recorded here rather than in a session doc so it
         stays attached to the signal that detects it.
     28. Owner lock wait (`owner_lock_wait`) — an owner's wait for `db.lock`
-        (utils.md's acquire loop). Detail `{owner, phase: 'waiting' |
+        (db_coordination.md's acquire loop). Detail `{owner, phase: 'waiting' |
         'deadline', holder, outcome, open_error}`:
         - phase 'waiting' — emitted, severity 'warn', when an owner starts
           waiting on a guest or 'unregistered' holder;
@@ -813,10 +849,13 @@ def gather_findings(db_conn, today_date, log_dir,
         `{request_id, ticker, candidates}`, `candidates` a list of
         `(order_date, order_id)`. Level: abort.
     38. Exit rejection streak (`exit_rejection_streak`) — consecutive
-        structural rejections of a position's exit logical orders reaching
+        structural rejections of a position's exit logical orders — each a
+        rejection from the synchronous result or from order-end resolution
+        (live_mode_runner.md) — reaching
         `live_mode.exit_reject_streak_threshold` (default 3). Source:
         health_events where finding_name='exit_rejection_streak'; detail
-        `{ticker, logical_order_id, streak_count, reject_code, reject_reason}`.
+        `{ticker, logical_order_id, streak_count, reject_code, reject_reason}`,
+        reject_code and reject_reason from the rejected request.
         Recorded once per streak per position. Level: warn.
     39. Reconcile deferred (`reconcile_deferred`) — a ticker Broker Reconcile
         did not compare or settle this call. Source: health_events where
@@ -856,17 +895,21 @@ def gather_findings(db_conn, today_date, log_dir,
         Level: warn.
     43. Regime holdout gate failed (`regime_holdout_gate_failed`) — with
         `optimizer.regime_holdout.gate.enabled`, the deployed `run_id`'s
-        verdict resolved to 'fail', and session start stopped before
-        Inferencer init (live_mode_runner.md). Source: health_events where
+        verdict resolved to 'fail', and participation was blocked before
+        Inferencer init — the start's outcome 'blocked' (live_mode_runner.md).
+        Source: health_events where
         finding_name='regime_holdout_gate_failed'; detail
         `{run_id, optimizer_run_id, verdict}`. Level: abort.
-    44. Regime holdout verdict (`regime_holdout_verdict`) — recorded at every
-        live session start: the deployed `run_id`'s `regime_holdout_verdict`
-        row (pipeline_optimizer.md's report items and verdict), or that no
-        row exists. Source: health_events where
+    44. Regime holdout verdict (`regime_holdout_verdict`) — recorded at each
+        start reaching step 7 (live_mode_runner.md's Session Lifecycle): the
+        deployed `run_id`'s `regime_holdout_verdict` row
+        (pipeline_optimizer.md's report items and verdict), or that no row
+        exists. Source: health_events where
         finding_name='regime_holdout_verdict'; detail
-        `{run_id, verdict, report}`. Level: ok — a report, never an alert on
-        its own.
+        `{run_id, verdict, report}`. Level — a report, never an alert on its
+        own:
+        - 'ok' when the verdict is 'pass';
+        - 'info' when it is 'pass_with_warning' or 'fail', or no row exists.
     45. Tick alignment failed (`tick_alignment_failed`) — a held interval's
         derived-bundle alignment failed and the ticker's bundle source
         degraded to vendor 10-tick (live_mode_runner.md's Per-Ticker Tick
@@ -896,15 +939,82 @@ def gather_findings(db_conn, today_date, log_dir,
         exception_message}`. Level: warn.
     49. Guest DB open failed (`guest_db_open_failed`) — a guest's DuckDB open
         failing while it holds `db.lock`. Source: the DB access coordination
-        helper (utils.md's Helper deliveries), which builds and delivers it
-        DB-less at the run's first failure and at each change of class;
-        gather_findings() does not collect it. Detail `{run_id, tool, unit,
-        open_error: {class, message}}`. Severity:
+        helper (db_coordination.md's Helper deliveries), which builds and
+        delivers it DB-less at the run's first failure and at each change of
+        class; gather_findings() does not collect it. Detail `{run_id, tool,
+        unit, open_error: {class, message}}`. Severity:
         - 'warn' for class 'lock_conflict';
         - 'abort' for class 'unmatched', the alert naming a possibly damaged
           file and the DuckDB recovery procedure (shadow_retraining.md).
+    50. Session phase mismatch (`session_phase_mismatch`) — Source:
+        health_events where finding_name='session_phase_mismatch', recorded
+        at a date's first 'phase_mismatch' result (live_mode_runner.md);
+        detail as recorded, `{ticker, side, order_type, local_phase, rsp_cd,
+        rsp_msg}`. Level: warn.
+    51. Order unmapped (`order_unmapped`) — Source: health_events where
+        finding_name='order_unmapped', recorded once per (ticker, date) for a
+        request refused 'unmapped' (live_mode_runner.md); detail as recorded,
+        `{ticker, side, purpose}`. Level: abort. The runner invokes the
+        `order_unmapped` path when it records the event (Invocation
+        Contract).
+    52. Ticker-master check (`ticker_master_check`) — reads the
+        `evening_ticker_master_check` stage's `SUMMARY` line, its
+        per-outcome counts, from that run's
+        `logs/metadata_crawler_{date}.log` (metadata_crawler.md's Evening
+        Ticker-Master Check), reported at evening end over that run's stage;
+        on any other path it reads the previous trading day's, as finding 33
+        does for its own stage.
+        Level:
+        - 'info' when any count is nonzero;
+        - 'ok' when all are zero.
+    53. Work transition (`work_transition`) — guest_supervisor.md's work
+        journal, read through its report function `work_journal_view()`
+        alone, over the span since the previous report; reported at session
+        start and at evening end:
+        - a work turning 'halted' → 'warn';
+        - a work turning superseded → 'warn' when its trigger is
+          'scheduled', 'info' when 'manual';
+        - detail:
+          - work_id;
+          - variant;
+          - trigger;
+          - progress_at;
+          - cause, with the superseding work for a manual supersede;
+          - the dependents waiting on it;
+        - `resume.sqlite` unreadable → the store reported unreadable,
+          'warn'.
+    54. Scheduled work deferred (`scheduled_work_deferred`) — a scheduled run
+        refused by guest_supervisor.md's new-run resolution. Delivered by
+        guest_supervisor.md through alert_delivery.md's `deliver()` on every
+        refusal (Invocation Contract), which builds the finding entry;
+        gathered at session start and at evening end from that path's
+        records in `log_dir/health_report_{date}.log` over the span since the
+        previous report. Severity 'info'; detail:
+        - the deferred run's:
+          - tool;
+          - variant;
+          - trigger;
+        - the blocker — `restore_store`, or the blocking work's:
+          - work_id;
+          - variant;
+          - whether its creating run passed `--supersede` (its creation
+            journal row);
+          - created_at;
+          - progress_at.
+    55. Start outcome (`start_outcome`) — the start's outcome
+        (live_mode_runner.md's Session Lifecycle), `{kind, at, causes:
+        [{gate, detail}]}`, passed by the runner to the `session_start` and
+        `session_start_abort` paths (`run_health_report()`'s `start_outcome`,
+        Alert Delivery below); built from that argument, not gathered.
+        Severity:
+        - 'abort' on `session_start_abort` — 'ended', and 'blocked' with a
+          cause other than the Early-Close gate;
+        - 'info' for 'blocked' by the Early-Close gate alone;
+        - 'ok' for 'participating'.
 
-    Returns: dict of {finding_name: {severity: 'ok'|'warn'|'abort', detail: ...}}
+    Returns: dict of {finding_name: {severity: 'ok'|'info'|'warn'|'abort', detail: ...}},
+    severities ordered ok < info < warn < abort (alert_delivery.md's
+    max_severity())
     """
     ...
 ```
@@ -913,8 +1023,9 @@ def gather_findings(db_conn, today_date, log_dir,
 
 ## DB Health Observation (R-9)
 
-A read-only summary emitted at each owner's acquisition of the DB (utils.md's
-acquire()), warm restarts and manual owner runs included. It reports:
+A read-only summary emitted at each owner's acquisition of the DB
+(db_coordination.md's acquire()), warm restarts and manual owner runs
+included. It reports:
 
 - the `data/market.duckdb` file size
 - row counts for every `PURGE_REGISTRY` member (metadata_crawler.md) and for
@@ -977,12 +1088,17 @@ def run_health_report(db_conn, today_date, log_dir, config,
                       findings_subset: list[str] | None = None,
                       suppressible: bool = False,
                       alert_key: str | None = None,
-                      live_aggregates: dict | None = None) -> None:
+                      live_aggregates: dict | None = None,
+                      start_outcome: dict | None = None) -> None:
     """See Invocation Contract below for the call paths — its rows — and the
-    argument each one passes. `alert_key` is required when suppressible."""
+    argument each one passes. `alert_key` is required when suppressible.
+    `start_outcome` — the session_start and session_start_abort paths' — adds
+    finding 55, built from it."""
     findings = gather_findings(db_conn, today_date, log_dir,
                                subset=findings_subset,
                                live_aggregates=live_aggregates)
+    if start_outcome is not None:
+        findings["start_outcome"] = <finding 55 from start_outcome and alert_key>
     alert_delivery.deliver(alert_key, findings, config, log_dir,
                            db_conn=db_conn, suppressible=suppressible,
                            scope="whole" if findings_subset is None
@@ -1026,7 +1142,7 @@ released.
                                          (alert_delivery.md's drain())
 5. Handle.close('done')                  (the session state, the DuckDB
                                           close, the db.lock release —
-                                          utils.md's DB Access Coordination)
+                                          db_coordination.md)
 ```
 Why the drain precedes the DB close is alert_delivery.md's Drain.
 
@@ -1067,9 +1183,11 @@ Drain timeout, by path:
   - `owner_lock_wait`, drained at the owner's abort or give-up exit;
   - `owner_error_end`;
   - `guest_db_open_failed` for class 'unmatched';
-- `drain_timeout_seconds` — every other path, `token_refresh_failed`,
-  `evening_end` and `guest_db_open_failed` for class 'lock_conflict'
-  included.
+- `drain_timeout_seconds` — every other path, these included:
+  - `token_refresh_failed`;
+  - `evening_end`;
+  - `scheduled_work_deferred`;
+  - `guest_db_open_failed` for class 'lock_conflict'.
 
 ---
 
@@ -1085,20 +1203,31 @@ across three files and drifted.
 | Scheduled, session start | `session_start` | None | False | yes | yes | — |
 | Scheduled, session end | `session_end` | None | False | yes | yes | — |
 | Breaker trip (R-4) | `breaker_trip` | None | False | yes | yes | — |
-| `clock_check` abort (R-8) | `clock_check_abort` | None | False | yes | yes | — |
+| Start ended or blocked (R-8) | `session_start_abort` | None | False | yes | yes | — |
 | Negative bar-latency sample | `bar_close_premise_violation` | finding 27 | True | yes | yes | — |
+| Order unmapped | `order_unmapped` | finding 51 | False | yes | yes | — |
 | Evening liveness probe | `evening_liveness_probe` | DB-only findings | False | yes | yes | — |
-| Scheduled, evening end | `evening_end` | findings 1 and 4 over that evening run's stages; finding 9 when that run's `evening_execution_param_fit` SUMMARY line reports the fit executed | False | yes | yes | — |
+| Scheduled, evening end | `evening_end` | findings 1 and 4 over that evening run's stages; finding 9 when that run's `evening_execution_param_fit` SUMMARY line reports the fit executed; finding 11; finding 52 over that run's `evening_ticker_master_check` SUMMARY; findings 53 and 54 over the span since the previous report | False | yes | yes | — |
 | Owner lock wait | `owner_lock_wait` | finding 28 | False | **no** | yes | — |
 | Token refresh failure | `token_refresh_failed` | finding 46 | False | **no** | yes | — |
 | Owner error end | `owner_error_end` | finding 11 (that run) | False | **no** | yes | — |
 | Guest DB open failure | `guest_db_open_failed` | finding 49 | False | **no** | yes | — |
+| Scheduled work deferred | `scheduled_work_deferred` | finding 54 | False | **no** | yes | — |
 
+- `session_start` and `session_start_abort` carry the start outcome as
+  finding 55, passed in `start_outcome`, each start invoking one of them
+  once, at the outcome's point (live_mode_runner.md's Session Lifecycle):
+  - `session_start_abort`, at abort severity — 'ended', and 'blocked' with a
+    cause other than the Early-Close gate;
+  - `session_start` — 'blocked' by the Early-Close gate alone, and
+    'participating'.
 - A path whose DB column reads **no** writes no `alert_log` row
   (alert_delivery.md's Delivery).
 - The owner error end and guest DB open failure paths are delivered by the DB
-  access coordination helper (utils.md's Helper deliveries), which builds
-  their finding entries and passes them to alert_delivery.md's `deliver()`.
+  access coordination helper (db_coordination.md's Helper deliveries), which
+  builds their finding entries and passes them to alert_delivery.md's
+  `deliver()`; the scheduled work deferred path is delivered the same way by
+  guest_supervisor.md, on every refusal of a scheduled run.
 - `log_write_failed` is also an `alert_key` but not a path — it is injected
   into whichever delivery is in flight (alert_delivery.md's Log Writing) and
   is never suppressed.
@@ -1140,33 +1269,51 @@ always present.
   session crashes. The axis and its column above are KEPT rather than
   deleted: it is a real requirement a future finding could have, and
   retaining it means the classification does not have to be rebuilt then.
-  Every path's entry is `—` for now, including `clock_check_abort`, whose
-  former `partial` described exactly the case R-9 removed — an abort before
-  Gate 2 now leaves its probe measurements in the DB rather than in memory.
+  Every path's entry is `—` for now, including `session_start_abort`, whose
+  former `partial` (as `clock_check_abort`) described exactly the case R-9
+  removed — an abort before Gate 2 now leaves its probe measurements in the
+  DB rather than in memory.
 - **`log_dir` files** — the `SUMMARY`, `RESIDUE`, `RUN` and `STAGE` lines of
   `logs/metadata_crawler_{date}.log` and `logs/live_mode_runner_{date}.log`:
   - finding 4;
   - finding 10;
   - the missing-`SUMMARY` finding;
-  - finding 1's no-row cause.
+  - finding 1's no-row cause;
+  - finding 52;
+  - finding 54, from `log_dir/health_report_{date}.log`.
   Readable without the DB, which is why the DB-less paths can produce
   anything at all.
-- **DB**: findings 1, 2, 3, 5, 8, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
-  22, 23, 24, 25, 26, 27, 29, 30, 31, 32, 33, 34, 35, 36-45, 48. Of those, 30-33 and 35
-  read `live_scan_daily`; 33 alone reads a row written by the evening batch
-  rather than by the session being reported, so on a session-end call it
+- **DB** — findings:
+  - 1-3;
+  - 5;
+  - 8 and 9;
+  - 12-27;
+  - 29-45;
+  - 48;
+  - 50;
+  - 51.
+  Of those, 30-33 and 35 read `live_scan_daily`; 33 alone reads a row
+  written by the evening batch rather than by the session being reported,
+  so on a session-end call it
   describes the PREVIOUS day.
 - **Neither**:
   - finding 6 (placeholder);
   - finding 7 (placeholder);
   - finding 28;
   - finding 46.
-- **Run history** — utils.md's report functions over the coordination store,
-  readable on every path, so the table above has no column for it:
+- **Run history** — db_coordination.md's report functions over the
+  coordination store, readable on every path, so the table above has no
+  column for it:
   - finding 11 (`abnormal_runs()`, `missed_scheduled_run()`);
   - finding 1's no-row cause (`run_info()`).
+- **Work records** — guest_supervisor.md's report functions over
+  `resume.sqlite`, readable on every path:
+  - finding 11 (`work_opened_by()`);
+  - finding 53 (`work_journal_view()`).
 - Finding 49, and finding 11 under `owner_error_end`, are built by the DB
-  access coordination helper, not gathered.
+  access coordination helper, not gathered; finding 54 under
+  `scheduled_work_deferred` is built by guest_supervisor.md; finding 55 is
+  built by `run_health_report()` from its `start_outcome` argument.
 - On the evening liveness probe, finding 11 is that path's own conclusion —
   the crash its wait found (`predecessor_crashed`) — with the run's details
   from run history (`abnormal_runs()`).
@@ -1187,7 +1334,8 @@ If today's runner run ended `not_expected` or no runner run exists today,
 the session never started —
 an ordinary non-trading outcome, not a crash — and the subset narrows to
 finding 1. Reporting the full sweep there would emit an all-zero report that
-reads like an incident.
+reads like an incident. Finding 11 still reaches the operator at evening end
+(`evening_end`'s subset).
 
 **`today_date`** is the trading day the CALLING PROCESS started on, fixed at
 start and never re-derived — the same rule metadata_crawler.md's Constraints

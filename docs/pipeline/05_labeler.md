@@ -30,7 +30,9 @@ ticks_df: pd.DataFrame
 
 halts_df: pd.DataFrame
     columns: [ticker, date, halt_start, halt_end, reason_code]
-    # trading_halts table rows for this ticker-date
+    # trading_halts table rows for this ticker-date; a row whose halt_end is
+    # NULL covers every slot of that date from its halt_start on
+    # (db_schema.md's trading_halts.halt_end)
 
 trading_calendar: pd.DataFrame
     columns: [date, is_trading_day, session_close, after_hours_end, has_data]
@@ -165,7 +167,9 @@ After-market bars (hour > last_bar(date)) are never included.
 Halt classification applies across all time periods (pre/regular/after-market).
 
 For each missing bar slot up to last_bar(date):
-    if slot overlaps halt interval in halts_df → "halt" (excluded from valid count)
+    if slot overlaps halt interval in halts_df → "halt" (excluded from valid count;
+                                                  a NULL halt_end covers the
+                                                  date from halt_start on)
     else                                        → "no_trade" (OHLC = prior close, volume=0)
 
 --- Step 2: Breach detection via track_label_breach() ---
@@ -386,8 +390,7 @@ labeler:
   # execution:'s on the other.
   # after_market_close_hour REMOVED. It duplicated the after-market boundary
   # already carried by trading_calendar.after_hours_end, which is what the
-  # live process's R-9 hard cap resolves from and what metadata_crawler.md's
-  # evening-cron derivation is stated against.
+  # live process's R-9 hard cap resolves from.
   # NOT the ingestion range, which also reads 200000: that range is fixed by
   # decision and does not move with the calendar, while after_hours_end does.
   # The two coincided at 200000, and grouping them as one boundary was the

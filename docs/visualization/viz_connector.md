@@ -64,7 +64,7 @@ class VizConnector(ABC):
         """Render an equity curve from trade log data.
 
         Args:
-            trade_log: DataFrame as returned by BacktestEngine._build_trade_log().
+            trade_log: BacktestEngine.run()'s trade_log_df.
 
         Returns:
             Opaque figure handle (backend-dependent).
@@ -75,7 +75,7 @@ class VizConnector(ABC):
         """Render a histogram of P&L percentages.
 
         Args:
-            trade_log: DataFrame as returned by BacktestEngine._build_trade_log().
+            trade_log: BacktestEngine.run()'s trade_log_df.
         """
 
     # ── Prediction Visualization ──────────────────────────────────────

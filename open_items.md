@@ -26,28 +26,36 @@ confirmation that it still reads correctly.
 
 ## Suggested order
 
-1. **Manual-intervention CLI** is unblocked.
+1. **Optimizer session_mode search over features computed once** enters
+   first, the highest priority of every item here.
+2. **Manual-intervention CLI** is unblocked.
    The async boundary that used to sit here is closed: how many clients exist
    and where the boundary falls are both decided, and its shared review
-   surface with (2)'s sub-questions no longer exists because those are
+   surface with (3)'s sub-questions no longer exists because those are
    settled too.
-2. **WS/REST tape asymmetry and exit-trigger path transitions** is blocked on
+3. **WS/REST tape asymmetry and exit-trigger path transitions** is blocked on
    SHADOW-PERIOD DATA rather than on design time, so it is not sequenced
    against the items above. Only its deferred part remains.
-3. **`api_contract_checklist.md` re-evaluation** goes last by construction —
+4. **`api_contract_checklist.md` re-evaluation** goes last by construction —
    it collects what the items above establish.
-4. **Real-time bid/ask spread** is blocked on calendar time, not design time,
+5. **Real-time bid/ask spread** is blocked on calendar time, not design time,
    so it is not sequenced against anything here.
-5. **Config-duplicating signature defaults** is unblocked but is hygiene
+6. **Config-duplicating signature defaults** is unblocked but is hygiene
    rather than a design blocker, so it is not sequenced against the items
    above either. It is listed because a new item left out of this list is the
    carry-forward defect this file exists to prevent, inverted.
-6. **No path from a trained model's `run_id` to the live model** is unblocked
+7. **No path from a trained model's `run_id` to the live model** is unblocked
    and not sequenced against the items above.
-7. **Finding 6 divergence — resampling unit and threshold** is not sequenced
+8. **Finding 6 divergence — resampling unit and threshold** is not sequenced
    against the items above.
-8. **Lock measurements** is not sequenced against the items above.
-9. **Crashed runner relaunch** is not sequenced against the items above.
+9. **Lock measurements** is not sequenced against the items above.
+10. **Run launchers** is not sequenced against the items above.
+11. **Halt spanning midnight** is not sequenced against the items above.
+12. **Selection-phase search design** is not sequenced against the items
+    above.
+13. **Step decomposition of the per-run guests** is not sequenced against
+    the items above.
+14. **Code-version identifier** is not sequenced against the items above.
 
 ---
 
@@ -190,18 +198,16 @@ Not a new design problem — a pointer, so it isn't lost among the items
 above. `docs/ops/api_contract_checklist.md` holds the vendor-contract
 assumptions the specs rest on, among them:
 
-- unverified and graded **A**: T-1 (REST/WS tick granularity), T-21 (each
-  execution reported under exactly one order number), T-25
-  (`AstkExecBaseQty` reflecting same-day executions immediately)
+- unverified and graded **A** — the rows its Grade column marks A with an
+  empty Measured column;
 - measured: T-6
 - retired: T-3, T-7, T-8, T-14, T-15, T-16, T-29
 
 Rows are not removed as questions are settled, because that file's Role
 and Constraints forbid deleting rows — a broker change would
 make a settled question live again, and a deleted row would have to be
-rediscovered. T-1, T-21 and T-25 are the only A-graded rows, and each must be
-verified, or its fallback path confirmed sufficient, before Stage 2
-(Pilot) — see that file's own "When to use it" section. Not duplicated here;
+rediscovered. Each A-graded row must be verified before Stage 2 (Pilot) —
+see that file's own "When to use it" section. Not duplicated here;
 consult that file directly rather than letting a second copy of its contents
 drift out of sync.
 
@@ -254,7 +260,6 @@ omission while the two agree.
 - `02_indicator_calculator.md` `reset_mode` `"date"` — its own config block
 - `02_indicator_calculator.md` `regular_start` `"093000"` — its own config block
 - `utils.md` `ambiguity_priority` `"up"`, TWICE in one file — `05_labeler.md`
-- `utils.md` `n_sessions` `20` — `02_indicator_calculator.md`
 - `utils.md` `vol_metric` `"avg_intraday_range"` — `pipeline_optimizer.md`
 - `utils.md` `embargo_days` `5` — `06_class_balancer.md`
 - `01_entry_detection.md` `max_sideways_ratio` `0.6` — its own config block
@@ -263,8 +268,7 @@ omission while the two agree.
 
 **Not members**, having no config counterpart: `utils.md`'s `window_days` and
 `val_fraction`, `07_lgbm_pipeline.md`'s `importance_type`, and the local
-defaults — `return_intermediate`, `balance`, `fold_idx`, `dry_run`,
-`return_data`.
+defaults — `return_intermediate`, `balance`, `fold_idx`, `dry_run`.
 
 **`target_valid_bars` is excluded**, its default already removed. That one was
 removed because it broke WITHIN one engine: `09_backtest_engine.md` counts
@@ -305,8 +309,8 @@ its threshold are undecided.
 
 ## Lock measurements
 
-**Problem.** The DB access coordination (utils.md) relies on lock behaviour
-not yet measured:
+**Problem.** The DB access coordination (db_coordination.md) relies on lock
+behaviour not yet measured:
 - the time for another process to take a lock after its holder is killed,
   on Linux and on Windows;
 - that a forked child holds none of its parent's locks;
@@ -314,7 +318,73 @@ not yet measured:
 
 ---
 
-## Crashed runner relaunch
+## Run launchers
 
-**Problem.** No process relaunches a crashed LiveModeRunner for warm
-restart; the dispatcher does not.
+**Problem.** Runs the system needs have no launcher:
+- no process relaunches a crashed LiveModeRunner for warm restart; the
+  dispatcher does not;
+- no launcher or schedule is specified for the optimizer's 'refresh' run —
+  its command is `run_guest pipeline_optimizer --trigger scheduled`
+  (pipeline_optimizer.md), and nothing issues it.
+
+---
+
+## Optimizer session_mode search over features computed once
+
+**Problem.** pipeline_optimizer.md's search space varies
+`entry_detector.session_mode` per trial, while the input Preprocessor work
+computes features once under its config's session_mode — run_preprocess.md's
+session-stats load filter, 02_indicator_calculator.md's rvol baseline span —
+and a trial's session_mode reaches only ClassBalancer's sample filter.
+Consequences:
+- trial evaluation is biased against session_mode values other than the input
+  work's;
+- a deployment config set to the winning trial's session_mode computes live
+  features under a session_mode the model was not trained with, undetected by
+  Health Gate 1d's derived config_hash comparison — session_mode is applied at
+  load, outside the `precomputed_session_stats` config_hash.
+
+---
+
+## Halt spanning midnight
+
+**Problem.** Whether the NYSE halt pages give a halt continuing from D into
+D+1 its own D+1 row is unverified. Without one:
+- D+1 slots before resumption are classified no_trade rather than halt
+  (`trading_halts`' NULL `halt_end` covers D alone), skewing
+  `precomputed_session_stats` baselines and labels whose windows include D+1;
+- the label outcome stays covered by 05_labeler.md's Case D, and live trading
+  by the halt-status poller's snapshot.
+
+The evening Halt Comparison's `halt_live_only` metric on D+1 observes the
+case. A classification rule changed after the answer reaches already-computed
+derived rows only as a code change does (Code-version identifier, below).
+
+---
+
+## Selection-phase search design
+
+**Problem.** The selection phase's search design is not specified. It
+covers:
+- restoring `dimensionality_reducer.importance_averaging` to a search space;
+- a `sample_weighted` basis that differs from `uniform`
+  (08_dimensionality_reducer.md).
+
+---
+
+## Step decomposition of the per-run guests
+
+**Problem.** Whether each per-run guest (guest_supervisor.md's Tool Registry)
+splits into steps resumed through guest_supervisor.md is undecided. Until
+then each restarts from scratch after self-termination (db_coordination.md's
+Unit scope).
+
+---
+
+## Code-version identifier
+
+**Problem.** No path acquires a code-version identifier. A
+guest_supervisor.md work's config_hash and every derived table's config_hash
+carry none, so a code change that alters computed values without changing
+the feature schema hash is resumed into the same work, and its derived rows
+stay under the same config_hash. Design deferred.

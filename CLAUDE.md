@@ -250,7 +250,7 @@ Output: prose explanation + recommendation only.
 
 ## Session Start Checklist
 
-1. `conda activate venv`
+1. `source .venv/bin/activate`
 2. `git status`
 3. Check task queue above
 4. Read `docs/data/data_boundary.md` and the relevant pipeline doc before implementing

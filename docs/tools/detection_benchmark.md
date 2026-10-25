@@ -18,43 +18,50 @@ class sample counts and computation time before committing to a full pipeline ru
 
 ## CLI Usage
 
-**DB access role.** A guest (db_schema.md's DB File Ownership Windows),
-through utils.md's DB Access Coordination:
-- the entry point runs inside `register('guest', 'detection_benchmark', trigger)`;
-- `market.duckdb` is opened only inside `guest_unit('detection_benchmark', None)`,
-  which waits for admission without limit;
-- the run is one unit, the connection that unit yields passed wherever
-  this entry point takes `db_conn`;
+**DB access role.** A per-run guest (db_schema.md's DB File Ownership Windows;
+db_coordination.md's Unit scope), run through guest_supervisor.md's
+`run_guest`:
+- `run_guest detection_benchmark` enters
+  `register('guest', 'detection_benchmark', trigger)` and opens one
+  `guest_unit('detection_benchmark', None)` around the body, which waits for admission
+  without limit;
+- the body is handed that unit's connection, passed wherever this tool
+  takes `db_conn`, and calls neither `register()` nor `guest_unit()`;
+- `tools/detection_benchmark.py` run directly hands over to
+  `run_guest detection_benchmark`;
 - while an owner waits past `coordination.guest_max_hold_seconds`, the run
-  ends by self-termination and is re-run.
+  ends by self-termination and is re-run from scratch.
 
 ```bash
+# python tools/detection_benchmark.py <args> hands over to
+# run_guest detection_benchmark <args>
+
 # Full run: detect + label, report class counts and timing
-python tools/detection_benchmark.py \
+run_guest detection_benchmark \
     --db-path data/market.duckdb \
     --config configs/pipeline_config.yaml
 
 # Dry run: timing estimate only (no labeling, count detections only)
-python tools/detection_benchmark.py \
+run_guest detection_benchmark \
     --db-path data/market.duckdb \
     --config configs/pipeline_config.yaml \
     --dry-run
 
 # Override specific filter thresholds inline (no config file edit needed)
-python tools/detection_benchmark.py \
+run_guest detection_benchmark \
     --db-path data/market.duckdb \
     --config configs/pipeline_config.yaml \
     --override "entry_detector.B_min_volume_1min=80000" \
     --override "entry_detector.G_min_ratio=3.0"
 
 # Limit to specific date range
-python tools/detection_benchmark.py \
+run_guest detection_benchmark \
     --db-path data/market.duckdb \
     --config configs/pipeline_config.yaml \
     --date-from 20250101 --date-to 20250331
 
 # Limit to N random tickers (for quick sanity check)
-python tools/detection_benchmark.py \
+run_guest detection_benchmark \
     --db-path data/market.duckdb \
     --config configs/pipeline_config.yaml \
     --sample-tickers 100
@@ -206,7 +213,7 @@ before it is switched on — not whether to switch it on, which is
 `pipeline_optimizer.md`'s `execution_eval` question.
 
 ```bash
-python tools/detection_benchmark.py \
+run_guest detection_benchmark \
     --db-path data/market.duckdb \
     --config configs/pipeline_config.yaml \
     --decay-sweep 0,5,10,20,30,40,50,60 \
@@ -297,3 +304,4 @@ Benchmark results are NOT written to `experiment_log` (that table is for model r
 - `--override` applies in-memory only — config file is never modified
 - SQL-based detection is mandatory for performance; Python-loop fallback only for unsupported conditions
 - Benchmark results saved to `tools/benchmark_results/` — not to `experiment_log`
+- Calls neither `register()` nor `guest_unit()` — `run_guest` opens its unit

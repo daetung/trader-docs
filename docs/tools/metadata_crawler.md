@@ -7,7 +7,7 @@
 
 ## Role
 
-Seven responsibilities combined into one daily-run tool, split across two
+Responsibilities combined into one daily-run tool, split across two
 schedule points (see "Dual Schedule" below — evening full run, plus a
 lightweight premarket corporate-events refresh), with a third, unrelated
 schedule entry for the overnight token refresh (see "Overnight Token
@@ -28,6 +28,12 @@ Refresh"):
    below):
    - premarket CIK-map-based rename detection, with evening self-correction;
    - evening incremental `fundamentals_quarterly` collection.
+8. **NYSE trading-halt crawl** — the evening `evening_nyse_halts` stage: the
+   run's date's halts into `trading_halts` (Additional Data Sources' NYSE
+   Trading Halts)
+9. **Ticker-master check** — the evening `evening_ticker_master_check`
+   stage: the trading API's ticker master compared with `ticker_cik_map`
+   (Evening Ticker-Master Check)
 
 ---
 
@@ -135,7 +141,9 @@ calendar sidesteps the price signal entirely instead of trying to tune
 around that floor.
 
 ```python
-def crawl_corporate_events_investing(dividends_filter: str, db_conn) -> int:
+def crawl_corporate_events_investing(
+    dividends_filter: str, tradable_index: dict, db_conn
+) -> int:
     """
     Scrapes investing.com's calendars for splits and dividends — unlike
     crawl_corporate_events()'s per-ticker yfinance loop, there is no ticker
@@ -175,8 +183,9 @@ def crawl_corporate_events_investing(dividends_filter: str, db_conn) -> int:
           the parser carries the group's date forward.
         - The ticker is not a column. It is a bracketed label inside the
           company cell, and extracting it is this crawler's job — it runs
-          ahead of normalize_vendor_symbol(), whose scope stays
-          case/separator/class-suffix folding.
+          ahead of utils.md's match_vendor_symbol(), whose rule stage
+          (normalize_vendor_symbol()) stays case/separator/class-suffix
+          folding.
         - splits: the ratio string parses as a:b, a and b each an integer
           or a decimal (e.g. "1.5:1", "1.05:1"), into
           corporate_events.ratio = a / b, which puts 2:1 at 2.0 and 1:20 at
@@ -189,18 +198,16 @@ def crawl_corporate_events_investing(dividends_filter: str, db_conn) -> int:
           dividend_gross_from_events(). Payment Date, Yield and Type are not
           stored.
 
-    Filters scraped rows to active_ticker_universe via query-time symbol
-    normalization — utils.md's normalize_vendor_symbol(), which owns the
-    case/separator/class-suffix rules, reused here rather than
-    reimplemented, since every consumer of it faces the same "does this
-    vendor's symbol string identify a ticker we track" problem (resolved
-    this design pass; no longer a naive exact match). Normalization is
-    best-effort, not a
-    guarantee — health_report.md finding 10 keeps tracking the residual
-    mismatch rate, from the RESIDUE line this function writes once per call
-    to its hosting process's structured log (Output / Logging) — then
-    writes each row through the shared
-    upsert_corporate_event() helper below with source='investing'.
+    Resolves each scraped row's ticker through utils.md's
+    match_vendor_symbol() against tradable_index (the caller's 'tradable'
+    index, utils.md's build_symbol_index()), with no exchange_hint — the
+    single path every vendor symbol takes. A row unmatched after every
+    stage is not ours and is skipped. Matching is best-effort, not a
+    guarantee — health_report.md finding 10 tracks the residue, from the
+    RESIDUE line this function writes once per call to its hosting
+    process's structured log (Output / Logging). Then writes each matched
+    row through the shared upsert_corporate_event() helper below with
+    source='investing'.
     Does NOT write corporate_events directly: the one-row-per-event
     invariant (see db_schema.md) and the vendor-disagreement handling both
     live in that helper, so neither vendor's crawler can bypass them.
@@ -221,15 +228,15 @@ Notes:
 - Also called forward-looking, for the next trading day, during the
   evening run (investing.com's calendar is populated ahead of the
   effective date)
-- Symbol matching applies utils.md's normalize_vendor_symbol()
-  (case/separator/class-suffix) — no longer naive
-  exact matching. Best-effort, not a guarantee: residual mismatches stay
-  visible via health_report.md finding 10's match-rate tracking rather
+- Symbol matching is utils.md's match_vendor_symbol() against the
+  caller's 'tradable' index, with no exchange_hint, at every call.
+  Best-effort, not a guarantee:
+  residual mismatches stay visible via health_report.md finding 10 rather
   than being treated as a solved-and-closed gap.
 - Coverage assumption: investing.com's calendar is assumed to span the
   full US-listed universe this system trades, not a large-cap subset —
   observed as such this session but not independently verified against a
-  vendor spec sheet. Treated the same as active_ticker_universe for
+  vendor spec sheet. Treated as covering the 'tradable' index for
   matching purposes; if coverage later proves partial, "not found in
   investing.com's calendar" stops being a safe proxy for "no event" and
   this crawl's absence-of-a-row can no longer be read as confirmation.
@@ -291,6 +298,12 @@ def upsert_corporate_event(
     each, with its own source and basis_date — not the raw values, which a
     restating source expresses in a later split's basis.
 
+    An insert or update appends its source_changes rows in the same
+    transaction (db_schema.md's Source changes): the row's event_date and,
+    for a written split or reverse_split, the event_date of each dividend of
+    that ticker, whatever its source, whose (event_date, basis_date]
+    contains the split's event_date. A no-op agreement appends none.
+
     Returns True if corporate_events was inserted or updated, False on a
     no-op agreement.
     """
@@ -319,16 +332,28 @@ Schedule" below for why they differ:
 04:00 ET (--premarket-open, single process — see Dual Schedule below):
     1. detect_rename_candidates()                          # writes batch_runs
                                                              #   stage='premarket_rename'
-    2. quotes       = bulk_fetch_today_first_price(...)     # trading API, chunked
-       halt_status  = utils.query_halt_status(...)           # NOT a dbsec call;
-                                                             #   no chunk size
-                                                             #   (utils.md)
+    1b. build_trading_api_symbol_map(db_conn)              # writes batch_runs
+                                                             #   stage='premarket_trading_api_symbol_map'
+        tradable_index = utils.build_symbol_index(db_conn, 'tradable')
+                                                             # after 1b; its tickers
+                                                             #   are steps 2-3's set
+    2. quotes       = bulk_fetch_today_first_price(<the index's tickers>)
+                                                             # trading API, chunked
+       <the Halt-Status Poller's single-fetch entry, given tradable_index>
+                                                             # one fetch filling this
+                                                             #   process's snapshot
+                                                             #   (live_mode_runner.md)
+       halt_status  = utils.query_halt_status(<the index's tickers>)
+                                                             # NOT a dbsec call; reads
+                                                             #   that snapshot; no
+                                                             #   chunk size (utils.md)
        # sequential, not parallel — see Dual Schedule below for why
-    3. for ticker in active_ticker_universe:
+    3. for ticker in <the index's tickers>:
            crawl_corporate_events(ticker, db_conn)            # yfinance — dominant cost
                                                              # writes batch_runs
                                                              #   stage='premarket_corporate_events'
-    3b. crawl_corporate_events_investing("this_week", db_conn) # item N: investing.com
+    3b. crawl_corporate_events_investing("this_week", tradable_index, db_conn)
+                                                             # item N: investing.com
                                                              # bulk (own db_conn —
                                                              # the premarket run holds
                                                              # db.lock; no other
@@ -340,26 +365,33 @@ Schedule" below for why they differ:
 09:20 ET (R-1: LiveModeRunner in-process task — see live_mode_runner.md's
 "In-Process Premarket Recheck"; --premarket-recheck below is manual/debug
 only, a guest not admitted in the runner window):
-    1. quotes       = bulk_fetch_today_first_price(...)     # trading API, chunked
-       halt_status  = utils.query_halt_status(...)           # NOT a dbsec call;
-                                                             #   no chunk size
-                                                             #   (utils.md)
+    1. quotes       = bulk_fetch_today_first_price(<the runner's 'tradable'
+                                                     index tickers>)
+                                                             # trading API, chunked
+       halt_status  = utils.query_halt_status(<the same tickers>)
+                                                             # NOT a dbsec call; reads
+                                                             #   the running poller's
+                                                             #   snapshot (utils.md)
        # sequential — same function, same reasoning as above
     2. check_corporate_event_anomaly(db_conn, config, quotes, halt_status)
                                                              # writes batch_runs
                                                              #   stage='premarket_quarantine_recheck'
        # full-universe fresh re-evaluation, NOT a delta; at 09:20 it runs
        # before the investing refresh (the 04:00 order is unchanged)
-    3. crawl_corporate_events_investing("this_week", db_conn)  # item N: yes, this
+    3. crawl_corporate_events_investing("this_week", tradable_index, db_conn)
+                                                             # item N: yes, this
                                                              # pass DOES refresh
                                                              # corporate_events now
                                                              # (contrast the old
                                                              # design, which never
                                                              # re-crawled at 09:20)
     4. yfinance narrow crawl (crawl_corporate_events(ticker, db_conn)) for
-       any ticker newly quarantined in step 2                      # item N
-    5. per ticker that gained a new same-day corporate_events row in
-       steps 3-4:                                                  # item N
+       any ticker of the runner's 'tradable' index newly quarantined in
+       step 2                                                      # item N
+    5. first, today's stale precomputed_session_stats groups of the
+       tickers steps 3-4 wrote corporate_events for are recomputed under
+       the deployment config (live_mode_runner.md); then, per ticker that
+       gained a new same-day corporate_events row in steps 3-4:   # item N
        once Eager Pool has run — each ticker's write its own transaction
        under one write_lock hold, issued as that ticker's seed is ready,
        no batching across tickers:
@@ -371,9 +403,13 @@ only, a guest not admitted in the runner window):
        - no calculator ("db" mode, ticker not yet restored) → the seed is
          recomputed and persisted, quarantine_reason cleared in the same
          transaction
-       before Eager Pool has run (Step 4b late-start path) → clear
-       quarantine_reason if set at once; Eager Pool computes on the fresh
-       rows
+       on the late recheck (live_mode_runner.md's Session Lifecycle step
+       4b; Eager Pool not yet run) → every ticker holding today's
+       indicator_cache rows and a corporate_events row dated today is
+       re-seeded, its seed recomputed and persisted with quarantine_reason
+       cleared in the same transaction; any other ticker that gained a
+       same-day row has quarantine_reason cleared at once if set, and Eager
+       Pool computes on the fresh rows
        # writes through db_write() — this process's own writer, no
        # inter-process coordination (see live_mode_runner.md)
     The pass is run_premarket_recheck_bundle(), which writes its own
@@ -422,8 +458,10 @@ def check_corporate_event_anomaly(
     This offline batch context has no live tick stream, so there is no
     tick-rate fallback available here the way live_mode_runner.md has one
     for its own query_halt_status() call: if halt_status is None — no fresh
-    snapshot, the poller having produced none yet or holding one past its
-    freshness ceiling — every ticker in that call is treated as NOT halted,
+    snapshot: outside the runner, the single fetch failed; in the runner,
+    the poller has produced none yet or holds one past its freshness
+    ceiling — every
+    ticker in that call is treated as NOT halted,
     the conservative direction. There is no per-ticker absence to handle
     beside it: the contract keys every requested ticker. Suppressing a
     quarantine
@@ -454,8 +492,10 @@ def check_corporate_event_anomaly(
             # Does not touch rename_pending — see db_schema.md's
             # ticker_cik_map (N-2 restructure): the two suspend reasons are
             # now independent columns, so this write can never clobber an
-            # unrelated rename-pending flag, and is_tradable() ORs both
-            # — no code change needed there for this addition.
+            # unrelated rename-pending flag, and is_tradable() fails on a
+            # set rename_pending, on a set quarantine_reason and on a
+            # missing trading_api_symbol alike — no code change needed
+            # there for this addition.
             log to tools/quarantine_candidates.log for manual review
         elif (current row has quarantine_reason = 'corporate_event_anomaly'
               and has_event_today):
@@ -512,12 +552,23 @@ Note: Halts occur across all time periods — no time filter applied.
 ```python
 def crawl_nyse_halts(date: str, db_conn) -> int:
     """
-    Fetch halts for given date from NYSE.
-    Upsert into trading_halts table.
+    Fetch halts for the given date from NYSE, the page chosen by date:
+    trade-halt-current for today, trade-halt-history for an earlier date.
+    A trading day for which the page yields zero rows (rows fetched, not
+    rows inserted) is a failure, not a halt-free day.
+    Upsert into trading_halts table; per (ticker, date) whose trading_halts
+    rows were inserted or changed, appends a source_changes row for that
+    date in the same transaction (db_schema.md's Source changes).
     Returns: number of rows inserted.
     """
     ...
 ```
+
+Called by:
+- the evening run's `evening_nyse_halts` stage, after `evening_ingestion`
+  and before `evening_tick_bar_aggregates`, for the run's date only; a crawl
+  failure leaves the stage 'failed';
+- migration_tool.md's trading_halts backfill, for every ingested date.
 
 ### US Market Holidays
 ```
@@ -569,8 +620,12 @@ These functions are safe to call multiple times (upsert).
 
 ## Session Stats Update (Daily)
 
-After calendar and coverage update, compute REFERENCE_SESSION baselines for
-the next trading day. This ensures session_stats are available before market open.
+After calendar and coverage update, compute REFERENCE_SESSION baselines under
+the deployment config (`pipeline_config.yaml`):
+- the next trading day's groups, so session_stats are available before
+  market open;
+- every stale group of the deployment config_hash (db_schema.md's Derived
+  tables); stale groups of other config_hashes are left to their consumers.
 
 ```python
 from utils import populate_precomputed_session_stats
@@ -581,20 +636,61 @@ next_trading_day = get_next_trading_day(today, db_conn)
 
 populate_precomputed_session_stats(
     db_conn=con,
+    config=config,              # the deployment config
     dates=[next_trading_day],   # as_of_date for which we need baselines
-    n_sessions=20,
 )
+
+# Every stale group of the deployment config_hash: per as_of_date, only the
+# tickers whose group there is stale — no absent group of an earlier date
+# is computed.
+for as_of_date, tickers in <the deployment config_hash's stale groups, by as_of_date>:
+    populate_precomputed_session_stats(
+        db_conn=con, config=config, dates=[as_of_date], tickers=tickers,
+    )
 ```
 
 `populate_precomputed_session_stats()`:
 - Computes per-bar averages for `as_of_date = next_trading_day` using
-  the prior 20 sessions' data (now available since today's data just ingested)
+  the prior `indicators.reference_session.n_sessions` sessions' data (now
+  available since today's data just ingested)
 - Halt handling applied per metric type (see utils.md for details)
 - Corporate-event adjustment applied per metric type before aggregation,
-  using `corporate_events` as populated by this same evening run (see
-  utils.md populate_precomputed_session_stats() section D.)
-- Safe to re-run (INSERT OR IGNORE)
+  using `corporate_events` as stored when a group is computed (see
+  utils.md populate_precomputed_session_stats() section D.); a later
+  corporate_events change — the forward check below, a premarket crawl —
+  turns the groups it reaches stale, and their recomputation carries it:
+  this stage on a later evening, or LiveModeRunner's Step 2 for today's
+  groups (live_mode_runner.md)
+- Re-running, per group:
+  - an absent group is computed;
+  - a stale group is recomputed, its rows replaced;
+  - a current group is skipped
 - Runs after ingestion — ensures today's data is included in the baseline
+
+---
+
+## Evening Ticker-Master Check (`stage='evening_ticker_master_check'`)
+
+After Session Stats Update and right before the forward check below. The
+evening run builds the 'tradable' index from the DB once
+(`utils.build_symbol_index(db_conn, 'tradable')`), for this stage and the
+forward check.
+
+Per-exchange ticker-master calls (trading_api.md's tradable ticker list, one
+call per listing exchange), compared with `ticker_cik_map`'s current rows
+(db_schema.md's current-row rule) by `trading_api_symbol`:
+- appeared — a returned code no current row holds;
+- disappeared — a row in that day's 'tradable' index whose code is not
+  returned;
+- changed — a current row holding a returned code whose
+  `trading_api_exchange` or `trading_api_name` differs.
+
+Observes only: writes nothing to `ticker_cik_map`. Writes:
+- its `batch_runs` row;
+- a `SUMMARY` line carrying each outcome's count;
+- per-ticker `INFO` lines.
+A failure leaves the stage 'failed' and blocks nothing. health_report.md's
+ticker-master check finding reads that `SUMMARY`.
 
 ---
 
@@ -609,13 +705,14 @@ which covers a weekend and a mid-week market holiday by one rule:
 
 ```python
 week = "this_week" if same_week(next_trading_day, today) else "next_week"
-crawl_corporate_events_investing(week, db_conn)
+crawl_corporate_events_investing(week, tradable_index, db_conn)
+                       # tradable_index: the evening run's, built from the DB
 ```
 
-Does NOT affect tonight's `precomputed_session_stats` — those are past-date
-baselines already computed above; a future-dated corporate_events row cannot
-enter their computation, so this step is safe to run after the
-ordering-sensitive session-stats step rather than before it. Writes
+A row it writes for the next trading day enters the footprint of that day's
+groups computed above, turning them stale; LiveModeRunner's Step 2
+recomputes today's stale groups before loading them (live_mode_runner.md),
+so running after the session-stats step costs no correctness. Writes
 `batch_runs` `stage='evening_investing_forward_check'`
 (`status='running'` at start, `'success'`/`'failed'` at completion).
 
@@ -649,7 +746,7 @@ loop A always starts and always subscribes, the former
 
 | Condition | Outcome |
 |---|---|
-| Neither file exists | SKIP — no-op `batch_runs` row, the same shape the non-trading-day crons already write |
+| Neither file exists | SKIP — no-op `batch_runs` row, the same shape the crawl runs the dispatcher launches on a non-trading weekday already write |
 | Exactly one file exists | FAILURE — one process writes both sides now, so live-only means loop A's thread died and delayed-only means the runner never wrote its own aggregates; the `auxiliary_loop_stopped` health event (health_report.md finding 48) corroborates the former |
 | Either file fails to parse | FAILURE |
 | A file stops mid-session | SUCCESS — analysed for what it holds |
@@ -749,7 +846,7 @@ memory and only counts are persisted.
 cutoff (`entry_detector.max_entry_offset_minutes`, skipped entirely when null)
 and the after-market exclusion are applied by Inferencer BEFORE `detect()`, and
 it logs nothing when they reject. The late-day cutoff is now PER DATE — it
-resolves as `last_bar(date) - max_entry_offset_minutes` — so the evening pass
+resolves as `session_close(date) − max_entry_offset_minutes` — so the evening pass
 must resolve it against the SESSION'S date, not the date the pass runs on.
 While it was an absolute time the two agreed trivially; they no longer do.
 Comparing an unfiltered evening pass against that would turn every deliberate
@@ -776,9 +873,10 @@ recoverable by subtraction. No per-ticker roster table is added for it: the
 first days of data size the residual before any storage is built for it.
 
 **Universe scoping has a known residual.** The population is tickers holding
-today's `ohlcv_1min`, minus quarantine. The session's actual tradable list is
-persisted nowhere, so tickers the session could not have traded are still
-counted. Conditions A (price <= 20), B (50000) and D (100000) make the
+today's `ohlcv_1min`, minus quarantine. The session's tradable list is
+persisted (`live_session_state.all_tickers`) but not applied here, so
+tickers the session could not have traded are still counted. Conditions A
+(price <= 20), B (50000) and D (100000) make the
 passing set small enough that this is observable rather than dominant —
 stated rather than silently absorbed.
 
@@ -919,9 +1017,12 @@ whatever the earlier stages' status:
 Any step failing → `status='failed'`, the `.partial` file deleted, and the
 evening run ending normally.
 
-The stage also copies `coordination.sqlite` to
-`backup_dir/coordination_YYYYMMDD.sqlite` through the SQLite backup API, by
-utils.md's `backup_store(dest_path)`, under the stage's own run and skip rules.
+The stage also copies, through the SQLite backup API and under the stage's
+own run and skip rules:
+- `coordination.sqlite` to `backup_dir/coordination_YYYYMMDD.sqlite`, by
+  db_coordination.md's `backup_store(dest_path)`;
+- `resume.sqlite` to `backup_dir/resume_YYYYMMDD.sqlite`, beside it, by
+  guest_supervisor.md's `backup_resume_store(dest_path)`.
 
 - `YYYYMMDD` and the `batch_runs` date are the evening run's date basis.
 - Writes its own `batch_runs` row (`'running'` at start, then
@@ -936,8 +1037,8 @@ utils.md's `backup_store(dest_path)`, under the stage's own run and skip rules.
     finding 1;
   - under `--backup-only`; no other partial-run flag runs it.
 - `--backup-only` is the manual re-run:
-  - it runs this stage alone, as a guest unit with `timeout` 0 (utils.md's
-    DB Access Coordination) — not admitted, it exits with an error;
+  - it runs this stage alone, as a guest unit with `timeout` 0
+    (db_coordination.md) — not admitted, it exits with an error;
   - on failure it exits with an error;
   - the copy and its `batch_runs` row take the latest date carrying an
     `evening_*` `batch_runs` row; with none, it exits with an error.
@@ -958,7 +1059,12 @@ earlier stages' status: health_report.md's `evening_end` path.
     under finding 1 as an informational skipped item, taken from this run's
     own invocation;
   - finding 9 when this run's `evening_execution_param_fit` stage executed
-    the fit.
+    the fit;
+  - finding 11;
+  - the ticker-master check finding, over this run's
+    `evening_ticker_master_check` `SUMMARY`;
+  - the work-transition finding and the `scheduled_work_deferred` finding,
+    over the span since the previous report.
 - Runs in the full evening run, with or without its `--skip-*` flags; no
   partial-run flag runs it.
 - Order: gather → alert_delivery.md's `deliver()` (log, dispatch) →
@@ -1008,7 +1114,8 @@ lookback is silently truncated for that entire day.
 ```python
 def detect_rename_candidates(db_conn) -> list[dict]:
     """
-    1. Fetch SEC company_tickers.json → upsert ticker_cik_map
+    1. Fetch SEC company_tickers.json → upsert ticker_cik_map, writing
+       each row's sec_title (the file's title)
        (new (cik, ticker) pairings default to rename_pending=FALSE per
        db_schema.md — overridden to TRUE below when ambiguous. N-2: this
        and quarantine_reason, below check_corporate_event_anomaly(), are
@@ -1018,14 +1125,17 @@ def detect_rename_candidates(db_conn) -> list[dict]:
        is not required — it doesn't exist yet at premarket)
     3. Unambiguous matches: INSERT OR IGNORE INTO ticker_history
        (effective_date = today, a best-effort estimate; self-corrected this
-       evening — see below). ticker_cik_map row for ticker_new stays
+       evening — see below); an inserted row appends source_changes rows
+       for current_ticker, every date before effective_date, in the same
+       transaction. ticker_cik_map row for ticker_new stays
        rename_pending=FALSE — no gate needed, identity is confirmed.
     4. Ambiguous / CIK-unmatched:
        UPDATE ticker_cik_map SET rename_pending = TRUE
            WHERE cik=? AND ticker=?
-       (this is what LiveModeRunner's is_tradable() gate — see
-       execution_common.md — actually reads; the log below is for human
-       review, not machine consumption)
+       (one of the inputs LiveModeRunner's is_tradable() gate — see
+       execution_common.md — actually reads, beside quarantine_reason and
+       trading_api_symbol; the log below is for human review, not machine
+       consumption)
        log to tools/rename_candidates.log for manual review
 
     Fallback path (not integrated here): for cases SEC's company_tickers.json
@@ -1068,51 +1178,73 @@ because the two vendors need not format a ticker the same way (e.g. a
 class-suffix ticker rendered differently by each).
 
 ```python
-def build_trading_api_symbol_map(db_conn) -> list[dict]:
+def build_trading_api_symbol_map(
+    db_conn, master_rows: dict | None = None
+) -> list[dict]:
     """
-    1. Three bulk calls to the trading API's own ticker-master endpoint,
-       one per listing exchange (NYSE, NASDAQ, AMEX) — a single call each,
-       full universe returned per call, no per-ticker round trip. Exchange
-       is the call's own input parameter, not a response field: every
-       ticker returned by a given call is tagged with that call's exchange
-       directly, never parsed out of the response.
-    2. Match each returned ticker to a ticker_cik_map row: exact match
-       first, then utils.md's normalize_vendor_symbol() (case, separator,
-       class-suffix handling) — reused rather than reimplemented, since
-       every consumer of it faces the same "does this vendor's symbol
-       string identify a row we already track" problem.
-    3. Matched: UPDATE ticker_cik_map SET trading_api_symbol = ?,
-       trading_api_exchange = ? WHERE cik=? AND ticker=? (see
-       db_schema.md — trading_api_symbol stores the raw code only, never
-       an exchange-prefixed form; the prefix is assembled at the point of
-       an actual trading-API call, from trading_api_exchange, so a future
-       change to the prefix convention touches only that call site, not
-       stored data).
-    4. Unmatched after normalization: log to
-       tools/trading_api_symbol_candidates.log for manual review — same
-       "automated first pass, manual fallback for the residue" shape as
-       detect_rename_candidates(), resolved via
-       --register-trading-api-symbol (see CLI Usage).
-    5. No active_ticker_universe filter anywhere above: a ticker absent
-       from ticker_cik_map simply has no row to match against and is
-       skipped at step 2 by construction — universe scoping is an
-       entry-point-detection concern (01_entry_detection.md), not this
-       step's; every ticker the trading API supports is in scope here.
+    1. The trading API's own ticker master, per listing exchange (NYSE,
+       NASDAQ, AMEX), full universe per exchange, no per-ticker round trip:
+       - master_rows given — LiveModeRunner's per-exchange Session
+         Lifecycle Step 1 responses (live_mode_runner.md); no call is made;
+       - otherwise one bulk call per exchange, continuation pages
+         included; a failed call is
+         re-attempted every trading_api_symbol_map.retry_seconds until
+         trading_api_symbol_map.retry_deadline (America/New_York).
+       Exchange is the call's own input parameter, not a response field:
+       every code returned by a given call is tagged with that call's
+       exchange directly, never parsed out of the response.
+    2. For each code an exchange returned:
+       - each current ticker_cik_map row (db_schema.md's current-row rule)
+         already holding it as trading_api_symbol on that exchange keeps its
+         mapping, whether or not re-matched below, and gets
+         trading_api_seen_date = today and trading_api_name = the code's
+         KorIsnm, raw;
+       - a code no current row holds is matched through utils.md's
+         match_vendor_symbol() against the 'sec' index
+         (utils.build_symbol_index(db_conn, 'sec')).
+    3. An exact or rule match: UPDATE ticker_cik_map SET
+       trading_api_symbol = ?, trading_api_exchange = ?,
+       trading_api_name = ?, trading_api_seen_date = today on the matched
+       ticker's current row — the row with the latest last_seen_date when
+       several rows share the ticker (see db_schema.md — trading_api_symbol
+       stores the raw code only, never an exchange-prefixed form; the
+       prefix is assembled at the point of an actual trading-API call, from
+       trading_api_exchange, so a future change to the prefix convention
+       touches only that call site, not stored data).
+    4. A loose or name match is not applied: it is written to
+       tools/trading_api_symbol_candidates.log as a proposed match for
+       manual registration, beside the codes unmatched after every stage —
+       same "automated first pass, manual fallback for the residue" shape
+       as detect_rename_candidates(), resolved via
+       --register-trading-api-symbol (see CLI Usage). This residue has that
+       manual path, so this step writes no RESIDUE line and stays outside
+       health_report.md's finding 10.
+    5. No universe filter anywhere above: a code matching no row is
+       logged, not written — universe scoping is an entry-point-detection
+       concern (01_entry_detection.md), not this step's; every ticker the
+       trading API supports is in scope here.
 
-    Full-universe overwrite every run, not a delta: all three calls return
-    the complete current set each time, so there is nothing to track
-    between runs and no separate delta-detection logic exists.
+    Never cleared:
+        - trading_api_symbol;
+        - trading_api_exchange;
+        - trading_api_name.
+    Each run reads the complete current master; nothing is tracked between
+    runs.
     """
 ```
 
-**Partial-failure handling.** If any of the three per-exchange calls fails,
-the whole step is reported to `batch_runs` as `status='failed'` for
-`stage='premarket_trading_api_symbol_map'` — a 2-of-3 success is not
-written as a partial update. Yesterday's `trading_api_symbol` /
-`trading_api_exchange` values are left untouched either way, never cleared
-on failure — the same "preserve the last-known-good value rather than
-silently run on an incomplete refresh" posture as the quarantine and
-corporate-events handling elsewhere in this file.
+**Partial-failure handling.** The matches of every succeeded exchange call
+are written; a failed exchange's rows are left untouched. The stage is
+`status='failed'` for `stage='premarket_trading_api_symbol_map'` while any
+exchange call has failed at the step's end. The same "preserve the
+last-known-good value rather than silently run on an incomplete refresh"
+posture as the quarantine and corporate-events handling elsewhere in this
+file.
+
+**Hosted by LiveModeRunner.** At a cold start, when today's
+`premarket_trading_api_symbol_map` row is not 'success', LiveModeRunner runs
+this step on its Session Lifecycle Step 1 responses (`master_rows`),
+overwriting that stage's row (live_mode_runner.md).
 
 Writes its own `batch_runs` row (`stage='premarket_trading_api_symbol_map'`,
 `date=today`) — `status='running'` at start, `status='success'`/`'failed'`
@@ -1128,7 +1260,9 @@ def self_correct_rename_effective_dates(db_conn, today) -> None:
     For ticker_history rows with effective_date within the last 5 trading
     days: compare registered effective_date against
     MIN(date) FROM ohlcv_1min WHERE ticker = ticker_new.
-    If different: UPDATE ticker_history SET effective_date = actual.
+    If different: UPDATE ticker_history SET effective_date = actual,
+    appending source_changes rows for current_ticker, from the earlier date
+    to the day before the later, in the same transaction.
 
     For any ticker_new confirmed here (a row now exists in ohlcv_1min):
         UPDATE ticker_cik_map SET rename_pending = FALSE
@@ -1194,7 +1328,9 @@ def collect_fundamentals_incremental(db_conn) -> int:
     submissions feed; if new filings exist since the last stored filed_date
     for that ticker, fetch companyfacts and upsert into fundamentals_quarterly
     via resolve_xbrl_tag_value() (see utils.md) per configs/xbrl_tag_map.json
-    tag priority. Skipped if --skip-fundamentals.
+    tag priority; each inserted or changed (ticker, filed_date) appends a
+    source_changes row from filed_date, open end, in the same transaction.
+    Skipped if --skip-fundamentals.
     """
 ```
 
@@ -1228,7 +1364,7 @@ following day, and never inside a session.
 
 ```bash
 # Overnight token refresh — coordination.schedule.token_refresh.time
-# (utils.md), default "03:00" America/New_York. The scheduled (bare) form
+# (db_coordination.md), default "03:00" America/New_York. The scheduled (bare) form
 # processes the production and demo accounts in one process, each with its
 # own skip and its own retry budget.
 python tools/collect_daily.py \
@@ -1274,8 +1410,10 @@ blocks nothing:
   directly.
 
 **Blast radius is bounded, not by luck.** Revocation is account-wide, but no
-other trading-API consumer exists at 03:00:
-- the evening batch makes no trading-API call;
+other trading-API consumer depends on the token at 03:00:
+- the evening batch's only trading-API calls are its ticker-master check's,
+  which observe only; one cut by the revocation leaves that stage 'failed',
+  blocking nothing;
 - the premarket batch starts later.
 
 Batch entry points keep the SDK's automatic reissue enabled, having no
@@ -1287,10 +1425,11 @@ WebSocket connection to disturb; the live session does not (see
 ## Dual Schedule: Evening Full Run + Premarket Corporate-Events Refresh
 
 The evening run (21:00 ET, below) computes `precomputed_session_stats` for
-tomorrow using corporate_events as crawled at that time. This ordering must
-not change — moving the full crawl to premarket would mean session_stats
-baselines are computed BEFORE that day's own corporate_events refresh,
-reintroducing the staleness problem baselines are meant to avoid.
+tomorrow using corporate_events as stored at that time. The full crawl stays
+in the evening run: a corporate_events change after the groups are computed
+turns them stale, and LiveModeRunner's Step 2 recomputes today's stale groups
+before loading them — cheap for the few tickers a premarket refresh changes,
+not for a full crawl's.
 
 Instead, a second, lightweight, corporate-events-only crawl runs at premarket,
 supplementing (not replacing) the evening run — this improves freshness for
@@ -1310,8 +1449,13 @@ for that day's own bar loading, even though it's still in time for the
 following day's `precomputed_session_stats` (evening) and future sessions.
 
 ```bash
-# Premarket open, 04:00 ET — single process (N-1): rename detection,
-# quotes/halt fetch, corporate-events crawl, anomaly check, in that order.
+# Premarket open, 04:00 ET — single process (N-1), in this order:
+#   - rename detection;
+#   - the trading-API symbol map;
+#   - the 'tradable' index;
+#   - quotes and halt fetch;
+#   - corporate-events crawls (yfinance, investing.com);
+#   - anomaly check.
 # Replaces running --corporate-events-only and --ticker-rename-only as two
 # separate processes at this slot (see Constraints — that was a DuckDB
 # single-writer collision risk, both processes writing ticker_cik_map at
@@ -1324,15 +1468,17 @@ python tools/collect_daily.py \
 # recheck is now a LiveModeRunner in-process task (see
 # live_mode_runner.md's "In-Process Premarket Recheck"). This flag remains
 # for running the quotes/halt + anomaly-check pass by hand OUTSIDE a live
-# session — as a guest it is not admitted in the runner window.
+# session — the 'tradable' index built from the DB, one halt single fetch
+# before utils.query_halt_status() — and as a guest it is not admitted in
+# the runner window.
 python tools/collect_daily.py \
     --db-path data/market.duckdb \
     --premarket-recheck
 ```
 
 Timing: `--premarket-open` at 04:00 ET, well before premarket bar
-accumulation begins. The 09:20 ET recheck (R-1: now in-process, not this
-cron) is chosen as the latest point that comfortably fits its own cost
+accumulation begins. The 09:20 ET recheck (R-1: now in-process, not a
+scheduled run) is chosen as the latest point that comfortably fits its own cost
 (quotes + halt fetch, sequential, ~150s each ≈ 300s total — see
 `check_corporate_event_anomaly()` above) ahead of 09:30 regular-session
 open, while getting as close to open as possible for freshness (premarket
@@ -1365,22 +1511,17 @@ residual is what `check_corporate_event_anomaly()`'s price-gap detection
 exists to catch (see below) — a defense that does not depend on either
 crawl at all.
 
-**Residual risk (narrowed by item N; fully closed only once R1 also
-lands).** Patch N by itself closes the 04:00 gap (dual-vendor) and adds a
-forward-looking investing.com check the evening before (see "Evening
-Forward-Looking Corporate-Events Check" above) — but the 09:20 pass
-described just above this paragraph is, by itself, still the OLD
-`--premarket-recheck` (quotes/halt + anomaly-check only, no crawl of any
-kind) until `r1_inprocess_recheck.patch` is also applied. That patch moves
-this pass in-process and is what actually wires up the 09:20 investing
-bulk crawl, the yfinance narrow crawl for newly-quarantined tickers, and
-`caching_calculator.md`'s scoped mid-session recompute trigger (see that
-file) — none of which fire from anything in THIS patch alone. Applied
-together (N then R1, per the handoff's patch order), the intraday-staleness
-gap that motivated this whole item is closed for anything either vendor
-reflects by 09:20; `check_corporate_event_anomaly()`'s price-gap heuristic
-remains the third and final defense layer for the residual neither vendor
-catches in time.
+**Residual risk.** The 04:00 pass crawls both yfinance and investing.com,
+and a forward-looking investing.com check runs the evening before (see
+"Evening Forward-Looking Corporate-Events Check" above). The in-process
+09:20 recheck (live_mode_runner.md's In-Process Premarket Recheck) closes
+the intraday-staleness gap for anything a vendor reflects by 09:20,
+through:
+- its investing bulk crawl;
+- the yfinance narrow crawl for newly-quarantined tickers;
+- `caching_calculator.md`'s scoped mid-session recompute.
+`check_corporate_event_anomaly()`'s price-gap heuristic remains the final
+defense layer, for the residual no vendor reflects in time.
 
 ---
 
@@ -1456,16 +1597,21 @@ python tools/collect_daily.py \
     --backfill-meta
 
 # Corporate events only — a guest: --premarket-open's corporate-events crawl
-# steps (the yfinance per-ticker crawl and the investing.com bulk call),
-# writing the premarket_corporate_events row dated the run day; no anomaly
-# check
+# steps (the yfinance per-ticker crawl and the investing.com bulk call) over
+# the 'tradable' index built from the DB, writing the
+# premarket_corporate_events row dated the run day; no anomaly check
 python tools/collect_daily.py \
     --db-path data/market.duckdb \
     --corporate-events-only
 
 # Premarket open (N-1) — the actual 04:00 ET scheduled entry (see Cron /
-# Scheduler Setup); rename detection + quotes/halt fetch + corporate-events
-# crawl + anomaly check, one sequential process
+# Scheduler Setup), one sequential process:
+#   - rename detection;
+#   - the trading-API symbol map;
+#   - the 'tradable' index;
+#   - quotes and halt fetch;
+#   - corporate-events crawls (yfinance, investing.com);
+#   - anomaly check.
 python tools/collect_daily.py \
     --db-path data/market.duckdb \
     --premarket-open
@@ -1473,13 +1619,14 @@ python tools/collect_daily.py \
 # Premarket recheck — MANUAL/DEBUG ONLY (R-1). No longer the scheduled
 # 09:20 ET entry — that is now a LiveModeRunner in-process task (see
 # live_mode_runner.md's "In-Process Premarket Recheck"). This flag runs
-# the quotes/halt + anomaly-check pass by hand, outside a live session.
+# the quotes/halt + anomaly-check pass by hand, outside a live session, on
+# the 'tradable' index built from the DB, one halt single fetch first.
 python tools/collect_daily.py \
     --db-path data/market.duckdb \
     --premarket-recheck
 
-# Overnight token refresh (see "Overnight Token Refresh" above and the cron
-# entry below). Unlike its neighbours in this section, which are manual,
+# Overnight token refresh (see "Overnight Token Refresh" above and the
+# dispatcher entry below). Unlike its neighbours in this section, which are manual,
 # debug or partial-run flags, this one's primary use is the scheduled
 # entry — it is listed here for completeness, not because it is normally
 # invoked by hand. The bare form processes both accounts; --account
@@ -1491,8 +1638,9 @@ python tools/collect_daily.py \
     --db-path data/market.duckdb \
     --token-refresh --account production
 
-# Dispatcher (see Cron / Scheduler Setup) — the one crontab entry; launches
-# the scheduled runs with --trigger scheduled
+# Dispatcher (see Cron / Scheduler Setup) — its crontab entry sits beside
+# the resume sweep's (guest_supervisor.md); launches the scheduled
+# runs with --trigger scheduled
 python tools/collect_daily.py --db-path data/market.duckdb --dispatch --trigger scheduled
 ```
 
@@ -1564,7 +1712,7 @@ Daily Collection — 20250715
     Duration            : 0m 12s
 
   [Session Stats — next trading day: 20250716]
-    precomputed_session_stats: 11,847 tickers × 390 bars × 8 metrics computed
+    precomputed_session_stats: 11,847 tickers × 390 bars × 9 metrics computed
                                (390 = an ordinary session; a capacity estimate,
                                 not a per-date assertion)
     Duration            : 1m 48s
@@ -1598,11 +1746,20 @@ A `RESIDUE` line records one symbol-matching pass's residue for
 `health_report.md`'s finding 10:
 - its fields:
   - `source`;
-  - `items`;
-  - `unmatched`;
+  - `items` — the items matched at any stage;
+  - `fallback` — the items matched only at the loose or name stage;
+  - `excluded` — the items unmatched after every stage;
 - `crawl_corporate_events_investing()` writes one per call;
 - LiveModeRunner's halt-status poller writes one per poll, to the runner
-  log.
+  log, and its single-fetch entry one per fetch, to its hosting process's
+  log — here, that of the flag calling it (`--premarket-open`, or the
+  manual `--premarket-recheck`);
+- for the halt source, each process counts a feed item once per day, on
+  first sight, keyed by (symbol, HaltDate, HaltTime), HaltTime normalized
+  and ReasonCode outside the key, against the set of keys seen that day
+  (live_mode_runner.md's Halt-Status Poller);
+- build_trading_api_symbol_map() writes none, its residue having a manual
+  path.
 
 The structured log is per hosting process:
 - LiveModeRunner owns `logs/live_mode_runner_{date}.log` ({date} = the
@@ -1620,7 +1777,7 @@ The structured log is per hosting process:
 
 **Evening job start gate.** The full evening run is an owner (db_schema.md's
 DB File Ownership Windows): before its first stage (metadata/corporate-events
-crawl) it waits under its wait spec through utils.md's `acquire()`:
+crawl) it waits under its wait spec through db_coordination.md's `acquire()`:
 - phase A:
   - today's session state terminal (`done`, `failed`, `not_expected`) →
     phase B;
@@ -1630,7 +1787,7 @@ crawl) it waits under its wait spec through utils.md's `acquire()`:
   - no session state today and no runner run today → phase B;
 - phase B: `db.lock` attempts; starting to wait on a guest or 'unregistered'
   holder emits health_report.md finding 28 phase `waiting`;
-- `coordination.schedule.evening.deadline` (utils.md, default 23:30 ET), in
+- `coordination.schedule.evening.deadline` (db_coordination.md, default 23:30 ET), in
   either phase → finding 28 phase `deadline` (`owner='evening'`) and the run
   aborts — manual intervention. Tomorrow's Health Gate 1a then aborts
   tomorrow on missing session stats — the right fail-safe, reached noisily
@@ -1648,7 +1805,7 @@ Crash path, taken on `predecessor_crashed`:
 The liveness probe also runs, narrowed to finding 1, when today's runner run
 ended `not_expected` or no runner run exists today.
 
-Yield: at each stage boundary the evening run calls `should_yield()` (utils.md)
+Yield: at each stage boundary the evening run calls `should_yield()` (db_coordination.md)
 and yields when the premarket or the runner is `waiting` with its run lock
 held:
 - it ends with state and end kind `yielded`;
@@ -1661,14 +1818,14 @@ held:
 **Premarket start gate.** `--premarket-open` is an owner and waits under its
 wait spec through `acquire()` before its first DB access:
 - no phase A; phase B takes `db.lock` by attempts;
-- at `coordination.schedule.premarket.deadline` (utils.md, default 05:00 ET)
+- at `coordination.schedule.premarket.deadline` (db_coordination.md, default 05:00 ET)
   the run alerts (health_report.md finding 28 phase `deadline`,
   `owner='premarket'`) and aborts, and the runner's start follows its own
   wait spec (live_mode_runner.md's Session Start Gating);
 - it holds the DB from acquisition to its process exit.
 
 **Owner state.** Each owner run records in its coordination state, through
-utils.md's helper:
+db_coordination.md's helper:
 - `--premarket-open`: today's `session_expected`
   (`trading_calendar.is_trading_day(today)`) and boundaries
   `{date, is_trading_day, session_close, after_hours_end, written_at,
@@ -1676,8 +1833,9 @@ utils.md's helper:
 - the full evening run, after its Calendar and Coverage Update: the next
   weekday's `session_expected` and boundaries in the same form.
 
-**Dispatcher.** One crontab entry replaces the per-run entries:
-`collect_daily.py --dispatch`, an aux run (utils.md's DB Access Coordination):
+**Dispatcher.** Its crontab entry replaces the per-run entries, beside the
+resume sweep's own entry (guest_supervisor.md's `resume_guests`):
+`collect_daily.py --dispatch`, an aux run (db_coordination.md):
 - it reads config only — no coordination-store state and no lock beyond its
   run lock;
 - each minute it launches, as a detached process passing
@@ -1694,7 +1852,7 @@ utils.md's helper:
 
 ```bash
 # The dispatcher — every minute, weekdays; the times live in
-# coordination.schedule (utils.md):
+# coordination.schedule (db_coordination.md):
 # - evening 21:00 ET: after the day's JSON dump completes — NOT merely after
 #   market close: the dump ends at 20:00 ET, which is also the ingestion
 #   range's own upper bound (see Constraints);
@@ -1712,6 +1870,12 @@ utils.md's helper:
     python tools/collect_daily.py \
         --db-path data/market.duckdb \
         --dispatch --trigger scheduled >> logs/collect_daily_dispatch.log 2>&1
+
+# The resume sweep — every minute, its own entry beside the dispatcher's
+# (guest_supervisor.md's Relaunch Sweep):
+* * * * * cd /path/to/stock-scalping && \
+    source .venv/bin/activate && \
+    resume_guests >> logs/resume_guests.log 2>&1
 
 # (R-1: the 09:20 ET recheck is not a scheduled run. It runs as a
 # LiveModeRunner in-process task — see live_mode_runner.md's "In-Process
@@ -1734,7 +1898,7 @@ fmp_api_key: "your_key_here"
 
 ```yaml
 # The schedule times and the premarket and evening deadlines are the
-# coordination: block's (utils.md's DB Access Coordination):
+# coordination: block's (db_coordination.md):
 # - coordination.schedule.evening.deadline (default "23:30" ET) — the evening
 #   run's wait deadline (Cron / Scheduler Setup's "Evening job start gate"),
 #   sized against the 21:00 ET start: a deadline at the start time itself
@@ -1748,7 +1912,7 @@ fmp_api_key: "your_key_here"
 # another mount; off-host replication is the operator's.
 backup_dir: "data/backups/"
 
-# coordination.schedule.token_refresh.time (default "03:00" ET, utils.md) is
+# coordination.schedule.token_refresh.time (default "03:00" ET, db_coordination.md) is
 # the overnight token refresh's time (see "Overnight Token Refresh"). AFTER
 # MIDNIGHT deliberately: the evening run can overrun past its own deadline.
 # Early rather than close to the session because refresh cadence and token
@@ -1768,6 +1932,12 @@ backup_dir: "data/backups/"
 # list of any length. The key's own value was estimated against an assumed
 # ~100 tickers/sec ceiling — a figure the vendor publishes per endpoint and
 # the SDK paces against automatically.
+
+# build_trading_api_symbol_map()'s re-attempts of a failed per-exchange call
+# (Premarket Trading-API Symbol Map).
+trading_api_symbol_map:
+  retry_seconds:  60              # re-attempt interval
+  retry_deadline: "05:00"         # America/New_York; past it the step ends
 
 quarantine:
   price_anomaly_threshold: 0.40   # |today_first_price / yesterday_close - 1|
@@ -1806,10 +1976,11 @@ quarantine:
 - Ingestion logic delegates to `migrate_json_to_duckdb.py` — no duplicated logic
 - Calendar/coverage update always runs after ingestion — not optional
 - Session stats update runs after calendar/coverage update — not optional unless --skip-session-stats
-- Session stats update always uses the EVENING run's corporate_events state —
-  the ordering (crawl → ingest → calendar/coverage → session stats) within a
-  single evening run must not change; the premarket refresh is intentionally
-  a separate, later, supplementary crawl that session_stats does NOT re-read
+- Session stats update computes on the corporate_events stored when it runs —
+  the ordering (crawl → ingest → calendar/coverage → NYSE halt crawl → tick
+  bar aggregates → session stats) within a single evening run must not
+  change; a later corporate_events change, the premarket refresh included,
+  reaches the groups through stale-group recomputation
 - `populate_trading_calendar()`, `populate_ticker_coverage()`, and `populate_precomputed_session_stats()` sourced from `utils.py`
 - Every `collect_daily.py` invocation writes a stage's `batch_runs` row only
   when it executes that stage — `status='running'` at its own start,
@@ -1818,8 +1989,10 @@ quarantine:
   and a re-run overwrites the rows of the stages it executes. The full
   evening run's stages, in order:
   - `stage='evening_ingestion'` (around Steps 3-4 above);
+  - `stage='evening_nyse_halts'` (NYSE Trading Halts);
   - `stage='evening_tick_bar_aggregates'` (Tick Bar Aggregates Update);
   - `stage='evening_session_stats'` (Session Stats Update);
+  - `stage='evening_ticker_master_check'` (Evening Ticker-Master Check);
   - `stage='evening_investing_forward_check'` (Evening Forward-Looking
     Corporate-Events Check, item N);
   - `stage='evening_feed_coverage'` (Feed Coverage Analysis);
@@ -1848,8 +2021,7 @@ quarantine:
   - a later run without the flag writes that stage's row normally;
   - the `batch_runs.status` values are unchanged.
 - Every flag other than `--premarket-open`, the full evening run,
-  `--token-refresh` and `--dispatch` is a guest (utils.md's DB Access
-  Coordination):
+  `--token-refresh` and `--dispatch` is a guest (db_coordination.md):
   - its unit is one stage, with `timeout` 0 — not admitted, it exits with an
     error;
   - not admitted at a stage boundary, it ends, the stages not run writing no
@@ -1858,9 +2030,11 @@ quarantine:
 - `--premarket-open` (N-1; replaces running `--ticker-rename-only` and
   `--corporate-events-only` as two separate cron processes at 04:00 ET)
   runs `detect_rename_candidates()` → `build_trading_api_symbol_map()` →
-  `bulk_fetch_today_first_price()` +
-  `utils.query_halt_status()` → `crawl_corporate_events()` for all tickers
-  → `check_corporate_event_anomaly()`, as one sequential process — no
+  the 'tradable' index (`utils.build_symbol_index()`) →
+  `bulk_fetch_today_first_price()` + the Halt-Status Poller's single-fetch
+  entry + `utils.query_halt_status()` → `crawl_corporate_events()` for the
+  index's tickers → `crawl_corporate_events_investing()` →
+  `check_corporate_event_anomaly()`, as one sequential process — no
   metadata fields, no ingestion, no calendar/session-stats steps. Two
   separate OS processes both writing `ticker_cik_map` at the same 04:00
   slot was a DuckDB single-writer collision risk (P-5) — merging into one
@@ -1885,9 +2059,11 @@ quarantine:
   `bulk_fetch_today_first_price()` + `utils.query_halt_status()` →
   `check_corporate_event_anomaly()` (full-universe fresh re-evaluation) →
   `crawl_corporate_events_investing()` (item N bulk vendor) → a yfinance
-  narrow crawl for any newly-quarantined ticker (item N) → a scoped-recompute
-  trigger for tickers that gained a new same-day corporate_events row (item
-  N, caching_calculator.md). It cannot run concurrently with a still-running
+  narrow crawl for any newly-quarantined ticker (item N) → the recompute of
+  today's stale session-stats groups of the tickers it wrote corporate_events
+  for → a scoped-recompute trigger for tickers that gained a new same-day
+  corporate_events row (item N, caching_calculator.md). It cannot run
+  concurrently with a still-running
   `--premarket-open`:
   - that process holds `db.lock` until its process exit;
   - the recheck runs inside LiveModeRunner, which opens the DB only while
@@ -1902,14 +2078,21 @@ quarantine:
   - `check_corporate_event_anomaly()`'s own
     `stage='premarket_quarantine_recheck'` (09:20 call pattern above).
 - Must be safe to run multiple times on the same date (idempotent) —
-  `--premarket-open`'s four internal steps are each independently
-  idempotent (`crawl_corporate_events()`'s `upsert_corporate_event()`
-  write path — a no-op on an already-agreeing row, item N;
-  `bulk_fetch_today_first_price()`/`query_halt_status()` are stateless
-  reads; `check_corporate_event_anomaly()`'s UPDATE reflects only that
-  run's fresh inputs, not an accumulating count) — re-running the whole
-  flag is therefore also safe, though `--premarket-recheck` cannot run
-  concurrently with a still-running `--premarket-open`, which holds
+  each of `--premarket-open`'s internal steps is independently idempotent:
+  - `detect_rename_candidates()`'s upsert and INSERT OR IGNORE;
+  - `build_trading_api_symbol_map()`'s writes of the current master;
+  - `crawl_corporate_events()`'s and `crawl_corporate_events_investing()`'s
+    `upsert_corporate_event()` write path — a no-op on an already-agreeing
+    row, item N;
+  - stateless reads:
+    - `bulk_fetch_today_first_price()`;
+    - the single fetch;
+    - `query_halt_status()`;
+  - `check_corporate_event_anomaly()`'s UPDATE, reflecting only that run's
+    fresh inputs, not an accumulating count;
+  re-running the whole flag is therefore also safe, though
+  `--premarket-recheck` cannot run concurrently with a still-running
+  `--premarket-open`, which holds
   `db.lock` until its process exit.
 - Log files (`tools/rename_candidates.log`, `tools/quarantine_candidates.log`,
   `tools/metadata_missing.log`) have no rotation/retention policy specified
@@ -1925,8 +2108,9 @@ quarantine:
   rejected — that would add a `trading_calendar` dependency at 03:00 to
   save one wasted issuance. This is
   intended: `trading_calendar`'s `is_trading_day` is what downstream
-  consumers (Health Gate 1, LiveModeRunner's own start condition — not
-  specified here, out of scope) check to decide whether to actually run a
+  consumers (Health Gate 1, LiveModeRunner's own start condition —
+  live_mode_runner.md's Session Start Gating, where a non-trading day ends
+  the run `not_expected`) check to decide whether to actually run a
   session that day, not the presence or absence of a `batch_runs` row.
 - Failed metadata tickers do not block ingestion — two steps are independent
 - No session time filter on ingested data — all periods (040000~200000) stored.
