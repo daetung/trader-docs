@@ -202,37 +202,6 @@ def expand_synthetic_ticks(
 
 ---
 
-### Config Hashing
-
-The single definition of canonical JSON and of config_hash. Every
-config_hash is computed here:
-- guest_supervisor.md's work identity;
-- each derived table's producer (db_schema.md's Derived tables).
-
-Canonical JSON of a value:
-- keys sorted at every level;
-- UTF-8;
-- no insignificant whitespace;
-- values as the YAML loader parses them, serialized by the standard JSON
-  encoder.
-
-```python
-def canonical_json(value) -> str:
-    """The canonical JSON text of `value` (rules above)."""
-    ...
-
-
-def config_hash(content) -> str:
-    """
-    The hash of canonical_json(content). The content is the caller's: a
-    producer's Config Keys Used, or a work's covered config with its input
-    files' contents (guest_supervisor.md).
-    """
-    ...
-```
-
----
-
 ### Price Breach Detection
 
 ```python
@@ -466,6 +435,37 @@ def apply_overrides(config: dict, overrides: dict) -> dict:
 
     Used by PipelineOptimizer (hyperparameter config override)
     and detection_benchmark.py (--override CLI flag).
+    """
+    ...
+```
+
+---
+
+### Config Hashing
+
+The single definition of canonical JSON and of config_hash. Every
+config_hash is computed here:
+- guest_supervisor.md's work identity;
+- each derived table's producer (db_schema.md's Derived tables).
+
+Canonical JSON of a value:
+- keys sorted at every level;
+- UTF-8;
+- no insignificant whitespace;
+- values as the YAML loader parses them, serialized by the standard JSON
+  encoder.
+
+```python
+def canonical_json(value) -> str:
+    """The canonical JSON text of `value` (rules above)."""
+    ...
+
+
+def config_hash(content) -> str:
+    """
+    The hash of canonical_json(content). The content is the caller's: a
+    producer's Config Keys Used, or a work's covered config with its input
+    files' contents (guest_supervisor.md).
     """
     ...
 ```
