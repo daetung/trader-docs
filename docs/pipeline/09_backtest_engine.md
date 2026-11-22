@@ -26,10 +26,13 @@ predictions: pd.DataFrame
     # one row per entry point candidate in test split
 
 config: dict
-db_conn: duckdb.DuckDBPyConnection   # injected via constructor
+provider                             # connection provider, injected via constructor:
+                                     # opens a unit per preload (run_backtest.md,
+                                     # pipeline_optimizer.md)
 ```
 
-OHLCV and tick data are fetched internally from DuckDB per ticker/date as needed.
+Each ticker's data is read in one preload, in a unit the provider opens; the
+simulation runs without DB access (DB Access Strategy).
 
 ---
 
@@ -40,27 +43,31 @@ class BacktestEngine:
     def __init__(
         self,
         config: dict,
-        db_conn: duckdb.DuckDBPyConnection,
+        provider,
     ):
         """
-        Loads the boundary maps via utils.md's load_session_boundaries(db_conn),
-        once for the run. ACQUIRED rather than received because run_backtest.py
-        holds none to give — unlike the Inferencer, whose LiveModeRunner already
-        has them. The asymmetry is about which caller holds the maps, not about
-        the kind of module.
-
-        The trading_calendar read elsewhere in this file is a one-row
-        next-trading-day lookup for dead position resolution and is unrelated.
+        Loads the boundary maps via utils.md's load_session_boundaries(), once
+        for the run, with the trading_calendar read, in one unit the provider
+        opens. ACQUIRED rather than received because run_backtest.py holds none
+        to give — unlike the Inferencer, whose LiveModeRunner already has them.
+        The asymmetry is about which caller holds the maps, not about the kind
+        of module.
         """
         ...
 
     def run(
         self,
         predictions: pd.DataFrame,
-    ) -> tuple[pd.DataFrame, dict]:
+    ) -> tuple[pd.DataFrame, dict, list[float]]:
         """
         Run full backtest simulation.
-        Returns (trade_log_df, summary_dict).
+        Returns (trade_log_df, summary_dict, on_time_expected_returns).
+
+        on_time_expected_returns: late_entry_expected_return(row, p_ref,
+            p_now = p_ref) for every on-time entry that clears the admission
+            sequence, whatever late_entry_enabled — the population a θ-using
+            execution variant's θ and the candidate derivation of θ are taken
+            from (pipeline_optimizer.md).
 
         trade_log_df: one row per executed trade — matches trade_log table schema.
                       Written to DuckDB trade_log table by Backtester (run_backtest.py),
@@ -86,22 +93,27 @@ class BacktestEngine:
                                            # pricing included
             dead_position_rate  : float  — the same numerator
             suppressed_count    : int    — entries blocked by suppress_threshold
-            # Entry-gate rejection counters (R-5), one per gate of the
-            # Chronological Simulation's admission sequence. A candidate
-            # stopped at a gate produces NO trade_log row, so these are its
-            # only record. Diagnostic only — best_config() ranks on
-            # winning_rate alone. Five, not eleven: `gate_result` has
-            # eleven non-'submitted' values;
-            # 'freeze'/'not_tradable'/'bar_integrity'/'no_terms' have no
-            # backtest concept (N-5 — 'bar_integrity' is a live
-            # bar-arrival-latency signal, so there is nothing for backtest
-            # to detect, and 'no_terms' is the outcome of a vendor call
-            # backtest never makes), 'breaker' is evaluated but never
+            # Entry-gate rejection counters (R-5), one per
+            # inference_log.gate_result value with a backtest concept. A
+            # candidate stopped at a gate produces NO trade_log row, so these
+            # are its only record. Diagnostic only — best_config() ranks on
+            # winning_rate alone. The non-'submitted' values without a
+            # counter: 'freeze'/'not_tradable'/'bar_integrity'/'no_terms'/
+            # 'cap_inert' have no backtest concept (N-5 — 'bar_integrity' is
+            # a live bar-arrival-latency signal, so there is nothing for
+            # backtest to detect, 'no_terms' is the outcome of a vendor call
+            # backtest never makes, and 'cap_inert' is a live refusal under
+            # live_mode.entry_price_cap_inert — backtest applies no cap with
+            # θ inert), 'breaker' is evaluated but never
             # enforced here (see breaker_* below, not a blocked-count,
             # which would wrongly imply enforcement), and 'error' has no
             # analogue since backtest makes no network calls. Key names use
             # inference_log.gate_result's own values so live and backtest
             # are directly comparable.
+            gate_blocked_residual_edge   : int  — late-detection candidates the
+                                                  residual-edge gate dropped,
+                                                  with θ applying (Entry
+                                                  Decision Logic)
             gate_blocked_cap_tickers     : int  — execution.max_tickers
             gate_blocked_cap_per_ticker  : int  — execution
                                                   .max_positions_per_ticker
@@ -150,6 +162,21 @@ class BacktestEngine:
 
 ## DB Access Strategy
 
+Through a connection provider that opens a unit per preload, in every
+context (run_backtest.md's unit opener, pipeline_optimizer.md's
+BacktestEngine preloads):
+- per ticker, one preload reads everything its simulation reads — the
+  ohlcv and ticks of its entry dates and of its carried and next-data
+  dates; halts through the halt-interval resolver; ticker_data_coverage;
+  corporate_events; the symbology layer's rows (the carried-date and
+  next-data reads resolve the successor symbol through them);
+- trading_calendar is read once, in one unit the provider opens;
+- the simulation runs without DB access;
+- Backtester writes experiment_log and trade_log in one unit and one
+  transaction (run_backtest.md's final-write unit, or the optimizer step's
+  write unit).
+The subsections below state what each read covers.
+
 ### OHLCV (per ticker)
 ```sql
 SELECT * FROM ohlcv_1min
@@ -157,8 +184,9 @@ WHERE ticker = ?
   AND date IN (entry_and_carried_dates_for_this_ticker)
 ORDER BY date, hour
 ```
-Loaded once per ticker at the start of that ticker's processing.
-Covers its entry dates and carried dates — not the full dataset.
+Read in the ticker's preload.
+Covers its entry dates, carried dates and next-data dates — not the full
+dataset.
 
 ### Tick data (per ticker/date — full day)
 ```sql
@@ -166,8 +194,7 @@ SELECT * FROM tick_10
 WHERE ticker = ? AND date = ?
 ORDER BY hour, seq_id
 ```
-Loaded once per ticker/date combination — at each processed date's start,
-for the tickers of its entry candidates and of its carried positions.
+Read in the ticker's preload, for its entry, carried and next-data dates.
 Full day loaded (including after-market), expanded into synthetic ticks by
 utils.md's `expand_synthetic_ticks()`, and filtered in memory:
 - Entry fills and in-window breach: synthetic ticks whose second is greater
@@ -180,12 +207,11 @@ utils.md's `expand_synthetic_ticks()`, and filtered in memory:
   through the full day (Exit fill simulation)
 
 ### Trading halts (per ticker/date)
-```sql
-SELECT * FROM trading_halts
-WHERE ticker = ? AND date = ?
+```python
+halts = utils.halt_intervals(ticker, dates, src)   # the halt-interval resolver
 ```
-Loaded once per ticker/date alongside OHLCV and tick data.
-Passed explicitly to all internal methods.
+Read in the ticker's preload; each date's intervals are passed explicitly to
+all internal methods for that date.
 
 ### Trading calendar (for dead position resolution)
 ```sql
@@ -194,6 +220,7 @@ WHERE date > ? AND has_data = TRUE
 ORDER BY date LIMIT 1
 ```
 Filters to next date where `has_data = TRUE` — consistent with Labeler dead position logic.
+Answered from the run's one trading_calendar read.
 
 ### Ticker data coverage (for dead position Case B and the carried-date state tests)
 ```sql
@@ -206,15 +233,15 @@ WHERE ticker = ? AND date = ?
 SELECT event_type, event_date, ratio, amount, source, basis_date FROM corporate_events
 WHERE ticker = ? AND event_date > ? AND event_date <= ?
 ```
-Queried only when Case A/D resolution is reached or a position is carried —
-not on every trade:
+The ticker's rows are read in its preload and used where:
 - Case A/D: over (D, D+1], the same window and rationale as Labeler's
   equivalent lookup (see `05_labeler.md`);
 - a carried position: over its carried interval, (the entry date, the
   completion date] (Carried position).
-The split factor is `utils.md`'s single rule, applied through
-`cum_split_ratio()`; a 'dividend' row's amount is read only through
-`utils.md`'s dividend amount function, never from `amount` directly.
+The split factor is `utils.md`'s single rule, applied through its frame form
+`split_ratio_from_events()` over the preload's rows; a 'dividend' row's
+amount is read only through `dividend_gross_from_events()`, never from
+`amount` directly.
 
 **Iteration order is DATE-major, not ticker-major.** The concurrency caps
 (`execution.max_tickers` / `execution.max_positions_per_ticker`) and the
@@ -227,25 +254,12 @@ For each (ticker, date) group, the following data is loaded from DuckDB once
 and passed down to internal methods:
 
 ```python
-# Loaded once per ticker
-ohlcv_ticker = db_conn.execute("""
-    SELECT * FROM ohlcv_1min
-    WHERE ticker = ? AND date IN (?)
-    ORDER BY date, hour
-""", [ticker, *dates]).df()
-
-# Loaded once per ticker/date — entry and carried tickers of each
-# processed date
-ticks_td = db_conn.execute("""
-    SELECT * FROM tick_10 WHERE ticker = ? AND date = ?
-    ORDER BY hour, seq_id
-""", [ticker, date]).df()
-
-halts_td = db_conn.execute("""
-    SELECT * FROM trading_halts WHERE ticker = ? AND date = ?
-""", [ticker, date]).df()
-# a row whose halt_end is NULL covers every slot of that date from its
-# halt_start on (db_schema.md's trading_halts.halt_end)
+# From the ticker's preload (one unit the provider opens)
+ohlcv_ticker = preload.ohlcv          # entry, carried and next-data dates
+ticks_td     = preload.ticks[date]    # ordered by (hour, seq_id)
+halts_td     = preload.halts[date]    # the halt-interval resolver's intervals;
+                                      # an interval whose end is NULL covers
+                                      # that date from its start on
 
 # halts_td passed explicitly to all internal methods
 synthetic, effective_end = utils.expand_synthetic_ticks(ticks_td, halts_td)
@@ -338,12 +352,13 @@ Procedure:
     )
     order_type = execution_common.permitted_order_type(
         "buy", config["execution"]["entry_order_type"],
-        phase at the anchor)              # execution_common.md's Session Phase
+        utils.session_phase() at the anchor)  # execution_common.md's Session Phase
     limit_price = None if order_type == "market" \
         else the Entry Limit Price rule  # execution_common.md: the
     # entry_gap-derived limit rounded DOWN to tick(price), capped at P_cap
-    # when execution.entry_price_cap_enabled — S from this candidate's
-    # prediction row. A configured market entry forced to limit takes it too.
+    # when execution.entry_price_cap_enabled and θ applies (no cap with θ
+    # inert) — S from this candidate's prediction row. A configured market
+    # entry forced to limit takes it too.
     last_print = the price of the last synthetic tick
         (utils.expand_synthetic_ticks()) whose time's integer part is less
         than the anchor; p_entry when no such tick exists
@@ -461,8 +476,7 @@ Entry executed only if signal is not None AND cooldown check passes.
 
 `can_enter()` moved to `docs/utils/execution_common.md` — now shared with
 LiveModeRunner (previously backtest-only by virtue of only being defined
-here). See execution_common.md for the full spec and the
-session_mode="combined" cross-boundary behavior.
+here). See execution_common.md for the full spec.
 
 ### Chronological Simulation
 
@@ -591,14 +605,23 @@ h <  backtest.late_detection_rate:
         EXEMPT — take the candidate normally. This is promotion:
         live promotes a ticker after a rotation-slot finding, so its next
         bar close is guaranteed to be seen.
-    elif not execution.late_entry_enabled:
+    elif not execution.late_entry_enabled, or θ inert (execution_common.md's
+         binding; the traded model's run_id is Backtester.run()'s
+         model_run_id, run_backtest.md):
         DROP the candidate. No trade_log row and no gate counter — nothing
         was attempted; live never saw it.
     else:
-        enter at t_open + delay, delay = h2 * backtest
+        late path, at t_open + delay, delay = h2 * backtest
         .late_detection_delay_max_s, h2 a second hash of the same key.
         Uniform delay follows from the rotation cursor's arbitrary phase;
         live_scan_daily can falsify it.
+        The residual-edge gate, θ applying: enter only when
+        late_entry_expected_return(row, p_ref, p_now) exceeds θ —
+            p_ref: the t bar's open;
+            p_now: the last synthetic tick at or before t_open + delay,
+                   else the t bar's opening tick;
+        otherwise drop it with no trade_log row, counted in
+        gate_blocked_residual_edge (these drops alone).
 ```
 
 A HASH, not an RNG. No seed to manage, invariant to iteration order in this
@@ -675,6 +698,7 @@ direction, exit_price, exit_hour, is_ambiguous = utils.track_price_breach(
     threshold_up=tp_pct,
     threshold_dn=config["execution"]["stop_loss_pct"],
     exit_interpolation=config["execution"]["exit_interpolation"],
+    ambiguity=self._ambiguity_rule,     # the AmbiguityRule built at init
 )
 # A breach on a synthetic tick (steps 1–2) gives direction, exit_hour = that
 # tick's second and exit_price = its price; is_ambiguous = False.
@@ -739,7 +763,7 @@ simulation's anchor, recorded in `exit_anchor_bar` / `exit_anchor_date`,
 the reference mode included and NULL on never-opened rows:
 - on the tp/sl path, `effective_second` above rather than the raw
   `exit_hour`;
-- on the `time_limit` path, the instant the valid-bar count was reached;
+- on the `time_limit` path, the holding deadline instant;
 - on the `session_end` path and the dead-position Cases reached through it,
   `exit_deadline(date)`.
 
@@ -750,17 +774,20 @@ the reference mode included and NULL on never-opened rows:
 ### Session close exit (priority over time-limit)
 
 ```python
-if current bar hour == exit_deadline(date):     # utils.md — PER DATE
+if the instant exit_deadline(date) is reached,  # utils.md — PER DATE; with
+                                                 # or without a bar at that minute
     exit_reason = "session_end"
     # DEAD-POSITION RESOLUTION FIRST, ahead of any fill modelling:
-    if exit_deadline(date) bar is halt/no_data:
+    if exit_deadline(date)'s minute lies inside a halt interval or the date
+       has no data:
         fallback: first tick_10 row with hour > exit_deadline(date)
         if none: → dead position          # no ticks at all → no simulator call
     mode, _ = execution_common.exit_fill_mode(
         config, "session_end", the exit's permitted order type, carried=False)
     if mode == "reference":   # simulate_nondirectional_exit_fill false
-        exit_price = the reference price (that bar's close, or the
-                     after-market tick fallback above)
+        exit_price = the reference price — the last print strictly before
+                     the exit instant (execution_common.md's reference-price
+                     rule), or the after-market tick fallback above
     else:
         anchor    = exit_deadline(date)
         reference = the price of the last synthetic tick whose time's
@@ -778,18 +805,19 @@ zero fill there means liquidity was absent, which is a different fact.
 ### Time-limit exit
 
 ```python
-if config["execution"]["max_hold_bars"] valid bars elapsed since entry
-   (via build_effective_bar_sequence, which is passed THAT SAME key as its
-    target_valid_bars — the parameter carries no default, because a default of
-    60 would cap the sequence below the count this line tests and make the
-    exit unreachable whenever the key exceeds 60):
+if the holding deadline instant is reached
+   (build_effective_bar_sequence's, which is passed
+    config["execution"]["max_hold_minutes"] as its hold_minutes — the
+    parameter carries no default, because a default below the key would cap
+    the sequence and make the exit unreachable):
     exit_reason = "time_limit"
     mode, _ = execution_common.exit_fill_mode(
         config, "time_limit", the exit's permitted order type, carried=False)
     if mode == "reference":   # simulate_nondirectional_exit_fill false
-        exit_price = close of last valid bar
+        exit_price = the last print strictly before the holding deadline
+                     (execution_common.md's reference-price rule)
     else:
-        anchor    = the instant that count was reached
+        anchor    = the holding deadline instant
         reference = the price of the last synthetic tick whose time's
                     integer part is less than the anchor (no fallback)
         → simulate_exit(anchor, reference, quantity, "time_limit",
@@ -807,13 +835,15 @@ in-progress fill is re-triggered.
 simulate_exit(anchor, reference_price, quantity, exit_reason, carried):
     # carried: true on a Carried date exit, false otherwise
     order_type = execution_common.permitted_order_type(
-        "sell", config["execution"]["exit_order_type"], phase at the anchor)
+        "sell", config["execution"]["exit_order_type"],
+        utils.session_phase() at the anchor)
     mode, rate = execution_common.exit_fill_mode(config, exit_reason,
                                                  order_type, carried)
     if config["backtest"]["exit_fill_rate_disabled"]:
         rate = 1                # all volume after the anchor; a switch, not a rate
-    ticks = synthetic ticks whose second is greater than the anchor, through
-            the full day
+    ticks = synthetic ticks whose second is greater than the anchor, up to
+            the first instant whose phase is 'closed', where the simulation
+            ends and the remainder is carried
 
     Spans — split where the order path changes, each one
     execution_common.simulate_exit_fill() call (batch form) taking the prior
@@ -833,10 +863,18 @@ simulate_exit(anchor, reference_price, quantity, exit_reason, carried):
                 instant
             k starts at execution.exit_ladder_seed; once the elapsed time
             since the anchor reaches execution.exit_order_stuck_minutes:
-              - inside the regular session (utils.md's Session Boundary
-                Derivations): the remainder escalates to market pricing;
+              - inside the regular session (utils.session_phase()
+                'regular'): the remainder escalates to market pricing;
               - outside it: k += execution.exit_ladder_increment per
                 re-quote, up to execution.exit_ladder_cap.
+            Inside the final liquidation window ([after_hours_end(date) −
+            execution.final_liquidation_minutes, after_hours_end(date))), a
+            remainder proceeding as limit is re-priced at k = max(its
+            current k, 1.0) at the window's first re-quote, then advances by
+            execution.exit_ladder_increment per re-quote up to
+            execution.exit_ladder_cap, regardless of
+            execution.exit_order_stuck_minutes (execution_common.md's Exit
+            Limit Pricing).
 
     → weighted_avg_exit_price (reference_price when nothing filled),
       total_filled, unfilled_qty = quantity - total_filled,
@@ -872,10 +910,10 @@ carried instead of taking `dead_position_penalty_pct` on the remainder:
   'C'.
 
 **Split normalisation.** At each carried date the remaining quantity is
-multiplied by `utils.cum_split_ratio()` over (the previous date the
-position was in, this date]; a fill increment's per-share cost is
-`fill_price` ÷ `cum_split_ratio()` over (the entry date, the increment's
-date].
+multiplied by `utils.split_ratio_from_events()` over (the previous date the
+position was in, this date], over the preload's corporate_events rows; a
+fill increment's per-share cost is `fill_price` ÷ `split_ratio_from_events()`
+over (the entry date, the increment's date].
 
 **Split fraction disposal**, per `backtest.split_fraction_disposal`:
 - a carried remainder's exit order quantity is the floor of the remaining
@@ -902,14 +940,14 @@ with carried (execution_common.md's `exit_fill_mode()`):
 - a limit remainder is quoted at `execution.exit_ladder_seed` at that
   date's anchor; at each later re-quote, with that elapsed time past
   `execution.exit_order_stuck_minutes`:
-  - outside the regular session, k advances by
+  - outside the regular session (`utils.session_phase()`), k advances by
     `execution.exit_ladder_increment` up to `execution.exit_ladder_cap`;
   - inside the regular session, the remainder escalates to market pricing;
   - k does not carry over from the previous date;
 - the ladder's m and s:
   - until that date's first bundle is sealed, m is the m held at the end of
     the previous date the position was carried in ÷
-    `utils.cum_split_ratio()` over (that date, this date], and s is the s
+    `utils.split_ratio_from_events()` over (that date, this date], and s is the s
     held then;
   - from that date's first sealed bundle on, m and s follow the Exit fill
     simulation's rules over that date's bundles and bars only;
@@ -940,7 +978,8 @@ below-one-share fraction a split leaves on a carried position:
 
 **Carried dividend.** For each 'dividend' `corporate_events` row with
 `event_date` after the entry date and no later than the completion date,
-the cash by `utils.dividend_gross_amount()`'s cash-flow reader rule — the
+the cash by `utils.dividend_gross_amount()`'s cash-flow reader rule, its
+gross through the frame form `dividend_gross_from_events()` — the
 shares held being the remaining quantity at the start of that `event_date`,
 in that date's basis:
 - credited at the close-completion instant as part of the close credit,
@@ -966,7 +1005,7 @@ does not apply to the split fraction value, the carried dividend, or Case B
   as filled quantity × (p − c):
   - p the increment price, × (1 − `backtest.carried_exit_penalty_pct`) when
     the increment's date is after the first exit date;
-  - c = `fill_price` ÷ `cum_split_ratio()` over (the entry date, the
+  - c = `fill_price` ÷ `split_ratio_from_events()` over (the entry date, the
     increment's date];
 - a carried row's remaining quantity priced by Case B or carried Case C
   accrues its value − that quantity × c at that row's `exit_bar`, c taken at
@@ -1002,7 +1041,7 @@ basis comment):
   `backtest.dataset_end_carry_haircut_pct`) — + the split fraction value +
   the carried dividend − `fill_price` × `quantity`) ÷ (`fill_price` ×
   `quantity`), the remainder term only on a Case B / carried Case C row;
-- basis normalisation, R being `cum_split_ratio()` over (the entry date,
+- basis normalisation, R being `split_ratio_from_events()` over (the entry date,
   the completion date]:
   - `fill_price` ÷ R;
   - `quantity` and `requested_quantity` × R;
@@ -1046,6 +1085,11 @@ Replaces prior definition (1-minute bar level simultaneous breach).
 A breach found on synthetic ticks — inside the entry window or its
 continuation (Exit Logic) — is never ambiguous: each synthetic tick carries
 one price.
+The direction is decided by BacktestEngine's `utils.AmbiguityRule`, built at
+init from `execution.ambiguity_priority` and `execution.ambiguity_seed` and
+passed to `track_price_breach()` — "ohlc_path" by default: the bundle's open
+nearer its high reaches the high first, nearer its low the low first, an
+equidistant open decided by the seeded hash (utils.md).
 Recorded in `trade_log.is_ambiguous` for post-hoc analysis.
 
 ---
@@ -1063,10 +1107,12 @@ Case A — next trading day has_data=True AND ticker exists in ticker_data_cover
     if exit_price cannot be resolved from either source (NaN/unavailable):
         → Case D (below)
     exit_price *= (1 - dead_position_penalty_pct)
-    r = cum_split_ratio() over (D, D+1]   (utils.md's split factor; 1.0 if none)
+    r = split_ratio_from_events() over (D, D+1], the preload's rows
+        (utils.md's split factor; 1.0 if none)
     dividend_term = Σ over 'dividend' rows with event_date IN (D, D+1] of
         the per-share net amount by utils.md's dividend_gross_amount()
-        cash-flow reader rule × the split factor over (D, that
+        cash-flow reader rule (its gross through dividend_gross_from_events())
+        × the split factor over (D, that
         event_date]   (0.0 if none) — per share entered; same overnight
         window and rationale as Labeler's Case A (see 05_labeler.md); US
         splits and ex-dividend adjustments always take effect before
@@ -1287,9 +1333,9 @@ backtest:
   late_detection_delay_max_s: 0.0    # upper bound of the uniform delay applied
                                       # to a rotation-detected candidate when
                                       # execution.late_entry_enabled is true.
-                                      # Ignored when it is false, since those
-                                      # candidates are dropped rather than
-                                      # delayed
+                                      # Ignored when it is false or θ is inert,
+                                      # since those candidates are dropped
+                                      # rather than delayed
 # position_size_cash_pct, position_size_vol_pct, take_profit_up3/up5,
 # stop_loss_pct, exit_interpolation, sell_rate_tp/sl, use_all_cash moved to
 # the shared `execution:` section (see docs/utils/execution_common.md) —
@@ -1370,14 +1416,15 @@ fill_increments          VARCHAR,   -- JSON, when backtest.record_fill_increment
   run_backtest's body as run_guest runs it, or at pipeline_optimizer's work
   creation — selecting them through `entry_fill_rate()` /
   `exit_fill_mode()`; it does not resolve again
-- `db_conn` injected via constructor for testability (mock DB in tests)
-- OHLCV loaded once per ticker for all its entry and carried dates
-- Tick data loaded once per ticker/date (full day); filtered in memory by range
-- `halts_td` passed explicitly to all internal methods — no internal DB queries after initial load
-- Session close (exit_deadline(date) bar) triggers immediate exit — takes priority over time-limit
+- The connection provider is injected via constructor for testability (mock DB in tests); one preload per ticker reads everything its simulation reads, and the simulation runs without DB access
+- OHLCV read in the ticker's preload for all its entry, carried and next-data dates
+- Tick data read in the ticker's preload (full day per date); filtered in memory by range
+- `halts_td` — the halt-interval resolver's intervals for the date — passed explicitly to all internal methods
+- Session close (the instant exit_deadline(date), with or without a bar) triggers immediate exit — takes priority over time-limit
 - `simulate_exit_fill()` is not called for `session_end` or `time_limit` exits
   while `execution.simulate_nondirectional_exit_fill` is false, its default —
-  the bar close and the last valid bar's close are used directly, so current
+  the reference price (the last print strictly before the exit instant) is
+  used directly, so current
   output is preserved BYTE-FOR-BYTE, the same guarantee `late_detection_rate:
   0.0` carries. Turning it on routes both through the simulator with the
   generalised anchor and `sell_rate_neutral`, which changes the exit price on
@@ -1391,8 +1438,8 @@ fill_increments          VARCHAR,   -- JSON, when backtest.record_fill_increment
   is the divergence it exists to remove. With it off, live writes the
   reference price straight to `exit_price` rather than calling the simulator,
   so on and off branch over the SAME anchor
-- After-market data used only as fallback when exit_deadline(date) bar is halt/no_data
-- Dead position: session_end fallback fails only (exit_deadline(date) halt + no after-market data)
+- After-market data used only as fallback when exit_deadline(date)'s minute lies inside a halt interval or the date has no data
+- Dead position: session_end fallback fails only (that condition + no after-market data)
 - Dead position lookup uses `has_data = TRUE` filter (not `is_trading_day`) — consistent with Labeler;
   so do the carried-date state tests (Carried position)
 - Dead position Case A pnl uses the split-normalised exit and the net dividend term
@@ -1438,7 +1485,7 @@ fill_increments          VARCHAR,   -- JSON, when backtest.record_fill_increment
   moment in time (see Chronological Simulation)
 - Suppressed entries (suppress_threshold) not logged to trade_log
 - `suppressed_count` tracked in summary for diagnostics
-- `run()` returns `tuple[pd.DataFrame, dict]` — trade_log_df and summary_dict;
+- `run()` returns `tuple[pd.DataFrame, dict, list[float]]` — trade_log_df, summary_dict and on_time_expected_returns;
   DB writes (trade_log INSERT, experiment_log INSERT) performed by Backtester (run_backtest.py),
   not by BacktestEngine
 - Sourced from `utils.py`:
@@ -1491,7 +1538,7 @@ fill_increments          VARCHAR,   -- JSON, when backtest.record_fill_increment
   runs on synthetic tick prices, which interpolate within a bundle and do
   not carry its high/low. What is lost is the ORDER of two extremes inside one
   bundle, which is exactly what `is_ambiguous` records and
-  `ambiguity_priority` resolves. (Previously stated as backtest being unable
+  BacktestEngine's `utils.AmbiguityRule` resolves. (Previously stated as backtest being unable
   to SEE intra-bundle spikes, and as live's WS STREAM being the "true" one —
   both wrong: the bundle carries the extreme, and the direction can invert,
   since a print in the half the WS entitlement drops is absent from live's
@@ -1522,3 +1569,11 @@ fill_increments          VARCHAR,   -- JSON, when backtest.record_fill_increment
   (1) and (2) are both live open residuals. (1) is inherent to the
   historical dataset's granularity, not a design gap; (2) is a design gap
   and is blocked on shadow-period data.
+- The after-hours exit path ends at the stored data's end, before 19:30 (the
+  ingestion range, db_schema.md's Ingestion Rules):
+  - the date's last synthetic tick precedes 19:30; a remainder unfilled when
+    it is read is carried;
+  - on an ordinary day, the final liquidation window's part from 19:30 holds
+    no data;
+  - live, its shadow-stage fill simulation included, works the exit until the
+    hard cap (live_mode_runner.md's Session Shutdown).

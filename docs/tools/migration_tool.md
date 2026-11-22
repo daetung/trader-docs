@@ -1,7 +1,7 @@
 # Tool: JSON → DuckDB Migration
 
 **File:** `tools/migrate_json_to_duckdb.py`
-**Standalone CLI tool — a per-run guest run through guest_supervisor.md's `run_guest`; no pipeline dependencies beyond `src/utils`**
+**Standalone CLI tool — a per-chunk guest run through guest_supervisor.md's `run_guest`; no pipeline dependencies beyond `src/utils`**
 
 ---
 
@@ -20,16 +20,34 @@ workflow is `init_db.py` first, then this tool. The two are peers with the
 same DB access role below — neither imports the other, and this
 tool does not defensively re-create anything.
 
-**DB access role**: a per-run guest (db_schema.md's DB File Ownership
+**DB access role**: a per-chunk guest (db_schema.md's DB File Ownership
 Windows; db_coordination.md's Unit scope), run through guest_supervisor.md's
 `run_guest`. This tool is run manually and rarely, never on an automated
 schedule:
 - `run_guest migration_tool` enters
-  `register('guest', 'migration_tool', trigger)` and opens one
-  `guest_unit('migration_tool', None)` around the body, which waits for
-  admission without limit;
-- the body is handed that unit's connection, passed wherever this tool
-  takes `db_conn`, and calls neither `register()` nor `guest_unit()`;
+  `register('guest', 'migration_tool', trigger)` and hands the body a unit
+  opener, each call opening one `guest_unit('migration_tool', None)`, which
+  waits for admission without limit;
+- the body's units, each step's connection the unit's:
+  - ingestion: one unit per file;
+  - calendar and coverage initialization: one unit;
+  - one unit per ticker: corporate events; tick bar aggregates;
+    fundamentals backfill;
+  - trading_halts backfill: one unit per date;
+  - session stats: one unit per as_of_date;
+  - Ingestion-Range Cleanup:
+    - one unit enumerating the affected dates — those holding an
+      `ohlcv_1min`, `tick_10` or `tick_bar_aggregates` row at an hour outside
+      the ingestion range;
+    - one unit per affected date: steps 1 and 2 for that date, step 1's
+      moves, deletions and `source_changes` rows in one transaction;
+    - one unit, run whether or not a date is affected: step 3 over every
+      `ticker_data_coverage` row, then `populate_ticker_coverage()` over
+      every date holding an `ohlcv_1min` or `tick_10` row; then step 4,
+      `populate_trading_calendar()` with date_range None;
+  - a read that enumerates a step's chunk keys, its ticker or date list,
+    runs in a unit of its own before those chunks;
+- the body calls neither `register()` nor `guest_unit()`;
 - `tools/migrate_json_to_duckdb.py` run directly hands over to
   `run_guest migration_tool`;
 - while an owner waits past `coordination.guest_max_hold_seconds`, the run
@@ -88,6 +106,12 @@ run_guest migration_tool \
     --db-path data/market.duckdb \
     --skip-session-stats
 
+# Ingestion-Range Cleanup — runs the cleanup alone; another migration
+# argument but --verbose given with it is an error at start
+run_guest migration_tool \
+    --ingestion-range-cleanup \
+    --db-path data/market.duckdb
+
 # python tools/migrate_json_to_duckdb.py <args> hands over to run_guest migration_tool <args>
 ```
 
@@ -103,8 +127,14 @@ run_guest migration_tool \
      b. Load JSON → pd.DataFrame
      c. Parse all fields to their column types (strings → DECIMAL(18,6)
         prices / BIGINT volumes; db_schema.md's Ingestion Rules)
-     d. Filter to valid trading hours: hour >= '040000' AND hour <= '200000'
-        (pre-market, regular session, after-market; overnight excluded)
+     d. Filter to valid trading hours: hour >= '040000' AND hour < '193000'
+        (pre-market, regular session, after-market; the overnight and the
+        vendor cut's uneven tail excluded); a tick file's rows at hours in
+        [193000, 200000) go to tick_10_tail, in the file's import
+        transaction:
+        - seq_id as tick_10's, per (ticker, date, hour);
+        - the duplicate skip stays on tick_10;
+        - INSERT OR IGNORE absorbs a re-import's tail rows
      e. For tick data: assign seq_id within each (ticker, date, hour) group
      f. Bulk insert into DuckDB (INSERT OR IGNORE), appending source_changes
         rows per imported (table, ticker, date) in the import's transaction
@@ -112,7 +142,8 @@ run_guest migration_tool \
 4. Log: files processed / skipped / failed
 
 5. Post-migration: initialize calendar and coverage tables
-     a. populate_trading_calendar(db_conn, all_ingested_dates)
+     a. populate_trading_calendar(db_conn, every date from one calendar year
+        before the first ingested date through one year past the run day)
      b. populate_ticker_coverage(db_conn, all_ingested_dates)
      (both functions sourced from utils.py)
 
@@ -148,10 +179,17 @@ run_guest migration_tool \
        - intra_avg_vol_per_tick_baseline;
        - gap_pct_mean;
        - gap_pct_std.
-     Halt handling applied per metric type (see utils.md for details):
-       - Cumulative metrics: halt bars contribute volume=0; full-day no-data sessions excluded
-       - Per-bar metrics: halt slots excluded per hour slot; count may differ by hour
-       - gap_pct: nearest non-halt bar fallback for last_bar(date)/093000; session excluded if none
+     Bar handling per metric type, over the bars the broker supplied (see
+     utils.md for details):
+       - Cumulative metrics: counted from the session's start over the
+         existing bars; full-day no-data sessions excluded
+       - Per-minute metrics: a baseline at slot H averages only the sessions
+         that have a bar at H — count may differ by slot; intra_return's
+         prev_close at H is the close of the last existing bar before H
+       - gap_pct: the regular open is the open of the date's first
+         regular-session bar (session_phase() 'regular'), the prior close
+         the close of the last existing bar at or before last_bar(date); a
+         D-k with no regular-session bar is excluded
      Corporate-event adjustment (from Step 5b's data) applied per metric type
      before aggregation — see utils.md populate_precomputed_session_stats() D.
      buy_ratio_baseline requires tick_10 data (lee_ready classification).
@@ -194,17 +232,30 @@ ingested_dates = con.execute(
     "SELECT DISTINCT date FROM ohlcv_1min ORDER BY date"
 ).df()["date"].tolist()
 
-populate_trading_calendar(db_conn=con, date_range=ingested_dates)
+calendar_dates = <every date from one calendar year before ingested_dates[0]
+                  through one year past the run day — the US-Eastern date of
+                  this run>
+populate_trading_calendar(db_conn=con, date_range=calendar_dates)
 populate_ticker_coverage(db_conn=con, dates=ingested_dates)
 ```
 
 `populate_trading_calendar()`:
 - Uses `pandas_market_calendars` (NYSE) to determine `is_trading_day`, `is_holiday`
-- Sets `has_data=True` for dates present in `ohlcv_1min`
+- Computes the calendar context columns — `next_closure_last_session`,
+  `next_closure_reopen`, `prev_closure_last_session`, `prev_closure_reopen`,
+  `next_session_close` — from the library's schedule, writing them on a
+  row's insert, on a row whose value is NULL whatever its date, and
+  otherwise only while the row's date is after the run day (utils.md);
+  rows filled at backfill carry the library's schedule then
+- Sets each date of its range's `has_data` to whether `ohlcv_1min` holds that
+  date, TRUE to FALSE included
 - Safe to re-run (upsert)
+- An existing database gains this span's rows by a re-run of step 5a
 
 `populate_ticker_coverage()`:
-- Groups `ohlcv_1min` and `tick_10` by (ticker, date) to set `has_1min`, `has_tick`
+- Sets, for each (ticker, date) of its dates holding an `ohlcv_1min` or
+  `tick_10` row, `has_1min` and `has_tick` each to whether its table holds a
+  row
 - Safe to re-run (upsert)
 
 ---
@@ -275,8 +326,11 @@ for ticker in all_ingested_tickers:
     for indicator in [...]:  # all 9 registered tick-derived indicators —
                               # see 02_indicator_calculator.md's Tick-Derived
                               # Indicator Scale Sensitivity registry
-        compute_tick_bar_aggregates(ticker, start_date, end_date, [indicator], db_conn)
-        # INSERT OR IGNORE into tick_bar_aggregates — see db_schema.md
+        compute_tick_bar_aggregates(ticker, start_date, end_date, [indicator],
+                                    config["indicators"]["lee_ready"]["momentum_n"],
+                                    db_conn)
+        # INSERT OR IGNORE into tick_bar_aggregates under the current data
+        # version — see db_schema.md
 ```
 
 ```python
@@ -288,6 +342,13 @@ for ticker in all_ingested_tickers:
                                                      # (ticker, filed_date) appends
                                                      # a source_changes row
                                                      # (db_schema.md)
+    # Per filing (accn), a metric's values come from the highest-priority
+    # tag holding facts in that filing (utils.md's resolve_xbrl_tag_value());
+    # each row carries its companyfacts unit. A row with unit NULL is not
+    # read; this backfill, re-run, repopulates such rows.
+
+# then fx_rates: the evening_fx_rates stage's function (metadata_crawler.md),
+# after the fundamentals backfill — the currencies its units name
 ```
 
 Both are large one-time backfills (tick_bar_aggregates over the full
@@ -383,17 +444,21 @@ Migration summary:
   Skipped  : 2,480 files   (already in DB)
   Failed   : 0 files
   Duration : 14m 32s
-  Rows inserted: ohlcv_1min=9,399,000 | tick_10=43,200,000
+  Rows inserted: ohlcv_1min=9,399,000 | tick_10=43,200,000 | tick_10_tail=21,720
 
 Post-migration:
   trading_calendar        : 1,260 dates populated
   ticker_data_coverage    : 11,847 tickers × dates populated
-  precomputed_session_stats: 11,847 tickers × 1,240 dates × 390 bars × 9 metrics populated
-                             (390 = an ordinary session; a capacity estimate)
+  precomputed_session_stats: 11,847 tickers × 1,240 dates × the premarket and
+                             regular slots of an ordinary day × 9 metrics
+                             populated (a capacity estimate)
   Duration (session stats): 8m 14s
 ```
 
-Failed files are logged to `tools/migration_errors.log` with filename and exception.
+Failed files are logged to `tools/migration_errors.log` with filename and
+exception, and each is recorded beside it through `record_health_event()` with
+`direct_write` — finding `collection_gaps`, its ticker, detail {date,
+resolution, file, error}.
 
 ---
 
@@ -401,15 +466,21 @@ Failed files are logged to `tools/migration_errors.log` with filename and except
 
 - Must be runnable independently from the pipeline: no `src/` imports beyond
   `src/utils` (utils, and guest_supervisor for the hand-over to `run_guest`)
-- Calls neither `register()` nor `guest_unit()` — `run_guest` opens its unit
-  and hands the body its connection
+- Calls neither `register()` nor `guest_unit()` — the body opens its units
+  through the unit opener `run_guest` hands it
 - Issues no DDL — `tools/init_db.py` (see `init_db.md`) must have created the
-  schema first; this tool only INSERTs and populates
+  schema first; this tool only INSERTs, deletes (the Ingestion-Range Cleanup)
+  and populates
 - Duplicate skip is at `(ticker, date)` granularity per table — entire file skipped if any row exists
 - Zip files: extract to tempdir, process, clean up — do not leave temp files
-- Time range filter: `hour >= '040000' AND hour <= '200000'` (no session
-  filtering). Fixed, not per-date — it excludes overnight, and an early-close
-  day has nothing past its own after_hours_end
+- Time range filter: `hour >= '040000' AND hour < '193000'` for `ohlcv_1min`
+  and `tick_10` (no session filtering):
+  - a date's files run from the preceding evening's 20:00 (overnight) to a
+    vendor cut a few seconds past 19:30; the range keeps [04:00, 19:30),
+    excluding the overnight and the cut's uneven tail;
+  - it is fixed, not per-date, an early-close day ending at 17:00 inside it;
+  - a tick file's rows at hours in [193000, 200000) go to `tick_10_tail`
+    (step 3d)
 - Must handle malformed JSON files gracefully (log and continue, do not crash)
 - Post-migration calendar/coverage population is mandatory — not optional
 - Post-migration corporate events crawl (Step 5b) is mandatory — not optional,
@@ -424,6 +495,9 @@ Failed files are logged to `tools/migration_errors.log` with filename and except
 - `crawl_corporate_events()` and `crawl_nyse_halts()` sourced from
   `tools/collect_daily.py`, not `utils.py` — imported across tool boundaries
   for these steps
+- A cleanup run performs the Ingestion-Range Cleanup alone; the processing
+  steps, the post-migration steps and their mandatory rules are a migration
+  run's
 
 ---
 
@@ -455,9 +529,11 @@ def audit_survivorship_bias(
        [collection_start_date, collection_end_date], per delisting_source>
        delisting_source: external data, not yet selected (candidates: SEC
        EDGAR Form 25 filings, a purchased/scraped historical ticker
-       roster) — this function's contract (an external source yielding a
-       ticker-with-date-range list) is fixed now so the comparison logic
-       can be designed against it before the source itself is chosen.
+       roster) — this function's contract is fixed now so the comparison
+       logic can be designed against it before the source itself is
+       chosen: its rows carry ticker, date range, delisting reason, CIK, and
+       SIC when the source provides it. One source serves this audit and
+       the Security Identity Audit (below).
 
     3. missing = expected_tickers - present_tickers
 
@@ -495,17 +571,103 @@ gap_ratio >= threshold:
         backfill via migrate_json_to_duckdb.py's existing per-ticker
         ingestion path, same as any other JSON backfill.
     else:
-        attach a standing caveat to backtest/experiment_log reporting:
-        "measured survivorship gap_ratio = X — dn5 exposure may be
-        understated by an unquantified amount." Deliberately not
-        converted into a numeric haircut applied to reported metrics —
-        an invented correction factor would present false precision;
-        stating the raw measured gap is more honest than manufacturing
-        an adjusted number from it.
+        the operator adds a quarantine.data_caveats entry naming the
+        measured gap_ratio — "measured survivorship gap_ratio = X — dn5
+        exposure may be understated by an unquantified amount."
+        Deliberately not converted into a numeric haircut applied to
+        reported metrics — an invented correction factor would present
+        false precision; stating the raw measured gap is more honest than
+        manufacturing an adjusted number from it.
 ```
+
+---
+
+## Security Identity Audit (one-time, manual)
+
+Run manually, once, right after the Survivorship Audit (P-11), after the
+metadata crawl has written `stock_meta` rows. Like it, NOT part of the
+automated migration path. It reads the Survivorship Audit's
+`delisting_source`.
+
+```python
+def audit_security_identity(db_conn, config, delisting_source) -> dict:
+    """
+    Samples: labeled_samples of the deployment config's preprocess
+    config_hash.
+
+    Q1 — the securities whose chain-latest symbol has no ticker_cik_map row,
+         each with its last date with bars.
+
+    Q2, mapping and snapshot — groups:
+           - the sample's ticker with or without a ticker_cik_map row;
+           - the chain-latest symbol with or without a stock_meta snapshot;
+         per group: count, share, Case B rate (dead_position_case 'B');
+         identity_gap_ratio = the samples without a mapping or without a
+         snapshot ÷ all samples.
+
+    Q2, shares none — the samples whose shares_outstanding resolves none
+         through estimate_historical_meta() — its closes
+         utils.load_session_boundaries()'s, its lookback_days the config's
+         indicators.lookback_days — each under its first matching cause:
+           - no ticker_cik_map row;
+           - a non-common security_type — warrant, unit, right, preferred,
+             debt;
+           - security_type etf or fund;
+           - a sample date on or before the ticker's earliest
+             fundamentals_quarterly shares_outstanding filed_date;
+           - other, a ticker without such a row included;
+         shares_none_ratio = these samples ÷ all samples.
+
+    Q3 — the symbols whose ticker_data_coverage dates with has_1min TRUE
+         leave a gap of at least quarantine.reuse_gap_trading_days trading
+         days, listed as reuse candidates.
+
+    Unit consistency — per ticker on the crawled dates, the vendor
+         shares_outstanding ÷ the fundamentals shares_outstanding as of the
+         date, listed when outside [1 ÷ quarantine.unit_ratio_band,
+         quarantine.unit_ratio_band].
+
+    Test issues — the ohlcv_1min symbols the symbol directory flags Test
+         Issue Y, listed; the audit fetches the symbol directory itself.
+
+    Returns the full breakdown.
+    """
+    ...
+```
+
+**Decision policy** (fixed now):
+- the operator adds a `quarantine.data_caveats` entry naming the measured
+  ratios, kept until the open item "Point-in-time security identity" is
+  applied;
+- `identity_gap_ratio` ≥ `quarantine.identity_gap_threshold` with a roster
+  carrying CIK obtainable → that open item is worked.
 
 ```yaml
 # pipeline_config.yaml addition
 quarantine:
   survivorship_gap_threshold: 0.02   # see audit_survivorship_bias() above
+  identity_gap_threshold: 0.02       # audit_security_identity(); a placeholder
+  reuse_gap_trading_days: 60         # its Q3; a placeholder
+  unit_ratio_band: 1.5               # its unit consistency; a placeholder
+  data_caveats: []                   # operator-written strings, each naming a
+                                     # measured data gap; the system never
+                                     # writes it. Shown in run_backtest.md's
+                                     # Output Format and model_deploy.md's
+                                     # Main view
 ```
+
+---
+
+## Ingestion-Range Cleanup (one-time, manual)
+
+Run manually, once, as a guest, on a database ingested under the former
+range; a re-run is harmless. Its units are the DB access role's above.
+
+1. It moves the `tick_10` rows at hours in [193000, 200000) to `tick_10_tail`
+   and deletes the other `ohlcv_1min` and `tick_10` rows outside the
+   ingestion range, appending a `source_changes` row per (table, ticker,
+   date) it removes rows from, in its transaction.
+2. It deletes the `tick_bar_aggregates` rows at hours outside the range.
+3. It deletes the `ticker_data_coverage` rows whose (ticker, date) keeps
+   neither an `ohlcv_1min` nor a `tick_10` row.
+4. It runs `populate_trading_calendar()` with date_range None.

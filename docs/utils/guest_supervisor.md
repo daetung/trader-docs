@@ -25,9 +25,11 @@ Module dependencies:
     - `register()`;
     - units;
     - `run_info()`;
-  - alert_delivery.md (the `scheduled_work_deferred` delivery);
+  - alert_delivery.md — `deliver()` for a scheduled refusal's first
+    delivery, `write_to_log()` for the refusals recorded without dispatch
+    and for finding 56's `code_version_unattested` records;
   - utils.md (Config Hashing for a work's config_hash; `generate_run_id()`
-    for its work_id);
+    for its work_id; Code Versions for the code checks);
 - this module runs tool bodies by their registry module paths;
 - a tool script only hands over to `run_guest`; tool bodies use neither
   this module nor db_coordination.md beyond what `run_guest` hands them;
@@ -47,21 +49,29 @@ Module dependencies:
 
 The single list of the tools run through `run_guest`. Each entry:
 - name;
-- unit kind — per run | per step (db_coordination.md's Unit scope);
+- unit kind — per run | per chunk | per step (db_coordination.md's Unit
+  scope);
 - body module path, resolved at run time;
 - whether the tool produces a sealed result (Sealed Results, below);
-- per variant, the config keys naming input files.
+- per variant, the variant's inputs;
+- the code areas it computes from (utils.md's Code Versions).
+
+A per-step tool opens a work; a per-chunk or per-run tool opens none.
 
 Registered:
-- `run_preprocess` — per step; sealed result;
-- `pipeline_optimizer` — per step; input files:
-  - variants `'full'` and `'exploitation'`: `optimizer.selected_features_path`;
-  - variant `'selection'`: none;
-- `run_train` — per run;
-- `run_backtest` — per run;
-- `detection_benchmark` — per run;
-- `init_db` — per run;
-- `migration_tool` — per run.
+- `run_preprocess` — per step; sealed result; areas: data;
+- `pipeline_optimizer` — per step; areas: data and training; the variant's
+  inputs:
+  - `'exploitation'`: the content of `optimizer.selected_features_path`;
+  - `'refit'`: the retained configuration (pipeline_optimizer.md);
+  - `'full'`: none;
+  - `'selection'`: none;
+- `run_train` — per chunk; areas: data and training;
+- `run_backtest` — per chunk; areas: data and training;
+- `detection_benchmark` — per chunk; areas: data;
+- `migration_tool` — per chunk; areas: data;
+- `model_deploy` — per chunk; no areas;
+- `init_db` — per run; no areas.
 
 A file the registry names as an input of some variant is written by its
 producer through temp + rename (pipeline_optimizer.md's `'selection'`
@@ -84,18 +94,33 @@ A new run:
 - `--supersede` is accepted only for a manual run; with
   `--trigger scheduled` it is an error at start.
 
+The code check: for a tool with areas, `run_guest` checks them before
+New-Run Resolution, `--resume-work` runs included (utils.md's Code
+Versions); an unattested area ends the run `'blocked'` with cause
+`code_unattested`, a finding 56 entry recorded through alert_delivery.md's
+`write_to_log()` alone, not dispatched, under alert_key
+`'code_version_unattested'`.
+
+A tool that opens no work (a per-chunk or per-run tool):
+- `run_guest` skips New-Run Resolution and work opening;
+- `--trigger scheduled`, `--supersede` and `--resume-work` are errors at
+  start;
+- a self-terminated run ends without a relaunch.
+
 A `--resume-work` run:
 - takes the trigger from the work;
 - opens that work directly and hands it to the body;
-- ends `'normal'` without opening when:
+- ends `'normal'` without opening when, in this order:
+  - `resume.lock` is held;
+  - the work's code_versions differ from the lock's — the work turns
+    superseded first (Code Versions of a Work, below);
   - the work is not `'active'`;
   - the work is held by a live run;
-  - `resume.lock` is held;
 - with `--trigger` or `--supersede` is an error at start.
 
 What the body receives:
-- a step tool — a work opener and a unit opener, the body opening its work
-  before its first step; the work opener:
+- a step tool — a work opener, a unit opener and the step helpers (Steps,
+  below), the body opening its work before its first step; the work opener:
   - opens the body's work by New-Run Resolution (below), run on the
     connection of the unit in which the body calls it, given:
     - the run's pin;
@@ -106,11 +131,45 @@ What the body receives:
     - covered config;
     - pin;
     - stale-batch test;
-  - answers the body's reads of the tool's work records — its unfinished
-    work's config_hash, and the `updated_at` of its latest `'done'` work
-    per variant (pipeline_optimizer.md's refresh run);
+  - answers the body's reads of the tool's work records:
+    - its unfinished work's config_hash, and whether that work is held by a
+      live run;
+    - the `updated_at` of its latest `'done'` work per variant
+      (pipeline_optimizer.md's refresh run);
+    - the pipeline_optimizer works carrying a given divergence week, with
+      each work's status (Reports, below);
+  - answering a read of the tool's unfinished work, applies the
+    code-version supersede (Code Versions of a Work, below) first, in its own
+    `resume.sqlite` transaction, then answers as with no unfinished work,
+    naming the work it superseded;
+- a per-chunk tool — a unit opener, each call opening one
+  `guest_unit(tool, None)`;
 - a per-run tool — the connection of one `guest_unit(tool, None)` opened
   around the body.
+
+Units hold DB work only (db_coordination.md's Unit scope):
+- a guest holds a unit only for a bounded chunk of DB work; the tool's own
+  compute runs outside units;
+- a DB function that computes internally runs inside the unit of its call,
+  each call bounded — `populate_precomputed_session_stats()`,
+  `compute_tick_bar_aggregates()`, the crawlers and
+  `compute_vol_regime_holdout()` among them;
+- between units a run waits for admission;
+- no unit is opened while another unit of the same run is held;
+- a run self-terminated while holding a unit (over
+  `coordination.guest_max_hold_seconds` while an owner waits): a per-chunk
+  tool re-runs from scratch; a step tool resumes through its work.
+
+The change check: for a run whose tool has areas, the unit opener, before
+opening each unit, compares the run's areas with their state at the run's
+start (utils.md's Code Versions):
+- the set of member files;
+- each file's mtime and size;
+- the listed distributions' versions.
+On a difference it recomputes the areas' code_hash; one differing from the
+code_hash attested at the start ends the run `'blocked'` with cause
+`code_changed`, no unit opened, a finding 56 entry recorded through
+`write_to_log()` as for `code_unattested`.
 
 What the body works on, one of:
 - the opened work — from the work opener, or handed by `run_guest` to a
@@ -155,9 +214,14 @@ CREATE TABLE works (                    -- rows are never deleted
     config_hash       TEXT NOT NULL,
     -- fixed inputs, set at creation:
     config_snapshot   TEXT NOT NULL,    -- JSON: the covered config with the
-                                        -- variant's input-file contents
+                                        -- variant's inputs, and code_versions:
+                                        -- the lock's versions of the areas
+                                        -- its config_hash holds
     pin               TEXT NOT NULL,    -- JSON, tool-defined
-    tool_snapshots    TEXT,             -- JSON, tool-defined (rate_snapshot)
+    tool_snapshots    TEXT,             -- JSON, tool-defined: rate_snapshot;
+                                        -- the champion snapshot; a
+                                        -- divergence-dispatched work's
+                                        -- divergence week and target run_id
     input_works       TEXT,             -- JSON [{work_id, seal_hash}]; each
                                         -- seal_hash recorded at first
                                         -- consumption, fixed thereafter
@@ -179,7 +243,7 @@ CREATE TABLE work_journal (             -- append-only, never purged
     ts       TEXT NOT NULL,
     work_id  TEXT NOT NULL,
     event    TEXT NOT NULL,             -- 'created' | the status entered
-                                        -- | 'opened'
+                                        -- | 'opened' | 'deferral_notified'
     cause    TEXT,
     detail   TEXT                       -- JSON
 );
@@ -210,24 +274,45 @@ CREATE TABLE work_journal (             -- append-only, never purged
 ## Config Hash and Fixed Inputs
 
 - `config_hash` = utils.md's `config_hash()` over the config keys the tool
-  uses and the content hash of every input file of the work's variant:
+  uses, the variant's inputs, and code_versions holding the lock's area
+  versions:
   - run_preprocess — the keys its Config Keys Used lists inside
-    config_hash;
+    config_hash; the data version;
   - pipeline_optimizer — the full config with the dispatched phase, not
-    `'refresh'`;
+    `'refresh'`; the data and training versions;
 - the fixed inputs, set when the work is created:
   - `config_snapshot`;
   - `pin`;
   - `tool_snapshots`;
   - `input_works`;
 - every execution of a work reads the work's fixed inputs, never the
-  current config or input files.
+  current config or the variant's current inputs.
+
+---
+
+## Code Versions of a Work
+
+An unfinished work whose code_versions differ from the lock's turns
+superseded, in one `resume.sqlite` transaction:
+- its journal row: cause `code_version_changed`, its detail naming the
+  work's versions and the lock's;
+- its unfinished dependents turn superseded with cause propagated
+  (Dependency, below).
+The run then proceeds as with no unfinished work. This precedes every other
+handling of the unfinished work:
+- a `--resume-work` run: after its `resume.lock` condition, before its
+  not-`'active'` and held-by-a-live-run conditions; the run then ends
+  `'normal'`;
+- New-Run Resolution, for the run's own work and a dependent's input work;
+- the refresh run's first look (pipeline_optimizer.md), before its held-work
+  rule and its config_hash comparison.
 
 ---
 
 ## New-Run Resolution
 
-Checked and created in one `resume.sqlite` transaction.
+Checked and created in one `resume.sqlite` transaction, after the
+code-version supersede above.
 
 With an unfinished work of the tool:
 - a manual run with `--supersede` turns that work and its unfinished
@@ -258,8 +343,17 @@ each by this resolution with the dependent's trigger:
 
 A refused run:
 - ends `'blocked'` (db_coordination.md's end kinds);
-- when scheduled, is delivered as `scheduled_work_deferred` through
-  alert_delivery.md's `deliver()` (health_report.md), on every refusal.
+- when scheduled, is a `scheduled_work_deferred` refusal (health_report.md's
+  finding 54), its finding entry carrying `dispatched`: true | false:
+  - the first scheduled refusal blocked by a given work: in the refusal's
+    `resume.sqlite` transaction the blocking work's journal gains event
+    `'deferral_notified'`; after that transaction commits, the refusal is
+    delivered through alert_delivery.md's `deliver()`;
+  - a later scheduled refusal blocked by a work carrying
+    `'deferral_notified'` is recorded through `write_to_log()` alone and not
+    dispatched;
+  - a scheduled refusal blocked by `restore_store` is delivered on every
+    refusal, nothing written to `resume.sqlite`.
 
 While `resume.lock` is held the resolution refuses, the run ending
 `'blocked'`. While `resume.sqlite` is unreadable the resolution raises, the
@@ -323,11 +417,78 @@ work.
 ## A Run's Work
 
 Child API, called by the body on its opened work:
-- `work_progress()` — sets `progress_at`, at each step commit;
+- `work_progress()` — sets `progress_at`, immediately before each step
+  commit;
 - `work_close(status)`.
 
-A live run whose work turns superseded ends `'superseded'`, checking at each
-step commit and in its wait loop.
+A live run whose work turns superseded ends `'superseded'`, checking at
+`s.write()`, at `db_step()`'s commit and in its wait loop.
+
+### Steps
+
+A step of a step tool holds a read unit and a write unit, its compute
+running between them outside any unit:
+- the read unit — the step's done check, releasing the unit when done; the
+  step's DB reads; its mark, where the step takes one;
+- the write unit — the step's DB writes; `work_progress()`; the commit.
+
+The step helpers a step tool receives with its unit opener:
+- `with step(done, read=None, results=None) as s:`:
+  - entering opens the read unit and runs done(conn):
+    - true → `s.skipped` is True, and `s.results` is results(conn) when
+      results is given;
+    - false → `s.skipped` is False, and `s.inputs` is read(conn) when read
+      is given;
+  - the read unit commits the rows that DB functions called in it wrote,
+    then is released;
+  - the body computes under `if not s.skipped:` holding no unit; a component
+    reading the DB during compute takes the unit opener as its connection
+    provider;
+  - `s.write(fn)`, in this order:
+    - opens the write unit;
+    - a work turned superseded → the run ends `'superseded'`, nothing
+      written;
+    - renames the step's result files from the temp files written during
+      compute;
+    - fn(conn);
+    - `work_progress()`;
+    - the commit;
+  - a step not skipped ends with `s.write()`; with nothing to write, fn
+    writes no row;
+  - an exception in the body or in fn → no commit, the write unit rolled
+    back;
+- `with db_step(done) as d:`, for a step whose work is all DB work:
+  - one unit; done(d.conn) true → `d.skipped` is True and the body does
+    nothing;
+  - otherwise the body works on d.conn; on leaving without an exception, in
+    this order: the superseded check; `work_progress()`; the commit.
+- A step's body opens no step.
+- The helpers serve step tools only: a per-chunk tool opens its units
+  through the unit opener; a per-run tool works on the connection of the one
+  unit `run_guest` opens around its body.
+
+The I/O rule of a guest's steps and chunks:
+- a component neither writes to the DB nor commits; it returns the rows it
+  produces — Trainer, Backtester, BacktestEngine and the Regime Holdout
+  Report computation among them;
+- the owner writes those rows: a step tool's coordinator or body, in the
+  step's write unit, `work_progress()` immediately before the commit; a
+  per-chunk tool's body, in its write chunk;
+- a step's result files are written through temp + rename before the write
+  unit's commit; model artifacts are saved by Trainer during compute;
+- DB reads happen in the step's read unit, and during compute in units a
+  connection provider opens, each one bounded read;
+- rows a step produces are used from memory, never read back from the DB;
+- the code after a step takes the step's results: from a computed step, its
+  in-memory output; from a skipped step, rows read in its read unit when the
+  done check holds;
+- exceptions:
+  - a DB function that computes internally writes inside the unit of its
+    call;
+  - a step whose work is all DB work runs in one unit, pipeline_optimizer.md's
+    regime holdout step included;
+  - a write conditioned on current rows, within the write unit's
+    transaction.
 
 ---
 
@@ -398,6 +559,9 @@ Launch:
 - `work_opened_by(run_id)` — the `work_id` of the work that run opened,
   from the journal's `'opened'` rows, or None (health_report.md's
   abnormal-end finding);
+- `works_for_divergence_week(week_start)` — the pipeline_optimizer works
+  carrying that divergence week in `tool_snapshots`, each with its status
+  (shadow_retraining.md's divergence trigger, health_report.md's finding 6);
 - outside this module's own paths they are read by health_report.md, in
   its own process or in live_mode_runner.md's session-start report;
 - each raises on a `resume.sqlite` that is present but unreadable; the
@@ -423,7 +587,10 @@ guest_supervisor:
 - Work rows are never deleted
 - At most one unfinished work per tool
 - Every execution of a work reads its fixed inputs, never the current
-  config or input files
+  config or the variant's current inputs
 - The sweep is the sole launcher of works
 - Tool bodies use neither this module nor db_coordination.md beyond what
   `run_guest` hands them
+- A component neither writes to the DB nor commits; the owner writes its
+  rows in the write unit (Steps)
+- No unit is opened while another unit of the same run is held

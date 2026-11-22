@@ -23,6 +23,9 @@ bars: pd.DataFrame
     # strictly bars t-N ... t-1 (fully closed bars only)
     # t bar must be excluded before passing to this module
     # may include pre-market and after-market bars
+    # only the bars the broker supplied: a minute without trades has no bar
+    # and none is created; a trading day on which the ticker has no 1-min
+    # bar is absent from the frame
 
 ticks: pd.DataFrame  (optional, for tick-based indicators)
     columns: [ticker, date, hour, price, volume]
@@ -36,6 +39,16 @@ pd.DataFrame  # same index as input bars, one or more indicator columns
 
 # Exception: gap_percentile() returns float (scalar)
 ```
+
+**Bar-based indicators run over the existing bars** — every indicator here
+except the REFERENCE_SESSION indicators, `vwap`, `pivot_points` and
+`gap_percentile`, and the detection conditions' bar windows:
+- their lengths and windows count bars;
+- a lag reference is the previous existing bar.
+The REFERENCE_SESSION indicators compare by clock minute of day against
+prior sessions, cumulative quantities counting from the session's start.
+`vwap` anchors at its session reset time; `pivot_points` read the prior
+session's bars.
 
 ---
 
@@ -77,7 +90,7 @@ rsi(bars, n)
 
 roc(bars, n)
     → Rate of Change: (close - close[n]) / close[n] * 100
-    → close[n] is the latest valid bar at or before position t−n
+    → close[n] is the close of the existing bar n positions back
       (Incremental Computation Rule, NaN-term handling)
     → default: n=12
 
@@ -142,8 +155,6 @@ ad(bars)
     → ad = cumsum(money_flow_multiplier * volume)
     → a flat bar (high == low) contributes 0 and the output at that bar is
       defined (Incremental Computation Rule, I5a)
-    → a halt bar outputs NaN and the cumulative sum carries over it
-      (Incremental Computation Rule, I5b)
 
 vwap(bars, reset_mode, regular_start)
     → Volume-Weighted Average Price
@@ -154,7 +165,7 @@ vwap(bars, reset_mode, regular_start)
         (includes pre-market bars if present)
 
     reset_mode = "regular_session":
-        Reset at regular_start (default "093000") each date
+        Reset at regular_start (config indicators.vwap.regular_start) each date
         Bars before regular_start are excluded from VWAP calculation (NaN)
 
     note: VWAP reset_mode is read from config and passed by FeatureExtractor
@@ -175,16 +186,15 @@ pivot_points(bars)
     → "previous session" = previous date's regular session
       (093000~last_bar(previous date)) — PER DATE, so a session following an
       early close reads that day's real range and not a 15:59 that never existed
-    → prev_close = the close of that session's last valid bar; prev_high and
-      prev_low over its valid bars — a session halted through its close
-      reads its last print (Incremental Computation Rule, I5b)
+    → prev_close = the close of its last existing bar at or before
+      last_bar(prior date); prev_high and prev_low over its existing bars
     → output columns: pp, r1, r2, r3, s1, s2, s3 (absolute prices)
     → distance features derived in Vectorizer via level_distance()
 
 fibonacci_retracement(bars, window_bars)
     → Identify swing high and swing low within window
-    → swing_high = max(close[-window_bars:])  ← implemented via monotonic deque
-    → swing_low  = min(close[-window_bars:])  ← implemented via monotonic deque
+    → swing_high = max(high[-window_bars:])   ← implemented via monotonic deque
+    → swing_low  = min(low[-window_bars:])    ← implemented via monotonic deque
     → Compute standard Fibonacci levels:
          level_0    = swing_low
          level_236  = swing_low + 0.236 * (swing_high - swing_low)
@@ -196,13 +206,13 @@ fibonacci_retracement(bars, window_bars)
     → output columns: fib_0, fib_236, fib_382, fib_500, fib_618, fib_786, fib_1000
       (absolute prices — varies per bar as window slides)
     → distance features derived in Vectorizer via level_distance()
-    → window_bars default: 390 — chosen as roughly one ordinary session's bar
-      count, which is the RATIONALE for the number, not a property of the window.
+    → window_bars default: 390 bars — one regular session of bars, which is
+      the RATIONALE for the number, not a property of the window.
       This is a SLIDING window over the bars frame ("varies per bar as window
       slides", monotonic-deque max/min, NaN for the first window_bars-1 bars);
       it is a CONTINUOUS indicator and spans session boundaries by design, so it
       neither aligns to a session nor needs a per-date bound. Its sibling
-      sr_levels.window_bars is 480, which is no session length at all.
+      sr_levels.window_bars defaults to 300 bars.
 
     Implementation note (monotonic deque):
         When called on the full ticker bars DataFrame, fibonacci_retracement()
@@ -217,37 +227,84 @@ sr_levels(bars, n_levels, window_bars)
     → Identify top-N local maxima and minima by scipy prominence score
     → For each of top-N resistance levels (local maxima):
          price_rN      : absolute price of local maximum
-         pivot_hour_rN : HHMMSS of the bar where local maximum occurred
          bars_since_rN : bars elapsed since local_max_N
                          (relative to last bar in passed window = t-1)
          prominence_rN : scipy prominence score
     → For each of top-N support levels (local minima):
          price_sN      : absolute price of local minimum
-         pivot_hour_sN : HHMMSS of the bar where local minimum occurred
          bars_since_sN : bars elapsed since local_min_N
                          (relative to last bar in passed window = t-1)
          prominence_sN : scipy prominence score
+    → Computation:
+         - resistance peaks are detected over `high`; support troughs over
+           `low`;
+         - minima are found as maxima of the negated series; their
+           prominence is positive;
+         - find_peaks takes no parameters: every local extremum is a
+           candidate, and only the top-n_levels selection applies;
+         - the computation follows scipy find_peaks and peak_prominences
+           default semantics, their plateau rule at the window edge
+           included;
+         - r1 and s1 are the levels of largest prominence, in descending
+           order; a tie orders the more recent pivot first
     → Raw level data only — distance features (dist_rN_pct, dist_sN_pct,
       nearest_resistance_dist, sr_asymmetry, etc.) are computed by
       Vectorizer.sr_distance() using P_entry per entry point
     → Pad missing levels with NaN if fewer than n_levels extrema found
-    → peaks are detected over the window's valid bars (Incremental
-      Computation Rule, W2); bars_since_rN counts bar positions, and
-      pivot_hour_rN is unchanged
-    → default: n_levels=3, window_bars=480 (~2 trading days)
+    → peaks are detected over the window's existing bars (Incremental
+      Computation Rule, W2); bars_since_rN counts bar positions
+    → computed per entry point, in training and in live, over the last
+      window_bars bars ending at t-1
+    → default: n_levels=3, window_bars=300 — the conventional
+      support/resistance loopback
 
-    pivot_hour_rN / pivot_hour_sN:
-        Absolute bar timestamp of the pivot. Used by extract_batch() when
-        applying the "per-entry-point recomputation" strategy for sr_levels:
-        bars_since_rN can be recomputed cheaply from pivot_hour without
-        re-running scipy prominence.
-        In the per-entry-point case, bars_since_rN from the fresh call is
-        already t-1 relative — no recomputation needed.
+sr_channels(bars, source, pivot_period, loopback_bars, width_range_bars,
+            channel_width_pct, min_strength, max_num_sr)
+    → Support/resistance channels from confirmed pivots, beside sr_levels
+    → source series: "high_low" takes `high` for pivot highs and `low` for
+      pivot lows; "close_open" takes max(close, open) and min(close, open)
+    → a pivot high at bar j: its value is strictly greater than each of the
+      pivot_period bars on each side; a pivot low mirrors it; a bar that is a
+      pivot high and a pivot low counts as a pivot high
+    → a pivot is confirmed at bar j + pivot_period, and its location is that
+      confirmation bar
+    → the pivot list:
+         - a confirmed pivot is inserted at the front;
+         - on each confirmation bar, pivots whose location lies more than
+           loopback_bars before that bar are removed from the back
+    → channels are recomputed only on confirmation bars and persist until
+      the next one; at a recompute bar:
+         - cwidth = (the highest `high` − the lowest `low` over the last
+           width_range_bars bars) × channel_width_pct / 100;
+         - each pivot seeds a band lo = hi = its value; one pass over the
+           list in order adds each pivot whose distance (hi − value if
+           value ≤ hi, else value − lo) is at most cwidth, widening the
+           band; each added pivot, the seed included, adds 20 to the band's
+           strength;
+         - each bar from the recompute bar back through loopback_bars bars
+           whose `high` or `low` lies inside the band adds 1 to its
+           strength;
+         - selection: it repeatedly takes the candidate of strictly
+           greatest strength at or above min_strength × 20, the earlier list
+           position winning a tie; after each pick, every candidate whose hi
+           or lo lies inside the picked band is disqualified, the pick
+           included; it stops after 10 picks;
+         - the picks are sorted by strength descending, ties keeping their
+           order; the first max_num_sr are the channels
+    → the value at an entry is the channel set of the latest recompute bar
+      at or before t-1; with none, NaN
+    → raw outputs, for N up to max_num_sr, NaN where absent:
+         sr_ch_hi_N, sr_ch_lo_N, sr_ch_strength_N
+    → raw channel data only — distance features are computed by the
+      Vectorizer's dedicated method beside sr_distance() (03_vectorizer.md)
+    → computed per entry point: live in
+      CachingIndicatorCalculator.get_for_entry(), training on the same
+      adj_bars frame as Strategy A
 ```
 
 ### Bid-Ask Spread Indicators
 ```
-lee_ready(ticks, bars)
+lee_ready(ticks, bars, momentum_n)
     → Apply Lee-Ready (Tick Test) algorithm to tick_10 data
     → Classify each tick as buyer-initiated (+1) or seller-initiated (-1)
       Rule: uptick → buyer, downtick → seller, zero-tick → inherit prior direction
@@ -258,24 +315,23 @@ lee_ready(ticks, bars)
       tick_direction_momentum carries over it (Incremental Computation Rule,
       NaN-term handling); the zero-tick direction inheritance is per tick
       and unchanged across a halt
-    → default: momentum_n = 5
+    → momentum_n: config lee_ready.momentum_n, no default
 
 roll_spread(bars, n)
     → Roll Model: spread = 2 * sqrt(-cov(ΔP_t, ΔP_{t-1}))
     → Uses 1min close prices; computed over rolling window n
     → Output: roll_spread_pct = roll_spread / close  (normalized)
     → If cov > 0 (model breaks down): return NaN
-    → ΔP pairs are taken between consecutive valid bars of the window
+    → ΔP pairs are taken between consecutive existing bars of the window
       (Incremental Computation Rule, W2)
-    → default: n = 20
+    → n: config roll_spread_window, no default
 
 hl_spread(bars)
     → Corwin-Schultz High-Low Spread estimator
     → Uses intraday high/low of each 1min bar
     → spread = 2*(exp(alpha) - 1) / (1 + exp(alpha))
       where alpha derived from rolling 2-bar H/L ratios
-    → the previous bar of the 2-bar pair is the latest valid bar
-      (Incremental Computation Rule, NaN-term handling)
+    → the previous bar of the 2-bar pair is the previous existing bar
     → Output: hl_spread_pct per bar (normalized by close)
     → lee_ready()'s bundle direction, hl_spread_pct and roll_spread_pct also
       feed execution_common.md's exit spread estimator
@@ -285,21 +341,20 @@ hl_spread(bars)
 ### Missing Bar Classification
 ```
 classify_missing_bars(bars, halts_df, date)
-    → Detect gaps in bar sequence (missing HHMMSS within full trading day)
-    → Covers pre-market, regular session, and after-market hours
-    → For each missing bar slot:
-         if slot overlaps any halt interval in halts_df → "halt"
+    → Classify each minute without a bar in [PREMARKET_OPEN,
+      after_hours_end(date)), the entry date through t-1, as halt or no-trade
+    → For each minute without a bar:
+         if it lies inside a halt interval of halts_df → "halt"
              (halts can occur across all time periods, not only regular session)
-         else                                           → "no_trade"
+         else                                          → "no_trade"
+    → halts_df: the halt-interval resolver's intervals (utils.md)
     → Output: dict with keys:
          missing_bar_slots  : list of HHMMSS strings
          classification     : dict[HHMMSS → "halt" | "no_trade"]
          halt_bar_count     : int
          no_trade_bar_count : int
-
-    Filling strategy (applied before indicator calculation):
-         no_trade bars: volume=0, OHLC = prior bar close (forward-fill)
-         halt bars:     volume=0, OHLC = NaN (do NOT forward-fill)
+    → Fills nothing: no bar is created, and no halt row exists in the bar
+      frame
 ```
 
 ### Tick-Derived Indicators
@@ -360,10 +415,9 @@ tick_burstiness(ticks, bars)
     → NULL if fewer than 2 bundles in the bar (no interval exists)
 ```
 
-Halt and no-trade bars (Incremental Computation Rule, I5a/I5b):
-- every tick-derived output is NaN at a halt bar, `tpm` included;
-- a no_trade bar keeps `tpm` = 0, and a ratio whose denominator is 0 there
-  is NaN (I5a).
+A tick-derived indicator takes a value at each existing bar; a bar with no
+tick bundle gives NaN, and a ratio whose denominator is 0 is NaN (Incremental
+Computation Rule, I5a).
 
 ---
 
@@ -394,40 +448,37 @@ REFERENCE_SESSION: current session value normalized by prior session baseline
 ```
 
 ```
-rvol(bars, date, n_sessions, session_mode, session_stats)
+rvol(bars, date, n_sessions, session_stats)
     → Relative Volume: today's cumulative volume at time T
       divided by average cumulative volume at time T over prior N sessions
     → today_cumvol_at_T = sum(bars[date==today, hour<=T]["volume"])
     → baseline = session_stats["rvol_baseline"][T]
       (prior N sessions avg cumulative volume at hour T; precomputed and stored in DB)
-    → session_mode: follows entry_detector.session_mode
-         "regular": prior regular session bars only (093000~last_bar(date))
-         "pre":     prior pre-market bars (040000~092900)
-         "combined": both
+    → slots and the today window: data_boundary.md's REFERENCE_SESSION
+      Indicator Boundary — a prior session contributes to slot H only in its
+      premarket and regular phases; the measured value is the REFERENCE_SESSION
+      today window
     → output: per-bar ratio series (today session only; prior session bars → NaN)
-    → the cumulative sum carries over a halt bar, whose output is NaN
-      (Incremental Computation Rule, I5b)
     → output column: rvol
 
-rel_dvol(bars, date, n_sessions, session_mode, session_stats)
+rel_dvol(bars, date, n_sessions, session_stats)
     → Relative Dollar Volume: same as rvol but using close * volume (dollar volume)
     → baseline = session_stats["rel_dvol_baseline"][T]
       (prior N sessions avg cumulative dollar volume at hour T; precomputed and stored in DB)
-    → the cumulative sum carries over a halt bar, whose output is NaN
-      (Incremental Computation Rule, I5b)
     → output column: rel_dvol
 
 gap_percentile(bars, date, n_sessions, session_stats, dividend_amount)
     → Today's gap = (today_regular_open - adjusted_prev_close) / adjusted_prev_close
-      today_regular_open = open price of 093000 bar — NaN when that bar
-                   is a halt bar, with no forward search
-      prev_close = close price of the last valid bar in the previous date's
-                   regular session (093000~last_bar(previous date))
+      today_regular_open = open of the date's first regular-session bar
+                   (utils.session_phase() 'regular')
+      prev_close = close price of the last existing bar at or before
+                   last_bar(previous date) in its regular session
                    — PER DATE. last_bar(), never exit_deadline(): this is the
                    session's final print, a data fact, not the exit policy
       adjusted_prev_close = prev_close - dividend_amount
       (split scale is already consistent — bars are pre-adjusted by the caller
-       via adjust_bars_for_corporate_events() before reaching this method;
+       via adjust_bars_for_corporate_events() or its frame form
+       adjust_bars_from_events() before reaching this method;
        only the ex-dividend cash-drop component needs correcting here)
     → dividend_amount: cash dividend per share with ex-dividend date = today
       (0.0 if none). The caller looks this up from corporate_events for
@@ -441,20 +492,19 @@ gap_percentile(bars, date, n_sessions, session_stats, dividend_amount)
        populate_precomputed_session_stats() — see utils.md)
     → Returns float (scalar) — NOT a DataFrame
     → NaN conditions:
-         - t bar = "093000" (today's open = t bar open = P_entry → FORBIDDEN)
-         - t < "093000" (pre-market entry; regular session not yet open)
-         - the 093000 bar is a halt bar
+         - the first regular-session bar's hour is not before t (that bar is
+           the t bar — today's open = P_entry → FORBIDDEN — or later)
          - baseline has insufficient data (count < n_sessions / 2)
     → output: float | NaN  (single scalar per entry point)
 
 intraday_seasonality(indicator_series, date, n_sessions,
-                     delta_minutes, session_mode, metric, session_stats)
+                     delta_minutes, metric, session_stats)
     → Normalize a per-bar metric series against its prior-session baseline
       at the same time-of-day (±delta_minutes window)
     → indicator_series: pre-computed metric time series for today's bars
          (e.g. volume series from bars, tpm series from tpm(), etc.);
-         the price_return series takes prev_close from the latest valid bar
-         (Incremental Computation Rule, NaN-term handling)
+         the price_return series takes prev_close from the previous
+         existing bar
     → metric: "volume" | "price_return" | "tpm" | "buy_sell_ratio"
          buy_sell_ratio baseline loaded from precomputed_session_stats (tick-derived,
          pre-computed at migration step — not calculated at runtime)
@@ -471,7 +521,7 @@ intraday_seasonality(indicator_series, date, n_sessions,
     → output column: intra_season_{metric}  (e.g. intra_season_vol)
 
 relative_avg_vol_per_tick(bars, ticks, date, n_sessions, delta_minutes,
-                          session_mode, session_stats)
+                          session_stats)
     → Cross-session per-slot comparison of avg_vol_per_tick — same pattern
       as rvol/rel_dvol (current value over baseline), not a self-rolling
       comparison against this ticker's own recent bars
@@ -529,9 +579,10 @@ Applies to:
   `ad`) is rebased by exact subtraction to the first non-NaN value of the
   window being vectorized, before conversion to float.
 - **I4 — recursive filters.** A recursive filter on estimates (`ema`, Wilder
-  smoothing, `parabolic_sar`) keeps batch-incremental parity through I1. With
-  `lookback_days` meeting H_max (Config Keys' constraint), its output does
-  not depend on its origin:
+  smoothing, `parabolic_sar`) keeps batch-incremental parity through I1. An
+  admitted entry has at least H_max bars in [the lookback start, t-1]
+  (01_entry_detection.md's entry admission), so its output does not depend
+  on its origin:
   - H_max — the largest, over enabled recursive-filter chains, of the chain's
     summed per-stage horizon H = 53·ln2 / −ln(1−α), with ema α = 2/(span+1)
     and Wilder α = 1/n;
@@ -547,28 +598,26 @@ Applies to:
     `bollinger_bands`' `pct_b`, `cci`.
   - An accumulator term with a zero-range denominator — `ad`'s flat bar —
     contributes 0, and the output at that bar is defined.
-- **I5b — halt bars.**
-  - A halt bar is identified by NaN OHLC after Missing Bar Classification's
-    filling.
-  - Every term reading a halt bar is a NaN term — its volume term and its
-    tick-derived terms included, the filled volume of 0 being no
-    observation.
-  - The halt bar's own output is NaN.
-- **NaN-term handling**, whatever the NaN's origin:
-  - the origins covered:
-    - I5a;
-    - I5b;
-    - a no-tick bar's 0/0 ratio;
+  - A REFERENCE_SESSION ratio whose baseline is zero or NaN is NaN: `rvol`,
+    `rel_dvol`, `intraday_seasonality`, `relative_avg_vol_per_tick`.
+- **I5b — halts.**
+  - A halt is a halts_df interval; no halt row exists in the bar frame.
+  - Bar-based indicators receive no input for its minutes.
+  - No term is NaN on its account.
+- **NaN-term handling**, for:
+  - I5a's zero-range ratios;
+  - a bar with no tick bundle;
   - cumulative and recursive state is carried unchanged over a NaN term;
-  - a lag-k reference is the latest valid bar at or before position t−k:
+  - a lag reference is the previous existing bar (lag k: k existing bars
+    back):
     - previous close;
     - previous high/low;
     - `close[n]`;
   - window computations follow W2.
-- **W2 — windows over valid bars.**
-  - A window is the last n bar positions.
-  - Every operation in it runs over the window's valid bars in order, NaN
-    terms removed:
+- **W2 — windows over existing bars.**
+  - A window is the last n existing bars.
+  - Every operation in it runs over the window's bars in order, NaN terms
+    removed:
     - sums;
     - counts;
     - means;
@@ -577,7 +626,7 @@ Applies to:
     - extrema;
     - peak detection;
     - consecutive pairs.
-  - An output is NaN when the window's valid count is below what its
+  - An output is NaN when the window's count of non-NaN terms is below what its
     statistic requires — a mean needs 1, a variance 2.
   - Warm-up — the series holding fewer than n bar positions — remains a
     separate NaN rule.
@@ -597,7 +646,8 @@ Applies to:
 | Volume Ratio | `vr_volume` | distinct from `vr_volatility` |
 | Pivot outputs | `pp`, `r1`..`r3`, `s1`..`s3` | absolute prices |
 | Fibonacci outputs | `fib_0`, `fib_236`, `fib_382`, `fib_500`, `fib_618`, `fib_786`, `fib_1000` | absolute prices |
-| S/R raw | `price_r{n}`, `pivot_hour_r{n}`, `bars_since_r{n}`, `prominence_r{n}` | `price_r1`, `pivot_hour_r1` |
+| S/R raw | `price_r{n}`, `bars_since_r{n}`, `prominence_r{n}` | `price_r1` |
+| S/R channel raw | `sr_ch_hi_{n}`, `sr_ch_lo_{n}`, `sr_ch_strength_{n}` | `sr_ch_hi_1` |
 | RVOL | `rvol` | `rvol_mean`, `rvol_last` |
 | Relative dollar vol | `rel_dvol` | `rel_dvol_mean`, `rel_dvol_last` |
 | Gap percentile | `gap_pct` | scalar, no suffix |
@@ -613,14 +663,16 @@ Never use bare `vr` as a column name.
 Classifies each indicator by how a split (encountered inside a Strategy A/B
 loaded bars window) affects its value, for use by FeatureExtractor's per-entry
 rescale step (see `04_feature_extractor.md`, Strategy A). Bars passed into this
-module are pre-adjusted by the caller via `adjust_bars_for_corporate_events()`
-(anchored to the last date in the loaded window); this table determines
-whether a sliced indicator value needs a further scalar correction
-(`f_e = cum_split_ratio(entry_date, anchor_date)`) back to the entry's own
-native scale before being handed to the Vectorizer.
+module are pre-adjusted by the caller via `adjust_bars_for_corporate_events()`,
+or its frame form `adjust_bars_from_events()` (anchored to the last date in
+the loaded window); this table determines whether a sliced indicator value
+needs a further scalar correction (`f_e = cum_split_ratio(entry_date,
+anchor_date)`, or `split_ratio_from_events()` over the caller's rows) back to
+the entry's own native scale before being handed to the Vectorizer.
 
 Only indicators reachable via Strategy A/B (the single-pass, whole-range
-computation) are listed — REFERENCE_SESSION indicators are excluded here
+computation), and `sr_levels` / `sr_channels`, computed per entry point on the
+same adj_bars frame, are listed — REFERENCE_SESSION indicators are excluded here
 because their scale consistency is handled separately (today-series volume
 terms already share the same anchor as the baseline; see `rvol`/`rel_dvol`
 above and `utils.md` `populate_precomputed_session_stats()`). Tick-derived
@@ -632,9 +684,9 @@ Derived Indicator Scale Sensitivity" below instead.
 
 | scale_type | Slice-time correction | Indicators |
 |---|---|---|
-| `price` | × f_e | `ma`, `ema`, `macd`, `parabolic_sar`, `atr`, `bollinger_bands` (upper/middle/lower only), `vwap`, `fibonacci_retracement`, `pivot_points` |
+| `price` | × f_e | `ma`, `ema`, `macd`, `parabolic_sar`, `atr`, `bollinger_bands` (upper/middle/lower only), `vwap`, `fibonacci_retracement`, `pivot_points`, `sr_levels` (`price_rN`, `price_sN`, `prominence_rN`, `prominence_sN`), `sr_channels` (`sr_ch_hi_N`, `sr_ch_lo_N`) |
 | `volume` | ÷ f_e | `volume_ma`, `vr_volume` numerator only (see note), `obv`, `ad` |
-| `invariant` | none | `rsi`, `roc`, `stochastic`, `cci`, `mfi`, `bollinger_bands` (`pct_b`, `bandwidth` outputs only), `adx`, `dmi`, `vr_volatility`, `vr_volume` (ratio output — numerator and its own `volume_ma` denominator scale identically, cancels), `roll_spread` (`roll_spread_pct` output), `hl_spread` (`hl_spread_pct` output) |
+| `invariant` | none | `rsi`, `roc`, `stochastic`, `cci`, `mfi`, `bollinger_bands` (`pct_b`, `bandwidth` outputs only), `adx`, `dmi`, `vr_volatility`, `vr_volume` (ratio output — numerator and its own `volume_ma` denominator scale identically, cancels), `roll_spread` (`roll_spread_pct` output), `hl_spread` (`hl_spread_pct` output), `sr_levels` (`bars_since_rN`, `bars_since_sN`), `sr_channels` (`sr_ch_strength_N`) |
 
 Notes:
 - `bollinger_bands()` and `vr_volume()` straddle two scale_types depending on
@@ -663,6 +715,7 @@ indicator's raw output is always already expressed in that bar's own
 native date's scale; it was never `reference_date`-anchored to begin with.
 Correction (where scale_type requires it) is applied directly to
 `entry_date` via `utils.adjust_tick_derived_series_for_corporate_events()`,
+or its frame form `utils.adjust_tick_derived_series_from_events()`, the one
 called from `04_feature_extractor.md`'s tick-derived dispatch path — not via
 this file's step 2a2 mechanism above, and not through a `reference_date`
 detour.
@@ -688,10 +741,10 @@ Minimum tick-bundle count: `avg_delta_per_tick`, `tick_realized_vol`,
 tick bundles exist within a bar (each requires a bundle-to-bundle
 comparison) — a bar with fewer bundles returns NULL for that indicator (see
 `db_schema.md` `tick_bar_aggregates`), not an error and not a silently
-dropped row. A bar with zero tick bundles (halt / no-trade slot) has no row
-at all for any tick-derived indicator in `tick_bar_aggregates` — callers
-reindex the sliced series against the full expected bar index so the gap
-surfaces as an explicit NaN rather than silently shrinking the window fed to
+dropped row. A bar with no tick bundle has no row at all for any
+tick-derived indicator in `tick_bar_aggregates` — callers reindex the sliced
+series against the bars' own index so such a bar surfaces as an explicit NaN
+rather than silently shrinking the window fed to
 `window_comparison`/`statistical_summary` (see `04_feature_extractor.md`).
 
 ## Adding a New Tick-Derived Indicator — Checklist
@@ -750,8 +803,8 @@ class IndicatorCalculator:
     def obv(self, bars: pd.DataFrame) -> pd.DataFrame: ...
     def ad(self, bars: pd.DataFrame) -> pd.DataFrame: ...
     def vwap(self, bars: pd.DataFrame,
-             reset_mode: str = "date",
-             regular_start: str = "093000") -> pd.DataFrame: ...
+             reset_mode: str,
+             regular_start: str) -> pd.DataFrame: ...
 
     # Level-based
     def pivot_points(self, bars: pd.DataFrame) -> pd.DataFrame: ...
@@ -759,11 +812,15 @@ class IndicatorCalculator:
                                window_bars: int) -> pd.DataFrame: ...
     def sr_levels(self, bars: pd.DataFrame, n_levels: int,
                   window_bars: int) -> pd.DataFrame: ...
+    def sr_channels(self, bars: pd.DataFrame, source: str,
+                    pivot_period: int, loopback_bars: int,
+                    width_range_bars: int, channel_width_pct: float,
+                    min_strength: int, max_num_sr: int) -> pd.DataFrame: ...
 
     # Spread / Market Microstructure
     def lee_ready(self, ticks: pd.DataFrame, bars: pd.DataFrame,
-                  momentum_n: int = 5) -> pd.DataFrame: ...
-    def roll_spread(self, bars: pd.DataFrame, n: int = 20) -> pd.DataFrame: ...
+                  momentum_n: int) -> pd.DataFrame: ...
+    def roll_spread(self, bars: pd.DataFrame, n: int) -> pd.DataFrame: ...
     def hl_spread(self, bars: pd.DataFrame) -> pd.DataFrame: ...
 
     # Missing bar classification
@@ -786,13 +843,13 @@ class IndicatorCalculator:
     # REFERENCE_SESSION
     def rvol(
         self, bars: pd.DataFrame, date: str,
-        n_sessions: int, session_mode: str,
+        n_sessions: int,
         session_stats: dict,          # reads session_stats["rvol_baseline"]
     ) -> pd.DataFrame: ...
 
     def rel_dvol(
         self, bars: pd.DataFrame, date: str,
-        n_sessions: int, session_mode: str,
+        n_sessions: int,
         session_stats: dict,          # reads session_stats["rel_dvol_baseline"]
     ) -> pd.DataFrame: ...
 
@@ -811,14 +868,13 @@ class IndicatorCalculator:
         date: str,
         n_sessions: int,
         delta_minutes: int,
-        session_mode: str,
         metric: str,
         session_stats: dict,
     ) -> pd.DataFrame: ...
 
     def relative_avg_vol_per_tick(
         self, bars: pd.DataFrame, ticks: pd.DataFrame, date: str,
-        n_sessions: int, delta_minutes: int, session_mode: str,
+        n_sessions: int, delta_minutes: int,
         session_stats: dict,   # reads session_stats["intra_avg_vol_per_tick_baseline"]
     ) -> pd.DataFrame: ...
 ```
@@ -829,11 +885,9 @@ class IndicatorCalculator:
 
 ```yaml
 indicators:
-  lookback_days: 5              # CONTINUOUS indicators lookback (days)
-                                # Constraint: lookback_days * 390 >=
-                                # max(window_bars, H_max) (I4's H_max);
-                                # checked at config load, a violation
-                                # refusing start
+  lookback_days: 5              # CONTINUOUS indicators lookback (trading
+                                # days); entry admission by bar availability
+                                # is 01_entry_detection.md's
   ma_windows: [5, 10, 20]
   ema_windows: [9, 20]
   macd: {fast: 12, slow: 26, signal: 9}
@@ -852,7 +906,7 @@ indicators:
     regular_start: "093000"
     precalculate_bars: 0        # SESSION_RESET — session start precalculation not applicable
   fibonacci:
-    window_bars: 390
+    window_bars: 390            # one regular session of bars
     precalculate_bars: "window" # precalculate window_bars worth of bars at session start
   lee_ready:
     momentum_n: 5
@@ -864,9 +918,19 @@ indicators:
   # hl_spread: no params (bar-level calculation)
   sr_levels:
     n_levels: 3
-    window_bars: 480
-    precalculate_bars: 0        # per-entry-point recomputation in live mode;
-                                # once per date per entry point in training
+    window_bars: 300            # the conventional support/resistance loopback
+    precalculate_bars: 0        # computed per entry point, in training and
+                                # in live
+  sr_channels:
+    source: "high_low"          # "high_low" | "close_open"
+    pivot_period: 10
+    loopback_bars: 290
+    width_range_bars: 300
+    channel_width_pct: 5
+    min_strength: 1
+    max_num_sr: 6
+    precalculate_bars: 0        # computed per entry point, in training and
+                                # in live
   tpm:
     precalculate_bars: 0        # default: session-only; "lookback" also valid (see above)
   avg_vol_per_tick:
@@ -899,9 +963,14 @@ indicators:
   reference_session:
     n_sessions: 20              # prior sessions for baseline; independent of lookback_days
     delta_minutes: 5            # ±window for intraday_seasonality time averaging
+    window_bars: 60             # the REFERENCE_SESSION today window
+                                # (data_boundary.md); a placeholder pending
+                                # measurement
+    price_extremes_sessions: 252  # trading days of precomputed_session_stats'
+                                  # price_52h / price_52l (utils.md)
 
   # precalculate_bars default for CONTINUOUS indicators (not explicitly listed above):
-  # "lookback" → lookback_days * 390 bars precalculated at session start
+  # "lookback" → the whole historical_bars precalculated at session start
   # Applied to: ma, ema, macd, parabolic_sar, adx, dmi, rsi, roc, stochastic,
   #             cci, mfi, bollinger_bands, atr, vr_volatility, volume_ma, vr_volume,
   #             obv, ad, roll_spread, hl_spread
@@ -924,20 +993,22 @@ indicators:
   - batch and incremental implementations bitwise equal under a contract
     test
 - Every bar-input indicator follows:
-  - I5b — a halt bar's output is NaN;
+  - I5b — a halt is a halts_df interval: no input for its minutes, no NaN
+    term on its account;
   - NaN-term handling — state carries over NaN terms, and lag references
-    reach the latest valid bar;
-  - W2 — window operations run over valid bars
+    reach the previous existing bar;
+  - W2 — window operations run over the last n existing bars
 - `dmi()` must not duplicate the calculation logic of `adx()` — call or delegate internally
 - VWAP reset behavior is controlled by `reset_mode` argument — caller (FeatureExtractor) reads from config and passes explicitly
 - `fibonacci_retracement()` and `pivot_points()` output level values as absolute prices, not distances — distance features are derived in Vectorizer via `level_distance()`
-- `sr_levels()` outputs raw level data only (`price_rN`, `pivot_hour_rN`, `bars_since_rN`, `prominence_rN`) — P_entry is never passed to this method; distance features derived in Vectorizer via `sr_distance()`
+- `sr_levels()` outputs raw level data only (`price_rN`, `bars_since_rN`, `prominence_rN`) — P_entry is never passed to this method; distance features derived in Vectorizer via `sr_distance()`
+- `sr_channels()` outputs raw channel data only (`sr_ch_hi_N`, `sr_ch_lo_N`, `sr_ch_strength_N`) — P_entry is never passed to this method; distance features derived in the Vectorizer's dedicated method beside `sr_distance()`
 - `bars_since_rN` is computed relative to the last bar in the passed window (always t-1) — it is a raw temporal measurement, not a derived feature
-- `classify_missing_bars()` applies halt classification across all time periods — halts_df is the authoritative source regardless of hour
+- `classify_missing_bars()` applies halt classification across all time periods — halts_df is the authoritative source regardless of hour — and fills nothing
 - `gap_percentile()` returns float, not DataFrame — FeatureExtractor handles inline (does not pass to Vectorizer)
 - REFERENCE_SESSION baseline data must be supplied by caller (FeatureExtractor) via `session_stats` dict — IndicatorCalculator does not query DuckDB directly; `rvol` reads `session_stats["rvol_baseline"]`, `rel_dvol` reads `session_stats["rel_dvol_baseline"]`
 - `intraday_seasonality()` takes a pre-computed indicator_series and a `session_stats` dict (not historical_bars) — does not internally call other indicator methods
 - `fibonacci_retracement()` uses monotonic deque for O(N) sliding window max/min when processing full ticker bars
 - `gap_percentile()`'s `dividend_amount` is a caller-supplied scalar (corporate_events lookup) — this method does not query DuckDB directly, consistent with the session_stats supply pattern
-- Raw bars passed into this module are assumed pre-adjusted for splits by the caller (`adjust_bars_for_corporate_events()`); this module has no corporate_events awareness beyond the `dividend_amount` scalar on `gap_percentile()` — see "Corporate Event Scale Sensitivity" table above for which outputs still need a caller-side scalar rescale after slicing
+- Raw bars passed into this module are assumed pre-adjusted for splits by the caller (`adjust_bars_for_corporate_events()`, or its frame form `adjust_bars_from_events()`); this module has no corporate_events awareness beyond the `dividend_amount` scalar on `gap_percentile()` — see "Corporate Event Scale Sensitivity" table above for which outputs still need a caller-side scalar rescale after slicing
 - Tick-derived indicators requiring a bundle-to-bundle comparison (`avg_delta_per_tick`, `tick_realized_vol`, `path_efficiency`, `tick_burstiness`) must return NaN for bars with fewer than 2 tick bundles, consistent with this file's existing warm-up NaN convention (e.g. `roll_spread`'s `cov > 0` breakdown case) — never raise, never silently omit the bar

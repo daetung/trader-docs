@@ -24,11 +24,12 @@ Live inference endpoint: LiveModeRunner (execution orchestrator)
             └── EntryPointDetector.detect()            ← signal detection (not scan())
             └── [entry_points INSERT to DuckDB]        ← Inferencer responsibility
             └── FeatureExtractor.extract()             ← direct call (no Preprocessor)
-                  (CachingIndicatorCalculator injected via DI)
+                  (the ticker's CachingIndicatorCalculator, passed per call)
             └── model.load(run_id)                     ← load trained artifacts
             └── model.predict(models, X)               ← probability output
             └── execution_common.resolve_signal(row, threshold, suppress_threshold)
-            └── inference_log writes (DuckDB)
+            └── inference_log writes and inference_features rows (DuckDB,
+                through write_fn; the feature rows buffered, flush_features())
 ```
 
 Inferencer does NOT use Preprocessor. Live inference uses `FeatureExtractor.extract()`
@@ -49,11 +50,14 @@ REFERENCE_SESSION: RVOL, rel_dvol, gap_percentile, intraday_seasonality
                  Baseline from precomputed_session_stats (loaded at session start)
 ```
 
-`calculate_required_history()` considers CONTINUOUS indicators only:
-- `min_bars = lookback_days * 390` — not per-date. The 390 names the regular
-  session while `bars` is loaded across the full 040000~200000 range, so the
-  real supply is nearer 960 min/day; the margin is understated rather than at
-  risk, on an early-close day as on any other.
+`calculate_required_history()` (04_feature_extractor.md) returns the
+entry-admission requirement the Inferencer keeps:
+- `min_trading_days` — the lookback window of `indicators.lookback_days`
+  trading days through `prior_trading_days()`, every one of which must have
+  bars (`utils.has_required_history()`);
+- `min_bars` — the bar requirement: the bars in [the lookback start, t-1]
+  number at least the largest of the sr_levels window, sr_channels'
+  requirement, the fibonacci window and H_max;
 - REFERENCE_SESSION baseline is satisfied by precomputed_session_stats independently
 
 ---
@@ -72,20 +76,23 @@ ticks: pd.DataFrame
 
 meta: dict
     # flat {field: value}, already resolved by the caller (LiveModeRunner's
-    # meta_bulk — see live_mode_runner.md) with per-field
-    # utils.estimate_historical_meta() fallback where today's stock_meta
-    # crawl is incomplete; not a raw stock_meta row passed through
-    # unresolved — matches 04_feature_extractor.md extract()'s meta contract
+    # meta_bulk — see live_mode_runner.md) from the prior-day row, the
+    # stock_meta row dated prior_trading_days(today, 1, closes): market_cap
+    # its value, else utils.estimate_historical_meta(); shares_outstanding
+    # estimate_historical_meta(), its first tier the prior-day row, None
+    # included; sector and security_type the latest rows with them set; not
+    # a raw stock_meta row passed through unresolved — matches
+    # 04_feature_extractor.md extract()'s meta contract
 
 entry: dict
     # {ticker, date, hour, p_entry}
     # hour = t bar open time
     # p_entry = t bar open price (from external real-time feed)
 
-session_stats: dict | None
-    # pre-loaded REFERENCE_SESSION baselines from precomputed_session_stats
-    # supplied by LiveModeRunner at session start
-    # format: {metric: {hour: smoothed_avg_value}}
+calculator: CachingIndicatorCalculator
+    # the entry ticker's calculator, passed per call by LiveModeRunner
+    # (calculators[ticker]); its read-only session_stats property holds the
+    # REFERENCE_SESSION baselines, format {metric: {hour: smoothed_avg_value}}
 ```
 
 **Output:**
@@ -119,10 +126,16 @@ _prepare_bars(bars, entry) -> pd.DataFrame | None:
 2. If rows were removed:
    → log to inference_log (event="bars_trimmed", fail_reason=f"trimmed {N} bars")
 
-3. Validate: if len(cleaned_bars) < self.required_bars:
+3. Validate the entry's history — the admission scan() applies:
+   - every date of prior_trading_days(entry["date"], lookback_days, closes)
+     has bars in cleaned_bars (utils.has_required_history());
+   - the bars in [the lookback start, t-1] number at least self.min_bars;
+   a failure of either:
    → log to inference_log (event="preload_fail",
-                            required_bars=self.required_bars,
-                            actual_bars=len(cleaned_bars))
+                            required_days=self.min_trading_days,
+                            actual_days=<those dates with bars>,
+                            required_bars=self.min_bars,
+                            actual_bars=<bars in [the lookback start, t-1]>)
    → return None
 
 4. return cleaned_bars
@@ -133,23 +146,16 @@ _prepare_bars(bars, entry) -> pd.DataFrame | None:
 ## Processing Flow
 
 ```
-infer(bars, ticks, meta, entry, session_stats=None):
+infer(bars, ticks, meta, entry, calculator):
 
 step 0: bars = self._prepare_bars(bars, entry)
         if bars is None: return None    # cause 'preload_fail', logged in _prepare_bars
 
-1. Session mode filter:
-       session_mode = config["entry_detector"]["session_mode"]
+1. Regular-session filter — entry points are regular-session only
+   (data_boundary.md):
        hour = entry["hour"]
-
-       last = last_bar(entry["date"])           # utils.md — PER DATE
-       if hour > last: return None              # after-market always excluded; cause 'filtered'
-
-       if session_mode == "regular" and not ("093000" <= hour <= last):
+       if utils.session_phase(entry["date"], hour, self.closes, self.ends) != "regular":
            return None                          # cause 'filtered'
-       if session_mode == "pre" and not ("040000" <= hour <= "092900"):
-           return None                          # cause 'filtered'
-       # "combined" passes both pre-market and regular
 
 2. Late-day filter:
        off = config["entry_detector"]["max_entry_offset_minutes"]
@@ -162,6 +168,7 @@ step 0: bars = self._prepare_bars(bars, entry)
 
 3. EntryPointDetector.detect(bars, date=entry["date"],
                               shares_outstanding=meta["shares_outstanding"])
+       # passed as resolved, None included (condition E false)
        if not detected:
            log inference_log (event="no_detection")
            return None      # cause 'no_detection'
@@ -173,16 +180,24 @@ step 0: bars = self._prepare_bars(bars, entry)
        # (utils.md's Numeric Rules, V4)
 
 5. Obtain halts_df from the injected accessor — no DB query here:
-       halts_df = halt_accessor(entry["ticker"], entry["date"])
+       halts_df = halt_accessor(entry["ticker"], <the frame's dates>)
+       # the halt-interval resolver's intervals, covering every date of the
+       # frame (04_feature_extractor.md)
 
 6. FeatureExtractor.extract(bars, ticks, meta, entry, halts_df,
-                             session_stats=session_stats,
-                             session_close=session_close(entry["date"]))
+                             session_stats=calculator.session_stats,
+                             calculator=calculator,
+                             session_close=session_close(entry["date"]),
+                             ends=self.ends,
+                             calendar_context=self.calendar_context)
        # is_near_close needs the exchange close. Flat, not the map: extract()
        # handles exactly one date, the same reason its meta stays flat.
+       # ends: the map; calendar_context: today's context, flat.
        → feature_vector dict[str, float]
-       (CachingIndicatorCalculator used via DI in FeatureExtractor)
+       (the ticker's CachingIndicatorCalculator, passed per call)
        (Encoding maps loaded internally by FeatureExtractor)
+       (corporate_events, fundamentals_quarterly and fx_rates read through
+        the FeatureExtractor's DB-backed reader, which LiveModeRunner supplies)
 
 7. X = pd.DataFrame([feature_vector])[feature_names]
    probs_df = model.predict(models, X)
@@ -198,10 +213,16 @@ step 0: bars = self._prepare_bars(bars, entry)
        )
 
 9. Log to inference_log:
+       logged_at = <now, generated once — the inference_log row and the
+                    inference_features row carry it>
        event = "signal_fired" if signal else ("suppressed" if suppressed else "no_signal")
        write_fn("INSERT INTO inference_log (logged_at, ticker, date, hour,
                  event, signal, prob_up5, prob_up3, prob_sw, prob_dn3,
                  prob_dn5, run_id) ...", params)
+       # an inference of these events appends its inference_features row —
+       # (logged_at, ticker, date, hour, run_id, features in meta
+       # feature_names order) — to the in-memory buffer flush_features()
+       # writes
 
 10. Return InferenceResult(
        ticker=entry["ticker"], date=entry["date"], hour=entry["hour"],
@@ -223,16 +244,17 @@ def infer_batch(
     bars_by_ticker:  dict[str, pd.DataFrame],
     ticks_by_ticker: dict[str, pd.DataFrame],
     meta_by_ticker:  dict[str, dict],
-    session_stats:   dict | None = None,
+    calculators_by_ticker: dict[str, CachingIndicatorCalculator],
 ) -> tuple[list[InferenceResult], dict]:
     """
     Process multiple candidates efficiently.
-    The halt accessor is called once per (ticker, date) pair — not per
-    candidate — and the result is cached for the duration of THIS
+    The halt accessor is called once per ticker, with its frame's dates —
+    not per candidate — and the result is cached for the duration of THIS
     infer_batch() call only, never held on the instance.
-    session_stats shared across all candidates (same session).
-    meta_by_ticker: per-ticker resolved flat dicts, same per-field fallback
-        contract as infer()'s meta (see Input/Output above) — not raw
+    calculators_by_ticker: each candidate's ticker's calculator, its
+        session_stats property the baselines extract() receives.
+    meta_by_ticker: per-ticker resolved flat dicts, the same prior-day-row
+        resolution as infer()'s meta (see Input/Output above) — not raw
         stock_meta rows passed through unresolved.
 
     Returns:
@@ -242,14 +264,14 @@ def infer_batch(
             "fired":        int,   # signals emitted (up5 or up3)
             "preload_fail": int,   # insufficient history
             "no_detection": int,   # detect() returned False
-            "filtered":     int,   # a filter: after-market | session mode | late day
+            "filtered":     int,   # a filter: not regular-session | late day
             "suppressed":   int,   # suppressed by suppress_threshold
             "no_signal":    int,   # inference completed, no signal
         }
         The keys other than "total" partition it: each candidate counts in
         exactly one of them.
     """
-    halts_cache: dict[tuple[str, str], pd.DataFrame] = {}
+    halts_cache: dict[str, pd.DataFrame] = {}
     results = []
     stats = {"total": 0, "fired": 0, "preload_fail": 0,
              "no_detection": 0, "filtered": 0, "suppressed": 0,
@@ -257,14 +279,13 @@ def infer_batch(
 
     for entry in candidates:
         stats["total"] += 1
-        ticker, date = entry["ticker"], entry["date"]
-        cache_key = (ticker, date)
-        if cache_key not in halts_cache:
-            halts_cache[cache_key] = halt_accessor(ticker, date)
+        ticker = entry["ticker"]
+        if ticker not in halts_cache:
+            halts_cache[ticker] = halt_accessor(ticker, <its frame's dates>)
         result, cause = self._infer_single(
             bars_by_ticker[ticker], ticks_by_ticker[ticker],
             meta_by_ticker[ticker], entry,
-            halts_cache[cache_key], session_stats,
+            halts_cache[ticker], calculators_by_ticker[ticker],
         )
         if result is None:
             stats[cause] += 1    # 'preload_fail' | 'filtered' | 'no_detection'
@@ -308,7 +329,8 @@ categorical_cols = meta["categorical_cols"]
 ```
 
 `categorical_cols` loaded from model artifact meta — no heuristic inference at runtime.
-`run_id` specified in config or passed at runtime.
+`run_id` is passed by LiveModeRunner: the session's model run_id
+(live_mode_runner.md).
 
 ---
 
@@ -336,24 +358,31 @@ class Inferencer:
         self,
         config: dict,
         run_id: str,
-        feature_extractor: FeatureExtractor,   # DI: CachingIndicatorCalculator injected
+        feature_extractor: FeatureExtractor,   # constructed with the reader only
         closes: dict[str, str],
-        halt_accessor: Callable[[str, str], pd.DataFrame],
+        ends: dict[str, str],
+        calendar_context: dict,                # today's, flat
+        halt_accessor: Callable[[str, list[str]], pd.DataFrame],
         write_fn: Callable[[str, tuple], None],   # contract owned by
                                                   # live_mode_runner.md's db_write()
     ):
         """
-        feature_extractor is injected with CachingIndicatorCalculator by LiveModeRunner.
-        calculate_required_history() result stored as self.required_bars at init.
+        run_id: the session's model run_id, passed by LiveModeRunner.
+        feature_extractor is constructed by LiveModeRunner with its DB-backed
+        reader only; the ticker's CachingIndicatorCalculator reaches
+        extract() per call (infer()'s calculator).
+        calculate_required_history()'s min_trading_days and min_bars stored
+        as self.min_trading_days and self.min_bars at init.
 
         closes is RECEIVED, not loaded here: LiveModeRunner holds it from its
         early-close gate, which runs before this init, and a second load would be
         a second delivery path for one fact. Held for the session the same way
-        required_bars is — the calendar cannot change mid-session.
+        min_bars is — the calendar cannot change mid-session.
 
-        The after_hours_end map is NOT taken: nothing here reads it, and utils.md's
-        after_hours_end() Callers list does not name this module. A caller takes
-        only the maps it reads.
+        ends — the after_hours_end map — and today's calendar context are
+        received the same way: step 1's session_phase() reads closes and
+        ends, and step 6 passes ends to extract() as the map `ends` and the
+        calendar context flat.
         """
         ...
 
@@ -363,7 +392,7 @@ class Inferencer:
         ticks: pd.DataFrame,
         meta: dict,
         entry: dict,
-        session_stats: dict | None = None,
+        calculator: CachingIndicatorCalculator,
     ) -> InferenceResult | None: ...
 
     def infer_batch(
@@ -372,8 +401,19 @@ class Inferencer:
         bars_by_ticker:  dict[str, pd.DataFrame],
         ticks_by_ticker: dict[str, pd.DataFrame],
         meta_by_ticker:  dict[str, dict],
-        session_stats:   dict | None = None,
+        calculators_by_ticker: dict[str, CachingIndicatorCalculator],
     ) -> tuple[list[InferenceResult], dict]: ...
+
+    def flush_features(self) -> tuple[int, int]:
+        """
+        Writes the inference_features buffer through write_fn in one
+        multi-row INSERT OR IGNORE and returns its (dropped, failed) row
+        counts; the buffer is left empty after each attempt, a failed
+        flush's rows lost and counted. LiveModeRunner calls it on
+        bar_latency_daily's periodic flush and in Session Shutdown, beside
+        bar_latency_daily's final flush; rows not flushed are lost on an
+        abrupt process end.
+        """
 ```
 
 ---
@@ -389,7 +429,7 @@ class Inferencer:
 - Entry point insertion to `entry_points` table is Inferencer's responsibility
 - `entry_points` INSERT uses INSERT OR IGNORE for idempotency
 - All inference_log writes include `run_id`
-- Encoding maps (`sector_map`, `day_of_week_map`, `halt_reason_code_map`) are loaded
+- Encoding maps (`sector_map`, `security_type_map`, `day_of_week_map`, `halt_reason_code_map`) are loaded
   internally by FeatureExtractor via `utils.load_encoding_map()` —
   Inferencer does not load or inject encoding maps directly
 - `categorical_cols` loaded from model artifact meta — no heuristic pattern matching
@@ -397,9 +437,10 @@ class Inferencer:
 - `suppress_threshold` read from `config["backtest"]["suppress_threshold"]`
 - No data leakage: t bar OHLCV must not be used as feature input
 - Preprocessor is NOT used in live inference — FeatureExtractor.extract() called directly
-- After-market entry points suppressed regardless of session_mode
-  (hour > last_bar(date))
-- Session mode and late-day filters applied by Inferencer before detect()
+- Entry points are regular-session only: an entry whose t bar hour is not in
+  the regular phase (utils.session_phase() on the closes and ends maps it
+  receives) takes cause 'filtered'
+- The regular-session and late-day filters are applied by Inferencer before detect()
 - `max_entry_offset_minutes`: when not null, signals with t bar open time >
   max_entry_hour(date) are not fired, where max_entry_hour(date) =
   session_close(date) - max_entry_offset_minutes (> operator consistent with
@@ -412,12 +453,20 @@ class Inferencer:
   date during a session — its crawl runs in the evening batch — and is not a
   live source. Unresolved intervals (`halt_end IS NULL`) are closed at supply
   time, so only closed intervals arrive here
-- No `db_conn`: the Inferencer has no remaining reader for one, and its two
-  writes go through `write_fn` — LiveModeRunner supplies `db_write`, so both
-  pass the `write_lock` funnel that P-5 declares the single write path
-- `infer_batch()` caches the accessor's result per (ticker, date) — not per
+- No `db_conn`: the Inferencer has no remaining reader for one — the
+  FeatureExtractor reads corporate_events, fundamentals_quarterly and
+  fx_rates through the DB-backed reader LiveModeRunner supplies — and its
+  writes go through `write_fn`:
+  - entry_points;
+  - inference_log;
+  - inference_features;
+  LiveModeRunner supplies `db_write`, so each passes the `write_lock` funnel
+  that P-5 declares the single write path
+- `infer_batch()` caches the accessor's result per ticker — not per
   candidate — for that call only
-- `session_stats` is supplied by LiveModeRunner at session start; None is allowed (graceful degradation)
+- `session_stats` reaches extract() as the ticker's calculator's property; it may be empty (graceful degradation)
+- Today's calendar context is supplied by LiveModeRunner at session start and
+  passed to extract(), never queried here
 - Model artifacts loaded from `run_id` at init — not reloaded per call
 - `feature_names` and `categorical_cols` come from the model artifact meta
   (Model Loading), not from FeatureExtractor at init

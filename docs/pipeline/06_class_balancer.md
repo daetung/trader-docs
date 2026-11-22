@@ -10,10 +10,11 @@ Reduce class imbalance in the labeled feature matrix before model training.
 Primary concern: sideways (`label_sw`) class is expected to heavily dominate.
 Uses downsampling only — no synthetic sample generation.
 
-Also responsible for session_mode filtering and temporal splitting,
-ensuring that train, val, and test splits reflect the correct session
-and time ordering. Two split modes are supported: `temporal` (single split)
-and `rolling` (walk-forward fold generation).
+Also responsible for temporal splitting, ensuring that train, val, and test
+splits reflect the correct time ordering. Entry points are regular-session
+only, fixed at `scan()` (data_boundary.md); no session filter applies here.
+Two split modes are supported: `temporal` (single split) and `rolling`
+(walk-forward fold generation).
 
 ---
 
@@ -26,7 +27,8 @@ labeled_df: pd.DataFrame
     # columns: [...features..., label_up5, label_up3, label_sw, label_dn3, label_dn5,
     #           is_dead_position, dead_position_case, is_ambiguous]
     # exactly one label column = 1 per row
-    # contains entry points from all sessions (no pre-filtering)
+    # contains every entry point scan() returned — regular-session only
+    # (no further filtering)
 ```
 
 **Output (split mode):**
@@ -42,10 +44,10 @@ Iterator[tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]]
 #   "fold_idx":         int,   # 0-based fold index
 #   "fold_train_start": str,   # 'YYYYMMDD' — first date of train window
 #   "fold_train_end":   str,   # 'YYYYMMDD' — last date of train window
-#   "fold_train_days":  int,   # trading days the train split holds (step 6)
+#   "fold_train_days":  int,   # trading days the train split holds (step 5)
 #   "fold_test_start":  str,   # 'YYYYMMDD' — first date of test window
 #   "fold_test_end":    str,   # 'YYYYMMDD' — last date of test window
-#   "fold_test_days":   int,   # trading days the test split holds (step 6)
+#   "fold_test_days":   int,   # trading days the test split holds (step 5)
 # }
 # Folds are always yielded in ascending fold_idx order (0, 1, 2, ...).
 # fold_run_ids[-1] in PipelineOptimizer is guaranteed to correspond to
@@ -132,9 +134,8 @@ Replaces random split to prevent future data leakage into training.
 
 ```
 Split order:
-1. Apply session_mode filter to full labeled_df
-2. Sort by date ascending
-3. Compute split boundaries by date (not by row count):
+1. Sort by date ascending
+2. Compute split boundaries by date (not by row count):
      unique_dates sorted ascending
      train_dates: first 70% of dates
      val_dates:   next 15% of dates (with embargo gap)
@@ -156,9 +157,8 @@ Walk-forward fold generation for robust out-of-sample evaluation.
 Each fold represents an independent train/val/test window advancing
 through time by step_weeks.
 
-Fold parameters can be overridden explicitly by the caller (e.g., PipelineOptimizer
-passing different values for outer vs. inner folds). If override parameters are None,
-values are read from `config["class_balancer"]`.
+Fold parameters are required and passed by the caller (e.g., PipelineOptimizer
+passing its inner_fold or outer_fold values from `config["class_balancer"]`).
 
 ```
 Fold structure (fixed window):
@@ -179,12 +179,11 @@ Rolling:
     counts as one week.
 
 Per fold:
-    1. Apply session_mode filter (if session_mode is not None)
-    2. Slice train/val/test by date ranges
-    3. Apply embargo gap (trading days) at each boundary the window has
-    4. Apply pre-balance filters to train
-    5. Apply downsampling to train if balance=True
-    6. Count the trading days each split ACTUALLY holds, as of step 3, and
+    1. Slice train/val/test by date ranges
+    2. Apply embargo gap (trading days) at each boundary the window has
+    3. Apply pre-balance filters to train
+    4. Apply downsampling to train if balance=True
+    5. Count the trading days each split ACTUALLY holds, as of step 2, and
        carry them in fold_meta — the train count reaches train_log as
        fold_train_days, the test count reaches experiment_log as
        fold_test_days (db_schema.md). Diagnostic only: no fold is skipped,
@@ -198,10 +197,10 @@ fold_meta contents:
     fold_idx:         0-based integer index of this fold
     fold_train_start: first date of train window ('YYYYMMDD')
     fold_train_end:   last date of train window ('YYYYMMDD')
-    fold_train_days:  trading days the train split holds (step 6)
+    fold_train_days:  trading days the train split holds (step 5)
     fold_test_start:  first date of test window ('YYYYMMDD')
     fold_test_end:    last date of test window ('YYYYMMDD')
-    fold_test_days:   trading days the test split holds (step 6)
+    fold_test_days:   trading days the test split holds (step 5)
 
 Yield order:
     Folds are always yielded in ascending fold_idx order (0, 1, 2, ...).
@@ -257,8 +256,7 @@ class ClassBalancer:
     def split(
         self,
         labeled_df: pd.DataFrame,
-        balance: bool = True,
-        session_mode: str | None = None,
+        balance: bool,
     ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """
         Temporal split into (train_balanced, val, test).
@@ -268,19 +266,16 @@ class ClassBalancer:
         not by this method itself.
 
         Order of operations:
-          1. session_mode filter
-          2. Sort by date, split by date boundaries
-          3. Apply embargo gap (trading days) at the train/val and val/test
+          1. Sort by date, split by date boundaries
+          2. Apply embargo gap (trading days) at the train/val and val/test
              boundaries
-          4. Apply pre-balance filters to train (Case C, Case D, ambiguous)
-          5. Apply downsampling to train if balance=True
-
-        All three splits contain only target session's entry points.
+          3. Apply pre-balance filters to train (Case C, Case D, ambiguous)
+          4. Apply downsampling to train if balance=True
 
         Args:
-            labeled_df:   full labeled feature matrix (all sessions)
-            balance:      whether to apply downsampling to train split
-            session_mode: "regular" | "pre" | "combined" | None
+            labeled_df:   full labeled feature matrix
+            balance:      whether to apply downsampling to train split;
+                          required — the caller passes it
         """
         ...
 
@@ -291,28 +286,26 @@ class ClassBalancer:
     def generate_folds(
         self,
         labeled_df:   pd.DataFrame,
-        balance:      bool = True,
-        session_mode: str | None = None,
-        max_folds:    int | None = None,
-        # Explicit fold parameter overrides — if None, read from config["class_balancer"]
-        window_weeks: int | None = None,
-        val_weeks:    int | None = None,
-        test_weeks:   int | None = None,
-        step_weeks:   int | None = None,
-        embargo_days: int | None = None,
+        balance:      bool,
+        window_weeks: int,
+        val_weeks:    int,
+        test_weeks:   int,
+        step_weeks:   int,
+        embargo_days: int,
+        max_folds:    int | None = None,   # None = no limit
     ) -> Iterator[tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]]:
         """
         Walk-forward fold generator.
         Yields (train_balanced, val, test, fold_meta) per fold.
         Folds are always yielded in ascending fold_idx order (0, 1, 2, ...).
 
-        If val_weeks=0 (or override val_weeks=0), val is returned as an
-        empty DataFrame. Caller is responsible for ignoring it.
+        If val_weeks=0, val is returned as an empty DataFrame. Caller is
+        responsible for ignoring it.
 
-        Explicit override parameters take precedence over config values.
-        This allows PipelineOptimizer to reuse the same method for both
-        inner folds (inner_fold config) and outer folds (outer_fold config)
-        without ClassBalancer needing to distinguish between them.
+        The fold parameters are required: the caller passes them — its
+        inner_fold or outer_fold config values (Config Keys, below). This
+        allows PipelineOptimizer to reuse the same method for both inner and
+        outer folds without ClassBalancer needing to distinguish between them.
 
         fold_meta dict keys:
             fold_idx         (int)  : 0-based fold index
@@ -324,15 +317,14 @@ class ClassBalancer:
             fold_test_days   (int)  : trading days the test split holds
 
         Order of operations per fold:
-          1. session_mode filter on full df (skipped if session_mode is None)
-          2. Compute fold date boundaries using resolved parameters
-          3. Slice train/val/test
-          4. Apply embargo gap (trading days) at each boundary the window has
-          5. Apply pre-balance filters to train (Case C, Case D, ambiguous)
-          6. Apply downsampling to train if balance=True
-          7. Count the trading days each split holds as of step 4, carried
-             in fold_meta (fold_train_days, fold_test_days) — Mode 2's step 6
-          8. Yield (train_balanced, val, test, fold_meta)
+          1. Compute fold date boundaries using the passed parameters
+          2. Slice train/val/test
+          3. Apply embargo gap (trading days) at each boundary the window has
+          4. Apply pre-balance filters to train (Case C, Case D, ambiguous)
+          5. Apply downsampling to train if balance=True
+          6. Count the trading days each split holds as of step 3, carried
+             in fold_meta (fold_train_days, fold_test_days) — Mode 2's step 5
+          7. Yield (train_balanced, val, test, fold_meta)
         """
         ...
 ```
@@ -350,7 +342,8 @@ class_balancer:
   exclude_case_d: false                # see Pre-Balance Filtering — Case D is a genuine
                                        # (if conservative) outcome, not a boundary artifact
   ambiguous_sample_action: "exclude"   # "exclude" | "keep"
-  embargo_days: 5                      # default; overridable per call
+  early_stopping_val_fraction: 0.15    # temporal_split_simple()'s val_fraction
+                                       # in pipeline_optimizer.md's calls
 
   # Temporal split parameters (used by ClassBalancer.split())
   temporal:
@@ -382,14 +375,13 @@ class_balancer:
 ## Constraints
 
 - Pre-balance filters applied to train split only — val and test are never filtered
-- session_mode filter applied before split — no cross-session contamination
+- No session filter applies — entry points are regular-session only from `scan()` (data_boundary.md)
 - Downsampling uses random sampling without replacement (random_state from config)
 - `generate_folds()` always yields in ascending fold_idx order — callers may rely on this
-- Explicit override parameters in `generate_folds()` take precedence over config values
+- `split()`'s `balance` and `generate_folds()`' fold parameters are required — the caller passes them
+- `class_balancer` is declared only in this file; pipeline_optimizer.md refers to it
 - `val_weeks=0` results in empty val DataFrame — caller must handle
 - `max_folds` limits total fold count; None = no limit
-- `session_mode=None` skips session filter — all entry points included (used for outer folds
-  where session_mode is a search variable resolved by the inner trial)
 - ClassBalancer has no knowledge of "outer" vs. "inner" fold semantics —
   distinction is managed entirely by the caller (PipelineOptimizer)
 - `generate_folds()` does NOT accept `holdout_dates` — holdout filtering is the

@@ -39,9 +39,10 @@ Do not load other module docs unless checking an interface boundary.
 Feature input:         bars t-1, t-2, ..., t-N  (fully closed OHLCV bars only)
 P_entry:               t bar open  →  reference value only, NOT a feature
 Forbidden as input:    t bar high / low / close / volume
-Label search range:    t bar open → last_bar(date) close or the
-                       execution.max_hold_bars'th valid bar close (whichever
-                       first). last_bar() is PER DATE — utils.md — and is 12:59
+Label search range:    t bar open → last_bar(date) close or the holding
+                       deadline — execution.max_hold_minutes of wall-clock
+                       minutes from the entry, halted minutes excluded
+                       (whichever first). last_bar() is PER DATE — utils.md — and is 12:59
                        on an early-close day, not 15:59
 10-tick for features:  ticks with timestamp < t bar open only
 10-tick for backtest:  ticks from t bar onward
@@ -49,7 +50,8 @@ Label search range:    t bar open → last_bar(date) close or the
                         exit tracking: full day incl. after-market)
 REFERENCE_SESSION:     prior session baselines sourced from precomputed_session_stats
                        (offline DB table) — NOT from bars feature window
-                       gap_percentile returns NaN for t="093000" or pre-market entries
+                       gap_percentile is NaN unless the date's first
+                       regular-session bar's hour is before t
 Fundamentals:          fundamentals_quarterly must be read as-of a date via
                        filed_date, NEVER fiscal_period_end — filtering on the
                        latter leaks pre-disclosure information into features

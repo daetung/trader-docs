@@ -19,7 +19,8 @@ Refresh"):
    history for all active tickers into `corporate_events` table
 3. **New data ingestion** — ingest newly collected JSON files into DuckDB
 4. **Calendar and coverage update** — incrementally update `trading_calendar`
-   and `ticker_data_coverage` for newly ingested dates
+   and `ticker_data_coverage` for newly ingested dates, and
+   `trading_calendar`'s one-year horizon
 5. **Session stats update** — compute and store `precomputed_session_stats`
    for newly ingested dates (REFERENCE_SESSION baselines)
 6. **Tick bar aggregates update** — compute and store `tick_bar_aggregates`
@@ -34,6 +35,9 @@ Refresh"):
 9. **Ticker-master check** — the evening `evening_ticker_master_check`
    stage: the trading API's ticker master compared with `ticker_cik_map`
    (Evening Ticker-Master Check)
+10. **FX rates and drift** — the evening `evening_fx_rates` stage
+    (FX Rates Update) and the drift stages `evening_prediction_drift` and
+    `evening_feature_drift` (Prediction and Feature Drift)
 
 ---
 
@@ -44,7 +48,7 @@ Refresh"):
 import yfinance as yf
 info = yf.Ticker("AAPL").info
 # Fields: sector, marketCap, sharesOutstanding,
-#         fiftyTwoWeekHigh, fiftyTwoWeekLow, averageVolume
+#         fiftyTwoWeekHigh, fiftyTwoWeekLow, averageVolume, quoteType
 ```
 
 ### Fallback: Financial Modeling Prep (FMP)
@@ -54,12 +58,13 @@ GET https://financialmodelingprep.com/api/v3/profile/{ticker}?apikey={key}
 - Free tier: 250 requests/day → use only for yfinance failures
 - API key stored in `configs/secrets.yaml` (gitignored)
 
-### Shares Outstanding fallback: SEC EDGAR
-```python
-GET https://data.sec.gov/submissions/CIK{cik}.json
+### security_type: Nasdaq Trader symbol directory
 ```
-- No API key required; rate limit 10 req/s
-- CIK lookup table cached locally in `configs/cik_map.json`
+https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt
+https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt
+```
+- Fetched ahead of the metadata fetch's per-ticker loop, each file received
+  only when it parses (Metadata Fetch Logic)
 
 ---
 
@@ -390,7 +395,12 @@ only, a guest not admitted in the runner window):
        step 2                                                      # item N
     5. first, today's stale precomputed_session_stats groups of the
        tickers steps 3-4 wrote corporate_events for are recomputed under
-       the deployment config (live_mode_runner.md); then, per ticker that
+       the deployment config (live_mode_runner.md); then each ticker that
+       gained a same-day split or reverse_split row in steps 3-4 has
+       meta_bulk[ticker] re-resolved by the runner's Session Lifecycle Step
+       3 rule, its group the recomputed one, replacing the entry at that
+       ticker's calculator swap below when a calculator exists, at once
+       otherwise and on the late recheck; then, per ticker that
        gained a new same-day corporate_events row in steps 3-4:   # item N
        once Eager Pool has run — each ticker's write its own transaction
        under one write_lock hold, issued as that ticker's seed is ready,
@@ -473,11 +483,10 @@ def check_corporate_event_anomaly(
     quarantine-eligible, not away from it.
 
     For each ticker with a non-null quote in `quotes`:
-        yesterday_close = <today's D-1 close, via the same halt-aware
-            search utils.md's gap_pct C. logic uses for a single prior
-            session: try D-1's last_bar(D-1) close; if halt/missing,
-            search backward within D-1's regular session for the last
-            non-halt bar; if none found, skip this ticker (no baseline)>
+        yesterday_close = <today's D-1 close: the close of the last
+            existing bar at or before last_bar(D-1), read through the
+            symbology layer (utils.md's ticker_segments()); none found →
+            skip this ticker (no baseline)>
         if yesterday_close is None: skip
         gap = abs(quotes[ticker] / yesterday_close - 1)
         has_event_today = EXISTS corporate_events
@@ -570,18 +579,12 @@ Called by:
   failure leaves the stage 'failed';
 - migration_tool.md's trading_halts backfill, for every ingested date.
 
-### US Market Holidays
+### FX Rates: ECB reference rates and yfinance FX
 ```
-Source: pandas_market_calendars library (NYSE calendar)
-
-Method:
-    import pandas_market_calendars as mcal
-    nyse = mcal.get_calendar("NYSE")
-    holidays = nyse.holidays().holidays
-
-Frequency: once per year (or on demand)
-Target table: us_holidays
-Populate 3 years forward on first run; refresh annually.
+Source: the ECB euro foreign exchange reference rates (a currency per EUR,
+        and USD per EUR); for a currency the ECB does not publish, the
+        yfinance '{CCY}=X' daily close
+Target table: fx_rates (FX Rates Update, below)
 ```
 
 ---
@@ -596,10 +599,21 @@ from tools.migrate_json_to_duckdb import migrate_date
 migrate_date(data_root, db_conn, date=today)
 ```
 
-Time range filter: `hour >= '040000' AND hour <= '200000'` (no session filtering).
-NOT per-date and deliberately so: the filter exists to exclude OVERNIGHT, and an
-early-close day has no data past its own `after_hours_end` (17:00), so the fixed
-upper bound still admits everything real and still excludes overnight.
+Time range filter: `hour >= '040000' AND hour < '193000'` for `ohlcv_1min` and
+`tick_10` (no session filtering):
+- a date's files run from the preceding evening's 20:00 (overnight) to a vendor
+  cut a few seconds past 19:30; the range keeps [04:00, 19:30), excluding the
+  overnight and the cut's uneven tail;
+- it is fixed, not per-date, an early-close day ending at 17:00 inside it;
+- a tick file's rows at hours in [193000, 200000) go to `tick_10_tail`.
+
+Collection-gap remediation (health_report.md's finding 59): the date's missing
+or corrected file is placed in data_root, then
+`collect_daily.py --ingest-only --date d` runs:
+- the per-table duplicate skip imports only the tables holding no row for the
+  symbol-date;
+- its source_changes rows turn the dependent derived rows stale;
+- its tick bar aggregates stage computes that date.
 
 ---
 
@@ -610,7 +624,9 @@ After each ingestion, incrementally update calendar tables via shared utils func
 ```python
 from utils import populate_trading_calendar, populate_ticker_coverage
 
-populate_trading_calendar(db_conn=con, date_range=[today])
+horizon_dates = <every date from the run day — the US-Eastern date of this
+                 run — through one year past it>
+populate_trading_calendar(db_conn=con, date_range=[today] + horizon_dates)
 populate_ticker_coverage(db_conn=con, dates=[today])
 ```
 
@@ -653,7 +669,8 @@ for as_of_date, tickers in <the deployment config_hash's stale groups, by as_of_
 - Computes per-bar averages for `as_of_date = next_trading_day` using
   the prior `indicators.reference_session.n_sessions` sessions' data (now
   available since today's data just ingested)
-- Halt handling applied per metric type (see utils.md for details)
+- Bar handling applied per metric type over the existing bars (see
+  utils.md for details)
 - Corporate-event adjustment applied per metric type before aggregation,
   using `corporate_events` as stored when a group is computed (see
   utils.md populate_precomputed_session_stats() section D.); a later
@@ -666,6 +683,24 @@ for as_of_date, tickers in <the deployment config_hash's stale groups, by as_of_
   - a stale group is recomputed, its rows replaced;
   - a current group is skipped
 - Runs after ingestion — ensures today's data is included in the baseline
+
+The stage (`evening_session_stats`) first checks its area, data (utils.md's
+Code Versions): an unattested area records the stage's batch_runs row
+'failed', its SUMMARY line naming code_unattested, and a finding 56 record
+through alert_delivery.md's `write_to_log()` (health_report.md).
+
+**Price extremes parity.** After computing the next trading day's groups,
+the stage writes `live_scan_daily` keys for its date D:
+- `extremes_parity_total` — the tickers with a counted field;
+- `extremes_parity_diverged` — those with a counted field where
+  |vendor ÷ derived − 1| > `price_extremes_parity.tolerance`.
+A field, price_52h or price_52l, is counted for a ticker when each of these
+is present:
+- vendor: the stock_meta row (ticker, D)'s value;
+- derived: the same metric of the ticker's next-trading-day group under the
+  config_hash the stage computed it with.
+A ticker with a split or reverse_split in (D, next trading day], in the
+corporate_events the stage computed the groups with, is not counted.
 
 ---
 
@@ -842,10 +877,20 @@ with rows that were never live decisions and make the comparison
 self-referential — this stage would be measuring itself. `detect()` runs in
 memory and only counts are persisted.
 
-**Both sides must carry the same filters.** `session_mode`, the late-day
-cutoff (`entry_detector.max_entry_offset_minutes`, skipped entirely when null)
-and the after-market exclusion are applied by Inferencer BEFORE `detect()`, and
-it logs nothing when they reject. The late-day cutoff is now PER DATE — it
+**Both sides must carry the same filters.** Inferencer applies, BEFORE
+`detect()`:
+- the regular-session check — an entry whose t bar hour is not in the
+  regular phase (`utils.session_phase()` on the closes and ends maps) is
+  filtered;
+- the late-day cutoff (`entry_detector.max_entry_offset_minutes`, skipped
+  entirely when null);
+- the history admission — `utils.has_required_history()` and the bar
+  requirement (inferencer.md's `_prepare_bars()` step 3).
+It logs nothing when the regular-session or late-day filter rejects. The
+evening pass applies the same filters, passing the closes and ends maps,
+over each ticker's bar history read through the symbology layer (utils.md's
+`ticker_segments()`), and passes `detect()` the shares_outstanding
+`utils.estimate_historical_meta()` returns for the date. The late-day cutoff is now PER DATE — it
 resolves as `session_close(date) − max_entry_offset_minutes` — so the evening pass
 must resolve it against the SESSION'S date, not the date the pass runs on.
 While it was an absolute time the two agreed trivially; they no longer do.
@@ -901,7 +946,16 @@ in that table, db_schema.md's schema comment is the canonical key list.
 `source='tick_rate_fallback'` intervals are NOT pooled into those metrics.
 Those measure a heuristic against an authority; these measure two sources
 against each other, and averaging the two questions together answers
-neither.
+neither. The row comparison above reads the stored symbols raw.
+
+It also writes, per date, the continuation metrics `halts.continuation`'s
+choice is read against — counted market-wide from `trading_halts` and
+`ohlcv_1min` through the symbology layer, independent of
+`halts.continuation`:
+- `halt_open_end_carried` — the tickers whose previous trading day's rows end
+  in a NULL-ended row and whose date has a row starting at or before its
+  first bar;
+- `halt_open_end_uncarried` — those tickers whose date has no such row.
 
 **Placed after the NYSE halt crawl and before Retention Purge.** It reads
 `trading_halts`, so the crawl that fills it for the date has to have run;
@@ -959,7 +1013,13 @@ PURGE_REGISTRY = {
     "live_position_adjustments": ("date", float("inf")),
     "regime_holdout_dates":   ("optimizer_run_id", float("inf")),
     "regime_holdout_verdict": ("evaluated_at",     float("inf")),
+    "model_candidates":       ("created_at",       float("inf")),
+    "inference_features":     ("date",             float("inf")),
+    "prediction_drift_daily": ("date",             float("inf")),
+    "feature_drift_daily":    ("date",             float("inf")),
+    "tick_10_tail":           ("date",             float("inf")),
 }
+# model_deployments is never purged, structurally excluded (db_schema.md)
 
 for table, (date_column, retention_days) in PURGE_REGISTRY.items():
     if retention_days == float("inf"):
@@ -1024,6 +1084,13 @@ own run and skip rules:
 - `resume.sqlite` to `backup_dir/resume_YYYYMMDD.sqlite`, beside it, by
   guest_supervisor.md's `backup_resume_store(dest_path)`.
 
+It also copies the artifact files of every run_id named by a
+`model_deployments` row or by an 'awaiting_approval' `model_candidates` row to
+`backup_dir/models/{run_id}/` when that copy is absent — a copy made once and
+never replaced; a failed copy is counted in the stage's `SUMMARY` line and
+does not fail the database backup (base_model.md: no artifact of such a
+run_id is deleted).
+
 - `YYYYMMDD` and the `batch_runs` date are the evening run's date basis.
 - Writes its own `batch_runs` row (`'running'` at start, then
   `'success'`/`'failed'`) and its own `SUMMARY` line.
@@ -1063,8 +1130,11 @@ earlier stages' status: health_report.md's `evening_end` path.
   - finding 11;
   - the ticker-master check finding, over this run's
     `evening_ticker_master_check` `SUMMARY`;
-  - the work-transition finding and the `scheduled_work_deferred` finding,
-    over the span since the previous report.
+  - finding 6 when the date is the last trading day of its calendar week;
+  - the work-transition finding, the `scheduled_work_deferred` finding and
+    finding 56, over the span since the previous report;
+  - finding 57;
+  - finding 59.
 - Runs in the full evening run, with or without its `--skip-*` flags; no
   partial-run flag runs it.
 - Order: gather → alert_delivery.md's `deliver()` (log, dispatch) →
@@ -1092,9 +1162,16 @@ reflect today's data.
 from utils import compute_tick_bar_aggregates
 
 for ticker in todays_ingested_tickers:
-    compute_tick_bar_aggregates(ticker, today, today, all_registered_indicators, db_conn)
-    # INSERT OR IGNORE into tick_bar_aggregates
+    compute_tick_bar_aggregates(ticker, today, today, all_registered_indicators,
+                                config["indicators"]["lee_ready"]["momentum_n"],
+                                db_conn)
+    # INSERT OR IGNORE into tick_bar_aggregates under the current data version
 ```
+
+The stage first checks its area, data (utils.md's Code Versions): an
+unattested area records the stage's batch_runs row 'failed', its SUMMARY line
+naming code_unattested, and a finding 56 record through
+alert_delivery.md's `write_to_log()` (health_report.md).
 
 Runs in the full evening run and under `--ingest-only`, in each honouring
 `--skip-tick-bar-aggregates`: skipped when it is passed (session stats step
@@ -1128,7 +1205,13 @@ def detect_rename_candidates(db_conn) -> list[dict]:
        evening — see below); an inserted row appends source_changes rows
        for current_ticker, every date before effective_date, in the same
        transaction. ticker_cik_map row for ticker_new stays
-       rename_pending=FALSE — no gate needed, identity is confirmed.
+       rename_pending=FALSE — no gate needed, identity is confirmed. Each
+       predecessor corporate_events row is upserted into the successor
+       symbol through upsert_corporate_event(), passing the row's own
+       source and basis_date — disagreements following its rules, its
+       writes appending source_changes as any write does; the predecessor
+       rows stay (offline readers read a security's events under its
+       chain-latest symbol — utils.md).
     4. Ambiguous / CIK-unmatched:
        UPDATE ticker_cik_map SET rename_pending = TRUE
            WHERE cik=? AND ticker=?
@@ -1328,20 +1411,102 @@ def collect_fundamentals_incremental(db_conn) -> int:
     submissions feed; if new filings exist since the last stored filed_date
     for that ticker, fetch companyfacts and upsert into fundamentals_quarterly
     via resolve_xbrl_tag_value() (see utils.md) per configs/xbrl_tag_map.json
-    tag priority; each inserted or changed (ticker, filed_date) appends a
-    source_changes row from filed_date, open end, in the same transaction.
+    tag priority — per filing (accn), a metric's values come from the
+    highest-priority tag holding facts in that filing; within it, per period,
+    shares_outstanding from the 'shares' facts, another metric from the
+    USD-denominated unit when present, else the period's one shared unit,
+    else not stored; each row carries its unit. Each inserted or changed
+    (ticker, filed_date) appends a source_changes row from filed_date, open
+    end, in the same transaction.
     Skipped if --skip-fundamentals.
     """
 ```
 
 - Runs in the full evening run as `stage='evening_fundamentals'`, after
-  Execution-Parameter Fit and before Retention Purge; its failure blocks no
+  Execution-Parameter Fit and before FX Rates Update; its failure blocks no
   downstream stage.
 - Writes its own `batch_runs` row and its own `SUMMARY` line:
   - `processed` — tickers with a CIK queried;
   - `updated` — tickers whose `fundamentals_quarterly` rows were upserted;
   - `failed` — tickers whose submissions or companyfacts fetch failed.
 - Its `int` return equals `updated`.
+
+---
+
+## FX Rates Update (`stage='evening_fx_rates'`)
+
+In the full evening run right after `evening_fundamentals`, with its own
+`batch_runs` row and `SUMMARY` line counting fetched and failed currencies; a
+failed currency → the row 'failed'.
+
+```python
+def collect_fx_rates(db_conn, run_date: str) -> dict:
+    """
+    - currencies: the non-USD currency parts of fundamentals_quarterly units;
+    - per currency: from the day after its latest fx_rates row, or from the
+      first trading_calendar date when it has none, through run_date;
+    - source per currency: the ECB when it publishes the currency — per_usd
+      being the currency per EUR ÷ USD per EUR, and EUR's 1 ÷ USD per EUR;
+      otherwise the yfinance '{CCY}=X' close;
+    - writes fx_rates (currency, date, per_usd, source 'ecb' | 'yfinance');
+      per write, a source_changes row for each ticker holding a
+      fundamentals_quarterly row in that currency, its date range the
+      written dates, in the same transaction (db_schema.md's Source changes).
+    Returns the fetched and failed currency counts.
+    """
+```
+
+migration_tool.md's post-migration backfills run this function after the
+fundamentals backfill.
+
+---
+
+## Prediction and Feature Drift (`stage='evening_prediction_drift'`, `stage='evening_feature_drift'`)
+
+`evening_prediction_drift` runs in the full evening run right after
+`evening_fx_rates`, between `evening_fundamentals` and
+`evening_retention_purge`; `evening_feature_drift` right after it, before
+`evening_retention_purge` — each writes a purge-registry member. Each has its
+own `batch_runs` row and `SUMMARY` line.
+
+A session of R: a date whose `live_session_state.run_id` is R and whose
+`session_diagnostics.start_outcomes` holds an entry of kind 'participating';
+a date whose session_diagnostics is NULL or holds no such entry is not one
+(shadow_retraining.md's Probation after a deployment).
+
+Each stage's date:
+- the evening's date is a session of R, R being that date's
+  `live_session_state.run_id` → the stage computes for R and replaces that
+  date's rows of R in one transaction;
+- otherwise → 'no_session', no rows written.
+
+**`evening_prediction_drift`:**
+- window: `inference_log` rows of run_id R on the last
+  `drift.window_sessions` sessions of R, with event 'signal_fired',
+  'no_signal' or 'suppressed';
+- per class probability — prob_up5, prob_up3, prob_sw, prob_dn3, prob_dn5:
+  the PSI of the window against R's reference (`{run_id}_reference.json`,
+  base_model.md), an empty bin's share floored at `drift.psi_floor`, and the
+  row count;
+- writes `prediction_drift_daily` (date, run_id, output, psi, n), key (date,
+  run_id, output);
+- R without a reference file → 'no_reference', no rows written.
+
+**`evening_feature_drift`:**
+- its R, window sessions and reference file are the prediction drift stage's;
+- observations: `inference_features` rows of run_id R on the window's dates;
+- per feature of the reference:
+  - numeric: the reference bins plus a NaN bin;
+  - categorical: the reference categories plus an unseen-category bin and a
+    NaN bin;
+  - the PSI over those bins, an empty share floored at `drift.psi_floor`;
+- writes `feature_drift_daily` (date, run_id, feature, psi,
+  nan_share_reference, nan_share_observed, n), key (date, run_id, feature);
+- a reference file without feature profiles → 'no_reference', no rows
+  written.
+
+No drift stage's values are a retraining trigger; health_report.md's finding 57
+reports them.
 
 ---
 
@@ -1574,7 +1739,9 @@ python tools/collect_daily.py --db-path data/market.duckdb --ticker-rename-only
 # List unresolved rename candidates for manual review
 python tools/collect_daily.py --list-rename-candidates
 
-# Manually register a rename (SEC-unmatched tickers only)
+# Manually register a rename (SEC-unmatched tickers only); each predecessor
+# corporate_events row is upserted into the successor symbol, as in
+# detect_rename_candidates() step 3
 python tools/collect_daily.py --register-rename OLD_TICKER NEW_TICKER 20260715
 
 # List unresolved trading-API symbol match candidates for manual review
@@ -1652,10 +1819,43 @@ python tools/collect_daily.py --db-path data/market.duckdb --dispatch --trigger 
 1. Load ticker list from DuckDB:
    SELECT DISTINCT ticker FROM ohlcv_1min
 
+1b. security_type's directory pass, ahead of the per-ticker loop:
+   - fetch the Nasdaq Trader symbol directory, nasdaqlisted.txt and
+     otherlisted.txt, each received only when it parses;
+   - build a 'sec' index (utils.md's build_symbol_index()) and match each
+     directory row not flagged Test Issue Y through match_vendor_symbol()'s
+     exact and rule stages, the row's symbol fields in turn —
+     nasdaqlisted.txt: Symbol; otherlisted.txt: ACT Symbol, then CQS Symbol,
+     then NASDAQ Symbol;
+   - a ticker matched by more than one row takes no directory kind that day;
+   - directory kind, the first matching:
+     - ETF Y → etf;
+     - Security Name containing "Warrant" → warrant;
+     - the word "Right" or "Rights" → right;
+     - the word "Unit" or "Units" with an SEC-notation unit suffix → unit,
+       the suffix: the ticker ends "-UN", or the ticker is a current ticker
+       of the same CIK followed by "U";
+     - "Preferred" → preferred;
+     - "Notes due" or "Debentures" → debt;
+     - "American Depositary" or "American Depository" → adr.
+
 2. For each ticker (batched, 100 at a time):
-   a. Fetch metadata from yfinance
-   b. If any required field is None → retry with FMP
-   c. If shares_outstanding still None → query SEC EDGAR
+   a. Fetch metadata from yfinance; a non-positive market_cap,
+      shares_outstanding, price_52h or price_52l is treated as None
+   b. If any required field is None → retry with FMP (the same non-positive
+      rule); still None → stored as NULL
+   c. security_type — the day's row:
+      - a directory kind → written; one differing from the ticker's
+        previous type is logged in the fetch log, naming the ticker, the
+        previous type and the new type;
+      - the directory received, the ticker matched, no directory kind, its
+        previous type a directory kind → the vendor rule's result, logged as
+        a change;
+      - otherwise a ticker holding a type in an earlier row → none written;
+      - a ticker with no type in any row → the vendor rule's result.
+      The vendor rule: yfinance info quoteType 'EQUITY' → equity, 'ETF' →
+      etf, 'MUTUALFUND' → fund; another value or none → the FMP profile:
+      isEtf → etf, isFund → fund, otherwise equity.
    d. Upsert into stock_meta (INSERT OR IGNORE, keyed on (ticker, date=today))
       — see db_schema.md V-1 fix: stock_meta is now (ticker, date)-keyed,
       append-only per date, not a single overwritten row per ticker.
@@ -1675,6 +1875,7 @@ python tools/collect_daily.py --db-path data/market.duckdb --dispatch --trigger 
 ```
 
 Required fields: `sector`, `market_cap`, `shares_outstanding`, `price_52h`, `price_52l`, `avg_volume`
+(`security_type` is not a Required field)
 
 Failed tickers logged to `tools/metadata_missing.log`. A field-level failure
 (some but not all required fields resolved) does not block ingestion or
@@ -1703,18 +1904,18 @@ Daily Collection — 20250715
     Imported          : 23,694
     Skipped           : 0
     Failed            : 0
-    Rows inserted     : ohlcv_1min=4,621,260 | tick_10=21,048,000
+    Rows inserted     : ohlcv_1min=4,621,260 | tick_10=21,048,000 | tick_10_tail=11,847
     Duration          : 3m 41s
 
   [Calendar Update]
-    trading_calendar    : 1 date upserted
+    trading_calendar    : 366 dates upserted (the processed date and the horizon)
     ticker_data_coverage: 11,847 rows upserted
     Duration            : 0m 12s
 
   [Session Stats — next trading day: 20250716]
-    precomputed_session_stats: 11,847 tickers × 390 bars × 9 metrics computed
-                               (390 = an ordinary session; a capacity estimate,
-                                not a per-date assertion)
+    precomputed_session_stats: 11,847 tickers × the premarket and regular
+                               slots of an ordinary day × 9 metrics computed
+                               (a capacity estimate, not a per-date assertion)
     Duration            : 1m 48s
 ```
 
@@ -1789,9 +1990,9 @@ crawl) it waits under its wait spec through db_coordination.md's `acquire()`:
   holder emits health_report.md finding 28 phase `waiting`;
 - `coordination.schedule.evening.deadline` (db_coordination.md, default 23:30 ET), in
   either phase → finding 28 phase `deadline` (`owner='evening'`) and the run
-  aborts — manual intervention. Tomorrow's Health Gate 1a then aborts
-  tomorrow on missing session stats — the right fail-safe, reached noisily
-  instead of silently.
+  aborts — manual intervention. Tomorrow's Health Gate 1a then blocks
+  tomorrow's participation on missing session stats — the right fail-safe,
+  reached noisily instead of silently.
 
 Crash path, taken on `predecessor_crashed`:
 - health_report.md finding 11 and the evening liveness probe's full sweep —
@@ -1836,8 +2037,9 @@ db_coordination.md's helper:
 **Dispatcher.** Its crontab entry replaces the per-run entries, beside the
 resume sweep's own entry (guest_supervisor.md's `resume_guests`):
 `collect_daily.py --dispatch`, an aux run (db_coordination.md):
-- it reads config only — no coordination-store state and no lock beyond its
-  run lock;
+- it reads config only — `coordination.schedule` and
+  `optimizer.refresh.schedule`; no coordination-store state and no lock
+  beyond its run lock;
 - each minute it launches, as a detached process passing
   `--trigger scheduled`, each of the scheduled runs whose
   `coordination.schedule.<name>.time` equals the current ET minute on one of
@@ -1846,6 +2048,11 @@ resume sweep's own entry (guest_supervisor.md's `resume_guests`):
   - LiveModeRunner;
   - the full evening run;
   - the overnight token refresh;
+- when `optimizer.refresh.schedule.time` equals the current ET minute on one
+  of its days, it launches as a detached process
+  `run_guest pipeline_optimizer --phase refresh --trigger scheduled`
+  (pipeline_optimizer.md's Refresh run); `coordination.schedule` stays the
+  owners' schedule;
 - a run started without `--trigger` is 'manual';
 - it registers only when it launches one;
 - a missed minute gets no later launch.
@@ -1854,8 +2061,7 @@ resume sweep's own entry (guest_supervisor.md's `resume_guests`):
 # The dispatcher — every minute, weekdays; the times live in
 # coordination.schedule (db_coordination.md):
 # - evening 21:00 ET: after the day's JSON dump completes — NOT merely after
-#   market close: the dump ends at 20:00 ET, which is also the ingestion
-#   range's own upper bound (see Constraints);
+#   market close: the dump ends at 20:00 ET (see Constraints);
 # - token_refresh 03:00 ET, weekdays: no API consumer exists at the weekend,
 #   and Monday 03:00 has no token to revoke at all — the one issued Friday
 #   expired Saturday — so it is a pure issue, the safer path rather than a
@@ -1864,7 +2070,9 @@ resume sweep's own entry (guest_supervisor.md's `resume_guests`):
 #   --ticker-rename-only and --corporate-events-only runs at that time (see
 #   "Dual Schedule" above and Constraints for the collision this merge
 #   removes);
-# - runner 04:00 ET: LiveModeRunner, whose wait spec follows the premarket.
+# - runner 04:00 ET: LiveModeRunner, whose wait spec follows the premarket;
+# - the scheduled refresh run 23:40 ET, optimizer.refresh.schedule
+#   (pipeline_optimizer.md): run_guest pipeline_optimizer --phase refresh.
 * * * * 1-5 cd /path/to/stock-scalping && \
     source .venv/bin/activate && \
     python tools/collect_daily.py \
@@ -1903,8 +2111,9 @@ fmp_api_key: "your_key_here"
 #   run's wait deadline (Cron / Scheduler Setup's "Evening job start gate"),
 #   sized against the 21:00 ET start: a deadline at the start time itself
 #   would leave no wait at all, and exceeding it costs two days of operation
-#   (this run aborts, and tomorrow's Health Gate 1a then aborts on missing
-#   session stats), so a transient wait must not reach it;
+#   (this run aborts, and tomorrow's Health Gate 1a then blocks tomorrow's
+#   participation on missing session stats), so a transient wait must not
+#   reach it;
 # - coordination.schedule.premarket.deadline (default "05:00" ET) — the
 #   premarket run's wait deadline and the runner's phase A deadline.
 
@@ -1948,6 +2157,38 @@ quarantine:
                                   # is a placeholder pending shadow-stage tuning
                                   # against real momentum-gapper false-positive
                                   # rates (see original P-8 problem statement).
+  corporate_event_value_tolerance: 0.01   # a placeholder pending measurement
+                                  # (api_contract_checklist.md's Y-2)
+
+# The drift stages (Prediction and Feature Drift); placeholders pending
+# measurement, psi_bins, psi_warn and feature_psi_warn excepted. psi_bins is
+# also the quantile bin count of Trainer's {run_id}_reference.json
+# (base_model.md).
+drift:
+  psi_bins: 10
+  window_sessions: 5
+  psi_floor: 0.0001
+  psi_warn: null                  # finding 57's prediction drift level
+  min_observations: 200
+  feature_psi_warn: null          # finding 57's feature drift level
+  feature_report_top: 10          # a placeholder pending measurement
+
+# evening_session_stats' price extremes parity (Session Stats Update).
+price_extremes_parity:
+  tolerance: 0.02                 # a placeholder pending measurement
+  warn: null                      # finding 57's parity level
+
+# Readers: utils.fx_per_usd() — FeatureExtractor's fundamentals ratios in
+# the fact's currency (04_feature_extractor.md); inside run_preprocess.md's
+# config_hash.
+fx_rates:
+  max_staleness_days: 5           # a placeholder
+
+# Readers: utils.get_ttm_value()'s annual fallback — FeatureExtractor's
+# fundamentals features (04_feature_extractor.md); inside run_preprocess.md's
+# config_hash.
+fundamentals:
+  annual_fallback_max_age_months: 18   # a placeholder
 ```
 
 ---
@@ -1955,9 +2196,11 @@ quarantine:
 ## Constraints
 
 - `secrets.yaml` must be in `.gitignore` — never commit API keys
-- yfinance is the primary metadata source; FMP and EDGAR are fallbacks only
-- Corporate events (splits, reverse splits, dividends) fetched from yfinance
-  only — no fallback needed for any of the three
+- yfinance is the primary metadata source; FMP is the fallback only.
+  security_type's source is the Nasdaq Trader symbol directory first, the
+  vendor rule for a ticker holding no type (Metadata Fetch Logic)
+- Corporate events (splits, reverse splits, dividends) come from yfinance and
+  investing.com, written through upsert_corporate_event() (item N)
 - `crawl_corporate_events()` fetches both splits and dividends in one call —
   they are not separate functions, to avoid two yfinance ticker sessions
 - Metadata upsert is `INSERT OR IGNORE` keyed on `(ticker, date=today)` — not
@@ -1971,8 +2214,11 @@ quarantine:
   value; a dividend's agreement test compares gross amounts in the
   `event_date` basis (utils.md's `dividend_gross_amount()`)
 - The ledger tables (`live_orders`, `live_order_requests`, `live_fills`,
-  `live_position_adjustments`) and `regime_holdout_dates` /
-  `regime_holdout_verdict` are PURGE_REGISTRY members at `inf`
+  `live_position_adjustments`), `regime_holdout_dates` /
+  `regime_holdout_verdict`, `model_candidates`, `inference_features`,
+  `prediction_drift_daily`, `feature_drift_daily` and `tick_10_tail` are
+  PURGE_REGISTRY members at `inf`; `model_deployments` and `fx_rates` are
+  structurally excluded
 - Ingestion logic delegates to `migrate_json_to_duckdb.py` — no duplicated logic
 - Calendar/coverage update always runs after ingestion — not optional
 - Session stats update runs after calendar/coverage update — not optional unless --skip-session-stats
@@ -2000,6 +2246,9 @@ quarantine:
   - `stage='evening_halt_comparison'` (Halt Comparison);
   - `stage='evening_execution_param_fit'` (Execution-Parameter Fit);
   - `stage='evening_fundamentals'` (Fundamentals Incremental Collection);
+  - `stage='evening_fx_rates'` (FX Rates Update);
+  - `stage='evening_prediction_drift'` (Prediction and Feature Drift);
+  - `stage='evening_feature_drift'` (Prediction and Feature Drift);
   - `stage='evening_retention_purge'` (Retention Purge, R-9 — the last data
     stage, being the only destructive one);
   - `stage='evening_backup'` (Nightly Backup, run whatever the earlier
@@ -2113,8 +2362,9 @@ quarantine:
   the run `not_expected`) check to decide whether to actually run a
   session that day, not the presence or absence of a `batch_runs` row.
 - Failed metadata tickers do not block ingestion — two steps are independent
-- No session time filter on ingested data — all periods (040000~200000) stored.
-  The bound stays fixed on an early-close day; see the Time range filter note
+- No session time filter on ingested data — all periods inside the ingestion
+  range (`hour >= '040000' AND hour < '193000'`) stored. The range stays fixed
+  on an early-close day; see the Time range filter note
 - The evening run must not start before that day's JSON dump has finished.
   On an early-close day the dump completes at 17:00 rather than 20:00, so the
   21:00 slot gains margin instead of losing it. THE RUN IS NOT MOVED EARLIER TO
@@ -2122,9 +2372,8 @@ quarantine:
   costs nothing, while ingesting before the dump finishes is permanent. This is
   why the exit path and the ingestion path do NOT share one boundary key even
   though both concern the after-market end.
-  The ingestion range's upper bound (`200000`) and the dump's completion are
-  the same instant by construction, so the 21:00 ET slot is derived from that
-  boundary rather than chosen independently — if the dump moves,
+  The 21:00 ET slot is derived from the dump's completion at 20:00 ET alone
+  rather than chosen independently — if the dump moves,
   `coordination.schedule.evening.time` moves with it. This is load-bearing
   because the duplicate-skip rule above
   is keyed on `(ticker, date)`: a date ingested while its after-market window

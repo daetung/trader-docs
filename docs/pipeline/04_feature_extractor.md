@@ -18,11 +18,15 @@ Also exposes a structured intermediate output interface for the Visualization to
 
 **Input:**
 ```python
-bars: pd.DataFrame      # ohlcv_1min, strictly bars t-N ... t-1 (before t bar open)
+bars: pd.DataFrame      # ohlcv_1min, strictly bars t-N ... t-1 (before t bar open);
+                        # only the bars the broker supplied, a trading day
+                        # without a 1-min bar absent from the frame
 ticks: pd.DataFrame     # tick_10, strictly ticks before t bar open
-meta: dict              # stock_meta row for this ticker
+meta: dict              # the caller's resolved meta for this ticker and date
+                        # (Source resolution per field, below)
 entry: dict             # {ticker, date, hour, p_entry}
-halts_df: pd.DataFrame  # trading_halts rows for this ticker-date
+halts_df: pd.DataFrame  # the halt-interval resolver's intervals (utils.md),
+                        # covering every date of the frame
 config: dict
 ```
 
@@ -43,25 +47,25 @@ class FeatureExtractor:
     def __init__(
         self,
         config: dict,
-        db_conn: duckdb.DuckDBPyConnection,
+        reader=None,
         calculator: IndicatorCalculator | None = None,
     ):
         """
-        calculator: injectable IndicatorCalculator instance.
-            Training:  IndicatorCalculator()  — stateless, default
-            Live mode: CachingIndicatorCalculator()  — cache-aware subclass
-            If None, defaults to IndicatorCalculator().
+        reader: the caller-supplied reader FeatureExtractor reads these
+            through — corporate_events, fundamentals_quarterly, fx_rates:
+            Training:  a frame-backed reader over the batch read unit's
+                       loaded rows (fx_rates rows dated in [load range
+                       start − fx_rates.max_staleness_days, load range end])
+            Live mode: a DB-backed reader on the runner's connection
+            Optional: without one the extractor serves only feature names,
+            feature groups and the schema.
+        calculator: the constructor's IndicatorCalculator, which training and
+            visualization use; IndicatorCalculator() when None.
+            Live mode constructs the FeatureExtractor with the reader only and
+            passes the ticker's CachingIndicatorCalculator per call, through
+            extract()'s calculator.
 
-        Init validates config constraints:
-            lookback_bars = config["indicators"]["lookback_days"] * 390
-            max_window = max(sr_levels.window_bars, fibonacci.window_bars,
-                             H_max)   # 02_indicator_calculator.md's I4
-            if lookback_bars < max_window:
-                raise ConfigurationError(
-                    f"lookback_days*390={lookback_bars} < max indicator window={max_window}. "
-                    f"Set lookback_days >= {ceil(max_window/390)}."
-                )
-            n_sessions and lookback_days are independent — no constraint between them.
+        n_sessions and lookback_days are independent — no constraint between them.
         """
         ...
 ```
@@ -74,11 +78,11 @@ class FeatureExtractor:
 bars (t-N ... t-1)
     │
     ├─► MissingBarClassifier          (pre-processing step)
-    │       classify gaps as halt / no_trade (using halts_df)
-    │       forward-fill no_trade bars; keep halt bars as NaN
-    │       (handled per 02_indicator_calculator.md's I5b)
+    │       classify each minute without a bar as halt / no_trade (using
+    │       halts_df); fills nothing — no bar is created and no halt row
+    │       exists (02_indicator_calculator.md's I5b)
     │       covers all time periods (pre/regular/after-market)
-    │       output: cleaned bars + market_structure_features dict
+    │       output: bars unchanged + market_structure_features dict
     │
     ├─► IndicatorCalculator (or CachingIndicatorCalculator)
     │       run all enabled indicators per config
@@ -87,17 +91,18 @@ bars (t-N ... t-1)
     ├─► Vectorizer
     │       for each indicator series, apply mapped transform method(s)
     │       sr_levels: call vectorizer.sr_distance() directly (not via transform())
+    │       sr_channels: call vectorizer.sr_channel_distance() directly
     │       gap_pct: inline scalar — NOT passed to Vectorizer
     │       output: dict[str, float]
     │
     ├─► MetaFeatureExtractor  (inline)
     │       log transform monetary fields
-    │       encode sector as integer category
+    │       encode sector and security_type as integer categories
     │       output: dict[str, float]
     │
     ├─► TemporalFeatureExtractor  (inline)
     │       derive time/date features from entry.hour, entry.date
-    │       lookup holiday calendar from DuckDB
+    │       read the entry date's calendar context (passed in)
     │       output: dict[str, float]
     │
     └─► merge all → single feature_vector
@@ -116,8 +121,9 @@ Strategy A — once per ticker (CONTINUOUS indicators):
     Bar-derived (adj_bars; anchored to reference_date):
         0. Corporate-event bar adjustment (before indicator computation):
            reference_date = max date present in the bars DataFrame for this call
-           adj_bars = utils.adjust_bars_for_corporate_events(bars, ticker,
-                          reference_date, db_conn)
+           adj_bars = utils.adjust_bars_from_events(bars, ticker,
+                          reference_date, events_df)
+           (events_df: the reader's corporate_events rows for the ticker)
            (single vectorized pass against corporate_events, a small table —
             no-op / near-zero cost for the vast majority of tickers with no
             split in the loaded range)
@@ -126,7 +132,8 @@ Strategy A — once per ticker (CONTINUOUS indicators):
         2. For each entry point in entry_points:
            a. Slice indicator time-series up to t-1 bar (by hour index)
            a2. Scale-type rescale (only when f_e != 1.0 for this entry — see below):
-               f_e = cum_split_ratio(entry_date, reference_date)  (1.0 if no split
+               f_e = utils.split_ratio_from_events(ticker, entry_date,
+                     reference_date, events_df)  (1.0 if no split
                      between entry_date and reference_date — the common case)
                if f_e != 1.0: apply per 02_indicator_calculator.md's
                      "Corporate Event Scale Sensitivity" table —
@@ -136,16 +143,14 @@ Strategy A — once per ticker (CONTINUOUS indicators):
            b. Apply Vectorizer to sliced (and rescaled, if applicable) series
               → feature vector
         Applies to: ma, ema, macd, rsi, atr, bb, adx, dmi, sar, vr_volume,
-                    obv, ad, vwap, roll_spread, hl_spread,
-                    rvol (today series), rel_dvol (today series),
-                    intra_season_{metric} (today series)
+                    obv, ad, vwap, roll_spread, hl_spread
 
         obv/ad exception: both are unbounded cumulative sums (no session reset),
         so step 0's single-pass adjustment is only valid for tickers/date-ranges
         with no split inside the loaded bars range. When corporate_events shows a
         split within [bars.date.min(), reference_date] for this ticker,
         extract_batch() falls back to per-entry-date recomputation for obv/ad
-        specifically: re-run adjust_bars_for_corporate_events() with
+        specifically: re-run adjust_bars_from_events() with
         reference_date=entry_date on bars up to that entry, then compute obv/ad
         fresh for that entry (no step 2a2 rescale needed in the fallback path,
         since the bars are already anchored to the entry's own date). All other
@@ -170,20 +175,20 @@ Strategy A — once per ticker (CONTINUOUS indicators):
                 these indicators specifically):
                scale_type = registry lookup in 02_indicator_calculator.md's
                    Tick-Derived Indicator Scale Sensitivity table
-               sliced = utils.adjust_tick_derived_series_for_corporate_events(
-                   sliced, ticker, entry_date, scale_type, db_conn
+               sliced = utils.adjust_tick_derived_series_from_events(
+                   sliced, ticker, entry_date, scale_type, events_df
                )
                (anchored directly to entry_date — no reference_date detour,
                since these series were never reference_date-anchored to begin
                with; invariant-type indicators pass through this call as a
                no-op, so all tick-derived indicators share one dispatch path
                regardless of scale_type)
-           a3'. Reindex to the full expected bar index for the sliced window
-                (same bar index bars/adj_bars uses for this ticker/date range)
-                before applying step a2'. A (ticker, date, hour) with zero
-                tick bundles (halt / no-trade slot) has no row in
-                tick_bar_aggregates for any indicator (see db_schema.md) —
-                reindexing surfaces this as an explicit NaN at that position,
+           a3'. Reindex to the bars' own index for the sliced window
+                (the index bars/adj_bars carries for this ticker/date range)
+                before applying step a2'. A (ticker, date, hour) without a
+                tick bundle has no row in tick_bar_aggregates for any
+                indicator (see db_schema.md) — reindexing surfaces a bar
+                with no tick bundle as an explicit NaN at that position,
                 rather than silently shrinking the window handed to
                 Vectorizer's window_comparison/statistical_summary (which
                 would understate the true window length and skew the
@@ -207,30 +212,33 @@ Strategy B — once per ticker (monotonic deque):
     Result: time series with one fib level set per bar.
     Sliced per entry point at t-1 (same as Strategy A).
 
-Strategy C — once per date (sr_levels only):
-    sr_levels uses scipy prominence — incremental computation not possible.
-    Computed once per date using bars up to that date's last entry point t-1.
-    All entry points within the same date share the same sr_levels (price_rN,
-    prominence_rN). bars_since_rN is recomputed per entry point from
-    pivot_hour_rN (cheap: count bars between pivot_hour and t-1).
-
-    if config["indicators"]["sr_levels"].get("exact_per_entry", False):
-        → per-entry-point: sr_levels(bars[:t-1_window], ...) per entry point
-    else (default):
-        → once per date with bars_since recomputation
+Strategy C — per entry point (sr_levels, sr_channels):
+    sr_levels uses scipy prominence over a sliding window, which cannot be
+    reduced to an O(1) per-bar update; sr_channels likewise recomputes its
+    channels from the pivot list.
+    For each entry point, sr_levels is computed from the last
+    indicators.sr_levels.window_bars bars ending at t-1 — the definition
+    CachingIndicatorCalculator.get_for_entry() uses in live — and
+    sr_channels the same way, by IndicatorCalculator.sr_levels() /
+    sr_channels() per entry point; no precomputation path.
+    They run on the same adj_bars frame as Strategy A, and Strategy A's f_e
+    rescale applies to their price-type outputs (02_indicator_calculator.md's
+    Corporate Event Scale Sensitivity) before the Vectorizer's distance
+    computation — for sr_distance, before the division by P_entry.
 
 Strategy D — once per date, scalar (gap_percentile only):
     gap_percentile returns float — not a time series.
     Computed once per date (same value for all entry points of the same date).
     session_stats dict provides the baseline.
-    dividend_amount looked up once per date from corporate_events
-    (event_type='dividend', event_date=today; 0.0 if none) — the row's gross
-    amount through utils.dividend_gross_amount(), never its raw value, and
-    no withholding applied — and passed to
-    IndicatorCalculator.gap_percentile() — corporate_events is queried here,
-    not inside IndicatorCalculator (which remains DB-unaware).
-    NaN for t="093000" or pre-market entries, or when the 093000 bar is a
-    halt bar (02_indicator_calculator.md).
+    dividend_amount looked up once per date from the reader's
+    corporate_events rows (event_type='dividend', event_date=today; 0.0 if
+    none) — the row's gross amount through utils.dividend_gross_from_events(),
+    never its raw value, and no withholding applied — and passed to
+    IndicatorCalculator.gap_percentile() — corporate_events is read here,
+    through the reader, not inside IndicatorCalculator (which remains
+    DB-unaware).
+    NaN unless the entry date's first regular-session bar's hour is before t
+    (02_indicator_calculator.md).
     Inserted directly into feature vector as "gap_pct" (no Vectorizer step).
 
 Strategy E — session_stats lookup (REFERENCE_SESSION baselines):
@@ -244,8 +252,13 @@ Strategy E — session_stats lookup (REFERENCE_SESSION baselines):
     tick_bar_aggregates (see db_schema.md, utils.md
     populate_precomputed_session_stats()), not computed from raw ticks at
     this layer.
-    The price_return today series takes prev_close from the latest valid
-    bar (02_indicator_calculator.md's NaN-term handling).
+    The REFERENCE today series — rvol, rel_dvol, intra_season_{metric},
+    relative_avg_vol_per_tick — are each sliced to the REFERENCE_SESSION
+    today window (data_boundary.md: the last
+    indicators.reference_session.window_bars bars ending at t-1, never
+    before the entry date's PREMARKET_OPEN) before the Vectorizer.
+    The price_return today series takes prev_close from the previous
+    existing bar.
 ```
 
 ---
@@ -257,7 +270,7 @@ class FeatureExtractor:
     def __init__(
         self,
         config: dict,
-        db_conn: duckdb.DuckDBPyConnection,
+        reader=None,
         calculator: IndicatorCalculator | None = None,
     ): ...
 
@@ -269,6 +282,8 @@ class FeatureExtractor:
         meta: dict,
         halts_df: pd.DataFrame,
         closes: dict[str, str],
+        ends: dict[str, str],
+        calendar_context: dict[str, dict],
         session_stats: dict | None = None,
     ) -> pd.DataFrame:
         """
@@ -279,12 +294,17 @@ class FeatureExtractor:
         for it. The boundary is enforced INTERNALLY, by the per-entry slice
         to t-1 that Strategies A, B and C specify below.
         halts_df passed explicitly for MissingBarClassifier and market_structure_features.
-        meta: date-keyed stock_meta resolution for this ticker's entry dates.
+        ends: the {date: after_hours_end} map run_preprocess.md keeps from
+            session_boundaries_from_frame().
+        calendar_context: {entry date: context} — utils.calendar_context()'s
+            map over the batch's entry dates (Temporal Features, below).
+        meta: date-keyed meta resolution for this ticker's entry dates.
             Format: {date_str: {field: value}}
             Keys are entry dates ('YYYYMMDD'); values are the per-field
-            resolved dict described in "Meta Features" below (real crawled
-            value where available, else utils.estimate_historical_meta()
-            fallback per field; sector always the most recent snapshot).
+            resolved dict described in "Meta Features" below (the stock_meta
+            prior-day row and utils.estimate_historical_meta() per field;
+            sector and security_type from the latest row with the field set;
+            price_52h and price_52l filled by the caller).
             extract_batch() internally selects meta[entry_date] for each entry
             point before computing meta_features. This mirrors the
             session_stats dispatch pattern below — required because
@@ -317,8 +337,11 @@ class FeatureExtractor:
         entry: dict,
         halts_df: pd.DataFrame,
         session_close: str,
+        ends: dict[str, str],
+        calendar_context: dict,
         return_intermediate: bool = False,
         session_stats: dict | None = None,
+        calculator: IndicatorCalculator | None = None,
     ) -> dict[str, float] | tuple[dict[str, float], dict]:
         """
         Single entry point feature extraction.
@@ -327,15 +350,27 @@ class FeatureExtractor:
         enforcement is achievable here — unlike extract_batch() above.
         Used in live inference (Inferencer) and visualization.
         halts_df passed explicitly — consistent with extract_batch() pattern.
+        ends: the {date: after_hours_end} map, passed by the Inferencer from
+            LiveModeRunner; session_close stays flat.
+        calendar_context: the entry date's calendar context, flat.
         meta: flat {field: value} dict for this single entry point's (ticker, date) —
             resolved by the caller the same way as extract_batch()'s per-date
-            entries (real value with utils.estimate_historical_meta() fallback
-            per field; sector from most recent snapshot). Not date-keyed here,
-            since a single entry point has exactly one date already.
+            entries (the stock_meta prior-day row and
+            utils.estimate_historical_meta() per field; sector and
+            security_type from the latest row with the field set; price_52h
+            and price_52l filled by the caller). Not date-keyed here, since a
+            single entry point has exactly one date already.
         session_stats: flat single-date baseline for this entry point's ticker/date.
             Format: {metric: {hour: smoothed_avg_value}} | None
-            In live mode, supplied by LiveModeRunner via CachingIndicatorCalculator._session_stats.
+            In live mode, the Inferencer passes calculator.session_stats, the
+            read-only property of the ticker's CachingIndicatorCalculator;
+            the REFERENCE today series are CachingIndicatorCalculator's
+            session-scoped incremental Layer 2 entries, returned through t-1
+            by get_for_entry() and sliced here to the today window.
             If None, REFERENCE_SESSION indicators return NaN.
+        calculator: None means the constructor's calculator; live mode passes
+            the ticker's CachingIndicatorCalculator (live_mode_runner.md's
+            calculators[ticker], through the Inferencer).
         When return_intermediate=True, returns (feature_vector, intermediate_dict)
         where intermediate_dict contains per-stage outputs for visualization.
         """
@@ -350,6 +385,34 @@ class FeatureExtractor:
         """
         ...
 
+    def get_feature_groups(self) -> dict[str, list[str]]:
+        """
+        Map each feature group that produces columns under the active config
+        to its feature column names; the union of the column lists is
+        get_feature_names(). Every feature column belongs to exactly one
+        group, named by the column's producer:
+            - an IndicatorCalculator method, named as in
+              02_indicator_calculator.md's Interface, its series' Vectorizer
+              outputs included:
+              - sr_distance's outputs → sr_levels;
+              - sr_channels' Vectorizer outputs → sr_channels;
+              - level_distance's outputs → fibonacci_retracement and
+                pivot_points, each for its own levels;
+              - gap_pct → gap_percentile;
+              - intra_season_{metric} → intraday_seasonality;
+            - a bar column the Vectorizer transforms directly
+              (03_vectorizer.md's "price close" and "volume" mapping rows) →
+              the column's name, close and volume;
+            - this file's feature sections:
+              - Meta Features → meta;
+              - Temporal Features → temporal;
+              - Market Structure Features → market_structure.
+        A method whose output enters no feature column names no group.
+        Used by pipeline_optimizer.md's optimizer.selection.group_alternatives
+        validation.
+        """
+        ...
+
     def get_feature_schema(self) -> dict[str, str]:
         """
         Return {feature_name: dtype_str} for all features.
@@ -360,34 +423,31 @@ class FeatureExtractor:
 
     def calculate_required_history(self) -> dict:
         """
-        Return minimum bars required for inference given current config.
-        Used by Inferencer for preload validation.
+        Return the history an entry needs given current config.
+        Used by Inferencer for preload validation (its _prepare_bars() step 3
+        checks the trading-day history and the bar count; a failure of either
+        logs preload_fail).
 
         Returns:
             {
-                "min_bars": int,           # lookback_days * 390
-                "min_trading_days": int,   # lookback_days
+                "min_trading_days": int,   # lookback_days — the trading days
+                                           # prior_trading_days() names, every
+                                           # one of which must have bars
+                                           # (utils.has_required_history())
+                "min_bars": int,           # the entry-admission bar requirement:
+                                           # bars in [the lookback start, t-1]
             }
 
-        Simplified: lookback_days * 390 is guaranteed >= max(window_bars, H_max)
-        by init constraint. n_sessions is independent (baselines from
-        precomputed_session_stats, not from bars window).
-
-        The 390 is NOT per-date and deliberately stays a literal, although
-        min_bars is a real threshold rather than a margin — it becomes
-        Inferencer.required_bars and decides inference_log event='preload_fail',
-        where a failing candidate returns None and is never inferred at all.
-        It survives an early close for two reasons. Bars are loaded across the
-        FULL 040000-200000 range, not the regular session, so the actual supply
-        is ~960 min/day against a 390 min/day nominal — the wording understates
-        the real margin, independently of early closes. And the init-time check
-        reads only lookback_days and window_bars, with no date in it at all, so
-        no calendar fact can reach it.
+        min_bars is the largest of:
+            - indicators.sr_levels.window_bars;
+            - sr_channels' requirement, max(width_range_bars,
+              loopback_bars + 2 × pivot_period + 1);
+            - indicators.fibonacci.window_bars;
+            - H_max (02_indicator_calculator.md's I4).
+        n_sessions is independent (baselines from precomputed_session_stats,
+        not from bars window).
         """
-        return {
-            "min_bars": self.config["indicators"]["lookback_days"] * 390,
-            "min_trading_days": self.config["indicators"]["lookback_days"],
-        }
+        ...
 ```
 
 ---
@@ -398,29 +458,49 @@ class FeatureExtractor:
 meta_features = {
     "log_market_cap":          float,   # log(market_cap); raw value in stock_meta
     "log_shares_outstanding":  float,   # log(shares_outstanding)
-    "log_price_52h":           float,   # log(price_52h)
-    "log_price_52l":           float,   # log(price_52l)
+    "log_price_52h":           float,   # log(price_52h), read from meta (the caller fills it)
+    "log_price_52l":           float,   # log(price_52l), read from meta (the caller fills it)
     "sector_code":             int,     # encoded via sector_map.json
                                         # unknown sector → 0
                                         # known sectors → 1, 2, 3, ...
                                         # registered as LightGBM categorical
+    "security_type_code":      int,     # encoded via security_type_map.json
+                                        # (content fixed, written by
+                                        # FeatureExtractor when absent):
+                                        # unknown → 0; equity → 1; etf → 2;
+                                        # fund → 3; adr → 4; warrant → 5;
+                                        # unit → 6; right → 7; preferred → 8;
+                                        # debt → 9
+                                        # registered as LightGBM categorical;
+                                        # sector_code's feature group (meta)
 
-    # Fundamentals-derived (yield form — see rationale below), from
-    # fundamentals_quarterly (db_schema.md) via utils.get_ttm_value() /
-    # utils.estimate_historical_meta()-style as-of lookup. All as-of
-    # filed_date <= entry_date (data_boundary.md point-in-time principle).
+    # Fundamentals-derived (yield form — see rationale below), from the
+    # reader's fundamentals_quarterly rows (db_schema.md): TTM values via
+    # utils.get_ttm_value(ticker, date, metric, rows), instant values via the
+    # as-of most-recent-filed lookup over the same rows, each returning
+    # (value, unit). All read the facts filed before entry_date, filed_date <
+    # entry_date (data_boundary.md point-in-time principle). get_ttm_value()'s
+    # annual fallback: when the quarterly TTM is unavailable, the latest FY
+    # value filed before entry_date
+    # whose fiscal_period_end lies within
+    # fundamentals.annual_fallback_max_age_months of it; else None.
+    # A monetary fact meets market_cap in its own currency: each ratio below
+    # is the value ÷ (market_cap × utils.fx_per_usd() of the value's
+    # currency, from the reader's fx_rates rows), None → NaN.
     # NaN if the underlying fundamentals_quarterly data is unavailable for
     # this ticker/date — LightGBM handles natively, no imputation.
-    "earnings_yield":          float,   # utils.get_ttm_value(ticker, date, "net_income", ...)
-                                        # / market_cap
+    "earnings_yield":          float,   # utils.get_ttm_value(ticker, date, "net_income", rows)
+                                        # / (market_cap × fx_per_usd)
     "book_to_price":           float,   # most-recent as-of stockholders_equity
-                                        # / market_cap
-    "sales_to_price":          float,   # utils.get_ttm_value(ticker, date, "revenue", ...)
-                                        # / market_cap
+                                        # / (market_cap × fx_per_usd)
+    "sales_to_price":          float,   # utils.get_ttm_value(ticker, date, "revenue", rows)
+                                        # / (market_cap × fx_per_usd)
     "dilution_rate":           float,   # QoQ shares_outstanding change rate — see
-                                        # "dilution_rate computation" below
-    "cash_to_mcap":            float,   # most-recent as-of cash / market_cap
-    "debt_to_mcap":            float,   # most-recent as-of total_liabilities / market_cap
+                                        # "dilution_rate computation" below;
+                                        # unchanged; an annual-only filer has none
+    "cash_to_mcap":            float,   # most-recent as-of cash / (market_cap × fx_per_usd)
+    "debt_to_mcap":            float,   # most-recent as-of total_liabilities
+                                        # / (market_cap × fx_per_usd)
 }
 ```
 
@@ -440,15 +520,16 @@ error) rather than an edge case requiring special handling.
 **dilution_rate computation:**
 ```
 shares_t   = most recent fundamentals_quarterly shares_outstanding as-of
-             entry_date's filing quarter
+             entry_date's filing quarter (the reader's rows)
 shares_t_1 = the PRIOR quarter's filed shares_outstanding value
-ratio      = cum_split_ratio(ticker, shares_t_1's fiscal_period_end,
-                             shares_t's fiscal_period_end, db_conn)
+ratio      = utils.split_ratio_from_events(ticker, shares_t_1's
+                             fiscal_period_end, shares_t's
+                             fiscal_period_end, events_df)
              # between the compared rows' instant dates (their
              # fiscal_period_end), not their filing dates
 dilution_rate = (shares_t / (shares_t_1 * ratio)) - 1
 ```
-The `cum_split_ratio()` correction is required for the same reason as
+The split-factor correction is required for the same reason as
 Strategy A's `f_e` rescale (see above): a real stock split between the two
 quarters would otherwise appear as a spurious multi-hundred-percent
 "dilution" (e.g. a 4:1 split reads as shares_t / shares_t_1 ≈ 4.0), when no
@@ -460,19 +541,27 @@ feature isolates genuine issuance/buyback activity from mechanical
 share-count changes.
 
 **Source resolution per field (caller responsibility, before meta_features
-computation):** `stock_meta` is keyed `(ticker, date)` — a row/field exists
-only for dates actually crawled. For each of `market_cap`,
-`shares_outstanding`, `price_52h`, `price_52l`, resolved independently per
-field (not per row):
+computation)** — data_boundary.md's "Point-in-time correctness for
+stock_meta": a `stock_meta` row's date is its crawl date, and a field for the
+entry date D is read from the prior-day row, the row dated the trading day
+`utils.prior_trading_days(D, 1, closes)` returns. Per field:
 ```
-value = stock_meta.get(ticker, entry_date, field)   # real crawled value, if present
-if value is None:
-    value = utils.estimate_historical_meta(ticker, entry_date, field, db_conn)
-    # derived from ohlcv_1min + corporate_events — see utils.md
+market_cap         = the prior-day row's value, else
+                     utils.estimate_historical_meta(ticker, D, "market_cap",
+                     closes, lookback_days, db_conn)
+shares_outstanding = utils.estimate_historical_meta(ticker, D, "shares_outstanding",
+                     closes, lookback_days, db_conn), its first tier the
+                     prior-day row
+                     # lookback_days: the caller's config
+                     # indicators.lookback_days
+price_52h, price_52l — filled by the caller: in training the metric of the
+                     batch's loaded precomputed_session_stats group of
+                     (ticker, D) at hour '000000', none → NaN; in live by
+                     live_mode.price_extremes_source (live_mode_runner.md)
 ```
-`sector` has no derivation path — always use the most recent available
-`stock_meta` snapshot regardless of entry date (accepted approximation,
-unrelated to corporate-event scale).
+`sector` and `security_type` have no derivation path — always the latest
+`stock_meta` row with the field set, whatever the entry date (accepted
+look-ahead, unrelated to corporate-event scale).
 `EntryPointDetector`'s filter E (condition E, turnover rate) uses this same
 `shares_outstanding` resolution via the identical utility — see
 `01_entry_detection.md`.
@@ -488,12 +577,38 @@ FeatureExtractor itself.
 
 ```python
 temporal_features = {
-    "minute_of_session": int,          # minutes since session open (entry.hour reference)
+    "minute_of_session": int,          # minutes from REGULAR_OPEN to entry.hour
     "day_of_week":       int,          # 0=Mon ... 4=Fri (encoded via day_of_week_map)
     "is_near_open":      int,          # 1 if within first 30 min of regular session
     "is_near_close":     int,          # 1 if entry.hour >= session_close(date)
                                        #   - 30 min; open on the right
-    "is_holiday_week":   int,          # 1 if trading week contains a US holiday
+    # From the entry date D's calendar context (utils.calendar_context();
+    # db_schema.md's trading_calendar):
+    "sessions_to_holiday":      int,   # the count of weekdays after D up to
+                                       # and including next_closure_last_session;
+                                       # 0 when next_closure_last_session is D
+    "next_holiday_weekday":     int,   # the weekday of the first weekday after
+                                       # next_closure_last_session — categorical,
+                                       # encoded via day_of_week_map
+    "next_closure_days":        int,   # the calendar days strictly between
+                                       # next_closure_last_session and
+                                       # next_closure_reopen
+    "sessions_since_holiday":   int,   # the count of weekdays from
+                                       # prev_closure_reopen up to and excluding D;
+                                       # 0 when prev_closure_reopen is D
+    "prev_holiday_weekday":     int,   # the weekday of the first weekday after
+                                       # prev_closure_last_session — categorical,
+                                       # encoded via day_of_week_map
+    "prev_closure_days":        int,   # the calendar days strictly between
+                                       # prev_closure_last_session and
+                                       # prev_closure_reopen
+    "next_session_early_close": int,   # 1 when next_session_close is earlier
+                                       # than REGULAR_CLOSE, else 0
+    # Reserved, not produced and outside get_feature_names():
+    "is_early_close":           int,   # 1 when session_close(D) is earlier than
+                                       # REGULAR_CLOSE; producing it is a
+                                       # feature-set change made when
+                                       # early-close sessions take entries
 }
 ```
 
@@ -514,19 +629,23 @@ grep on 155900 or 160000 could reach it; it was found on the MEANING axis. Makin
 the value available and making this site read it are separate changes, and a
 literal sweep closes only the second kind.
 
-`session_close` reaches this module as its OWN argument, alongside `halts_df`
-and `session_stats` — "passed explicitly, not fetched internally" is this
+`session_close` and the calendar context reach this module as their OWN
+arguments, alongside `halts_df` and `session_stats` — "passed explicitly, not
+fetched internally" is this
 module's standing rule and it never queries DuckDB directly. It is not folded
 into `meta`: `meta` is date-keyed so the shape would fit, but it carries
 stock_meta-sourced per-ticker values and a session close is neither.
 
 The SHAPE differs by entry point, following `meta`'s own precedent below:
-`extract_batch()` takes the `{date: session_close}` map because it spans many
-entry dates for one ticker, while `extract()` takes that date's close flat
-because it handles exactly one. Both are needed — `is_near_close` is in the
-shared feature dict, so live serving computes it too.
+`extract_batch()` takes the `{date: session_close}` map and the calendar
+context's `{entry date: context}` map because it spans many entry dates for
+one ticker, while `extract()` takes that date's close and that date's
+context flat because it handles exactly one. Both are needed —
+`is_near_close` and the calendar-context features are in the shared feature
+dict, so live serving computes them too.
 
-Holiday calendar sourced from `us_holidays` table in DuckDB.
+The calendar context is the entry date's `trading_calendar` row, the
+published schedule as it stood before D's session (data_boundary.md).
 `day_of_week` encoding map loaded via `utils.load_encoding_map("day_of_week_map")`.
 `is_monday` and `is_friday` binary features must NOT be generated (subsumed by `day_of_week`).
 
@@ -541,20 +660,23 @@ Scaling will be applied at MLP comparison stage only.
 ```python
 market_structure_features = {
     # Halt-related
+    # Halt-related — read from halts_df, the entry date's intervals,
+    # inferred ones included
     "had_halt_today":            int,    # 1 if any halt before t-1 bar else 0
-    "bars_since_last_halt":      int,    # bars since last halt ended; NaN if no halt today
+    "bars_since_last_halt":      int,    # existing bars since the halt ended;
+                                         # NaN if no halt today
     "halt_reason_code":          int,    # encoded via halt_reason_code_map.json
                                          # 0 = no halt today ("no_halt" entry in map)
                                          # registered as LightGBM categorical
                                          # always an integer — never NaN
     "halt_count_today":          int,    # total halts before t-1 bar
 
-    # Missing bar composition
-    "missing_bar_count":         int,    # total no_trade gap bars in lookback window
-
-    # Synthetic bar quality indicators
-    "synthetic_bar_ratio":       float,  # no_trade_bars / total_bars_in_window [0.0, 1.0]
-    "consecutive_synthetic_max": int,    # longest run of consecutive no_trade bars
+    # No-trade minutes — minutes without a bar outside halts_df intervals,
+    # counted from timestamps over the CONTINUOUS vectorization window
+    "no_trade_minute_count":            int,    # their count
+    "no_trade_minute_ratio":            float,  # their share of the window's
+                                                # minutes [0.0, 1.0]
+    "consecutive_no_trade_minute_max":  int,    # longest run of them
 }
 ```
 
@@ -576,16 +698,16 @@ When had_halt_today == 0:
     halt_count_today = 0
 ```
 
-**synthetic_bar_ratio computation:**
+**no_trade_minute_ratio computation:**
 ```
-lookback_bars = all bars in the t-N...t-1 window passed to IndicatorCalculator
-no_trade_bars = bars classified as no_trade by MissingBarClassifier
-                (halt bars excluded — they are NaN, not forward-filled)
+window_minutes   = the minutes of the CONTINUOUS vectorization window
+no_trade_minutes = minutes classified no_trade by MissingBarClassifier
+                   (minutes without a bar outside halts_df intervals)
 
-synthetic_bar_ratio = len(no_trade_bars) / len(lookback_bars)
+no_trade_minute_ratio = len(no_trade_minutes) / len(window_minutes)
 ```
 
-**consecutive_synthetic_max computation (FeatureExtractor responsibility):**
+**consecutive_no_trade_minute_max computation (FeatureExtractor responsibility):**
 ```
 From classify_missing_bars() output:
     classification: dict[HHMMSS → "halt" | "no_trade"]
@@ -593,8 +715,8 @@ From classify_missing_bars() output:
 Steps:
     1. Sort classification keys (HHMMSS strings) in ascending order
     2. Iterate sorted keys; count consecutive "no_trade" runs
-    3. consecutive_synthetic_max = max run length observed
-    4. If no no_trade bars exist → consecutive_synthetic_max = 0
+    3. consecutive_no_trade_minute_max = max run length observed
+    4. If no no_trade minutes exist → consecutive_no_trade_minute_max = 0
 ```
 
 ---
@@ -620,71 +742,81 @@ They are used by ClassBalancer for pre-balance filtering.
   accumulation origins agree
 - Feature column names must be deterministic and stable across runs
 - `extract_batch()` uses Strategy A/B (once per ticker) for CONTINUOUS indicators and fibonacci
-- `extract_batch()` uses Strategy C (once per date) for sr_levels by default
+- `extract_batch()` computes sr_levels and sr_channels per entry point (Strategy C)
 - `extract_batch()` uses Strategy D (once per date, scalar) for gap_percentile
 - `extract_batch()` internally dispatches session_stats[entry_date] per entry point before
   passing flat {metric: {hour: value}} to IndicatorCalculator REFERENCE_SESSION methods
 - Disabled feature groups (per config) produce no columns
-- `sector_code`, `day_of_week`, `halt_reason_code` must be passed as categoricals to LightGBM
+- `sector_code`, `security_type_code`, `day_of_week`, `next_holiday_weekday`,
+  `prev_holiday_weekday`, `halt_reason_code` must be passed as categoricals to LightGBM
 - NaN values permitted in continuous features — do not impute
 - `p_entry` must never appear as a feature column
 - `is_monday` and `is_friday` binary columns must NOT be generated
-- Missing bar classification must run before IndicatorCalculator receives bars
-- Halt bars (NaN OHLC) follow 02_indicator_calculator.md's Incremental
-  Computation Rule — a halt bar's own indicator output is NaN and is never
-  forward-filled:
+- Missing bar classification runs before IndicatorCalculator receives bars
+  and classifies without filling: no bar is created and no halt row exists;
+  halts follow 02_indicator_calculator.md's Incremental Computation Rule:
   - I5b;
   - NaN-term handling;
   - W2
-- Temporal features use `entry.hour` (t bar open time) as reference — not data leakage
-- Encoding maps (`sector_map`, `day_of_week_map`, `halt_reason_code_map`) loaded via
-  `utils.load_encoding_map()` internally — Inferencer does not load or inject maps
-- `sector_code` unknown → 0 (not -1); known sectors → 1, 2, 3, ...
+- Temporal features use `entry.hour` (t bar open time) and the entry date's
+  calendar context as reference — not data leakage
+- Encoding maps (`sector_map`, `security_type_map`, `day_of_week_map`,
+  `halt_reason_code_map`) loaded via `utils.load_encoding_map()` internally —
+  Inferencer does not load or inject maps
+- `sector_code` and `security_type_code` unknown → 0 (not -1); known values → 1, 2, 3, ...
 - `halt_reason_code` no halt → 0 ("no_halt" in map); known codes → 1, 2, ...; unknown codes → -1
 - All "categorical" typed features in `get_feature_schema()` are guaranteed integers, never NaN
 - `halts_df` passed explicitly to both `extract_batch()` and `extract()`;
   consistent with Labeler and BacktestEngine patterns (no internal DB queries)
-- `consecutive_synthetic_max`: computed by FeatureExtractor from `classify_missing_bars()`
+- `consecutive_no_trade_minute_max`: computed by FeatureExtractor from `classify_missing_bars()`
   classification dict, sorted by HHMMSS key ascending
-- `sr_distance()` called directly by FeatureExtractor — never via `transform()`
-- `synthetic_bar_ratio` and `consecutive_synthetic_max` computed from MissingBarClassifier
+- `sr_distance()` and `sr_channel_distance()` called directly by FeatureExtractor — never via `transform()`
+- `no_trade_minute_ratio` and `consecutive_no_trade_minute_max` computed from MissingBarClassifier
   output — no changes to IndicatorCalculator or Vectorizer required
 - `is_dead_position`, `dead_position_case`, `is_ambiguous` passed through from Labeler —
   not computed by FeatureExtractor
 - `gap_pct` scalar inserted directly into feature_vector — never passed to Vectorizer
 - `session_stats` is None during training if precomputed_session_stats not available —
   REFERENCE_SESSION indicators return NaN in that case (not an error)
-- `calculator` DI: IndicatorCalculator for training (stateless); CachingIndicatorCalculator
-  for live mode (injected by LiveModeRunner)
-- Init ConfigurationError if `lookback_days * 390 < max(sr_levels.window_bars, fibonacci.window_bars, H_max)` (02_indicator_calculator.md's I4)
+- `calculator`: the constructor's IndicatorCalculator for training and visualization
+  (stateless); in live mode the ticker's CachingIndicatorCalculator, passed per call to
+  `extract()` (live_mode_runner.md's calculators[ticker], through the Inferencer)
 - `n_sessions` and `lookback_days` are independent — no constraint between them
   (REFERENCE_SESSION baselines come from precomputed_session_stats, not from bars window)
-- Strategy A bars are corporate-event-adjusted (`utils.adjust_bars_for_corporate_events()`,
-  anchored to the max date in the loaded bars range) before indicator computation —
+- Strategy A bars are corporate-event-adjusted (`utils.adjust_bars_from_events()`
+  over the reader's corporate_events rows, anchored to the max date in the
+  loaded bars range) before indicator computation —
   raw, unadjusted bars must never reach IndicatorCalculator via this path; see
   `data_boundary.md` for the full raw-vs-adjusted boundary
 - `obv`/`ad` require the per-entry-date fallback described in Strategy A whenever
   a split falls within the loaded bars range for that ticker — this is the only
   Strategy A indicator pair with this exception
-- `meta_features` fields (`market_cap`, `shares_outstanding`, `price_52h`,
-  `price_52l`) are resolved per-field from `stock_meta(ticker, entry_date)`
-  with fallback to `utils.estimate_historical_meta()` — never from a single
-  global `stock_meta` snapshot; `sector` is the sole exception (no fallback,
-  always most-recent snapshot)
-- `gap_percentile()`'s `dividend_amount` is looked up from `corporate_events`
-  by FeatureExtractor (Strategy D), read through `utils.dividend_gross_amount()`
-  (gross, no withholding), and passed as a scalar — IndicatorCalculator
-  itself never queries `corporate_events`
+- `meta_features` fields (`market_cap`, `shares_outstanding`) are resolved
+  per-field by the caller — the stock_meta prior-day row and
+  `utils.estimate_historical_meta()` (data_boundary.md's "Point-in-time
+  correctness for stock_meta") — never from a single global `stock_meta`
+  snapshot; `price_52h` and `price_52l` are filled by the caller; `sector`
+  and `security_type` are the exceptions (no derivation, always the latest
+  row with the field set)
+- `gap_percentile()`'s `dividend_amount` is looked up from the reader's
+  `corporate_events` rows by FeatureExtractor (Strategy D), read through
+  `utils.dividend_gross_from_events()` (gross, no withholding), and passed as
+  a scalar — IndicatorCalculator itself never reads `corporate_events`
 - `extract_batch()`'s `meta` parameter is date-keyed (`{date: {field: value}}`),
   not a flat per-ticker dict — required because `stock_meta` is `(ticker, date)`-keyed;
   `extract()`'s `meta` remains flat since it handles exactly one date already
 - Fundamentals-derived meta features (`earnings_yield`, `book_to_price`,
   `sales_to_price`, `dilution_rate`, `cash_to_mcap`, `debt_to_mcap`) resolve
-  `fundamentals_quarterly` as-of `filed_date <= entry_date`, never
-  `fiscal_period_end` — see `data_boundary.md`'s point-in-time principle;
-  NaN (not an error) if no eligible filing exists as of `entry_date`
+  the reader's `fundamentals_quarterly` rows as-of `filed_date < entry_date`,
+  never `fiscal_period_end` — see `data_boundary.md`'s point-in-time
+  principle; NaN (not an error) if no eligible filing exists as of
+  `entry_date`; `get_ttm_value()`'s annual fallback reads facts filed before
+  entry_date
+- A monetary fundamentals fact meets `market_cap` in its own currency:
+  the ratio is the value ÷ (market_cap × `utils.fx_per_usd()`), the rate
+  dated on or before the trading day before the entry date, None → NaN
 - `dilution_rate`'s two-quarter shares_outstanding comparison must apply
-  `cum_split_ratio()` between the compared rows' instant dates (their
+  `utils.split_ratio_from_events()` between the compared rows' instant dates (their
   `fiscal_period_end`) before computing the QoQ
   ratio — a real split between quarters must not read as spurious dilution
   (same correction principle as Strategy A's `f_e` rescale, applied here to

@@ -17,7 +17,14 @@ Each transformation method is defined independently and mapped to specific indic
 **Input:**
 ```python
 series: pd.Series  # single indicator time-series, index = bar timestamps
-                   # covers bars t-N ... t-1 only
+                   # covers bars t-N ... t-1 only — the CONTINUOUS
+                   # vectorization window: every bar of the prior
+                   # indicators.lookback_days trading days and the entry
+                   # date through t-1; a REFERENCE today series instead
+                   # covers the REFERENCE_SESSION today window
+                   # (data_boundary.md), not the CONTINUOUS window
+                   # positions are bar order: the existing bars, a minute
+                   # without a bar taking no position
 reference_price: float  # P_entry — passed in for distance-based transforms only
 ```
 
@@ -57,7 +64,8 @@ Output keys:
 Applies to: price close, moving averages
 
 Output keys:
-    {name}_slope             ← OLS slope (normalized by price level)
+    {name}_slope             ← OLS slope (normalized by price level), its
+                               x-axis the bar positions (bar order)
     {name}_intercept         ← NOT emitted for obv/ad: the indicator mapping
                                routes those two here, and an intercept is a
                                level of an origin-dependent cumulative series
@@ -68,7 +76,8 @@ Output keys:
 ```
 Applies to: volume, TPM, avg_vol_per_tick, REFERENCE_SESSION today series
 
-Split window into current_half and prev_half:
+Split window into current_half and prev_half by bar order (a REFERENCE today
+series: its today window split the same way):
 Output keys:
     {name}_window_ratio      ← mean(current_half) / mean(prev_half)
                                NOT emitted for obv/ad: a ratio of two segments
@@ -117,29 +126,65 @@ FeatureExtractor calls sr_distance() directly on the Vectorizer instance.
 See "sr_distance dispatch" note below.
 
 Input: sr_df (pd.DataFrame) with columns:
-    price_rN, pivot_hour_rN, bars_since_rN, prominence_rN   (for N = 1..n_levels)
-    price_sN, pivot_hour_sN, bars_since_sN, prominence_sN
+    price_rN, bars_since_rN, prominence_rN   (for N = 1..n_levels)
+    price_sN, bars_since_sN, prominence_sN
 
 Output keys (per level N = 1..n_levels):
-    dist_rN_pct              ← (price_rN - P_entry) / P_entry
+    dist_rN_pct              ← (price_rN - P_entry) / P_entry, sign kept
     bars_since_rN            ← passed through from IndicatorCalculator output
-    prominence_rN            ← passed through from IndicatorCalculator output
+    prominence_rN_pct        ← prominence_rN / P_entry
 
-    dist_sN_pct              ← (P_entry - price_sN) / P_entry
+    dist_sN_pct              ← (P_entry - price_sN) / P_entry, sign kept
     bars_since_sN            ← passed through from IndicatorCalculator output
-    prominence_sN            ← passed through from IndicatorCalculator output
+    prominence_sN_pct        ← prominence_sN / P_entry
 
-Composite:
-    nearest_resistance_dist  ← min(dist_r1..rN)
-    resistance_density       ← mean(dist_r1..rN)
-    nearest_support_dist     ← min(dist_s1..sN)
+    In training the f_e rescale precedes the division by P_entry.
+    IndicatorCalculator's raw outputs are unchanged.
+
+Composite — every level, price_rN and price_sN alike, by its side of P_entry,
+a level above at distance (level - P_entry) / P_entry, one below at
+(P_entry - level) / P_entry:
+    nearest_resistance_dist  ← distance to the nearest level above P_entry
+    nearest_support_dist     ← distance to the nearest level below P_entry
+    resistance_density       ← mean distance of the levels above P_entry
     sr_asymmetry             ← nearest_resistance_dist - nearest_support_dist
-
-Note: pivot_hour_rN / pivot_hour_sN are NOT included in output features —
-they are internal to IndicatorCalculator for bars_since recomputation.
+The composites ignore NaN levels; a composite is NaN when no level lies on
+its side.
 ```
 
 NaN padding rule: if fewer than n_levels extrema found, pad missing levels with NaN.
+
+### 8. S/R Channel Distance
+```
+Applies to: sr_channels output from IndicatorCalculator
+Reference: P_entry (passed explicitly)
+
+The dedicated method beside sr_distance(), likewise NOT dispatched via
+transform(): FeatureExtractor calls sr_channel_distance() directly.
+
+Input: sr_ch_df (pd.DataFrame) with columns, for N up to max_num_sr:
+    sr_ch_hi_N, sr_ch_lo_N, sr_ch_strength_N   (NaN where absent)
+
+Output keys (per band N):
+    sr_ch_dist_N_pct         ← 0 when P_entry lies inside the band;
+                               (lo - P_entry) / P_entry when the band lies above;
+                               -(P_entry - hi) / P_entry when the band lies below
+    sr_ch_width_N_pct        ← (hi - lo) / P_entry
+    sr_ch_strength_N         ← passed through
+
+Composite:
+    sr_ch_nearest_resistance_dist ← the smallest (lo - P_entry) / P_entry over
+                                    bands above P_entry
+    sr_ch_nearest_support_dist    ← the smallest (P_entry - hi) / P_entry over
+                                    bands below P_entry
+    sr_ch_resistance_density      ← the mean of (lo - P_entry) / P_entry over
+                                    bands above P_entry
+    sr_ch_asymmetry               ← sr_ch_nearest_resistance_dist -
+                                    sr_ch_nearest_support_dist
+    sr_ch_in_channel              ← 1 when P_entry lies inside a band, else 0
+The composites ignore NaN bands; a composite is NaN when no band lies on its
+side. In training the f_e rescale precedes the distance computation.
+```
 
 ---
 
@@ -179,6 +224,7 @@ Configured in `pipeline_config.yaml`. Default mapping:
 | fibonacci_retracement | level_distance | — |
 | pivot_points | level_distance | — |
 | sr_levels | sr_distance | — |
+| sr_channels | sr_channel_distance | — |
 | **rvol** | **statistical_summary** | **window_comparison** |
 | **rel_dvol** | **statistical_summary** | **window_comparison** |
 | **relative_avg_vol_per_tick** | **statistical_summary** | **window_comparison** |
@@ -213,7 +259,7 @@ near-zero value even though the delta form cannot.
 After these exclusions every output remaining for `obv`/`ad` is
 ORIGIN-INVARIANT: `slope` and `r_squared` are unchanged by adding a constant
 to the series, and `window_delta` is a difference. That is what makes the two
-paths agree. Both vectorize the same `lookback_days * 390` window
+paths agree. Both vectorize the same CONTINUOUS vectorization window
 (`data_boundary.md`'s `bars t-N ... t-1`); what differs is the accumulation
 ORIGIN carried into it, because the cumulative sum is computed before the
 slice — training accumulates from the batch's lookback start, live from the
@@ -241,6 +287,9 @@ class Vectorizer:
                        name: str) -> dict[str, float]: ...
     def sr_distance(self, sr_df: pd.DataFrame, reference_price: float,
                     n_levels: int) -> dict[str, float]: ...
+    def sr_channel_distance(self, sr_ch_df: pd.DataFrame,
+                            reference_price: float,
+                            max_num_sr: int) -> dict[str, float]: ...
 
     def transform(self, series: pd.Series, method: str,
                   name: str, **kwargs) -> dict[str, float]:
@@ -257,8 +306,11 @@ class Vectorizer:
         sr_distance accepts pd.DataFrame (not pd.Series) and requires
         reference_price and n_levels arguments that do not fit the
         standard transform() interface.
-        FeatureExtractor calls vectorizer.sr_distance() directly for sr_levels.
-        Passing method="sr_distance" to transform() raises ValueError.
+        FeatureExtractor calls vectorizer.sr_distance() directly for sr_levels,
+        and vectorizer.sr_channel_distance() for sr_channels, which is
+        excluded the same way.
+        Passing method="sr_distance" or method="sr_channel_distance" to
+        transform() raises ValueError.
         """
         ...
 ```
@@ -268,19 +320,25 @@ class Vectorizer:
 ## Constraints
 
 - No indicator calculation logic here — all inputs come from IndicatorCalculator
-- All method parameters (window splits, prominence settings) from `pipeline_config.yaml`
+- All method parameters (window splits) from `pipeline_config.yaml`
 - Feature names must be deterministic and stable across runs (used as LightGBM column names)
 - NaN values are allowed in output — LightGBM handles them natively
 - Every method computes over a window's non-NaN entries; `{name}_last` keeps
   NaN as it stands — see "NaN Entries in a Window"
-- `transform()` must raise `ValueError` if method="sr_distance" is passed
-- `sr_distance()` is always called directly by FeatureExtractor, never via `transform()`
+- `transform()` must raise `ValueError` if method="sr_distance" or
+  method="sr_channel_distance" is passed
+- `sr_distance()` and `sr_channel_distance()` are always called directly by
+  FeatureExtractor, never via `transform()`
 - `level_distance()` is dispatched via `transform()` with `reference_price` as kwarg
 - `level_distance()` input is a pd.Series of a single level column (e.g. `fib_618`, `r1`)
   — FeatureExtractor iterates over level columns individually
 - `sr_distance()` receives `bars_since_rN` and `prominence_rN` from IndicatorCalculator
-  output directly — no recomputation; pass-through to output dict
-- `pivot_hour_rN` / `pivot_hour_sN` from sr_levels output are NOT included in Vectorizer output
+  output directly — no recomputation; `bars_since_rN` passes through to the
+  output dict, `prominence_rN` leaves it as `prominence_rN_pct`
+  (÷ P_entry)
+- `sr_channel_distance()` receives `sr_ch_hi_N`, `sr_ch_lo_N` and
+  `sr_ch_strength_N` from IndicatorCalculator output directly;
+  `sr_ch_strength_N` passes through
 - `dist_rN_pct` sign convention: positive = level above P_entry (resistance);
   `dist_sN_pct` sign convention: positive = level below P_entry (support)
 - Same sign convention applies to `level_distance()`: positive = level above P_entry

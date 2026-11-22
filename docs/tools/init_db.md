@@ -62,6 +62,47 @@ this tool decides or adds.
 
 **When `db_schema.md` changes, `SCHEMA_STATEMENTS` is re-transcribed from it.**
 The most recent occasion is one DDL set decided together, moving the table
+count 42 -> 48:
+- New tables (class 1):
+  - `model_deployments`;
+  - `model_candidates`;
+  - `prediction_drift_daily`;
+  - `inference_features`;
+  - `feature_drift_daily`;
+  - `fx_rates`;
+  - `tick_10_tail`.
+- `us_holidays` removed from `db_schema.md`.
+- `inference_log` (class 2): nullable columns, added by `ADD COLUMN` alone:
+  - `required_days` (`INTEGER`);
+  - `actual_days` (`INTEGER`);
+  - `entry_path` (`VARCHAR`).
+- `experiment_log` (class 2): `gate_blocked_residual_edge` (`INTEGER`),
+  nullable, by `ADD COLUMN` alone.
+- `fundamentals_quarterly` (class 2): `unit` (`VARCHAR`), nullable, by
+  `ADD COLUMN` alone.
+- `stock_meta` (class 2): `security_type` (`VARCHAR`), nullable, by
+  `ADD COLUMN` alone.
+- `trading_calendar` (class 2): nullable `VARCHAR` columns, added by
+  `ADD COLUMN` alone:
+  - `next_closure_last_session`;
+  - `next_closure_reopen`;
+  - `prev_closure_last_session`;
+  - `prev_closure_reopen`;
+  - `next_session_close`.
+- `tick_bar_aggregates` (REBUILD, without row copy): `data_version` joins
+  the primary key; no row is copied; its writers repopulate it.
+- No DDL change — value lists in comments:
+  - `alert_log` alert_key;
+  - `batch_runs` stages;
+  - `train_log` phase and trial_idx;
+  - `experiment_log` eval_type;
+  - `live_session_state` run_id and session_diagnostics keys;
+  - `live_scan_daily` metric keys;
+  - `trade_log` is_shadow;
+  - `precomputed_session_stats` metric;
+  - `inference_log` gate_result.
+
+The occasion before it was one DDL set decided together, moving the table
 count 40 -> 42, for:
 - the derived-data contract with its source journal;
 - the trading-API symbol columns;
@@ -364,23 +405,23 @@ Plain stdout; no log file and no `batch_runs` row (its DB access is the
 guest role above; the helper writes its `UNIT` lines, db_coordination.md).
 
 ```
-init:   created 42 tables, 0 already present    # fresh database
-init:   created 1 table, 41 already present     # after a new table was added
-verify: 42 tables checked, 0 differences
-verify: 42 tables checked, 1 difference
+init:   created 48 tables, 0 already present    # fresh database
+init:   created 1 table, 47 already present     # after a new table was added
+verify: 48 tables checked, 0 differences
+verify: 48 tables checked, 1 difference
         corporate_events: column 'basis_date' missing — ALTER needed
-verify: 42 tables checked, 1 difference          # a constraint, not a column
+verify: 48 tables checked, 1 difference          # a constraint, not a column
         trade_log: column 'signal' nullability differs — ALTER needed
-verify: 42 tables checked, 1 difference          # a table constraint
+verify: 48 tables checked, 1 difference          # a table constraint
         trade_log: CHECK constraint differs — REBUILD
-verify: 42 tables checked, 2 differences         # two columns, one table
+verify: 48 tables checked, 2 differences         # two columns, one table
         trading_calendar: column 'session_close' missing — ALTER needed
         trading_calendar: column 'after_hours_end' missing — ALTER needed
-verify: 42 tables checked, 2 differences         # a rename, seen from both sides
+verify: 48 tables checked, 2 differences         # a rename, seen from both sides
         live_positions: column 'lifecycle' missing — ALTER needed
         live_positions: column 'status' not in statements — reported
         # a rename seen from both sides; one RENAME COLUMN settles both
-verify: 42 tables checked, 1 difference          # the view
+verify: 48 tables checked, 1 difference          # the view
         live_position_state: view missing — re-run init
 ```
 

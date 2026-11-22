@@ -22,7 +22,9 @@ test:  pd.DataFrame    # unbalanced test split
 # all splits contain [...features..., label_up5, label_up3, label_sw, label_dn3, label_dn5]
 
 feature_names:      list[str]         # from FeatureExtractor.get_feature_names()
-categorical_cols:   list[str] | None  # ["sector_code", "day_of_week", "halt_reason_code"]
+categorical_cols:   list[str] | None  # ["sector_code", "security_type_code", "day_of_week",
+                                      #  "next_holiday_weekday", "prev_holiday_weekday",
+                                      #  "halt_reason_code"]
                                       # derived from FeatureExtractor.get_feature_schema()
                                       # None if not applicable
 sample_weight_col:  str | None        # column name for per-sample weights; None = uniform weights
@@ -181,10 +183,16 @@ models/lightgbm/{run_id}/
 ├── {run_id}_sw.lgb
 ├── {run_id}_dn3.lgb
 ├── {run_id}_dn5.lgb
-└── {run_id}_meta.json     # feature_names, categorical_cols, eval_result, config snapshot
+├── {run_id}_meta.json     # feature_names, categorical_cols, eval_result, config snapshot,
+│                          # and per code area its version and code_hash
+│                          # (utils.md's Code Versions)
+└── {run_id}_reference.json  # prediction and feature drift references (base_model.md)
 ```
 
-`run_id` format: `YYYYMMDD_HHMMSS` (generated via `utils.generate_run_id()`)
+`run_id` is the caller's: `utils.generate_run_id()`'s `YYYYMMDD_HHMMSS`
+standalone and for an optimizer final model; a structured format in an
+optimizer fold, outer eval or execution variant (utils.md's
+`generate_run_id()`)
 
 ---
 
@@ -278,9 +286,11 @@ Initial values: entry_threshold=0.5, suppress_threshold=0.5.
 - `feature_names` order must match FeatureExtractor.get_feature_names() exactly
 - `categorical_cols` derived from FeatureExtractor.get_feature_schema() by caller
 - Early stopping patience (50 rounds) is fixed; not exposed to optimizer in phase 1
-- Model artifacts must include `feature_names`, `categorical_cols`, and config snapshot for full reproducibility
+- Model artifacts must include `feature_names`, `categorical_cols`, the config snapshot, and per code area the version and code_hash, for full reproducibility
 - `predict()` returns probabilities, not binary labels — thresholding done by caller via `execution_common.resolve_signal()`
 - `sample_weight_col` applied to train only — val and test always use uniform weights
 - Weight column must exist in train DataFrame if `sample_weight_col` is not None — caller is responsible
 - `is_unbalance=True` and `sample_weight_col` may be used simultaneously; effective weight = class_weight × per_sample_weight
-- `run_id` generated via `utils.generate_run_id()`
+- `run_id` is the caller's — `utils.generate_run_id()`'s standalone and for an
+  optimizer final model; a structured format in an optimizer fold, outer eval
+  or execution variant (utils.md's `generate_run_id()`)

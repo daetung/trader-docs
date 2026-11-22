@@ -78,18 +78,24 @@ def late_entry_expected_return(
     Expected return of taking a signal LATE, at p_now, when its label anchor
     is p_ref (the t bar's open).
 
-    Used by BacktestEngine and LiveModeRunner when execution
-    .late_entry_enabled is true. Both engines must compute it identically —
-    the gate is what decides whether a rotation-detected candidate is taken
-    at all, so a divergence here is a divergence in which trades exist.
+    Its uses:
+        - each engine's residual-edge gate, under
+          execution.late_entry_enabled;
+        - BacktestEngine.run()'s on_time_expected_returns, whatever
+          late_entry_enabled;
+        - utils.live_late_entry_theta().
+    Both engines must compute it identically — the gate is what decides
+    whether a rotation-detected candidate is taken at all, so a divergence
+    here is a divergence in which trades exist.
 
     Logic:
         d = (p_now - p_ref) / p_ref          # drift since the anchor
         S = sum over classes of P(class) * target_multiple(class)
         return S / (1 + d) - 1
 
-    Enter iff the result exceeds execution.late_entry_min_expected_return_pct
-    — equivalently, iff S > (1 + theta) * (1 + d).
+    With θ applying, enter iff the result exceeds
+    execution.late_entry_min_expected_return_pct — equivalently, iff
+    S > (1 + theta) * (1 + d). With θ inert the late path does not run.
 
     NOT a gate on drift itself. Drift correlates POSITIVELY with model
     probability: a working model's high-probability points are the ones
@@ -118,12 +124,24 @@ def late_entry_expected_return(
 **theta is DERIVED, not guessed.**
 
 ```
-theta = Q_q({ E[r | 0] : on-time entries ACCEPTED in the baseline
-                         backtest pass })
+theta = Q_q({ E[r | 0] : the derivation's population })
       = Q_q({ S_i - 1 })          since d = 0 for an on-time entry
-
-default q = optimizer.execution_eval.late_entry_theta_quantile (0.10)
 ```
+
+The population, per derivation:
+- an execution variant: the on-time entries clearing the admission sequence
+  in its twin pass, on its own outer fold;
+- a candidate: the on-time entries clearing the admission sequence in the
+  final model's twin pass over final_val_split;
+- live: `utils.live_late_entry_theta()`'s population.
+
+q, per derivation:
+- an execution variant: its `late_entry_theta_quantile`, else
+  `optimizer.execution_eval.late_entry_theta_quantile`;
+- a candidate and live: each q of the θ quantile set, and
+  `execution.late_entry_theta_q` when set.
+
+θ reads model predictions alone, no outcome.
 
 It asks of a late entry only what an on-time entry already clears. Not
 simply `> 0`: `buy_rate` and slippage lift the real bar above zero, and a
@@ -140,17 +158,30 @@ probability vector was used only for ranking (`resolve_signal()`'s
 threshold comparisons), and here it enters an expected-value arithmetic
 directly.
 
-**Derivation is circular unless ordered**, so evaluation is two-pass: pass 1
-runs `late_entry_enabled: false` and collects the accepted on-time
-`E[r | 0]` distribution, theta is resolved from it per grid quantile, then
-passes 2..n run. See `pipeline_optimizer.md`'s `execution_eval`.
+**Derivation is circular unless ordered**: a θ-using execution variant takes
+θ from its twin — the first combination with the same keys except
+`late_entry_theta_quantile`, with `late_entry_enabled` and
+`entry_price_cap_enabled` false — whose run comes first, combinations using
+θ being sorted last. See `pipeline_optimizer.md`'s `execution_eval`.
 
-**TWO config keys, not one.**
-`execution.late_entry_min_expected_return_pct` holds the RESOLVED scalar and
-is what both engines read — live must never recompute theta at run time or
-it diverges from backtest — while
-`optimizer.execution_eval.late_entry_theta_quantile` is derivation-only and
-is read by the offline utility and the grid alone.
+**θ's config keys and its binding to a model.**
+- `execution.late_entry_min_expected_return_pct` holds the resolved θ every
+  engine reads; `execution.late_entry_theta_run_id` names the model it was
+  derived for and `execution.late_entry_theta_q` the quantile it was derived
+  at.
+- The binding: θ applies when `late_entry_min_expected_return_pct` is not
+  null and `late_entry_theta_run_id` equals the traded model's run_id — a
+  backtest's model_run_id, the session model in live; otherwise θ is inert.
+  With θ inert, the late path does not run, as with `late_entry_enabled`
+  false; backtest applies no entry price cap, and live follows
+  `live_mode.entry_price_cap_inert`. Live fixes θ's applicability at session
+  start.
+- θ comes from the candidate derivation (pipeline_optimizer.md,
+  model_candidates.late_entry_theta) or the live derivation
+  (`utils.live_late_entry_theta()`); `optimizer.execution_eval
+  .late_entry_theta_quantile` is read by the derivations and the grid.
+- Loaded-config validation: `entry_price_cap_enabled` true requires
+  `late_entry_min_expected_return_pct` and `late_entry_theta_run_id` set.
 
 ---
 
@@ -170,12 +201,7 @@ def can_enter(
     return (current_min - last_min) >= cooldown_minutes
 ```
 
-**Cooldown across session boundaries (session_mode="combined"):**
-Cooldown is applied continuously across the full time axis regardless of
-session boundaries. No cooldown reset at the pre-market/regular session boundary.
-
-**Cooldown across DATE boundaries: reset.** A different axis from the
-session rule above, and not to be conflated with it — `last_entry_hour` is
+**Cooldown across DATE boundaries: reset.** `last_entry_hour` is
 reset to `None` at every date boundary. `hour_to_minutes()` is
 minutes-since-midnight and carries no date, so a `last_entry_hour` carried
 over from a late prior-day entry makes `current_min - last_min` NEGATIVE
@@ -361,7 +387,7 @@ def check_funds_available(
     quantity: int,
     fill_price: float,
     available_cash: float,
-    use_all_cash: bool = True,
+    use_all_cash: bool,
 ) -> tuple[bool, int]:
     """
     Funds-availability gate — deliberately separate from
@@ -427,7 +453,7 @@ def check_funds_available(
         already sufficient.
 
         Otherwise (insufficient funds for the full requested quantity):
-            True (default): adjusted = floor(available_cash / fill_price)
+            True: adjusted = floor(available_cash / fill_price)
                 adjusted == 0 → (False, 0) — not even one share affordable
                 else → (True, adjusted) — proceed sized down to fit
                 available_cash exactly
@@ -455,7 +481,7 @@ execution:
                                    # not a configurable choice.
   max_positions_per_ticker:   2    # R-5: max concurrent positions on ONE
                                    # ticker. 0 = unlimited, backtest only —
-                                   # live clamps 0 to floor(max_hold_bars /
+                                   # live clamps 0 to floor(max_hold_minutes /
                                    # entry_cooldown_minutes), the largest
                                    # same-ticker stack the cooldown can admit
                                    # inside one position's maximum hold.
@@ -466,7 +492,12 @@ execution:
                                    # .max_positions, which was a single
                                    # global count and so could not express
                                    # "N positions, all on one ticker".
-  max_hold_bars:             60    # R-6: single source. Consumers are given
+  max_hold_minutes:          60    # R-6: single source. The holding limit:
+                                   # wall-clock minutes from the entry minus
+                                   # the minutes inside halt intervals —
+                                   # halts_df (the halt-interval resolver's,
+                                   # utils.md) in training and backtest,
+                                   # live_halt_episodes in live. Consumers are given
                                    # as a LIST, not a count: a count reads as
                                    # complete while a member sits outside it,
                                    # which is how the Labeler was missed.
@@ -480,24 +511,12 @@ execution:
                                    # same route: 09_backtest_engine.md and
                                    # 05_labeler.md each pass this key into
                                    # utils.md's build_effective_bar_sequence()
-                                   # as target_valid_bars, which carries no
-                                   # default of its own. A grep on this key
-                                   # therefore reaches that near-miss argument
-                                   # name from either end.
-                                   # One key serves both readings because they
-                                   # are the same quantity:
-                                   #   valid bars (build_effective_bar_sequence)
-                                   #     == elapsed minutes − halted minutes
-                                   # — that function excludes halt bars from the
-                                   # valid count and INCLUDES forward-filled
-                                   # no_trade bars, so live counting elapsed
-                                   # minutes less halted ones (from
-                                   # live_halt_episodes) lands on the same
-                                   # number backtest reaches by counting bars.
-                                   # The key NAME stays: backtest genuinely
-                                   # counts bars, and renaming would break
-                                   # R-6's single-source record without
-                                   # changing anything the key means.
+                                   # as hold_minutes, which carries no
+                                   # default of its own; that function
+                                   # returns the holding deadline instant.
+                                   # Live counts the same minutes — elapsed
+                                   # minus halted (live_halt_episodes) — so
+                                   # every engine reaches the same deadline.
   entry_cooldown_minutes:     5    # R-5/R-6: single source — can_enter()'s
                                    # cooldown_minutes for both engines.
                                    # entry_cooldown_minutes * 60 >=
@@ -514,7 +533,7 @@ execution:
                                    # carried the bare literal — the same
                                    # one-sided declaration of a value both
                                    # engines must agree on that R-6 fixed for
-                                   # max_hold_bars.
+                                   # max_hold_minutes.
                                    # RENAMED AND RE-MEANT from the former
                                    # session_close_exit_time: "155900". It is now
                                    # an OFFSET, resolved per date through
@@ -553,7 +572,7 @@ execution:
                                    # backstop poll cycles at
                                    # position_check_interval_seconds and is a
                                    # sixth of a 1-minute bar against
-                                   # max_hold_bars. It joins the guard
+                                   # max_hold_minutes. It joins the guard
                                    # constants feed_coverage_daily's density
                                    # buckets exist to resolve against data.
   ws_ticker_limit:           50    # R-7: tickers ONE WS CONNECTION can carry.
@@ -614,6 +633,12 @@ execution:
   take_profit_up3:          0.03
   stop_loss_pct:             0.03
   exit_interpolation:        true  # false = 1-minute bar only (asymmetric)
+  ambiguity_priority:  "ohlc_path"  # "up" | "dn" | "ohlc_path" — the
+                                    # priority of BacktestEngine's
+                                    # utils.AmbiguityRule, built at init and
+                                    # passed to track_price_breach()
+  ambiguity_seed:               0   # that rule's integer seed ("ohlc_path"'s
+                                    # equidistant case)
   sell_rate_tp:               0.30 # fraction of per-tick volume, take-profit exits
   sell_rate_sl:               0.15 # fraction of per-tick volume, stop-loss exits
   sell_rate_neutral:          0.15 # fraction of per-tick volume, DIRECTION-FREE
@@ -640,14 +665,12 @@ execution:
                                     # SEMANTICS SELECTOR read by BOTH engines, which
                                     # is why it sits here rather than under backtest:.
                                     # false (default): time_limit and session_end do
-                                    # NOT go through simulate_exit_fill(). Backtest
-                                    # takes the bar close / last valid bar's close;
-                                    # live writes the REFERENCE PRICE straight to
-                                    # exit_price. Those are the same number when the
-                                    # trigger falls on a bar boundary, and live has no
-                                    # bars to take a close from in any case, so on and
-                                    # off branch over the SAME anchor rather than over
-                                    # two notions of the exit moment.
+                                    # NOT go through simulate_exit_fill(): every
+                                    # engine takes the REFERENCE PRICE — the last
+                                    # print strictly before the exit instant (Exit
+                                    # Fill Simulation, below) — as exit_price, so
+                                    # on and off branch over the SAME anchor rather
+                                    # than over two notions of the exit moment.
                                     # true: both engines route those two reasons
                                     # through the simulator with the generalised
                                     # anchor and sell_rate_neutral.
@@ -696,8 +719,10 @@ execution:
                                     # a runtime override would desync live
                                     # from the backtest run that produced the
                                     # model it is trading
-  late_entry_enabled:       false  # take a rotation-detected candidate at
-                                   # p_now instead of dropping its bar. Read
+  late_entry_enabled:       false  # with θ applying, take a rotation-detected
+                                   # candidate at p_now instead of dropping
+                                   # its bar (θ inert: the late path does not
+                                   # run — Late-Entry Residual Edge). Read
                                    # by BOTH engines: backtest's
                                    # late-detection model branches on it
                                    # (09_backtest_engine.md) and live's scan
@@ -709,15 +734,18 @@ execution:
                                    # engine needs a bid/ask source for it
   late_entry_min_expected_return_pct: null
                                    # RESOLVED theta — see Late-Entry
-                                   # Residual Edge. null = the gate admits
-                                   # nothing, so late_entry_enabled: true
-                                   # with theta unset is inert rather than
-                                   # unbounded. Derived offline from a
-                                   # baseline backtest pass; never computed
-                                   # at run time by either engine.
+                                   # Residual Edge. null = θ inert: the
+                                   # late path does not run. Bound to a
+                                   # model by late_entry_theta_run_id; from
+                                   # the candidate derivation or the live
+                                   # derivation (utils.live_late_entry_theta()).
                                    # Also P_cap's θ when
                                    # entry_price_cap_enabled is true (Entry
                                    # Limit Price, below)
+  late_entry_theta_run_id:     null  # the run_id of the model θ was derived
+                                   # for; θ applies only when it equals the
+                                   # traded model's run_id
+  late_entry_theta_q:          null  # the quantile θ was derived at
   entry_order_type:      "market"  # "market" | "limit" — the CONFIGURED type;
                                     # the type an order takes is
                                     # permitted_order_type()'s (Session Phase
@@ -744,11 +772,14 @@ execution:
                                     # absolute: p_entry+value
   entry_price_cap_enabled:   false  # read by every engine. When true and the
                                     # entry's permitted order type is limit, the
-                                    # entry limit price is capped at P_cap (Entry
-                                    # Limit Price, below). Enabling requires
-                                    # late_entry_min_expected_return_pct to be
-                                    # defined — config validation rejects it
-                                    # otherwise
+                                    # entry limit price is capped at P_cap when
+                                    # θ applies; with θ inert, backtest applies
+                                    # no cap and live follows
+                                    # live_mode.entry_price_cap_inert (Entry
+                                    # Limit Price, below). Loaded-config
+                                    # validation: true requires
+                                    # late_entry_min_expected_return_pct and
+                                    # late_entry_theta_run_id set
   exit_order_type:       "market"  # "market" | "limit" — symmetric to
                                     # entry_order_type. NOT hard-fixed to
                                     # "market": an unprotected market order
@@ -777,6 +808,14 @@ execution:
   exit_ladder_cap:             1.5  # k ceiling. Bounds a runaway on malformed
                                     # or empty book data, not fill risk —
                                     # k > 1.0 rests below the bid deliberately
+  final_liquidation_minutes:    60  # the final liquidation window,
+                                    # [after_hours_end(date) −
+                                    # final_liquidation_minutes,
+                                    # after_hours_end(date)) (Exit Limit
+                                    # Pricing, below); an initial value
+                                    # pending measurement. Must be <
+                                    # after_hours_end(date) − session_close(date)
+                                    # on ordinary and early-close days
   exit_order_stuck_minutes:     10  # elapsed time since the exit anchor after
                                     # which a limit exit escalates — to market
                                     # inside the regular session, up the k
@@ -804,14 +843,15 @@ execution:
                                     # constraints are already known: 09:19
                                     # precedes the 09:20 premarket recheck
                                     # that gates quarantine, gap_pct does not
-                                    # exist until the 09:30 bar confirms, and
+                                    # exist until the first regular-session
+                                    # bar closes, and
                                     # an open-price fill has no
                                     # simulate_entry_fill() counterpart.
   # Moved from 09_backtest_engine.md's former `backtest:` block — backtest
   # and live must not carry independently-configurable copies of values
   # that are supposed to be identical between them. `backtest:` retains
   # only backtest-simulation-specific keys — see 09_backtest_engine.md's
-  # Config Keys. max_hold_bars (R-6) and entry_cooldown_minutes
+  # Config Keys. max_hold_minutes (R-6) and entry_cooldown_minutes
   # (R-5) moved here too: LiveModeRunner reads both, so neither was ever
   # backtest-simulation-specific.
 
@@ -991,7 +1031,8 @@ def exit_fill_mode(
 - the volume accumulated is that of the ticks the order could fill on — every
   tick for market, the ticks the limit rule below lets fill for a limit;
 - each increment fills at that tick's time;
-- ticks inside a halt interval (`halts_df`) are skipped.
+- ticks inside a halt interval (`halts_df`, the halt-interval resolver's
+  intervals — utils.md) are skipped.
 
 **Increment price, by order type:**
 - market, entry or exit: the tick's price;
@@ -1236,6 +1277,7 @@ The vendor permits order types by session phase:
 | Premarket 04:00 – regular open | yes | no |
 | Regular regular open – `session_close` | yes | yes |
 | After-hours `session_close` – `after_hours_end` | yes | no |
+| Closed — outside [04:00, `after_hours_end`) | no | no |
 
 **The boundaries are PER DATE**, resolved through the named accessors in
 `utils.md`'s Session Boundary Derivations — `session_close(date)` for the
@@ -1265,9 +1307,11 @@ def permitted_order_type(side: str, configured_type: str, phase: str) -> str:
         side:            'buy' | 'sell'
         configured_type: 'market' | 'limit' — execution.entry_order_type or
                          exit_order_type, or an escalation's 'market'
-        phase:           'premarket' | 'regular' | 'after_hours' — the
-                         instant's row of the table above, against that
-                         date's boundaries
+        phase:           'premarket' | 'regular' | 'after_hours' |
+                         'closed' — utils.session_phase()'s result for the
+                         instant, the table above's row
+    Raises on phase 'closed': a submission site submits nothing at 'closed'
+    and retries at its next cycle.
     A configured market entry forced to limit takes the Entry Limit Price
     rule (below), in BacktestEngine and live alike.
     """
@@ -1344,8 +1388,12 @@ included — in BacktestEngine and live alike:
 - the entry_gap-derived limit: `p_entry × (1 + entry_gap_value)` for
   "percentage", `p_entry + entry_gap_value` for "absolute", rounded down to
   `tick(price)`;
-- when `execution.entry_price_cap_enabled` is true, the limit is
-  min(the entry_gap-derived limit, P_cap):
+- when `execution.entry_price_cap_enabled` is true and θ applies (Late-Entry
+  Residual Edge's binding), the limit is min(the entry_gap-derived limit,
+  P_cap); with θ inert, backtest applies no cap and live follows
+  `live_mode.entry_price_cap_inert` — "uncapped": the entry_gap-derived
+  limit; "refuse": a limit entry is not submitted, gate_result 'cap_inert',
+  a market entry unaffected:
   - P_cap = p_entry × S / (1 + θ), rounded down to `tick(price)`;
   - S: `late_entry_expected_return()`'s probability-weighted target
     multiple, from the signal's inference;
@@ -1394,6 +1442,7 @@ re-quoted every `live_mode.position_check_interval_seconds`:
   - `exit_ladder_increment`;
   - `exit_ladder_cap`;
   - `exit_order_stuck_minutes`;
+  - `final_liquidation_minutes`;
 - live prices against the observed `ask1` / `bid1` (live_mode_runner.md);
 - BacktestEngine has no bid/ask and prices L = m × (1 + s × (½ − k)),
   rounded up to `tick(price)` — m the close of the last bundle sealed
@@ -1405,6 +1454,24 @@ A limit ladder serves any exit remainder proceeding as limit (Session Phase
 and Order Types):
 - a configured limit exit;
 - a market remainder switched at a phase boundary.
+
+**The final liquidation window**, [after_hours_end(date) −
+`execution.final_liquidation_minutes`, after_hours_end(date)):
+- inside it every exit remainder proceeding as limit is re-priced at
+  k = max(its current k, 1.0) at the window's first re-quote, then advances
+  by `exit_ladder_increment` at each re-quote up to `exit_ladder_cap`,
+  regardless of `exit_order_stuck_minutes`;
+- it applies in every engine:
+  - live, in every live session, the reduced session included;
+  - shadow;
+  - BacktestEngine;
+- `final_liquidation_minutes` joins the ladder keys every engine reads;
+- it opens no exit past an existing gate:
+  - the event-day exit gate;
+  - the exit_submission freeze;
+  - a halted position;
+  - an unmapped ticker;
+- `live_mode.exit_reject_retry_seconds` is unchanged inside it.
 
 ---
 
@@ -1475,9 +1542,10 @@ Normalisation and fallback:
   funds-availability gate uses a running/decrementing or freshly-queried value
 - `per_ticker_share_cap_pct` and `exposure_cap_pct` default to 0 (disabled) —
   at default config, behavior is identical to the pre-existing cash/vol-only sizing
-- `check_funds_available()`'s `use_all_cash` defaults to `True` — the default
-  behavior sizes a trade down to fit remaining cash rather than skipping it
-  outright; set `False` to restore the older all-or-nothing behavior
+- `check_funds_available()`'s `use_all_cash` has no default — callers pass
+  `execution.use_all_cash`; true sizes a trade down to fit remaining cash
+  rather than skipping it outright, false restores the older all-or-nothing
+  behavior
 - A quantity reduced by `use_all_cash` does NOT re-enter
   `compute_position_size()`'s caps. All four sizing terms are monotone in
   quantity and combined by `min()`, and `margin_of()` is linear in quantity
@@ -1485,7 +1553,8 @@ Normalisation and fallback:
   returned `quantity` satisfies all four by construction. Sizing sets the
   ceiling; the gate only lowers it. Stated because nothing said so before
   and a reader had to derive it
-- `p_entry`'s three roles SPLIT when `late_entry_enabled` is true, having
+- `p_entry`'s three roles SPLIT when `late_entry_enabled` is true with θ
+  applying, having
   coincided until now. As the `entry_points` primary-key component and
   detection record: t-bar open, UNCHANGED. As the label anchor in
   `labeled_samples`: t-bar open, UNCHANGED — moving it would redefine past
@@ -1527,8 +1596,8 @@ Normalisation and fallback:
   depend on the CURRENT contents of a table unrelated to the dates being
   simulated (non-deterministic re-runs of the "same" backtest, and
   systematic contamination of any backtest window that overlaps a
-  currently-suspended ticker — most relevant for P-12's live-vs-backtest
-  divergence check, since "recent" and "current" nearly coincide there).
+  currently-suspended ticker — most relevant for the shadow-period-end
+  comparison, since "recent" and "current" nearly coincide there).
   More fundamentally: both suspend reasons exist to hedge LIVE, real-time
   uncertainty about information a backtest already has resolved by the
   time anyone runs it (was this really a rename? was this really an

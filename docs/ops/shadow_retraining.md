@@ -385,61 +385,113 @@ fills.
 Two independent triggers, whichever fires first:
 
 **Calendar trigger** — `optimizer.refresh.calendar_cadence_days` (config,
-default 30 / monthly-level). Dispatches to PipelineOptimizer's `"full"`
-phase: existing hyperparameters and `selected_features.json` retained,
-model refit on data extended through the current date. Deliberately
-lightweight — a routine refresh is not expected to need a fresh
-hyperparameter search every cycle.
+default 30 / monthly-level). Dispatches to PipelineOptimizer's `"refit"`
+phase: the deployed model's retained configuration — its feature_config and
+feature_names (pipeline_optimizer.md's Retained configuration) — refit on
+data extended through the current date; with no retained configuration, the
+dispatch is `"exploitation"`. Deliberately lightweight — a routine refresh is
+not expected to need a fresh hyperparameter search every cycle.
 
-**Divergence trigger** — live rolling winning rate compared against a
-backtest-derived confidence interval, evaluated on a **calendar-week**
-window (Monday-start, a week with fewer than 3 trading days is excluded —
+**Divergence trigger** — the deployed model R's live winning rate, R the
+run_id of model_deployments' latest row, compared with its work's backtest
+through utils.md's `divergence_check()`, evaluated weekly on **calendar
+weeks** (Monday-start, a week with fewer than 3 trading days is excluded —
 reusing `ClassBalancer.generate_folds()`'s existing week-boundary
 convention rather than introducing a second, differently-behaved
 definition of "week" into the project):
+- the window: R's trades in the last
+  `optimizer.refresh.divergence.window_weeks` completed calendar weeks — a
+  calendar week is completed when its last trading day is on or before the
+  evaluation date — being `trade_log` rows that:
+  - match a `live_session_state` row of R by (run_id, date);
+  - have signal not NULL;
+  - have is_shadow FALSE;
+- the reference: the 'outer_validation' runs with execution_variant NULL of
+  R's work;
+- 'not_applicable', decided before `divergence_check()`: the window holds no
+  session of R (Probation after a deployment, below) at stage 'pilot' or
+  'scale';
+- the trigger fires on `divergence_check()`'s 'adverse' alone;
+- the trigger does not fire:
+  - during R's probation;
+  - when a pipeline_optimizer work not superseded carries the last completed
+    week as its divergence week in its tool snapshots (guest_supervisor.md's
+    read of the works carrying a given divergence week);
+  - while an 'awaiting_approval' candidate exists whose phase is the variant
+    the divergence would dispatch.
 
-```
-For the most recently completed calendar week:
-    live_winning_rate = trade_log winning rate for that week (is_shadow=FALSE)
-    backtest_ci = bootstrap-resampled CI of winning rate over an
-                  equivalent-length backtest window, using the currently
-                  deployed model — computed by utils.bootstrap_ci() with
-                  the optimizer.bootstrap keys (confidence 0.95); the
-                  resampling unit this trigger passes is undecided
-                  (open_items.md)
-    live_winning_rate outside backtest_ci → divergence flag for that week
-```
+This is the same computation `health_report.md`'s finding 6 uses —
+implemented once in `divergence_check()`, not duplicated; finding 6 is
+defined there and reported at the evening end of its week's last trading
+day.
 
-This is the same computation `health_report.md`'s divergence finding uses
-(see that doc's `gather_findings()` placeholder) — implemented once, read
-by both the per-session alert and the retraining trigger, not duplicated.
-
-If a divergence flag fires: `optimizer.refresh.divergence_reoptimize`
+If the divergence trigger fires: `optimizer.refresh.divergence_reoptimize`
 (config, default `true`) dispatches to PipelineOptimizer's `"exploitation"`
-phase instead of `"full"` — a severe enough live/backtest mismatch is
+phase instead of `"refit"` — an adverse live/backtest mismatch is
 treated as grounds for a fresh hyperparameter search, not just a data
 refresh, on the theory that the existing hyperparameters may no longer fit
 the current market regime.
 
-**The refresh run** — `optimizer.phase: "refresh"`, launched as
-`run_guest pipeline_optimizer --trigger scheduled` (pipeline_optimizer.md's
-Work):
-- it decides the dispatched phase (`'full'` or `'exploitation'`) before
-  opening its work;
-- it first looks for the tool's unfinished work: one whose config_hash
-  matches the current config's under `'full'` or under `'exploitation'` is
-  resolved by guest_supervisor.md's new-run resolution under that phase; one
-  matching no phase's hash refuses the run, the triggers not evaluated;
+**The refresh run** — the phase `'refresh'`, given by `--phase refresh`,
+launched by metadata_crawler.md's dispatcher at `optimizer.refresh.schedule`
+as `run_guest pipeline_optimizer --phase refresh --trigger scheduled`
+(pipeline_optimizer.md's Work):
+- it decides the dispatched phase before opening its work:
+  - the divergence trigger fired and `divergence_reoptimize` is true →
+    `'exploitation'`;
+  - otherwise, a fired trigger → `'refit'`;
+  - `'refit'` with no retained configuration → `'exploitation'`;
+- in one unit, which also reads the retained configuration, it first looks
+  for the tool's unfinished work, a work whose code_versions differ from the
+  lock's turning superseded first (guest_supervisor.md's Code Versions of a
+  Work):
+  - held by a live run that the refresh run would have resumed — its
+    config_hash matches the current config's under `'refit'` or
+    `'exploitation'` → the run ends `'normal'` without evaluating the
+    triggers and without a refusal;
+  - held by a live run otherwise → a scheduled refusal;
+  - not held: one whose config_hash matches the current config's under
+    `'refit'` or under `'exploitation'` — with no retained configuration,
+    under `'exploitation'` alone — is resolved by guest_supervisor.md's
+    new-run resolution under that phase; one matching no phase's hash
+    refuses the run, the triggers not evaluated;
 - with no unfinished work, it evaluates the calendar and divergence triggers
-  in one unit; no trigger firing ends the run `'normal'` without a work;
+  in that unit; no trigger firing ends the run `'normal'` without a work;
 - the calendar trigger's last refit is the `updated_at` of the latest
-  pipeline_optimizer work row closed `'done'` whose variant is `'full'` or
+  pipeline_optimizer work row closed `'done'` whose variant is `'refit'` or
   `'exploitation'` (guest_supervisor.md's work records; a closed row is not
   updated again); these do not satisfy the cadence:
   - a refused run;
   - a superseded work;
   - a halted work;
 - a `--resume-work` run skips the trigger evaluation.
+
+**Promotion** — a candidate, in this order:
+1. is written by the optimizer (pipeline_optimizer.md's Model Candidate);
+2. is reported in the evening end report (health_report.md);
+3. is approved by the operator through model_deploy (model_deploy.md);
+4. takes effect at the next session start under the current stage.
+
+**Probation after a deployment** — a session of R is a date whose
+`live_session_state.run_id` is R and whose
+`session_diagnostics.start_outcomes` holds an entry of kind
+'participating'; a date whose session_diagnostics is NULL or holds no such
+entry is not one. Probation of a deployed run_id R:
+- the first `optimizer.promotion.probation_sessions` sessions of R after R's
+  latest model_deployments row, whatever its action;
+- observations: `trade_log` rows, counted as total_trades counts, that have
+  (run_id, date) of such a session, signal not NULL, and is_shadow matching
+  the session's stage;
+- reference: the 'outer_validation' runs with execution_variant NULL of R's
+  work;
+- computation: finding 6's divergence computation (`divergence_check()`)
+  over the window since R's latest deployment row, evaluated at each evening
+  end gather during probation, cumulative; results 'adverse', 'within' or
+  'insufficient_sample';
+- the last probation session with 'within' is shown as probation completed;
+- during R's probation the divergence retraining trigger is not evaluated
+  for R;
+- a rollback stays the operator's decision.
 
 ---
 
@@ -520,7 +572,9 @@ wall-clock America/New_York times, which observe DST:
   `live_mode.session_hard_exit_offset_minutes` is subtracted, and so ONE
   entry here rather than two;
 - 21:00 ET evening batch run, `coordination.schedule.evening.time`;
-- 23:30 ET `coordination.schedule.evening.deadline`.
+- 23:30 ET `coordination.schedule.evening.deadline`;
+- 23:40 ET the scheduled refresh run's launch by the dispatcher,
+  `optimizer.refresh.schedule` (pipeline_optimizer.md's Refresh run).
 
 The set above is every wall-clock time the system schedules or gates
 behaviour against, whatever the mechanism:
@@ -576,7 +630,11 @@ comparison described above — an entry is compared against its authority:
   also copies `coordination.sqlite` to `backup_dir` as
   `coordination_YYYYMMDD.sqlite` (db_coordination.md's `backup_store()`),
   and beside it `resume.sqlite` as `resume_YYYYMMDD.sqlite`
-  (guest_supervisor.md's `backup_resume_store()`).
+  (guest_supervisor.md's `backup_resume_store()`), and the artifact files of
+  every run_id named by a model_deployments row or by an
+  'awaiting_approval' candidate to `backup_dir/models/{run_id}/` when that
+  copy is absent — a copy made once and never replaced; a failed copy is
+  counted in the stage's SUMMARY line and does not fail the database backup.
 - Retention: follows the posture the table purge registry takes — nightly
   copies are kept without limit until an operator sets a window against
   observed disk growth, so nothing is deleted by default and the growth is
@@ -605,4 +663,6 @@ comparison described above — an entry is compared against its authority:
     any work's run is alive: it moves the unreadable store aside and copies
     the backup in; known results:
     - a 'self_terminated' end of a run that opened a work after the backup
-      may be reported by health_report.md's finding 11.
+      may be reported by health_report.md's finding 11;
+  - model artifacts — a missing artifact directory is copied from
+    `backup_dir/models/{run_id}/`.

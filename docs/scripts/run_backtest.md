@@ -11,22 +11,29 @@ Loads test data, applies model predictions, runs BacktestEngine,
 writes results to trade_log and experiment_log tables.
 
 `run_backtest.py` is the **sole writer** of the `experiment_log` table.
-Called by PipelineOptimizer after the exploitation/full phase completes
+Called by PipelineOptimizer after the exploitation, refit or full phase completes
 and the best trial or consensus config is selected. Also runnable standalone.
 
 ---
 
 ## Input / Output
 
-**DB access role.** A per-run guest (db_schema.md's DB File Ownership Windows;
-db_coordination.md's Unit scope), run through guest_supervisor.md's
+**DB access role.** A per-chunk guest (db_schema.md's DB File Ownership
+Windows; db_coordination.md's Unit scope), run through guest_supervisor.md's
 `run_guest`:
 - `run_guest run_backtest` enters
-  `register('guest', 'run_backtest', trigger)` and opens one
-  `guest_unit('run_backtest', None)` around the body, which waits for admission
-  without limit;
-- the body is handed that unit's connection, passed wherever this tool
-  takes `db_conn`, and calls neither `register()` nor `guest_unit()`;
+  `register('guest', 'run_backtest', trigger)` and hands the body a unit
+  opener, each call opening one `guest_unit('run_backtest', None)`, which
+  waits for admission without limit;
+- the body's units:
+  - its first unit — rate resolution, the run_id check and the run's
+    source_changes mark (Pipeline Steps 1a, 1b);
+  - the units BacktestEngine opens through the unit opener as its connection
+    provider — one per ticker preload, and one for its trading_calendar read
+    (09_backtest_engine.md's DB Access Strategy);
+  - its final-write unit (Pipeline Steps 10, 11);
+- the simulation runs outside units;
+- the body calls neither `register()` nor `guest_unit()`;
 - `scripts/run_backtest.py` run directly hands over to
   `run_guest run_backtest`;
 - while an owner waits past `coordination.guest_max_hold_seconds`, the run
@@ -41,6 +48,7 @@ model_dir: Path | None  # directory containing trained model artifacts (optional
 **Output:**
 ```python
 # Printed to stdout:
+#   - quarantine.data_caveats entries, when any
 #   - Total trades, winning trades, winning rate
 #   - Avg PnL, total PnL, avg slippage
 #   - Dead position count and rate
@@ -48,6 +56,7 @@ model_dir: Path | None  # directory containing trained model artifacts (optional
 #   - Trade breakdown by signal and exit reason
 #   - Label base rates (from test_df directly)
 #   - Dead position case distribution (from test_df)
+#   - The input-change count, when non-zero (Input Change)
 
 # Written to DuckDB:
 #   - trade_log table: individual trade records
@@ -58,42 +67,67 @@ model_dir: Path | None  # directory containing trained model artifacts (optional
 
 ```
 1. Load config from pipeline_config.yaml
-1a. Rate resolution — at the start of run_backtest's body as run_guest runs
-    it: execution_common.md's resolve_rates() resolves every (rate, order
-    type) pair, overlays the in-memory config (Rate Overlay) and returns the
-    rate_sources map passed to the Backtester; the resolved values and their
-    source are logged. A Backtester PipelineOptimizer builds receives its
-    work's rates, resolved at work creation (pipeline_optimizer.md's Work)
-2. Load test_features.parquet from data/processed/ (or accept in-memory DataFrame)
+1a. Rate resolution — in run_backtest's first unit: execution_common.md's
+    resolve_rates() resolves every (rate, order type) pair, overlays the
+    in-memory config (Rate Overlay) and returns the rate_sources map passed
+    to the Backtester; the resolved values and their source are logged. A
+    Backtester PipelineOptimizer builds receives its work's rates, resolved
+    at work creation (pipeline_optimizer.md's Work)
+1b. In the same unit: the run_id check — run_id already in experiment_log
+    raises an error, nothing run — and the run's mark (Input Change, below)
+2. Load test_features.parquet from the data directory (--data-dir;
+   data_paths.processed_dir by default) (or accept in-memory DataFrame)
 3. Determine feature column names (exclude labels, identifiers, metadata columns)
    Metadata columns excluded from features: is_dead_position, dead_position_case, is_ambiguous
 4. Resolve model source and build predictions DataFrame:
    a. If model_dir is explicitly provided (non-None):
-      → load from model_dir / run_id
+      → load from model_dir / model_run_id
    b. Elif config["model"]["model_dir"] exists and is non-empty:
       → model_dir = Path(config["model"]["model_dir"])
-      → load from config model_dir / run_id
+      → load from config model_dir / model_run_id
       (covers optimizer-called context where model_dir=None but artifacts were saved by Trainer)
    c. Else (pre-computed probabilities — pure standalone path):
       → Use test_df columns directly (prob_* and label_* must exist)
 
    For paths (a) and (b):
-      model = create_model(config); models, meta = model.load(run_id)
+      model = create_model(config); models, meta = model.load(model_run_id)
       probs_df = model.predict(models, X_test)
       Build predictions DataFrame (ticker, date, hour, p_entry, probs, labels)
-5. Instantiate BacktestEngine(config, db_conn)
-6. trade_log, summary = engine.run(predictions)
+5. Instantiate BacktestEngine(config, provider) — the Backtester's connection
+   provider: run_backtest's unit opener, or the one PipelineOptimizer passes
+   (09_backtest_engine.md's DB Access Strategy)
+6. trade_log, summary, on_time_expected_returns = engine.run(predictions)
 7. Compute label base rates from test_df:
        base_rates = {label: test_df[f"label_{label}"].mean() for label in LABELS}
 8. Compute dead position case distribution from test_df:
        dead_case_dist = test_df[test_df["is_dead_position"]]["dead_position_case"].value_counts()
 9. Print results to stdout
-10. Write trade_log to DuckDB trade_log table — simulated prices pass V1
-        into its DECIMAL price columns (utils.md's Numeric Rules)
-11. Write experiment_log row to DuckDB — full field list in
-        "experiment_log Write" below (kept 1:1 with summary_dict; see
-        Constraints)
+10. Backtester.run() returns its result and writes nothing (Class
+    Interface); in run_backtest's final-write unit, one transaction,
+    Backtester.write(conn, result), issuing no commit:
+    a. checks run_id against experiment_log;
+    b. inserts the trade_log rows — simulated prices pass V1 into its
+       DECIMAL price columns (utils.md's Numeric Rules);
+    c. inserts the experiment_log row — full field list in
+       "experiment_log Write" below (kept 1:1 with summary_dict; see
+       Constraints)
+11. In the same unit, the input-change count (Input Change, below); a
+    non-zero count is printed after the commit (Output Format)
 ```
+
+---
+
+## Input Change
+
+A run_backtest run reads across units, so its input can change between
+them:
+- its first unit records the run's mark, the highest `source_changes` seq;
+- its final-write unit counts the `source_changes` rows with a higher seq
+  that intersect the run's read set:
+  - `source` one of the tables it read;
+  - `ticker` NULL or a symbol of the chains it read;
+  - `date_from`–`date_to`, a NULL end open, holding a date it read;
+- its printed summary flags a non-zero count with the count.
 
 ---
 
@@ -104,7 +138,7 @@ class Backtester:
     def __init__(
         self,
         config: dict,
-        db_conn: duckdb.DuckDBPyConnection,
+        provider,
         optimizer_run_id: str | None = None,
         *,
         rate_sources: dict,
@@ -122,14 +156,21 @@ class Backtester:
         fold_test_days:  int | None = None,
         eval_type:       str | None = None,
         execution_variant: str | None = None,
+        model_run_id:    str | None = None,
     ) -> dict:
         """
-        Run backtest, write trade_log and experiment_log.
-        Returns summary dict.
+        Run backtest and return its result; writes nothing (write(), below).
+        Returns:
+            "summary":                  dict          — BacktestEngine's summary_dict
+            "experiment_log_row":       dict          — built here (experiment_log Write)
+            "trade_log":                pd.DataFrame  — the trade_log rows
+            "on_time_expected_returns": list[float]   — BacktestEngine.run()'s
+                                                        (09_backtest_engine.md)
 
         Args:
             test_df:         test split DataFrame
-            run_id:          matches the train_log run_id for this backtest
+            run_id:          names the experiment_log row (and the model, when
+                             model_run_id is None)
             model_dir:       directory containing model artifacts.
                              Resolution order:
                                1. model_dir if explicitly provided (non-None)
@@ -148,17 +189,40 @@ class Backtester:
             eval_type:       None               → standard backtest (standalone or non-nested)
                              "outer_validation" → nested validation outer fold evaluation
                              "regime_holdout"   → regime holdout robustness check
-            execution_variant: JSON of the execution-key overrides this run
-                             was given, or None for the baseline. Set by
+                             "champion_validation" → champion outer evaluation
+                                                  (pipeline_optimizer.md)
+            execution_variant: JSON of the execution-variant combination's
+                             keys alone — θ's keys, set in the run's config,
+                             are not in it — or None for the baseline. Set by
                              PipelineOptimizer's execution_eval loop; always
                              None from the CLI. An IDENTIFIER, not a metric —
                              see Constraints on why it sits outside the 1:1
                              rule.
+            model_run_id:    the run_id of the model loaded, and the traded
+                             model's run_id θ binds to (execution_common.md);
+                             None → run_id. The execution variants pass their
+                             outer eval's run_id (pipeline_optimizer.md).
 
         optimizer_run_id passed via constructor (None for standalone).
+        provider passed via constructor: the connection provider handed to
+        BacktestEngine — run_backtest's unit opener, or the one
+        PipelineOptimizer passes (09_backtest_engine.md's DB Access Strategy).
         rate_sources passed via constructor: a resolve_rates() map
         (execution_common.md) — run_backtest's body's own, or the
         PipelineOptimizer work's rate_snapshot.
+        """
+        ...
+
+    def write(self, conn: duckdb.DuckDBPyConnection, result: dict) -> None:
+        """
+        Writes run()'s result on conn, issuing no commit:
+          - checks result's run_id against experiment_log — present raises
+            an error, nothing written;
+          - inserts the trade_log rows, their prices passing V1 (utils.md's
+            Numeric Rules);
+          - inserts the experiment_log row.
+        Called in run_backtest's final-write unit, or by PipelineOptimizer's
+        coordinator in the step's write unit (pipeline_optimizer.md).
         """
         ...
 ```
@@ -173,7 +237,8 @@ run_guest run_backtest [OPTIONS]
 
 Options:
     --config, -c        Path to pipeline_config.yaml (default: configs/pipeline_config.yaml)
-    --data-dir, -d      Directory containing test_features.parquet (default: data/processed)
+    --data-dir, -d      Directory containing test_features.parquet (default: None,
+                        meaning data_paths.processed_dir)
     --model-dir, -m     Directory containing trained model artifacts (optional)
     --run-id            Explicit run ID (default: YYYYMMDD_HHMMSS via utils.generate_run_id())
 ```
@@ -181,7 +246,7 @@ Options:
 CLI always runs with:
 ```
 optimizer_run_id=None, fold_idx=-1, outer_fold_idx=-1,
-eval_type=None, execution_variant=None (standalone mode),
+eval_type=None, execution_variant=None, model_run_id=None (standalone mode),
 rate_sources=<its own resolve_rates() map>
 ```
 
@@ -200,7 +265,8 @@ experiment_log_row = {
     "fold_idx":             fold_idx,            # -1 if standalone/outer eval
     "outer_fold_idx":       outer_fold_idx,      # -1 if non-nested
     "eval_type":            eval_type,           # None | "outer_validation" |
-                                                 # "regime_holdout"
+                                                 # "regime_holdout" |
+                                                 # "champion_validation"
     "execution_variant":    execution_variant,   # None = baseline pass
     "entry_fill_rate_disabled": config["backtest"]["entry_fill_rate_disabled"],
     "exit_fill_rate_disabled":  config["backtest"]["exit_fill_rate_disabled"],
@@ -222,6 +288,7 @@ experiment_log_row = {
     "dead_position_count":  summary["dead_position_count"],
     "dead_position_rate":   summary["dead_position_rate"],
     "suppressed_count":     summary["suppressed_count"],
+    "gate_blocked_residual_edge":   summary["gate_blocked_residual_edge"],
     "gate_blocked_cap_tickers":     summary["gate_blocked_cap_tickers"],
     "gate_blocked_cap_per_ticker":  summary["gate_blocked_cap_per_ticker"],
     "gate_blocked_cooldown":        summary["gate_blocked_cooldown"],
@@ -251,6 +318,10 @@ from `test_df["date"].min()`, `.max()` and `.nunique()`.
 BACKTEST RESULTS
 ============================================================
 
+Data caveats:                    # quarantine.data_caveats entries, one per
+  - <entry>                      # line (migration_tool.md); with none, no
+                                 # block
+
 Total trades:        1234        # opened trades only — never-opened rows
                                  # (db_schema.md's trade_log.exit_reason
                                  # values, never-opened family) are
@@ -264,6 +335,7 @@ Dead positions:      12  (0.97%)
 Suppressed entries:  45
 
 --- Entries Blocked at Gates ---
+  residual_edge:             7   # late-detection candidates dropped, θ applying
   max_tickers:              31
   max_positions_per_ticker: 12
   cooldown:                 88
@@ -307,6 +379,9 @@ Suppressed entries:  45
 Run ID: 20250715_143022
 Fold:   -1 (standalone)
 Elapsed: 45.2s
+Input changed: 3 source_changes rows since the run's mark
+                                 # printed after the commit, only when
+                                 # non-zero (Input Change)
 ```
 
 ---
@@ -346,7 +421,7 @@ Elapsed: 45.2s
   `init_db.md`'s class 2 — re-transcribe, then `ALTER TABLE ... ADD COLUMN`
   by hand; plain init will not do it
 - `summary_dict`'s key set and `experiment_log`'s metric columns are 1:1 —
-  every key BacktestEngine's `run()` returns has a matching column here,
+  every `summary_dict` key has a matching column here,
   and every metric column here is sourced from a `summary_dict` key. A name
   on only one side is a defect, not a style choice; this single rule
   replaces enumerating each metric's "must be present" individually as the
@@ -357,10 +432,13 @@ Elapsed: 45.2s
   - `negative_cash_count`
 - The `gate_blocked_*` and `breaker_*` metrics are diagnostic only —
   `PipelineOptimizer.best_config()` ranks on `winning_rate` and never reads
-  them. `best_execution_variant()` DOES rank on a metric column
-  (`avg_pnl_pct`), but only across rows sharing an `optimizer_run_id` and an
-  outer fold, so it compares execution variants rather than model configs
-  and does not change what `best_config()` selects. The gate counters exist so a run whose edge was capped out is
+  them. `best_execution_variant()` DOES rank on experiment_log metrics —
+  within one `optimizer_run_id`, per `execution_variant`, the mean over the
+  outer folds whose execution variants step is done of the fold's
+  `optimizer.execution_eval.rank_metric` value (`"sum_pnl_pct"` by default:
+  `avg_pnl_pct` × `total_trades`, 0 with no trade; or a metric column) — so
+  it compares execution variants rather than model configs and does not
+  change what `best_config()` selects. The gate counters exist so a run whose edge was capped out is
   distinguishable from one that simply produced few signals, which
   `winning_rate` alone cannot show; the breaker metrics exist so Pilot has
   real distributions to calibrate `execution.intraday_loss_limit_pct` /
@@ -385,12 +463,14 @@ Elapsed: 45.2s
   pre-computed prob_* columns in test_df; path (c) requires prob_* columns to exist
 - PipelineOptimizer calls `backtester.run()` with `model_dir=None` — the config fallback
   path (b) ensures artifacts saved by Trainer are correctly located at inference time
-- Rate resolution runs at the start of run_backtest's body only:
+- Rate resolution runs in run_backtest's first unit only:
   `Backtester.run()` called by PipelineOptimizer receives its work's
   resolved config and does not resolve
-- Calls neither `register()` nor `guest_unit()` — `run_guest` opens its unit
-- Built by PipelineOptimizer per step on that step's connection; Backtester
-  issues no commit of its own, its INSERTs committed with the step
+- Calls neither `register()` nor `guest_unit()` — the body opens its units
+  through the unit opener `run_guest` hands it
+- Built by PipelineOptimizer per step, the unit opener its connection
+  provider (guest_supervisor.md's step helpers); `run()` writes nothing, the
+  coordinator calling `write()` in the step's write unit
   (pipeline_optimizer.md's Work)
 - An exact replay of a run from its `experiment_log` row assumes the market
   data and `corporate_events` rows it read are unchanged since the run

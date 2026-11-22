@@ -29,10 +29,10 @@ ticks_df: pd.DataFrame
     # filtered internally per entry point (hour >= t_hour)
 
 halts_df: pd.DataFrame
-    columns: [ticker, date, halt_start, halt_end, reason_code]
-    # trading_halts table rows for this ticker-date; a row whose halt_end is
-    # NULL covers every slot of that date from its halt_start on
-    # (db_schema.md's trading_halts.halt_end)
+    columns: [start, end, reason_code, inferred]
+    # the halt-interval resolver's intervals for this ticker-date (utils.md's
+    # halt_intervals()); an interval whose end is NULL covers that date from
+    # its start on
 
 trading_calendar: pd.DataFrame
     columns: [date, is_trading_day, session_close, after_hours_end, has_data]
@@ -100,7 +100,9 @@ Bundle-level detection is more precise — tick_10 spans sub-minute windows,
 reducing the false-ambiguity rate from bar-level high/low comparisons.
 
 When ambiguity detected:
-    → ambiguity_priority determines breach direction ("up" or "dn")
+    → the Labeler's utils.AmbiguityRule — built at init from
+      labeler.ambiguity_priority ("up" | "dn"), no seed — decides the breach
+      direction
     → is_ambiguous = True on output row
     → Label is still assigned (not skipped)
 ```
@@ -155,22 +157,17 @@ ticks_from_t = ticks_df filtered to hour >= t_hour, sorted by (hour, seq_id)
 --- Step 1: Build effective bar sequence ---
 
 Use build_effective_bar_sequence() from utils.py, passing
-execution.max_hold_bars as its target_valid_bars and the {date: session_close}
-map as its closes. Neither has a default there: the cap is config's, and the
-boundary is the calendar's.
-Collect bars from t onward for this (ticker, date).
-Collection stops at whichever comes first:
-    - execution.max_hold_bars valid (non-halt) bars collected, or
-    - last_bar(date) reached
-After-market bars (hour > last_bar(date)) are never included.
-
-Halt classification applies across all time periods (pre/regular/after-market).
-
-For each missing bar slot up to last_bar(date):
-    if slot overlaps halt interval in halts_df → "halt" (excluded from valid count;
-                                                  a NULL halt_end covers the
-                                                  date from halt_start on)
-    else                                        → "no_trade" (OHLC = prior close, volume=0)
+execution.max_hold_minutes as its hold_minutes and the {date: session_close}
+map as its closes. Neither has a default there: the limit is config's, and the
+boundary is the calendar's. It returns the holding deadline — the instant
+execution.max_hold_minutes minutes after t, the minutes inside halts_df's
+intervals excluded — and the existing bars from t up to it.
+Collection runs to whichever comes first:
+    - the holding deadline, or
+    - last_bar(date)
+After-market bars (hour > last_bar(date)) are never included. A minute
+without a bar has none created; halts apply across all time periods
+(pre/regular/after-market).
 
 --- Step 2: Breach detection via track_label_breach() ---
 
@@ -182,7 +179,8 @@ label_direction, is_ambiguous = utils.track_label_breach(
     threshold_3pp      = config["labeler"]["threshold_3pp"],
     threshold_5pp      = config["labeler"]["threshold_5pp"],
     exit_interpolation = config["labeler"]["exit_interpolation"],
-    ambiguity_priority = config["labeler"]["ambiguity_priority"],
+    ambiguity          = self._ambiguity_rule,     # AmbiguityRule from
+                                                  # labeler.ambiguity_priority
 )
 
 if label_direction is not None:
@@ -198,14 +196,14 @@ else:
 Triggered when track_label_breach() returns None (no ±3pp breach).
 Exit path determined by which condition terminated Step 1:
 
-    Case A — time-limit exit (execution.max_hold_bars valid bars collected before last_bar(date) reached):
-        exit_price = close of last valid bar in effective_bars
+    Case A — time-limit exit (the holding deadline comes before last_bar(date)):
+        exit_price = close of the last existing bar before the deadline
         pnl = (exit_price - P_entry) / P_entry
         apply label by pnl threshold (same rules as Case B below)
         → no after-market fallback; no dead position
 
-    Case B — session close exit (last_bar(date) reached within execution.max_hold_bars valid bars):
-        exit_price = last_bar(date) close
+    Case B — session close exit (last_bar(date) comes before the holding deadline):
+        exit_price = close of the last existing bar at or before last_bar(date)
         # last_bar(), not exit_deadline(): Case B is not an exit POLICY but the
         # terminal condition of Step 1's collection, so it must land where
         # collection stopped. BacktestEngine's session-close exit IS a policy
@@ -215,7 +213,8 @@ Exit path determined by which condition terminated Step 1:
         # computes pnl from its own fills — but the observation window and the
         # exit instant then differ by nine minutes.
 
-        if last_bar(date) is halt or no_data:
+        if last_bar(date)'s minute lies inside a halt interval or the date
+        has no data:
             fallback: first tick_10 row with hour > last_bar(date) (after-market)
             if no after-market tick: → Dead position (Step 4)
 
@@ -230,11 +229,14 @@ Exit path determined by which condition terminated Step 1:
 --- Step 4: Dead position ---
 
 Dead position occurs only when:
-    - Session close exit price cannot be determined (last_bar(date) halt + no after-market data)
+    - Session close exit price cannot be determined (last_bar(date)'s minute
+      inside a halt interval or no data, and no after-market data)
     - Triggered from Step 3 Case B only — time-limit exit never leads to dead position
 
 In this case:
     Lookup next day with has_data=True via trading_calendar table.
+    The next-day reads for Case A/B — coverage, bars, ticks — resolve the
+    successor symbol through utils.md's symbology layer.
 
     Case A — has_data=True AND ticker exists in ticker_data_coverage:
         exit_price = next day pre-market first tick
@@ -329,13 +331,14 @@ Note: `build_effective_bar_sequence()` is an internal delegation to
 - t bar high/low/close/volume must NOT be used — only t bar open (P_entry) is permitted as reference
 - `is_ambiguous`'s two threshold tests and the pnl label boundaries are
   grid-value decisions (utils.md's Numeric Rules)
-- Halt bars are excluded from the valid count — search extends to compensate
-- Time-limit exit (Step 3 Case A): triggered when execution.max_hold_bars valid bars collected before last_bar(date);
-  exit_price = last valid bar close; no after-market fallback; no dead position
-- Session close exit (Step 3 Case B): triggered when last_bar(date) reached within execution.max_hold_bars valid bars;
-  after-market fallback applies when last_bar(date) is halt/no_data
+- Halted minutes are excluded from the holding minutes — the holding deadline extends to compensate
+- Time-limit exit (Step 3 Case A): triggered when the holding deadline (execution.max_hold_minutes) comes before last_bar(date);
+  exit_price = close of the last existing bar before the deadline; no after-market fallback; no dead position
+- Session close exit (Step 3 Case B): triggered when last_bar(date) comes first;
+  exit_price = close of the last existing bar at or before last_bar(date);
+  after-market fallback applies only when last_bar(date)'s minute lies inside a halt interval or the date has no data
 - Dead position triggered from Step 3 Case B only — time-limit exit never leads to dead position
-- After-market data usage limited to last_bar(date) halt/no_data fallback only (Step 3 Case B)
+- After-market data usage limited to that fallback only (Step 3 Case B)
 - build_effective_bar_sequence() collects bars up to last_bar(date) only — after-market bars never included
 - Dead position is the only case where after-market and next-day data are used
 - Threshold values (threshold_3pp, threshold_5pp) must be read from config, not hardcoded
@@ -344,7 +347,7 @@ Note: `build_effective_bar_sequence()` is an internal delegation to
 - `dead_position_case` must be set to "A", "B", "C", or "D" for dead position rows; None otherwise
 - `is_ambiguous` sourced from `track_label_breach()` Stage 1 return value only;
   Stage 2 ambiguity does not affect the flag
-- `ambiguity_priority` controls breach direction on simultaneous bundle breach — read from config
+- The Labeler's `utils.AmbiguityRule`, built at init from `labeler.ambiguity_priority` with no seed, decides breach direction on simultaneous bundle breach and is passed to `track_label_breach()`
 - `ticks_df` must be pre-loaded for the full day and passed explicitly;
   Labeler filters internally per entry point (hour >= t_hour)
 - `exit_interpolation` passed through to `track_label_breach()` — read from config
@@ -391,13 +394,11 @@ labeler:
   # after_market_close_hour REMOVED. It duplicated the after-market boundary
   # already carried by trading_calendar.after_hours_end, which is what the
   # live process's R-9 hard cap resolves from.
-  # NOT the ingestion range, which also reads 200000: that range is fixed by
-  # decision and does not move with the calendar, while after_hours_end does.
-  # The two coincided at 200000, and grouping them as one boundary was the
-  # coincidence doing the explaining.
+  # NOT the ingestion range, whose upper bound 193000 is fixed by decision
+  # and does not move with the calendar, while after_hours_end does.
   # Where this module needs it, it calls utils.md's after_hours_end(date)
   # against the map built below, rather than reading the column directly.
-  # max_holding_bars REMOVED — execution.max_hold_bars is the single source.
+  # max_holding_bars REMOVED — execution.max_hold_minutes is the single source.
   # R-6 established that and enumerated the consumers it knew of; this module
   # was not among them, because the key here was max_holDING_bars and no grep
   # on the established identifier could reach a near-miss name. That
@@ -420,8 +421,8 @@ labeler:
 | +3pp hit at bar 10, -3pp hit at bar 15 (before +5pp) | label_up3 |
 | -3pp hit first, -5pp reached | label_dn5 |
 | -3pp hit first, +3pp cuts off before -5pp | label_dn3 |
-| Neither ±3pp breached, last_bar(date) reached within execution.max_hold_bars bars | label_sw (session close exit) |
-| Neither ±3pp breached, execution.max_hold_bars valid bars collected before last_bar(date) | label_sw (time-limit exit, last valid bar close) |
+| Neither ±3pp breached, last_bar(date) reached before the holding deadline | label_sw (session close exit) |
+| Neither ±3pp breached, the holding deadline reached before last_bar(date) | label_sw (time-limit exit, close of the last existing bar before the deadline) |
 | Ambiguous bundle (both ±3pp in same bundle), priority="up" | label_up3/up5, is_ambiguous=True |
 | +3pp and +5pp in the SAME bundle | label_up3 — Stage 2 starts at exit_hour_1 with the Stage 1 breach bundle excluded, so the +5pp print in it is never scanned |
 | +3pp, +5pp and -3pp in the SAME bundle, priority="up" | label_up3, is_ambiguous=True — priority resolves direction, then the same bundle exclusion applies |
@@ -430,5 +431,5 @@ labeler:
 | Dead position Case C (no next day with has_data=True) | is_dead_position=True, case="C", label_sw |
 | Dead position Case D (Case A entered, exit_price unresolvable — extended halt) | is_dead_position=True, case="D", pnl=-1.0, label_dn5 |
 | Dead position Case A with split effective D+1 | pnl computed against raw P_entry with the exit multiplied by the split factor |
-| Halt bar skipped in valid count | label assigned after halt |
-| Time-limit exit: execution.max_hold_bars valid bars collected, last_bar(date) not yet reached | exit at last valid bar close, no dead position |
+| Halted minutes excluded from the holding minutes | label assigned after halt |
+| Time-limit exit: the holding deadline reached, last_bar(date) not yet reached | exit at the close of the last existing bar before the deadline, no dead position |

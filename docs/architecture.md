@@ -22,7 +22,7 @@ Raw JSON (1min / 10tick, all sessions)
         │                    precomputed_session_stats populated (REFERENCE_SESSION baselines)
         ▼
  EntryPointDetector           Candidate entry point selection (fixed logic)
-        │                     All sessions processed; session_mode filter at training stage
+        │                     Entry points regular-session only (scan()'s first exclusion step)
         │  (ticker, date, t)
         │
         ├─────────────────────────────────────────┐
@@ -30,7 +30,7 @@ Raw JSON (1min / 10tick, all sessions)
         ▼                                         ▼
  FeatureExtractor                              Labeler
    (internally calls:                    5 independent binary labels per entry point
-    IndicatorCalculator                  Exit at last_bar(date) or the execution.max_hold_bars limit;
+    IndicatorCalculator                  Exit at last_bar(date) or the holding deadline (execution.max_hold_minutes);
     → Vectorizer                         after-market fallback for session-end halt only
     + MetaFeatures                       is_dead_position flag for overnight hold cases
     + TemporalFeatures)                  [labels, is_dead_position,
@@ -70,13 +70,13 @@ Training endpoint:   PipelineOptimizer
 
 Live inference endpoint: LiveModeRunner (execution orchestrator)
                          │
-                         ├── CachingIndicatorCalculator  (injected into FeatureExtractor)
+                         ├── CachingIndicatorCalculator  (per ticker, passed to FeatureExtractor per call)
                          │       Layer 1: session_start_compute() — pivot_points, gap_pct
                          │       Layer 2: precalculate + on_bar_close() incremental update
                          │       fibonacci: monotonic deque O(1) per bar
-                         │       sr_levels: get_for_entry() per-entry-point recomputation
+                         │       sr_levels, sr_channels: get_for_entry() per-entry-point recomputation
                          │
-                         ├── FeatureExtractor.extract()  (DI: CachingIndicatorCalculator)
+                         ├── FeatureExtractor.extract()  (the ticker's CachingIndicatorCalculator, passed per call)
                          │       session_stats from precomputed_session_stats (loaded at session start)
                          │
                          ├── Inferencer  (service object — called per entry point)
@@ -120,7 +120,7 @@ Standalone scripts:
 |---|---|
 | `data/data_boundary.md` | **Read before any module implementation.** Shared boundary rules, P_entry definition, REFERENCE_SESSION boundary, leakage prevention, Corporate Event Adjustment Boundary (raw/adjusted/scalar-corrected layering) |
 | `data/db_schema.md` | DuckDB schema, JSON ingestion logic, inference_log, precomputed_session_stats. Live-session diagnostics: live_halt_episodes (observed halt intervals, ticker-scoped) and exit_trigger_agreement_daily (live-vs-backtest exit triggering, decomposed into tape and algorithm terms) |
-| `pipeline/01_entry_detection.md` | EntryPointDetector logic, session_mode, volume_base_hour, A-G monotonicity classification (which conditions may be evaluated mid-bar) |
+| `pipeline/01_entry_detection.md` | EntryPointDetector logic, volume_base_hour, A-G monotonicity classification (which conditions may be evaluated mid-bar) |
 | `pipeline/02_indicator_calculator.md` | All indicator methods, REFERENCE_SESSION indicators, VWAP reset_mode, missing bar classification, precalculate_bars config |
 | `pipeline/03_vectorizer.md` | Time-series → vector transformation methods, REFERENCE_SESSION mapping |
 | `pipeline/04_feature_extractor.md` | Integration entrypoint, DI constructor, extract_batch strategy (A~E), REFERENCE_SESSION handling, parquet column structure |
@@ -134,7 +134,7 @@ Standalone scripts:
 | `ops/api_contract_checklist.md` | Vendor-contract assumption inventory (trading API, yfinance, investing.com), graded by blast radius, tracked to verification before Pilot. Accumulates: a verified row keeps its measured value rather than being deleted |
 | `ops/shadow_retraining.md` | Shadow mode design, execution-parameter fitting (fit_execution_params()), retraining cadence |
 | `scripts/run_preprocess.md` | Preprocessor class — batched steps run as a guest_supervisor work whose sealed result the optimizer reads; training pipeline only |
-| `scripts/run_train.md` | Trainer class, session_mode filter, train_log |
+| `scripts/run_train.md` | Trainer class, train_log |
 | `scripts/run_backtest.md` | Backtester class, sole experiment_log writer |
 | `api/trading_api.md` | TradingAPI — the single caller-facing layer over the vendored trading-API SDK. Result contract (a rejected order returns HTTP 200), symbol/exchange encoding, async boundary. No other module imports the SDK |
 | `api/sdk_dependency.md` | The vendored SDK as an external artifact — adoption form, the three fork modifications and why none could be avoided, and the costs accepted with it |
@@ -145,13 +145,15 @@ Standalone scripts:
 | `utils/guest_supervisor.md` | The common guest entry point and its tool registry; resumable guest works — work records, resume, relaunch sweep |
 | `live/inferencer.md` | Live inference service object — _prepare_bars, infer/infer_batch, inference_log |
 | `live/live_mode_runner.md` | Live mode execution orchestrator — prefix-scan watchdog loop, recovery lane, position manager loop, session lifecycle, ticker-scoped 1-tick acquisition, shadow fills on the held-ticker REST tape |
-| `live/caching_calculator.md` | CachingIndicatorCalculator — Layer 1/2 cache, fibonacci deque, sr_levels per-entry-point |
+| `live/caching_calculator.md` | CachingIndicatorCalculator — Layer 1/2 cache, fibonacci deque, sr_levels and sr_channels per-entry-point |
 | `live/auxiliary_stream.md` | In-process host (loop A) for non-trading WebSocket subscriptions on a separate account — delayed-quote capture for feed-coverage measurement is its first consumer |
 | `tools/init_db.md` | Schema bootstrap CLI — creates every table from db_schema.md's canonical DDL; `--verify` reports schema drift read-only. Sole DDL-issuing component; prerequisite for migration_tool |
 | `tools/migration_tool.md` | JSON → DuckDB migration, trading_calendar/coverage init, precomputed_session_stats population |
 | `tools/detection_benchmark.md` | Entry detection threshold tuning + timing benchmark, plus the diagnostic delayed-entry decay sweep |
 | `tools/metadata_crawler.md` | Daily metadata fetch, new data ingestion, session stats daily update, evening detection-gap stage |
 | `tools/health_report.md` | Findings gathering and the invocation paths that deliver them |
+| `tools/model_deploy.md` | The operator's approval tool — approve, override, reject and rollback of model candidates into model_deployments |
+| `tools/code_version.md` | The code-version lock src/code_versions.json — bump, record, golden tests per area |
 | `visualization/viz_connector.md` | Abstract base class for visualization backends |
 
 ---
@@ -214,15 +216,18 @@ stock-scalping/
 │   │   ├── migration_tool.md
 │   │   ├── detection_benchmark.md
 │   │   ├── metadata_crawler.md
-│   │   └── health_report.md
+│   │   ├── health_report.md
+│   │   ├── model_deploy.md
+│   │   └── code_version.md
 │   └── visualization/
 │       └── viz_connector.md
-├── models/                        # trained model artifacts (.lgb, _meta.json)
+├── models/                        # trained model artifacts (base_model.md)
 ├── data/
 │   ├── raw/                       # original JSON (1min / 10tick)
 │   ├── processed/                 # feature matrix (.parquet)
 │   └── labeled/                   # feature + label
 ├── src/
+│   ├── code_versions.json         # the code-version lock (code_version.md)
 │   ├── data/
 │   │   └── loader.py
 │   ├── detection/
@@ -269,7 +274,9 @@ stock-scalping/
 │   ├── migrate_json_to_duckdb.py
 │   ├── collect_daily.py
 │   ├── detection_benchmark.py
-│   └── health_report.py
+│   ├── health_report.py
+│   ├── model_deploy.py
+│   └── code_version.py
 ├── api_doc/                       # vendor API documentation (markdown).
 │                                  #   External read-only reference, not a
 │                                  #   spec file — the source for the
@@ -290,9 +297,9 @@ stock-scalping/
 ├── configs/
 │   ├── pipeline_config.yaml
 │   ├── sector_map.json
+│   ├── security_type_map.json
 │   ├── day_of_week_map.json
 │   ├── halt_reason_code_map.json
-│   ├── cik_map.json
 │   ├── xbrl_tag_map.json
 │   └── secrets.yaml               # gitignored
 └── experiment_log.csv             # legacy; authoritative store is DuckDB

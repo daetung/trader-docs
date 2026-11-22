@@ -54,6 +54,7 @@ ROLES (db_schema.md's DB File Ownership Windows):
   - detection_benchmark;
   - init_db;
   - migration_tool;
+  - model_deploy (model_deploy.md);
   - the DuckDB recovery, `restore_db()` (Recovery, below).
 
 FACT CLASSES — a coordination fact belongs to one of:
@@ -224,6 +225,9 @@ manager wrapping each process's entry point:
   - 'blocked' is:
     - a new run refused by guest_supervisor.md's new-run resolution, guest_supervisor.md's
       restore_store() lock included;
+    - a guest run ended by run_guest's code checks (guest_supervisor.md):
+      - code_unattested, at its start;
+      - code_changed, at a unit opening;
     - a dependent ending because its input work is 'halted';
     - a consumer ending because the work it awaits turns:
       - 'halted';
@@ -326,19 +330,28 @@ to `timeout`:
 Unit scope:
 - a `collect_daily.py` guest flag's unit is one stage; not admitted at a
   stage boundary, it ends, the stages not run writing no row;
-- a per-run guest holds one unit for its whole run, the connection that
-  unit yields passed wherever the tool takes `db_conn`; while an owner waits
-  past `coordination.guest_max_hold_seconds`, such a run ends by
-  self-termination (below) and is re-run from scratch;
-- a step guest holds one unit per step and, ended by self-termination,
-  resumes through guest_supervisor.md;
-- which tool is a per-run guest and which a step guest is
-  guest_supervisor.md's tool registry;
+- a guest holds a unit only for a bounded chunk of DB work; the tool's own
+  compute runs outside units, and between units a run waits for admission;
+- a DB function that computes internally runs inside the unit of its call,
+  each call bounded — `populate_precomputed_session_stats()`,
+  `compute_tick_bar_aggregates()`, the crawlers and
+  `compute_vol_regime_holdout()` among them;
+- a per-run guest works on the connection of the one unit
+  `run_guest` opens around its body;
+- a per-chunk guest opens its units through `run_guest`'s unit opener, one
+  `guest_unit(tool, None)` per call;
+- a step guest holds a read unit and a write unit per step
+  (guest_supervisor.md's Steps);
+- a run self-terminated while holding a unit (over
+  `coordination.guest_max_hold_seconds` while an owner waits): a per-chunk
+  or per-run tool re-runs from scratch; a step tool resumes through
+  guest_supervisor.md;
+- which tool is of which unit kind is guest_supervisor.md's tool registry;
 - `restore_db()` holds one `file_unit` for the file replacement only
   (Recovery, below).
-No guest is exempt beyond `restore_db()`'s exception above. A per-run guest
-ended unadmitted is re-run from scratch; a step guest resumes through
-guest_supervisor.md.
+No guest is exempt beyond `restore_db()`'s exception above. A per-run or
+per-chunk guest ended unadmitted is re-run from scratch; a step guest resumes
+through guest_supervisor.md.
 `in_runner_window()` answers (iii)'s runner window.
 
 GUEST SELF-WATCHDOG — the helper runs a watchdog thread in every guest.
@@ -412,6 +425,7 @@ the shared `logs/guest_units_{date}.log`, in the crawler log's line format
   - detection_benchmark;
   - migration_tool;
   - init_db;
+  - model_deploy;
   - health_report.md's CLI;
   - duckdb_recovery;
 - `collect_daily.py` guests write no `UNIT` lines.

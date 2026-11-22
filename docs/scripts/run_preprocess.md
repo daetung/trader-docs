@@ -25,8 +25,9 @@ process.
 Preprocessor is a training-only component. Live inference uses
 `FeatureExtractor.extract()` directly via Inferencer — not Preprocessor.
 
-Session_mode filtering, temporal splitting, and rolling fold generation
-are handled entirely by ClassBalancer.
+Temporal splitting and rolling fold generation are handled entirely by
+ClassBalancer. Entry points are regular-session only, fixed at `scan()`
+(data_boundary.md); no session filter applies anywhere downstream.
 
 ---
 
@@ -40,10 +41,10 @@ db_coordination.md's Unit scope), run through guest_supervisor.md's
   opener and a unit opener;
 - every unit the unit opener opens is a `guest_unit('run_preprocess', None)`,
   waiting for admission without limit;
-- the body opens its work in its first unit, before its first step, and
-  holds one unit per step (Work, below);
-- a step's DB writes form one transaction committed at the step's end, on
-  the connection that step's unit opens;
+- the body opens its work in its first unit, before its first step; each
+  step holds a read unit and a write unit, its compute running between them
+  outside any unit (guest_supervisor.md's Steps; Work, below);
+- a step's DB writes form one transaction committed in its write unit;
 - the body calls neither `register()` nor `guest_unit()`;
 - `scripts/run_preprocess.py` run directly hands over to
   `run_guest run_preprocess`;
@@ -57,11 +58,18 @@ db_coordination.md's Unit scope), run through guest_supervisor.md's
 
 **Input:**
 ```python
-# From DuckDB, per batch, on the batch's unit connection (Pipeline Steps, Step 1):
+# From DuckDB, per batch, in the batch's read unit (Pipeline Steps, Step 1),
+# for its tickers and the chain symbols of each of their segments:
 ohlcv_1min:                  pd.DataFrame   # the batch's load range, all sessions
 tick_10:                     pd.DataFrame   # the batch's load range — full day per ticker/date
 stock_meta:                  pd.DataFrame
-trading_halts:               pd.DataFrame
+trading_halts:               pd.DataFrame   # the load range and the halt_open_into
+                                            # walk's earlier dates
+corporate_events:            pd.DataFrame   # dated through the load range end
+fundamentals_quarterly:      pd.DataFrame   # dated through the load range end
+fx_rates:                    pd.DataFrame   # [load range start −
+                                            #  fx_rates.max_staleness_days,
+                                            #  load range end]
 trading_calendar:            pd.DataFrame   # through the batch's load range end
 ticker_data_coverage:        pd.DataFrame
 precomputed_session_stats:   pd.DataFrame   # REFERENCE_SESSION baselines
@@ -87,7 +95,8 @@ test_features.parquet
 
 Config hash and fixed inputs (guest_supervisor.md's Config Hash and Fixed
 Inputs):
-- `config_hash` covers the keys Config Keys Used lists inside config_hash;
+- `config_hash` covers the keys Config Keys Used lists inside config_hash,
+  with code_versions holding the data version (utils.md's Config Hashing);
 - the pin:
   - `data_paths.db_path`;
   - the trading-date range of `ohlcv_1min` at work creation;
@@ -118,9 +127,13 @@ Batches — a step is one batch (ticker group, date chunk):
 - the pinned tickers, sorted, grouped by `preprocess.resume_batch_tickers`;
 - the pinned trading dates cut into consecutive chunks of
   `preprocess.resume_batch_dates`;
-- the load range: [chunk start − `indicators.lookback_days` trading days,
-  the next trading day with `has_data` after the chunk end among the pinned
-  trading dates — the chunk end when none];
+- the processing unit is a security segment: a batch loads, beside its
+  tickers, the chain symbols of each of their segments (utils.md's
+  symbology layer);
+- the load range: [the first element of utils.prior_trading_days(chunk
+  start, `indicators.lookback_days`, closes), the next trading day with
+  `has_data` after the chunk end among the pinned trading dates — the chunk
+  end when none];
 - a batch's reads end at its load range end, never after the pin's last
   trading date, for:
   - `ohlcv_1min`;
@@ -129,25 +142,32 @@ Batches — a step is one batch (ticker group, date chunk):
 - Labeler Case C applies where no trading day with `has_data` follows
   within the pinned dates.
 
-Each batch, in its own unit:
-1. checks whether it is done (batch done test, below), and if so releases
-   the unit without computing;
-2. ensures `precomputed_session_stats` for its tickers × chunk dates under
-   the work's fixed config, through `populate_precomputed_session_stats()`
-   (utils.md; db_schema.md's Derived tables, Production);
-3. takes its mark — the highest `source_changes` seq and that row's
-   `recorded_at` (db_schema.md's Derived tables, Mark);
-4. loads and runs Pipeline Steps 1–7 for its tickers, emitting for the
-   chunk dates only:
+Each batch is a `step()` (guest_supervisor.md's Steps), done the batch done
+test (below):
+1. the read unit — when done, the unit is released without computing;
+   otherwise its `read`:
+   - ensures `precomputed_session_stats` for its tickers × chunk dates under
+     the work's fixed config, through `populate_precomputed_session_stats()`
+     (utils.md; db_schema.md's Derived tables, Production);
+   - takes its mark — the highest `source_changes` seq and that row's
+     `recorded_at` (db_schema.md's Derived tables, Mark);
+   - loads its inputs (Pipeline Steps, Step 1), including corporate_events,
+     fundamentals_quarterly, fx_rates, ticker_history and the scan meta; the
+     halt_open_into walk beyond the load range runs here and loads its rows;
+2. compute, holding no unit — Pipeline Steps 1–7 in memory for its tickers,
+   except Step 6's market_cap and shares_outstanding estimates, read by
+   `estimate_historical_meta()` in one unit per ticker that a connection
+   provider (the unit opener) opens; emitting for the chunk dates only:
    - entry points;
    - labels;
    - features;
-5. writes `entry_points` and `labeled_samples` (Steps 3 and 5), commits,
-   and records progress (`work_progress()`);
-6. writes the batch matrix — an empty batch included, as a zero-row file
-   carrying the full schema dtypes — to a temp file renamed to
-   `data/processed/resume/{work_id}/batch_{group}_{chunk}.parquet`, its
-   parquet metadata carrying:
+   the batch matrix — an empty batch included, as a zero-row file carrying
+   the full schema dtypes — written to a temp file;
+3. `s.write()` — the write unit: `entry_points` and `labeled_samples`
+   (Steps 3 and 5), the batch file's rename to
+   `data/processed/resume/{work_id}/batch_{group}_{chunk}.parquet` before
+   the commit, `work_progress()`, the commit.
+The batch file's parquet metadata carries:
    - work_id;
    - group;
    - chunk;
@@ -155,7 +175,11 @@ Each batch, in its own unit:
    - the key-set hash;
    - the schema hash — the hash of `get_feature_names()`' ordered list with
      `get_feature_schema()`;
-   - the mark.
+   - the mark;
+   - the exclusion count of each bar-availability reason: no bar at t,
+     insufficient bars (01_entry_detection.md);
+   - the count of (ticker, date) whose first regular-session bar is not at
+     093000.
 
 Batch done test — a batch is done when:
 - its file passes guest_supervisor.md's result file check;
@@ -167,7 +191,7 @@ Batch done test — a batch is done when:
 Any other batch is processed again, its file replaced.
 
 A batch file's footprint:
-- its tickers and their `ticker_history` predecessors;
+- the chain symbols of its segments;
 - its load range, for:
   - `ohlcv_1min`;
   - `tick_10`;
@@ -175,20 +199,23 @@ A batch file's footprint:
   - `trading_calendar`;
   - `trading_halts`;
   - `ticker_history`;
-- `corporate_events` and `fundamentals_quarterly` dated through the load
-  range end;
+- `trading_halts` and `ohlcv_1min` from the earliest date the resolver's
+  halt_open_into walk read;
+- `corporate_events`, `fundamentals_quarterly` and `fx_rates` dated through
+  the load range end;
 - the `precomputed_session_stats` footprints of its tickers × chunk dates,
   the group present or absent.
-Values read from the latest `stock_meta` snapshot — `sector`, and
-`estimate_historical_meta()`'s latest-snapshot tier with its split
-adjustment — are outside it.
+`sector` and `security_type`, read from the latest `stock_meta` snapshot,
+and the `stock_meta` rows read for a date, all dated before it, are outside
+it.
 
-Seal — in its own unit, once every batch passes the batch done test, a
-batch failing it being processed again first:
+Seal — a `db_step()`, once every batch passes the batch done test, a
+batch failing it being processed again first; its body runs every batch
+done test and writes:
 - `data/processed/resume/{work_id}/_done.json`, written through temp +
-  rename, lists the batch files with their row counts and key-set hashes;
-- `work_close('done')`, the seal's hash recorded on the work
-  (guest_supervisor.md's Sealed Results).
+  rename, listing the batch files with their row counts and key-set hashes;
+then `work_close('done')` follows, the seal's hash recorded on the work
+(guest_supervisor.md's Sealed Results).
 
 Standalone part — a new run, outside the work, after its work part, whose
 result is one of:
@@ -197,8 +224,8 @@ result is one of:
 - awaited as a consumer.
 The standalone part:
 - loads the result through `load_result()` (Result Loader, below);
-- splits it — `ClassBalancer.split(balance=class_balancer.apply_balance,
-  session_mode=entry_detector.session_mode)` → (train_balanced, val, test);
+- splits it — `ClassBalancer.split(balance=class_balancer.apply_balance)` →
+  (train_balanced, val, test);
 - saves through `save()`, each file through temp + rename.
 A `--resume-work` run ends at its work part.
 
@@ -228,11 +255,12 @@ pipeline_optimizer.md:
 ## Pipeline Steps
 
 ```
-[Per batch — Work, above: run inside the batch's unit, its connection the
- db_conn below]
+[Per batch — Work, above: Step 1 in the batch's read unit, its connection
+ the db_conn below; Steps 2–7 compute holding no unit; the writes of Steps 3
+ and 5 and the batch file's rename in the batch's write unit]
 
-1. Load the batch — T = its tickers and their ticker_history predecessors,
-   R = its load range (Work, above):
+1. Load the batch — T = its tickers and the chain symbols of each of their
+   segments, R = its load range (Work, above):
        ohlcv_df    = SELECT * FROM ohlcv_1min   WHERE ticker IN T AND date IN R
                      ORDER BY ticker, date, hour
        ticks_df    = SELECT * FROM tick_10       WHERE ticker IN T AND date IN R
@@ -243,23 +271,33 @@ pipeline_optimizer.md:
        meta_df     = SELECT * FROM stock_meta    WHERE ticker IN T ORDER BY ticker, date
                      # (ticker, date)-keyed since stock_meta schema update —
                      # multiple rows per ticker now; NOT a single per-ticker snapshot
-       halts_df    = SELECT * FROM trading_halts WHERE ticker IN T
+       halts       = utils.halt_intervals(ticker, dates of R, src) per ticker
+                     # the halt-interval resolver (utils.md): stored rows read
+                     # through the symbology layer; src the frames loaded here
+                     # and the DB outside R — the halt_open_into walk beyond R
+                     # runs in this read unit and loads its rows
        calendar_df = SELECT * FROM trading_calendar WHERE date <= <R's end>
                      # R's end bounds the work's dataset (Work, above)
-       closes, _   = session_boundaries_from_frame(calendar_df)
+       closes, ends = session_boundaries_from_frame(calendar_df)
                      # utils.md — derived from the frame just loaded, not a
-                     # second query. The after_hours_end map is discarded: the
-                     # only consumer of it on this path is the Labeler, which
-                     # derives its own from calendar_df.
+                     # second query. closes and ends are kept: ends goes to scan()
+                     # and to extract_batch().
                      # calendar_df is still passed on in its own right, for
                      # has_data in Labeler's dead position resolution, which
-                     # the maps do not carry.
+                     # the maps do not carry, and for the calendar context
+                     # (utils.calendar_context(), Step 6).
        coverage_df = SELECT * FROM ticker_data_coverage WHERE ticker IN T
        corp_events_df = SELECT * FROM corporate_events WHERE ticker IN T
-                     # small table — the batch tickers' rows; its only reader on this
-                     # path is the Labeler (dead position Case A/D).
-                     # FeatureExtractor queries corporate_events itself
-                     # (Strategy A/D — see Constraints below)
+                     # small table — the batch tickers' rows; its readers are
+                     # the Labeler (dead position Case A/D) and
+                     # FeatureExtractor's frame-backed reader
+       fundamentals_df = SELECT * FROM fundamentals_quarterly WHERE ticker IN T
+                     # dated through R's end; served through FeatureExtractor's
+                     # reader
+       fx_rates_df = SELECT * FROM fx_rates
+                     WHERE date >= <R's start − fx_rates.max_staleness_days days>
+                       AND date <= <R's end>
+                     # served through FeatureExtractor's reader
 
        # REFERENCE_SESSION baselines — the chunk dates, after the batch's
        # ensure (Work, above); stats_config_hash = utils.config_hash() of
@@ -275,17 +313,20 @@ pipeline_optimizer.md:
        session_stats = build_session_stats_dict(
            session_stats_raw,
            delta_minutes=config["indicators"]["reference_session"]["delta_minutes"],
-           session_mode=config["entry_detector"]["session_mode"],
            closes=closes,
+           ends=ends,
        )
        # If precomputed_session_stats is empty (e.g., baseline not yet computed):
        # session_stats = {}  → extract_batch() receives session_stats=None per ticker
        # REFERENCE_SESSION indicators return NaN (not an error)
 
-2. EntryPointDetector.scan() for each ticker → entry_points (all sessions),
-   kept for the chunk dates only
-   late-day exclusion applied inside scan() when max_entry_offset_minutes
-   is not null (01_entry_detection.md)
+2. EntryPointDetector.scan() for each ticker → entry_points (regular-session
+   only — scan()'s first exclusion step), kept for the chunk dates only
+   scan() reads the stitched frame (the ticker's segments relabelled to it)
+   and entries are kept only for dates inside the scanned symbol's own
+   segment
+   history, bar-availability and late-day exclusions applied inside scan()
+   (01_entry_detection.md)
    scan() retrieves p_entry from bars[i+1]["open"] (t bar open price)
 
    # scan() meta (V-1): date-keyed, {date: {"shares_outstanding": value}}
@@ -293,22 +334,23 @@ pipeline_optimizer.md:
    # ticker's bars, since entry dates aren't known until scan() runs
    # (narrower than this would be circular). Deliberately separate from
    # Step 6's ticker_meta (market_cap, shares_outstanding, price_52h,
-   # price_52l and sector, keyed on entry dates only, a smaller
-   # and cheaper set once entry_points exists) — not unified into one dict.
+   # price_52l, sector and security_type, keyed on entry dates only, a
+   # smaller and cheaper set once entry_points exists) — not unified into
+   # one dict. Its estimates run in the read unit (Work, above).
    scan_meta = {
        date: {
-           "shares_outstanding": (
-               meta_df.loc[(ticker, date), "shares_outstanding"]
-               if (ticker, date) in meta_df.index
-                  and pd.notna(meta_df.loc[(ticker, date), "shares_outstanding"])
-               else utils.estimate_historical_meta(
-                   ticker, date, "shares_outstanding", db_conn
-               )
+           # estimate_historical_meta()'s tiers, its first the stock_meta
+           # prior-day row (data_boundary.md's "Point-in-time correctness
+           # for stock_meta"); None when unresolved — filter E false
+           "shares_outstanding": utils.estimate_historical_meta(
+               ticker, date, "shares_outstanding", closes,
+               config["indicators"]["lookback_days"], db_conn
            )
        }
        for date in bars_for_ticker["date"].unique()
    }
-   detector.scan(bars_for_ticker, ticker, meta=scan_meta, closes=closes)
+   detector.scan(bars_for_ticker, ticker, meta=scan_meta, closes=closes,
+                 ends=ends)
 
 3. Save entry_points to DuckDB entry_points table (INSERT OR IGNORE) —
    p_entry bound as `Decimal` through V1 into its DECIMAL(18,6) column (V4,
@@ -318,7 +360,7 @@ pipeline_optimizer.md:
        Per ticker/date:
            ohlcv_future_td = ohlcv_df filtered to (ticker, date, hour >= t_hour)
            ticks_td        = ticks_df filtered to (ticker, date), full day
-           halts_td        = halts_df filtered to (ticker, date)
+           halts_td        = the resolver's intervals for (ticker, date)
        labeler.label(
            entry_points_td, ohlcv_future_td, ticks_td, halts_td,
            calendar_df, coverage_df, corp_events_df
@@ -339,57 +381,66 @@ pipeline_optimizer.md:
    source_seq = the batch's mark seq; p_entry bound as `Decimal` through V1,
    as in step 3
 
-6. FeatureExtractor.extract_batch() for each ticker:
-       bars_td   = ohlcv_df filtered to (ticker)
+6. FeatureExtractor.extract_batch() for each ticker — the extractor
+   constructed with a frame-backed reader over the read unit's
+   corp_events_df, fundamentals_df and fx_rates_df:
+       segments  = the ticker's ticker_segments() (read in the read unit)
+       bars_td   = utils.slice_ticker_rows(ohlcv_df, ticker, segments)
        # No date or hour axis: the batch carries several entry dates
        # (ticker_dates below) and several entry hours, so neither is unique
        # within it. extract_batch() slices per entry point internally; that
        # docstring is the contract's single site.
 
-       # Ticker rename stitching (Item 4): if get_ticker_history(ticker, db_conn)
-       # is not None (the common case is None — no query cost beyond the small
-       # ticker_history lookup), additionally slice ohlcv_df for each
-       # predecessor_ticker (dates before that predecessor's effective_date),
-       # relabel the ticker column to the current ticker, and prepend to
-       # bars_td. Predecessor rows are already present in the in-memory
-       # ohlcv_df under their original symbol — no additional DB query needed
-       # for the bars themselves, only for the small ticker_history table.
+       # Ticker rename stitching: slice_ticker_rows() relabels each
+       # segment's symbol rows within its date range to the current ticker,
+       # over the read unit's frames — the chain symbols' rows are already
+       # present in the in-memory frames, so no DB query is needed here.
 
-       ticks_td  = ticks_df filtered to (ticker)
-       halts_td  = halts_df filtered to (ticker)   # every entry date of this
-                                                  # extract_batch() call
+       ticks_td  = utils.slice_ticker_rows(ticks_df, ticker, segments)
+       halts_td  = the resolver's intervals for the ticker, covering every
+                   date of the frame
        ticker_dates = entry_points_td["date"].unique()
 
-       # Per-date meta resolution (V-1): stock_meta is (ticker, date)-keyed —
-       # a single flat meta dict per ticker would apply one date's values to
-       # every entry point of that ticker regardless of its own date, which is
-       # exactly the staleness problem V-1 fixes. Build a date-keyed dict,
-       # mirroring the session_stats dispatch pattern below:
+       # Per-date meta resolution (V-1): a single flat meta dict per ticker
+       # would apply one date's values to every entry point of that ticker
+       # regardless of its own date, which is exactly the staleness problem
+       # V-1 fixes. Build a date-keyed dict, mirroring the session_stats
+       # dispatch pattern below — data_boundary.md's "Point-in-time
+       # correctness for stock_meta", the prior-day row being the stock_meta
+       # row dated utils.prior_trading_days(date, 1, closes)[0]:
        ticker_meta = {
            date: {
-               field: (
-                   meta_df.loc[(ticker, date), field]
-                   if (ticker, date) in meta_df.index and pd.notna(meta_df.loc[(ticker, date), field])
-                   else utils.estimate_historical_meta(ticker, date, field, db_conn)
-               )
-               for field in ["market_cap", "shares_outstanding", "price_52h", "price_52l"]
-           } | {
-               # sector has no derivation path — most recent available snapshot
-               # regardless of entry date (see 04_feature_extractor.md Meta Features)
-               "sector": meta_df[meta_df["ticker"] == ticker].sort_values("date")["sector"].iloc[-1]
+               # the prior-day row's value, else estimate_historical_meta(),
+               # read in one unit per ticker that the connection provider opens
+               "market_cap": ...,
+               # estimate_historical_meta(), its first tier the prior-day row
+               "shares_outstanding": ...,
+               # the metric of the batch's loaded precomputed_session_stats
+               # group of (ticker, date) at hour '000000'; none → NaN
+               "price_52h": ...,
+               "price_52l": ...,
+               # no derivation path — the chain-latest symbol's latest row
+               # with the field set, whatever the date
+               "sector": ...,
+               "security_type": ...,
            }
            for date in ticker_dates
        }
+       # The instrument rule (utils.md): a non-common security_type resolves
+       # shares_outstanding and market_cap None, the prior-day row's values
+       # included. A value may be None — a NaN feature.
 
        # Fundamentals-derived yield features (earnings_yield, book_to_price,
        # sales_to_price, dilution_rate, cash_to_mcap, debt_to_mcap — see
-       # 04_feature_extractor.md Meta Features) are resolved separately from
-       # fundamentals_quarterly inside extract_batch() itself, via
-       # utils.get_ttm_value() / an as-of most-recent-filed lookup — not
-       # added to ticker_meta here. ticker_meta stays scoped to the original
-       # 5 stock_meta-sourced fields; fundamentals_quarterly resolution does
-       # not depend on entry_date-keyed dict construction the way stock_meta
-       # did, since as-of filtering happens per-lookup inside extract_batch().
+       # 04_feature_extractor.md Meta Features) are resolved separately inside
+       # extract_batch() itself, over the reader's fundamentals_quarterly and
+       # fx_rates rows, via utils.get_ttm_value() / an as-of
+       # most-recent-filed lookup — not added to ticker_meta here.
+       # ticker_meta stays scoped to its stock_meta-sourced and
+       # caller-filled fields — market_cap, shares_outstanding, price_52h,
+       # price_52l, sector, security_type; fundamentals resolution does not
+       # depend on entry_date-keyed dict construction, since as-of filtering
+       # happens per-lookup inside extract_batch().
 
        # Supply REFERENCE_SESSION baselines for this ticker's dates
        # session_stats format: {as_of_date: {ticker: {metric: {hour: value}}}}
@@ -404,6 +455,8 @@ pipeline_optimizer.md:
        extractor.extract_batch(
            entry_points_td, bars_td, ticks_td, ticker_meta, halts_td,
            closes=closes,
+           ends=ends,
+           calendar_context=utils.calendar_context(calendar_df, ticker_dates),
            session_stats=ticker_session_stats,
        )
 
@@ -412,7 +465,7 @@ pipeline_optimizer.md:
      [ticker, date, hour, p_entry]
      + [features...]
      + [labels, is_dead_position, dead_position_case, is_ambiguous]
-   → contains all sessions; no session_mode filter applied here
+   → regular-session entries only, as scan() returned them
    → the chunk dates only; is_provisional and source_seq are not in it
      (labeled_samples columns only)
 
@@ -497,9 +550,14 @@ Inside config_hash (guest_supervisor.md's Config Hash and Fixed Inputs):
   - `lookback_days`
 - `vectorizer.*`
 - `labeler.*`
-- `execution.max_hold_bars`
+- `execution.max_hold_minutes`
 - `corporate_events.dividend_restated_sources`
 - `corporate_events.dividend_withholding_rate`
+- `halts.continuation`
+- `fx_rates.max_staleness_days`
+- `fundamentals.annual_fallback_max_age_months`
+Health Gate 1d's feature-contract config_hash (live_mode_runner.md; utils.md's
+deployability_checks()) is taken over this list, `labeler.*` excluded.
 
 Outside config_hash:
 - `data_paths.db_path`
@@ -515,12 +573,14 @@ Outside config_hash:
 ## Constraints
 
 - Preprocessor is responsible for feature extraction and labeling only
-- Session_mode filtering, splitting, and fold generation handled by ClassBalancer
+- Splitting and fold generation handled by ClassBalancer; no session filter
+  applies (entries are regular-session only from `scan()`)
 - Data loaded from DuckDB per batch, in bulk for the batch's tickers and load
-  range (Step 1); the DB reads extraction itself makes:
-  - `estimate_historical_meta()`;
-  - `get_ticker_history()`;
-  - FeatureExtractor's own `corporate_events` reads
+  range, in its read unit (Step 1); the DB reads extraction itself makes:
+  - `estimate_historical_meta()`: the scan meta's in the read unit, Step 6's
+    in provider units;
+  - `get_ticker_history()`: the read unit;
+  - `corporate_events`: the reader
 - `precomputed_session_stats` loaded per batch at Step 1 — the chunk dates and
   the batch tickers under its config hash — after the batch's ensure
 - `build_session_stats_dict()` returns `{as_of_date: {ticker: {metric: {hour: value}}}}`
@@ -535,33 +595,32 @@ Outside config_hash:
   - Labeler receives full day (hour >= t_hour filtered internally per entry point)
   - FeatureExtractor receives the unbounded per-ticker frame and slices per
     entry point internally
-- `halts_df` loaded per batch and passed explicitly to both Labeler (per
-  (ticker, date)) and FeatureExtractor (per ticker — every entry date of its
-  `extract_batch()` call)
+- Halt intervals come from the halt-interval resolver in the batch's read
+  unit and are passed explicitly to both Labeler (per (ticker, date)) and
+  FeatureExtractor (per ticker — every date of its frame)
 - `coverage_df` loaded per batch at step 1 and passed explicitly to Labeler.label()
 - `corp_events_df` loaded per batch at step 1 (the batch tickers' rows) and passed explicitly to
-  Labeler.label() (Case A/D adjustment) — FeatureExtractor's corporate-event bars
-  adjustment and gap_percentile dividend_amount lookup query `corporate_events`
-  independently inside `extract_batch()` (see `04_feature_extractor.md`), not via
-  a value passed in from this script. In both, a 'dividend' row's amount is read
-  through utils.md's dividend amount function — `dividend_gross_amount()` in
-  FeatureExtractor, its frame form `dividend_gross_from_events()` in the
-  Labeler — never from `amount` directly
-- `ticker_meta` (Step 6) is date-keyed, not a flat per-ticker dict — `stock_meta`'s
-  schema is `(ticker, date)`-keyed (see V-1 fix); per-field fallback to
-  `utils.estimate_historical_meta()` when a field is missing for a given date;
-  `sector` always uses the ticker's most recent available snapshot regardless of date
+  Labeler.label() (Case A/D adjustment); FeatureExtractor takes its rows through
+  its reader (see `04_feature_extractor.md`). In both, a 'dividend' row's amount
+  is read through `dividend_gross_from_events()`, never from `amount` directly
+- `fx_rates` rows loaded per batch at Step 1, served through FeatureExtractor's
+  reader
+- `ticker_meta` (Step 6) is date-keyed, not a flat per-ticker dict: per field,
+  `market_cap` the stock_meta prior-day row's value else
+  `utils.estimate_historical_meta()`, `shares_outstanding` that function's
+  tiers (its first the prior-day row), `price_52h` and `price_52l` the loaded
+  precomputed_session_stats group's day-level metric; the instrument rule
+  applied; `sector` and `security_type` always use the chain-latest symbol's
+  latest row with the field set, whatever the date
 - `scan_meta` (Step 2) is a separate, smaller date-keyed dict (shares_outstanding
   only) built BEFORE entry_points exists, keyed on all dates in the ticker's
   bars — not the same object as `ticker_meta`, which is keyed on entry dates
-  only and holds market_cap, shares_outstanding, price_52h, price_52l and
-  sector; the two are deliberately not unified
+  only and holds market_cap, shares_outstanding, price_52h, price_52l, sector
+  and security_type; they are deliberately not unified
   since entry dates aren't known until after `scan()` returns
-- Ticker rename stitching (Step 6): `get_ticker_history()` returns `None` for the
-  vast majority of tickers (no query cost beyond the small `ticker_history` lookup);
-  when it returns a history, predecessor-ticker rows are sliced from the
-  already-loaded `ohlcv_df` (same table, different ticker label) and relabeled —
-  no additional `ohlcv_1min` query needed
+- Ticker rename stitching (Step 6): `utils.slice_ticker_rows()` over the read
+  unit's frames — the chain symbols' rows are already loaded, relabelled per
+  segment; no additional query needed
 - `extract_batch()` called per ticker — no Python loop over `extract()` per entry point
 - Empty DataFrames handled gracefully in the standalone part's split output
   (saves _empty.parquet); an empty batch writes a zero-row batch file (Work)

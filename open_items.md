@@ -26,36 +26,25 @@ confirmation that it still reads correctly.
 
 ## Suggested order
 
-1. **Optimizer session_mode search over features computed once** enters
-   first, the highest priority of every item here.
-2. **Manual-intervention CLI** is unblocked.
-   The async boundary that used to sit here is closed: how many clients exist
-   and where the boundary falls are both decided, and its shared review
-   surface with (3)'s sub-questions no longer exists because those are
-   settled too.
-3. **WS/REST tape asymmetry and exit-trigger path transitions** is blocked on
-   SHADOW-PERIOD DATA rather than on design time, so it is not sequenced
-   against the items above. Only its deferred part remains.
-4. **`api_contract_checklist.md` re-evaluation** goes last by construction —
-   it collects what the items above establish.
-5. **Real-time bid/ask spread** is blocked on calendar time, not design time,
-   so it is not sequenced against anything here.
-6. **Config-duplicating signature defaults** is unblocked but is hygiene
-   rather than a design blocker, so it is not sequenced against the items
-   above either. It is listed because a new item left out of this list is the
-   carry-forward defect this file exists to prevent, inverted.
-7. **No path from a trained model's `run_id` to the live model** is unblocked
-   and not sequenced against the items above.
-8. **Finding 6 divergence — resampling unit and threshold** is not sequenced
-   against the items above.
-9. **Lock measurements** is not sequenced against the items above.
-10. **Run launchers** is not sequenced against the items above.
-11. **Halt spanning midnight** is not sequenced against the items above.
-12. **Selection-phase search design** is not sequenced against the items
-    above.
-13. **Step decomposition of the per-run guests** is not sequenced against
-    the items above.
-14. **Code-version identifier** is not sequenced against the items above.
+Items still unresolved, as one flat list:
+- **Daily raw market-data collection**.
+- **Vectorizer method mapping completeness**.
+- **Run launchers**, its crashed-runner part remaining.
+- **Manual-intervention CLI** — unblocked.
+- **WS/REST tape asymmetry and exit-trigger path transitions** — blocked on
+  shadow-period data; only its deferred part remains.
+- **Real-time bid/ask spread** — blocked on calendar time.
+- **Lock measurements**.
+- **Challenger shadow inference**.
+- **Point-in-time security identity** — worked when the Security Identity
+  Audit's identity_gap_ratio reaches its threshold and such a roster is
+  obtainable.
+- **Premarket entry enablement**.
+- **Fundamentals acceptance-time cutoff** — worked together with a premarket
+  or intraday fundamentals refresh.
+- **Delayed quote stream unavailable**.
+- **`api_contract_checklist.md` re-evaluation** — last; it collects what the
+  other items establish.
 
 ---
 
@@ -153,7 +142,9 @@ interface is drawn.
 A further design target: on launch, the CLI pre-fills a sell order for each
 position awaiting manual liquidation — `fraction_held` positions among them
 (`live_mode_runner.md`'s settlement pending) — for the operator to submit
-directly.
+directly. Those sell orders are phase-validated new requests, so its client
+is constructed with the closes and ends of `utils.load_session_boundaries()`
+(trading_api.md's Layer Responsibility Split).
 
 ---
 
@@ -246,67 +237,6 @@ the rest are answerable at a desk has not been sorted through.
 
 ---
 
-## Config-duplicating signature defaults
-
-A LATENT risk, not an active defect. A caller that passes the argument is
-unaffected, and the failure needs both an omission and a later config change.
-
-**The class.** A function-argument default equal to the configured value.
-Omitting the argument silently reads the default, and no test detects the
-omission while the two agree.
-
-**Members**, default site — config site:
-
-- `02_indicator_calculator.md` `reset_mode` `"date"` — its own config block
-- `02_indicator_calculator.md` `regular_start` `"093000"` — its own config block
-- `utils.md` `ambiguity_priority` `"up"`, TWICE in one file — `05_labeler.md`
-- `utils.md` `vol_metric` `"avg_intraday_range"` — `pipeline_optimizer.md`
-- `utils.md` `embargo_days` `5` — `06_class_balancer.md`
-- `01_entry_detection.md` `max_sideways_ratio` `0.6` — its own config block
-- `execution_common.md` `use_all_cash` `True` — its own config block
-- `08_dimensionality_reducer.md` `bottom_pct` `0.20` — its own config block
-
-**Not members**, having no config counterpart: `utils.md`'s `window_days` and
-`val_fraction`, `07_lgbm_pipeline.md`'s `importance_type`, and the local
-defaults — `return_intermediate`, `balance`, `fold_idx`, `dry_run`.
-
-**`target_valid_bars` is excluded**, its default already removed. That one was
-removed because it broke WITHIN one engine: `09_backtest_engine.md` counts
-`config["execution"]["max_hold_bars"]` valid bars over a sequence the function
-would have capped at 60, so raising the key past 60 made the time-limit exit
-unreachable rather than merely late. No equivalent internal contradiction is
-shown for the members above, and that is what makes the class latent.
-
-**The open question is which resolution the class takes**, not whether each
-site is a duplicate. Removal, as `target_valid_bars` took; or the `None`
-sentinel already present in `06_class_balancer.md` for the same parameter
-`utils.md` defaults to `5`; or a per-site judgement. Two patterns for one
-parameter already coexist, which is itself the argument for settling it once.
-
-**`01_entry_detection.md`'s `max_sideways_ratio` is the sharpest instance**:
-its own inline comment reads `# from config` beside the hardcoded default.
-
----
-
-## No path from a trained model's `run_id` to the live model
-
-**Problem.** The live model is the `run_id` set in config by hand
-(`inferencer.md`). `shadow_retraining.md` declares the retraining scope
-without containing a step that moves a newly trained `run_id` into that
-config. The regime holdout gate (`pipeline_optimizer.md`) only checks the
-configured `run_id` at session start; it does not choose one.
-
----
-
-## Finding 6 divergence — resampling unit and threshold
-
-**Problem.** `health_report.md`'s finding 6 and `shadow_retraining.md`'s
-divergence trigger compare live winning rate against a backtest CI. The CI is
-computed by `utils.bootstrap_ci()`, but the trigger's resampling unit and
-its threshold are undecided.
-
----
-
 ## Lock measurements
 
 **Problem.** The DB access coordination (db_coordination.md) relies on lock
@@ -320,71 +250,215 @@ behaviour not yet measured:
 
 ## Run launchers
 
-**Problem.** Runs the system needs have no launcher:
-- no process relaunches a crashed LiveModeRunner for warm restart; the
-  dispatcher does not;
-- no launcher or schedule is specified for the optimizer's 'refresh' run —
-  its command is `run_guest pipeline_optimizer --trigger scheduled`
-  (pipeline_optimizer.md), and nothing issues it.
+**Problem.** No process relaunches a crashed LiveModeRunner for warm
+restart; the dispatcher does not.
 
 ---
 
-## Optimizer session_mode search over features computed once
+## Premarket entry enablement
 
-**Problem.** pipeline_optimizer.md's search space varies
-`entry_detector.session_mode` per trial, while the input Preprocessor work
-computes features once under its config's session_mode — run_preprocess.md's
-session-stats load filter, 02_indicator_calculator.md's rvol baseline span —
-and a trial's session_mode reaches only ClassBalancer's sample filter.
-Consequences:
-- trial evaluation is biased against session_mode values other than the input
-  work's;
-- a deployment config set to the winning trial's session_mode computes live
-  features under a session_mode the model was not trained with, undetected by
-  Health Gate 1d's derived config_hash comparison — session_mode is applied at
-  load, outside the `precomputed_session_stats` config_hash.
+**Problem.** Entry points are regular-session only (data_boundary.md).
+Enabling premarket entries needs, as prerequisites:
+- a definition of minute_of_session for premarket entries;
+- a live premarket evaluation path:
+  - premarket scanning;
+  - incremental backfill of today's bars;
+  - the watchdog's premarket behaviour;
+  - finding 29's scope;
+- the train/live entry-population mismatch before the runner's Step 8;
+- protection of entries before the 09:20 premarket recheck;
+- verification of premarket fill and spread assumptions;
+- evaluation-population filtering and Health Gate comparison of the session
+  mode.
 
----
+Sites to widen:
+- scan()'s regular-phase exclusion step;
+- Inferencer's step 1 check;
+- the session_mode config comment;
+- data_boundary.md's regular-only entry rule.
 
-## Halt spanning midnight
+Already designed, carried here: the cooldown runs continuously across the
+premarket/regular boundary with no reset at 09:30.
 
-**Problem.** Whether the NYSE halt pages give a halt continuing from D into
-D+1 its own D+1 row is unverified. Without one:
-- D+1 slots before resumption are classified no_trade rather than halt
-  (`trading_halts`' NULL `halt_end` covers D alone), skewing
-  `precomputed_session_stats` baselines and labels whose windows include D+1;
-- the label outcome stays covered by 05_labeler.md's Case D, and live trading
-  by the halt-status poller's snapshot.
-
-The evening Halt Comparison's `halt_live_only` metric on D+1 observes the
-case. A classification rule changed after the answer reaches already-computed
-derived rows only as a code change does (Code-version identifier, below).
+Related: execution_common.md's `use_loo` comment.
 
 ---
 
-## Selection-phase search design
+## Challenger shadow inference
 
-**Problem.** The selection phase's search design is not specified. It
-covers:
-- restoring `dimensionality_reducer.importance_averaging` to a search space;
-- a `sample_weighted` basis that differs from `uniform`
-  (08_dimensionality_reducer.md).
+**Problem.** Before approval, the challenger predicts beside the deployed
+model in the session and its signals are recorded; once it exists, an
+awaiting candidate that passed it is reported 'warn'.
 
 ---
 
-## Step decomposition of the per-run guests
+## Point-in-time security identity
 
-**Problem.** Whether each per-run guest (guest_supervisor.md's Tool Registry)
-splits into steps resumed through guest_supervisor.md is undecided. Until
-then each restarts from scratch after self-termination (db_coordination.md's
-Unit scope).
+**Problem.** A security's identity over time:
+- the CIK valid on each date per security segment;
+- fundamentals read for that CIK;
+- a reused symbol as separate segments.
+
+Its source: a roster carrying CIK, the Survivorship Audit's source
+(migration_tool.md). Worked when the Security Identity Audit's
+identity_gap_ratio reaches its threshold and such a roster is obtainable.
 
 ---
 
-## Code-version identifier
+## Fundamentals acceptance-time cutoff
 
-**Problem.** No path acquires a code-version identifier. A
-guest_supervisor.md work's config_hash and every derived table's config_hash
-carry none, so a code change that alters computed values without changing
-the feature schema hash is resumed into the same work, and its derived rows
-stay under the same config_hash. Design deferred.
+**Problem.** A fundamentals fact is read for D when filed before D
+(data_boundary.md's "Point-in-time correctness for fundamentals"). A fact
+accepted on the prior trading day after 17:30 ET carries D's filing date and
+waits a day. Live reads fundamentals collected by the prior trading day's
+evening run alone.
+
+First-pass thinking:
+- source: the submissions feed's per-filing acceptance timestamp, joined to
+  companyfacts facts by accession; its field and time zone verified against
+  a live response; the migration backfill fetches the older submissions
+  files;
+- a per-row known date computed at collection, readers comparing it with D;
+  a fact without an acceptance time keeps the filed-before-D rule;
+- its gain depends on when live receives fundamentals:
+  - the evening run alone: facts accepted between 17:30 ET and the prior
+    trading day's `after_hours_end`;
+  - a premarket fundamentals refresh: facts accepted up to that refresh,
+    usable on D;
+  - an intraday fundamentals refresh: facts accepted during D, usable for
+    D's later entries — the cutoff per entry, accepted and received by a
+    refresh before the entry's t bar open — training resolving each entry
+    against the refresh schedule;
+- worked together with a premarket or intraday fundamentals refresh, not
+  alone.
+
+---
+
+## Delayed quote stream unavailable
+
+**Problem.** The V10/V11 delayed quote stream exists in the vendor's API
+documents only; measured, it delivers no data.
+
+Resting on it:
+- auxiliary_stream.md's delayed quote capture, its first consumer;
+- metadata_crawler.md's Feed Coverage Analysis and db_schema.md's
+  feed_coverage_daily;
+- health_report.md's feed coverage reporting;
+- live_mode_runner.md's Session Shutdown stage 2, held for
+  `auxiliary_stream.tail_minutes`;
+- api_contract_checklist.md's T-1 method paragraph;
+- this file's WS/REST tape asymmetry density buckets
+  (`delayed_prints_d1`..`d4`) and its `api_contract_checklist.md` item's T-1
+  method sentence.
+
+Open:
+- what measures the live stream's missing prints instead, the REST 1-tick
+  tape being the spec's complete tape;
+- whether loop A stays for its next consumer (V61).
+
+---
+
+## Vectorizer method mapping completeness
+
+**Problem.** The spec states that every computed indicator series is
+vectorized — 04_feature_extractor.md's Processing Pipeline ("for each
+indicator series, apply mapped transform method(s)") and its Strategy A
+lists; pipeline_optimizer.md's default group_alternatives [hl_spread,
+roll_spread], whose groups must be keys of get_feature_groups() — but
+03_vectorizer.md's mapping states no method for sar, sar_trend, adx,
+dmi_plus, dmi_minus, roc, cci, mfi, bb_upper, bb_middle, bb_lower,
+vr_volatility, volume_ma_{n}, vr_volume, vwap, buyer_initiated_ratio,
+tick_direction_momentum, roll_spread_pct and hl_spread_pct, and only
+bb_pctb's primary method (its Statistical Summary's Applies to).
+
+Also open:
+- no rule for an output absent from the mapping;
+- `vectorizer.*` sits inside config_hash (run_preprocess.md) and is declared
+  nowhere;
+- 03's per-method Applies to lines disagree with its table;
+- 04's Strategy A list omits roc, stochastic, cci, mfi, vr_volatility and
+  volume_ma.
+
+First-pass thinking:
+- every computed output holds a mapping row, FeatureExtractor init raising on
+  one that holds none;
+- methods after the existing rows' patterns: roc, cci, mfi and bb_pctb
+  statistical_summary + shape_features; adx, dmi_plus and dmi_minus
+  statistical_summary + linear_trend; sar_trend and vr_volatility
+  statistical_summary; vr_volume, buyer_initiated_ratio, roll_spread_pct and
+  hl_spread_pct statistical_summary + window_comparison;
+  tick_direction_momentum statistical_summary + linear_trend; volume_ma_{n}
+  as volume's row;
+- the price-level series bb_upper, bb_middle, bb_lower, sar and vwap through
+  level_distance on the t−1 value, a design call the spec does not yet make;
+- 03 gains a Config Keys section declaring `vectorizer.mapping`, its Applies
+  to lines pointing at the table;
+- 04's Strategy A membership stated as every bar-derived CONTINUOUS
+  indicator.
+
+---
+
+## Daily raw market-data collection
+
+**Problem.** No component produces the JSON dump that New JSON Ingestion
+(metadata_crawler.md) and migration_tool.md import — `{TICKER}_{DATE}_min.json`
+and `{TICKER}_{DATE}_tick.json` under data_root (db_schema.md's File Naming
+and Directory Convention):
+- metadata_crawler.md ingests "newly collected JSON files", its evening slot
+  derived from the dump's completion at 20:00 ET;
+- architecture.md's pipeline starts at Raw JSON;
+- utils.md's Numeric Rules name the dump among the broker API's values;
+  auxiliary_stream.md's delayed quote capture states that bid_ask_snapshots
+  and tick_10 come from REST polling;
+- `chart/min` and `chart/tick` are drawn by the live session alone, which
+  stores none of what they return in ohlcv_1min or tick_10.
+
+Open, the collector's:
+- universe per date: the tickers queried, from the trading API's ticker
+  master (`inquiry/stock-ticker`, per exchange, no date), and whether the
+  list is kept:
+  - the per-date ticker lists stored today: live_session_state.all_tickers,
+    on dates the runner started; ticker_cik_map.trading_api_seen_date, the
+    latest date alone;
+  - the ticker master serves no past date's list, so a date collected
+    without a kept list holds no universe;
+- queries: `chart/min` at 1 minute and `chart/tick` at 10 ticks — date range,
+  `InputOrgAdjPrc`, market code, `dataCnt` and `cont_key` paging; the
+  `InputOrgAdjPrc` setting the existing dump was collected under;
+- output: the JSON dump under its file convention, or a direct DuckDB load;
+- outcome per (ticker, date, resolution) — data, no records (message 2679),
+  error — and whether a no-record query writes a file;
+- timing: the vendor's cut a few seconds past 19:30; the completion the
+  evening slot derives from (stated 20:00 ET, 17:00 on an early-close day);
+  api_doc's tick-chart example shows a 19:59:57 print under its own date,
+  against the measured cut, the measurement governing;
+- call budget: the endpoints' per-account TPS, shared with the live session
+  until its shutdown;
+- failure: retry, and re-collection of a past date, how far back the vendor
+  serves one; the file finding 59's remediation places in data_root.
+
+Also open:
+- finding 59's failed-file gap does not resolve when the re-imported file
+  holds no in-range row, a zero-row import leaving no row and no
+  source_changes row;
+- a ticker missing both files on a date reads as a no-trade ticker-date, and
+  a date whose dump holds part of the tickers raises no date gap; a dead
+  position whose next has_data day is such a date resolves as Case B
+  (05_labeler.md, 09_backtest_engine.md).
+
+Stated intent (the original requirements): the separately developed JSON
+collection script is modified so newly collected data loads into DuckDB,
+split off as a tool, and merged with metadata crawling into one daily tool.
+
+First-pass thinking:
+- a collection stage in `collect_daily.py` ahead of New JSON Ingestion;
+- the universe as the date's ticker master across NYSE, NASDAQ and AMEX;
+- unadjusted prices (`InputOrgAdjPrc` 0), stored bars being raw and adjusted
+  through corporate_events;
+- a per-date manifest — every ticker queried and its outcome per resolution —
+  and a per-file ingestion outcome record, against which finding 59 judges
+  failed files and missing ticker-dates, the outcome record replacing the
+  `collection_gaps` health_events failure records and finding 59's
+  failed-file gap and its newness restated against it;
+- Case B unchanged, a missing ticker-date remediated through finding 59 and
+  source_changes.

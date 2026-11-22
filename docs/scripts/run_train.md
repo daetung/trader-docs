@@ -16,15 +16,15 @@ Called per fold by PipelineOptimizer (rolling walk-forward) or standalone via CL
 
 ## Class Interface
 
-**DB access role.** A per-run guest (db_schema.md's DB File Ownership Windows;
-db_coordination.md's Unit scope), run through guest_supervisor.md's
+**DB access role.** A per-chunk guest (db_schema.md's DB File Ownership
+Windows; db_coordination.md's Unit scope), run through guest_supervisor.md's
 `run_guest`:
-- `run_guest run_train` enters
-  `register('guest', 'run_train', trigger)` and opens one
-  `guest_unit('run_train', None)` around the body, which waits for admission
-  without limit;
-- the body is handed that unit's connection, passed wherever this tool
-  takes `db_conn`, and calls neither `register()` nor `guest_unit()`;
+- `run_guest run_train` enters `register('guest', 'run_train', trigger)` and
+  hands the body a unit opener, each call opening one
+  `guest_unit('run_train', None)`, which waits for admission without limit;
+- the body opens one unit, for its train_log write (train_log Write,
+  below); training runs outside units;
+- the body calls neither `register()` nor `guest_unit()`;
 - `scripts/run_train.py` run directly hands over to
   `run_guest run_train`;
 - while an owner waits past `coordination.guest_max_hold_seconds`, the run
@@ -35,7 +35,6 @@ class Trainer:
     def __init__(
         self,
         config: dict,
-        db_conn: duckdb.DuckDBPyConnection | None,
         optimizer_run_id: str | None = None,
     ): ...
 
@@ -58,7 +57,8 @@ class Trainer:
         dry_run:        bool = False,
     ) -> dict:
         """
-        Train model, evaluate, optionally run reducer, write train_log, save artifact.
+        Train model, evaluate, optionally run reducer, save artifact, and
+        return train_log_row — never inserting it (train_log Write, below).
 
         Args:
             train_df, val_df, test_df:
@@ -72,7 +72,8 @@ class Trainer:
                 Rolling inner fold index (0-based). Default -1 for standalone/outer eval.
             outer_fold_idx:
                 Outer fold index for nested validation (0-based). Default -1 for
-                non-nested runs (standalone, selection, full, non-nested exploitation).
+                non-nested runs (standalone, selection, full, non-nested exploitation)
+                and for a final model (exploitation, refit).
             fold_train_start, fold_train_end:
                 First and last date of the date range the model is actually
                 trained on ('YYYYMMDD'). None for standalone.
@@ -84,10 +85,16 @@ class Trainer:
                 split for the outer eval and the final model. Trainer does not
                 compute them.
             feature_config:
-                Active hyperparameter config dict for this trial.
+                Active hyperparameter config dict for this trial; for a
+                selection-phase run, the run's stage descriptor
+                (pipeline_optimizer.md).
                 None in standalone mode — full config snapshot used instead.
             feature_names:
-                Explicit feature list (exploitation phase, selected_features).
+                Explicit feature list — the exploitation phase's
+                selected_features; the selection phase's Stage A alternative
+                feature sets, Stage B-1's input set (passed with
+                run_reducer=True) and Stage B-2's voted sets
+                (pipeline_optimizer.md).
                 None = use FeatureExtractor.get_feature_names() (full set).
             run_reducer:
                 True = run DimensionalityReducer, return selected_features
@@ -95,22 +102,23 @@ class Trainer:
                        Does NOT trigger retraining within Trainer.run().
                 False = skip reducer (default).
             phase:
-                "selection" | "exploitation" | "full" | None (standalone).
+                "selection" | "exploitation" | "refit" | "full" | None (standalone).
                 Recorded in train_log for diagnostics.
             trial_idx:
                 0-based trial counter within the inner trial loop.
-                -1 for outer evaluation rows (not part of inner trial search).
+                -1 for outer evaluation rows (not part of inner trial search;
+                exploitation or refit).
+                -2 for a champion outer evaluation row (exploitation).
         0 for standalone/selection/full (single implicit trial), and also for
-        the exploitation-phase final (consensus) model — disambiguated from
+        the exploitation- or refit-phase final model — disambiguated from
         an exploitation inner trial 0 by outer_fold_idx: -1 for the final
         model, >=0 for an inner trial tied to a specific outer fold.
             dry_run:
-                True = train and evaluate normally, but skip train_log INSERT
-                       and model artifact save. Returns train_log_row in result dict.
-                       Used by parallel workers in nested validation — coordinator
-                       performs all DB writes after collecting worker results.
-                False = write train_log INSERT and save artifact (default).
-                db_conn may be None when dry_run=True.
+                True = train and evaluate normally, but skip the model artifact
+                       save. Used by parallel workers in nested validation.
+                False = save the artifact (default).
+                dry_run controls only the artifact save; train_log_row is
+                always returned and the caller writes it.
 
         Returns:
             dict with keys:
@@ -118,7 +126,7 @@ class Trainer:
                 "auc_std":           None    — populated by optimizer via UPDATE
                 "reduction_report":  dict | None  — non-None when run_reducer=True
                 "selected_features": list[str] | None  — non-None when run_reducer=True
-                "train_log_row":     dict    — always present; coordinator uses when dry_run=True
+                "train_log_row":     dict    — always present; the caller writes it
         """
         ...
 ```
@@ -133,10 +141,14 @@ run_guest run_train [OPTIONS]
 
 Options:
     --config, -c    Path to pipeline_config.yaml (default: configs/pipeline_config.yaml)
-    --data-dir, -d  Directory containing train/val/test parquet files (default: data/processed)
+    --data-dir, -d  Directory containing train/val/test parquet files (default:
+                    None, meaning data_paths.processed_dir)
     --run-id        Explicit run ID (default: YYYYMMDD_HHMMSS)
     --reduce        Run DimensionalityReducer AND retrain on selected features.
-                    Saves a second "_reduced" model artifact.
+                    Saves a second "_reduced" model artifact only when the
+                    reduced model's mean test AUC ≥ the full-feature model's
+                    auc_mean − dimensionality_reducer.auc_tolerance;
+                    auc_reduced_mean is recorded either way.
                     Standalone use only — PipelineOptimizer does not use this flag.
     --features      Path to selected_features.json (load pre-selected feature list)
 ```
@@ -157,10 +169,11 @@ train_log_row = {
     "run_id":              run_id,
     "optimizer_run_id":    optimizer_run_id,        # None for standalone
     "run_at":              run_at,
-    "phase":               phase,                   # "selection"|"exploitation"|"full"|None
-    "trial_idx":           trial_idx,               # -1 for outer eval; 0 for standalone/
+    "phase":               phase,                   # "selection"|"exploitation"|"refit"|"full"|None
+    "trial_idx":           trial_idx,               # -2 for a champion outer eval; -1 for
+                                                    # outer eval; 0 for standalone/
                                                     # selection/full and for the exploitation
-                                                    # final model (outer_fold_idx=-1
+                                                    # or refit final model (outer_fold_idx=-1
                                                     # disambiguates it from inner trial 0);
                                                     # 0-based otherwise for exploitation
                                                     # inner trials
@@ -181,17 +194,27 @@ train_log_row = {
     "auc_dn5":             eval_result["dn5"]["test_auc"],
     "auc_mean":            eval_result["mean_test_auc"],
     "auc_std":             None,    # set by PipelineOptimizer via UPDATE
-                                    # on fold_run_ids[-1] after trial completes
+                                    # on fold_run_ids[-1] after trial completes;
+                                    # the selection phase: the std over folds
+                                    # of the chosen candidate's auc_mean, set
+                                    # on its run_id at the largest fold_idx —
+                                    # with no eligible candidate, of the
+                                    # baseline runs' auc_mean, on the baseline
+                                    # run at the largest fold_idx
                                     # pruned trials retain NULL
-    "auc_reduced_mean":    None,    # set only when --reduce CLI flag used
+    "auc_reduced_mean":    None,    # set only when --reduce CLI flag used,
+                                    # whether or not the _reduced artifact is saved
     "best_of_loop":        False,   # set by PipelineOptimizer via UPDATE
     "is_pruned":           False,   # set TRUE by Coordinator via UPDATE for pruned trials
     "notes":               None,
 }
 ```
 
-When `dry_run=True`, this dict is included in the return value under `result["train_log_row"]`.
-The coordinator performs the actual INSERT. When `dry_run=False`, Trainer performs INSERT directly.
+Trainer.run() never inserts into train_log: this dict is returned under
+`result["train_log_row"]`. run_train writes the row — its auc_reduced_mean
+included under `--reduce` — in its write unit; the optimizer's coordinator
+writes its rows in the step's write unit (pipeline_optimizer.md). An artifact
+directory without a train_log row is an incomplete run.
 
 ---
 
@@ -201,6 +224,8 @@ The coordinator performs the actual INSERT. When `dry_run=False`, Trainer perfor
 model.*
 lgbm_params.*
 dimensionality_reducer.*
+data_paths.processed_dir
+drift.psi_bins
 
 trainer:
   use_ambiguous_sample_weight: false
@@ -215,6 +240,10 @@ trainer:
 - Must not modify the preprocessed data files
 - Must print summary results even if dimensionality reduction is run
 - Model artifacts must include config snapshot for reproducibility
+- Trainer saves `{run_id}_reference.json` with its artifacts, not under
+  dry_run (base_model.md): per class probability, `drift.psi_bins` quantile
+  bin edges of its val-split predictions and each bin's share; per feature of
+  meta feature_names, its profile over the val split
 - Must handle empty DataFrames gracefully (exit with error message)
 - `run_id` generated via `utils.generate_run_id()` only when run_id argument is None
 - In nested validation, coordinator pre-generates run_id and passes it explicitly —
@@ -222,13 +251,16 @@ trainer:
 - `experiment_log` is NOT written by run_train.py — only train_log
 - `best_of_loop` updated by PipelineOptimizer via UPDATE, not by Trainer itself
 - `is_pruned` updated by PipelineOptimizer Coordinator via UPDATE, not by Trainer
-- `auc_std` updated by PipelineOptimizer via UPDATE on `fold_run_ids[-1]`
+- `auc_std` updated by PipelineOptimizer via UPDATE on `fold_run_ids[-1]`; the
+  selection phase sets it on the chosen candidate's run_id at the largest
+  fold_idx (the baseline run's when no candidate is eligible)
 - `fold_idx` default -1 for standalone (no rolling fold); 0-based for rolling folds
 - `outer_fold_idx` default -1 for non-nested runs; 0-based for nested outer folds
 - `trial_idx` default 0 for standalone/selection/full; -1 for outer eval rows;
-  0-based for exploitation inner trials; also 0 for the exploitation final
-  model (outer_fold_idx=-1) — same "single implicit trial" semantics as
-  standalone/selection/full, just reached via a different phase
+  -2 for champion outer eval rows; 0-based for exploitation inner trials;
+  also 0 for the exploitation or refit final model (outer_fold_idx=-1) — same
+  "single implicit trial" semantics as standalone/selection/full, just
+  reached via a different phase
 - `fold_train_start`, `fold_train_end`, `fold_train_days` are passed by the caller —
   Trainer does not compute them
 - Sample weight column (`__sample_weight__`) generated inside Trainer when
@@ -237,11 +269,10 @@ trainer:
 - `run_reducer=True` returns selected_features and reduction_report — no retraining within Trainer.run()
 - `--reduce` CLI flag triggers full reduce-retrain cycle; NOT replicated when run_reducer=True
   is called by PipelineOptimizer
-- Session_mode filtering applied upstream by ClassBalancer — Trainer does not re-apply it
+- No session filter applies — entry points are regular-session only from `scan()` (data_boundary.md)
 - `is_ambiguous` column used for weight assignment only — never appears in feature_names
-- `dry_run=True`: db_conn may be None; no INSERT, no artifact save; train_log_row in result
-- `dry_run=False`: db_conn must be valid; performs INSERT and artifact save
-- Calls neither `register()` nor `guest_unit()` — `run_guest` opens its unit
-- Built by PipelineOptimizer per step on that step's connection; Trainer issues
-  no commit of its own, its INSERT committed with the step
-  (pipeline_optimizer.md's Work)
+- Trainer takes no db_conn and never inserts into train_log; `dry_run` controls
+  only the artifact save; train_log_row is always in the result
+- Calls neither `register()` nor `guest_unit()` — `run_guest` opens its units
+- Built by PipelineOptimizer per step without a connection; the caller writes
+  its train_log_row (pipeline_optimizer.md's Work)

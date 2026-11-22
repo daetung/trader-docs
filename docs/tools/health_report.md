@@ -55,7 +55,10 @@ Scheduled invocations:
     the fit;
   - finding 11;
   - finding 52 over that run's `evening_ticker_master_check` stage;
-  - findings 53 and 54 over the span since the previous report.
+  - finding 6 when the date is the last trading day of its calendar week;
+  - findings 53, 54 and 56 over the span since the previous report;
+  - finding 57;
+  - finding 59.
 
 EVENT-DRIVEN invocations fire outside that schedule. These triggers exist:
 - A circuit-breaker trip (R-4) — entries are frozen for the rest of the
@@ -84,7 +87,9 @@ EVENT-DRIVEN invocations fire outside that schedule. These triggers exist:
   runner's recording of its health event (live_mode_runner.md);
 - A scheduled run refused by guest_supervisor.md's new-run resolution
   (finding 54, `scheduled_work_deferred`), delivered by guest_supervisor.md
-  on every refusal.
+  on the first refusal blocked by a given work and on every refusal blocked
+  by `restore_store` — a later refusal blocked by a work carrying
+  'deferral_notified' is recorded through `write_to_log()` alone.
 
 These findings, on these event paths, are produced without a session's
 in-memory aggregates, at these sites:
@@ -114,10 +119,12 @@ a mid-session, pre-session, or post-session event.
 ## Findings Gathered
 
 ```python
-def gather_findings(db_conn, today_date, log_dir,
+def gather_findings(db_conn, today_date, log_dir, path: str,
                     subset: list[str] | None = None,
                     live_aggregates: dict | None = None) -> dict:
     """
+    `path` — the invocation path, the caller's alert_key (Invocation
+    Contract); the findings gathered per path read it.
     `subset` (None = every finding) is applied HERE, at collection, not as a
     filter over the finished result: this function otherwise sweeps
     batch_runs, ticker_cik_map, inference_log, trade_log, live_positions, the
@@ -187,8 +194,8 @@ def gather_findings(db_conn, today_date, log_dir,
        Detail view: `(cik, ticker, rename_pending, quarantine_reason)`.
     3. inference_log — preload_fail rate for today's run_id:
        COUNT(*) FILTER (WHERE event='preload_fail') / COUNT(*)
-       Alert threshold: TBD — not yet set (same deferral status as findings
-       6 and 7's thresholds below; the rate itself is always computed and
+       Alert threshold: TBD — not yet set (same deferral status as finding
+       7's threshold below; the rate itself is always computed and
        loggable, only the warn/abort cutoff is undecided).
     4. Structured logs — the STAGE and SUMMARY lines of the work stages
        carrying a SUMMARY obligation (premarket_*, evening_*,
@@ -200,16 +207,49 @@ def gather_findings(db_conn, today_date, log_dir,
        with no matching SUMMARY line, in a run ended 'normal' (run_info(),
        db_coordination.md), is flagged as a logging-mismatch finding on its own —
        distinct from the batch's own status.
-    5. tick_bar_aggregates Tier-2/3 fallback rate — LiveModeRunner's Health
+    5. tick_bar_aggregates cache gaps — LiveModeRunner's Health
        Gate 2 result for the current session, not recomputed here (see
        live_mode_runner.md). Read (R-9) from
        live_session_state.session_diagnostics rather than passed in as an
        in-memory tally, so a crashed session's value survives and the evening
        liveness probe can recover it.
-    6. Live winning-rate divergence vs. backtest — placeholder only. Its CI
-       is computed by utils.bootstrap_ci(), the same computation as
-       shadow_retraining.md's divergence trigger; the resampling unit and the
-       threshold are not yet defined (open_items.md).
+       Detail: the cache-gap summary —
+         - its measurement time;
+         - per date, the ticked and cached counts and the gap share;
+         - the dates above 0.20.
+       Level: 'warn' when a date is above 0.20, else 'ok'; NOT APPLICABLE
+       when no start of the session wrote it. A start writes none:
+         - with no "lookback"-configured indicator;
+         - when blocked into the reduced session;
+         - when it stops before write point (b).
+    6. Live winning-rate divergence vs. backtest — the weekly divergence
+       evaluation (shadow_retraining.md's Divergence trigger), computed
+       through utils.divergence_check(): the deployed model R
+       (model_deployments' latest row), R's trades in the last
+       optimizer.refresh.divergence.window_weeks completed calendar weeks,
+       against the 'outer_validation' runs with execution_variant NULL of R's
+       work; 'not_applicable' when the window holds no session of R at stage
+       'pilot' or 'scale'.
+       Gathered:
+         - on the evening_end path when the date is the last trading day of
+           its calendar week, over the weekly evaluation;
+         - on the session_start path when the previous trading day's
+           evening_health_report row is not 'success' and that day is the
+           last trading day of its calendar week.
+       Detail:
+         - target run_id;
+         - the window's weeks, days and trades;
+         - the observed winning rate;
+         - the CI, in_ci and ci_position;
+         - the verdict;
+         - each suppression of the trigger in force — probation, a
+           dispatched week (a pipeline_optimizer work not superseded
+           carrying the last completed week as its divergence week,
+           guest_supervisor.md's report function), an awaiting candidate;
+         - resume.sqlite unreadable → the dispatched-week state reported
+           unknown, the rest reported.
+       Level: 'adverse' → 'warn'; 'insufficient_sample' → 'info'; 'within'
+       and 'not_applicable' → 'ok'.
     7. Execution-parameter divergence (pilot stage onward) — mean absolute
        gap between trade_log.predicted_fill_price/predicted_weighted_avg_exit_price
        and their real (fill_price/weighted_avg_exit_price) counterparts,
@@ -228,7 +268,7 @@ def gather_findings(db_conn, today_date, log_dir,
        Independent of finding 6 — a model divergence and an
        execution-parameter divergence are different failure modes (retrain
        vs. recalibrate) and must not be merged into one signal. Threshold
-       TBD, same deferral as finding 6.
+       TBD.
     8. Halt-check signal-source rate (N-4: data path matches finding 5's
        pattern) — fraction of today's Position Manager Loop halt checks
        (see live_mode_runner.md's Position Manager Loop Step 1) tagged
@@ -241,7 +281,7 @@ def gather_findings(db_conn, today_date, log_dir,
        LiveModeRunner tallies signal_source per check as the session runs
        and persists the counts (R-9) to
        live_session_state.session_diagnostics on the bar_latency_daily flush
-       cadence, the same place Health Gate 2's tier_used summary reaches
+       cadence, the same place Health Gate 2's cache-gap summary reaches
        finding 5. Stored as counts per source rather than a precomputed
        fraction — a multi-valued numerator/denominator is why
        session_diagnostics is JSON and not a scalar column. Loss on a crash
@@ -386,8 +426,9 @@ def gather_findings(db_conn, today_date, log_dir,
     when it leaves no row anywhere else.
     13. restart_gap_exit count (R-2) — positions liquidated on warm restart
         for a tp/sl breach detected retroactively within the crash gap, or
-        liquidated immediately because the gap already exceeded
-        execution.max_hold_bars. A nonzero count is expected after any
+        liquidated immediately because the position's elapsed minus halted
+        hold already exceeded execution.max_hold_minutes. A nonzero count is
+        expected after any
         crash; the count itself is diagnostic (frequency/severity of
         crashes), not an error signal on its own.
     14. Position held overnight: halted through close (R-3) — count of
@@ -492,17 +533,17 @@ def gather_findings(db_conn, today_date, log_dir,
         distinct tally.
     19. Entries lost at the entry gates (R-5) — today's inference_log rows
         with event='signal_fired', grouped by gate_result: 'submitted' plus
-        one bucket per gate ('freeze', 'cap_tickers', 'cap_per_ticker',
-        'cooldown', 'not_tradable', 'bar_integrity', 'no_terms',
-        'sizing_zero', 'funds'). A COMPLETE enumeration of the gates, not a
+        one bucket per gate ('residual_edge', 'freeze', 'cap_tickers',
+        'cap_per_ticker', 'cooldown', 'not_tradable', 'bar_integrity',
+        'no_terms', 'sizing_zero', 'funds', 'cap_inert'). A COMPLETE enumeration of the gates, not a
         sample: 'error' and 'breaker' are absent because neither is a gate
         verdict — one is a raised exception, the other a session state.
         Read straight
-        from the table, NOT passed in from LiveModeRunner — unlike findings
-        5 and 8, whose aggregates travel in memory only because tier_used
-        and signal_source have nowhere to be stored, gate_result has a
-        column of its own (db_schema.md), so the query survives a crash and
-        needs no in-session tally threaded through this call.
+        from the table, NOT passed in from LiveModeRunner — findings 5 and 8
+        read values LiveModeRunner records in session_diagnostics, while
+        gate_result has a column of its own (db_schema.md), so the query
+        survives a crash and needs no in-session tally threaded through
+        this call.
         A candidate stopped at a gate produces no trade_log row, so these
         rows are the only record it existed; the cap buckets in particular
         are the sole evidence for whether execution.max_tickers and
@@ -513,8 +554,8 @@ def gather_findings(db_conn, today_date, log_dir,
         in practice. The same bucket names appear as BacktestEngine summary
         counters (09_backtest_engine.md), so a live session and a backtest
         over the same window are directly comparable; 'freeze',
-        'not_tradable', 'bar_integrity' and 'no_terms' are live-only, by
-        design rather than omission.
+        'not_tradable', 'bar_integrity', 'no_terms' and 'cap_inert' are
+        live-only, by design rather than omission.
         A broker rejection is NOT one of these buckets: it occurs after
         submission, so it is counted under 'submitted' here and surfaces in
         finding 17 as exit_reason='entry_rejected'.
@@ -588,9 +629,11 @@ def gather_findings(db_conn, today_date, log_dir,
         resumed, 13 = positions liquidated because of a restart,
         restart_count = how many restarts occurred), so a restart with no open
         positions gives restart_count > 0 with finding 13 at zero.
-    22. inference_log rows dropped (R-8) — count of diagnostic log writes
-        discarded by INSERT OR IGNORE on a PK collision, plus any suppressed
-        by the write-failure guard. This is what makes INSERT OR IGNORE
+    22. Diagnostic rows dropped (R-8) — per table, inference_log and
+        inference_features: the dropped rows, discarded by INSERT OR IGNORE
+        on a PK collision, and the failed rows, suppressed by the
+        write-failure guard — for inference_features, flush_features()'
+        counts added by the runner. This is what makes INSERT OR IGNORE
         acceptable: the content of a dropped row is gone, but the fact that
         rows are being dropped is not. Nonzero after the R-8 key and
         timestamp changes indicates a real defect (duplicate logging, a clock
@@ -710,7 +753,7 @@ def gather_findings(db_conn, today_date, log_dir,
         it requests has to determine.
         Each owner's spec keeps its deadline action:
         - `owner='evening'` — the run aborts, and tomorrow's Health Gate 1a
-          will abort tomorrow's session on missing session stats — the
+          will block tomorrow's participation on missing session stats — the
           intended fail-safe, reached loudly;
         - `owner='premarket'` — the run aborts, and the runner's start follows
           its own wait spec (live_mode_runner.md's Session Start Gating),
@@ -786,7 +829,7 @@ def gather_findings(db_conn, today_date, log_dir,
         scan never reached it at all. One calls for looking at the feed, the
         other at the scan.
         Also note the overlap the detail must state rather than resolve: a
-        promoted ticker that produced no late entry appears in BOTH
+        promoted ticker whose finding did not go through the late path appears in BOTH
         `gap_unevaluated` and `promotions_total` (see db_schema.md), so the
         two are never added.
         Level: warn. Threshold TBD, same deferral. Available only on the
@@ -979,17 +1022,29 @@ def gather_findings(db_conn, today_date, log_dir,
           - variant;
           - trigger;
           - progress_at;
-          - cause, with the superseding work for a manual supersede;
+          - cause, with the superseding work for a manual supersede, and
+            for `code_version_changed` the work's versions and the lock's;
           - the dependents waiting on it;
         - `resume.sqlite` unreadable → the store reported unreadable,
           'warn'.
+        It reports the halted and superseded transitions alone; a
+        'deferral_notified' event is not one.
     54. Scheduled work deferred (`scheduled_work_deferred`) — a scheduled run
-        refused by guest_supervisor.md's new-run resolution. Delivered by
-        guest_supervisor.md through alert_delivery.md's `deliver()` on every
-        refusal (Invocation Contract), which builds the finding entry;
-        gathered at session start and at evening end from that path's
+        refused by guest_supervisor.md's new-run resolution, which builds the
+        finding entry, carrying `dispatched`: true | false (Invocation
+        Contract):
+        - the first scheduled refusal blocked by a given work is delivered
+          through alert_delivery.md's `deliver()`, after the refusal's
+          `resume.sqlite` transaction gives the blocking work's journal a
+          'deferral_notified' event;
+        - a later refusal blocked by a work carrying 'deferral_notified' is
+          recorded through `write_to_log()` alone, not dispatched;
+        - a refusal blocked by `restore_store` is delivered on every refusal.
+        Gathered at session start and at evening end from that path's
         records in `log_dir/health_report_{date}.log` over the span since the
-        previous report. Severity 'info'; detail:
+        previous report, one entry per blocker: the blocker detail, the
+        refusal count, the first and last refusal times, and whether a
+        refusal was dispatched. Severity 'info'; detail:
         - the deferred run's:
           - tool;
           - variant;
@@ -1011,6 +1066,126 @@ def gather_findings(db_conn, today_date, log_dir,
           cause other than the Early-Close gate;
         - 'info' for 'blocked' by the Early-Close gate alone;
         - 'ok' for 'participating'.
+        Its causes include the model gate ('ended' at the session load, no
+        model_deployments row) and the code-version gate ('blocked', detail
+        the lock's hash, the current hash, the changed files and the changed
+        distribution versions).
+    56. Code version unattested (`code_version_unattested`) — recorded
+        through alert_delivery.md's `write_to_log()` alone, not dispatched,
+        under alert_key 'code_version_unattested', by:
+        - run_guest, on a run it ends 'blocked' with cause code_unattested
+          (at its start) or code_changed (at a unit opening);
+        - the evening_tick_bar_aggregates stage, on an unattested area;
+        - the evening_session_stats stage, on an unattested area.
+        Gathered from those records in `log_dir/health_report_{date}.log`
+        over the span since the previous report, on the session_start and
+        evening_end paths. Severity 'warn'; detail per record:
+        - the run or stage;
+        - the area;
+        - the reference hash — the lock's for code_unattested and the
+          stages, the run's start code_hash for code_changed;
+        - the current hash;
+        - the changed files;
+        - the changed distribution versions.
+        LiveModeRunner's code-version gate is reported through finding 55,
+        not here.
+    57. Model operations (`model_operations`) — gathered on the evening_end
+        path, and on the session_start path when the previous trading day's
+        evening_health_report row is not 'success'; not gathered on the
+        session_end, breaker_trip and session_start_abort paths nor by the
+        evening liveness probe's sweep; no event-driven path and no
+        alert_key of its own. Detail:
+        - the deployed model (model_deployments' latest row) and its
+          probation (shadow_retraining.md's Probation after a deployment):
+          the cumulative result at each evening end gather during
+          probation — 'adverse' | 'within' | 'insufficient_sample' — the
+          last probation session with 'within' shown as probation
+          completed;
+        - the candidates created since the previous evening end report, with
+          their verdicts; a candidate written 'rejected' with its causes —
+          the regime gate when regime_gate_blocked is true, the comparison
+          when its verdict is 'fail'; a candidate written 'superseded' with
+          its champion_run_id and the deployed run_id;
+        - every 'awaiting_approval' candidate with its approve command
+          (model_deploy.md);
+        - the candidates the operator rejected since the previous evening
+          end report, by status time (decided_at, or created_at when the
+          status is unchanged since writing), each with that decision and
+          its note;
+        - prediction drift: the date's prediction_drift_daily rows;
+        - feature drift: the count and the names of the features whose psi
+          ≥ drift.feature_psi_warn, when set, with n ≥ drift.min_observations,
+          and the drift.feature_report_top features of highest psi;
+        - for a drift stage that wrote no rows for the date, its section
+          states the stage's outcome, read from that evening's SUMMARY line
+          and batch_runs row — 'no_reference', 'no_session' or its
+          batch_runs status;
+        - price extremes parity, for the evening's date:
+          extremes_parity_total, extremes_parity_diverged and their ratio
+          when the total is above 0; with no extremes_parity key for the
+          date, evening_session_stats' batch_runs status;
+        - θ: the deployed model's live θ values with their count, or the
+          count while short of min_entries; each listed candidate's
+          candidate θ values; the config's θ binding —
+          late_entry_min_expected_return_pct, late_entry_theta_run_id,
+          late_entry_theta_q.
+        Level, the highest of:
+        - a probation result 'adverse' → 'warn', the detail carrying the
+          rollback command;
+        - with drift.psi_warn set, an output whose psi ≥ drift.psi_warn and
+          whose n ≥ drift.min_observations → 'warn';
+        - a feature listed against drift.feature_psi_warn → 'warn';
+        - with price_extremes_parity.warn set, a parity ratio ≥ it → 'warn';
+        - θ bound to the deployed model, differing at 6 decimals from its
+          live θ at late_entry_theta_q → 'info';
+        - an awaiting candidate → 'info';
+        - otherwise 'ok'.
+        No drift value is a retraining trigger; finding 6 keeps the
+        weekly divergence alone.
+    58. Late-entry θ unbound (`late_entry_theta_unbound`) — gathered on the
+        session_start path; reported when execution.late_entry_enabled or
+        execution.entry_price_cap_enabled is true and θ does not apply to
+        the session model (execution_common.md's θ binding). Detail:
+        - the session model's run_id;
+        - the config's θ binding — late_entry_min_expected_return_pct,
+          late_entry_theta_run_id, late_entry_theta_q;
+        - the session's effect per setting: late entry inert; the cap not
+          applied, or refusing limit entries (live_mode.entry_price_cap_inert);
+        - the session model's candidate θ values, and its live θ values or
+          count.
+        Level: entry_price_cap_enabled true → 'warn'; otherwise → 'info'.
+    59. Collection gaps (`collection_gaps`) — gathered on the evening_end
+        path. Gaps, each reported once per symbol-date or date:
+        - pair gap: a ticker_data_coverage row with has_1min ≠ has_tick, the
+          missing side named; a has_1min-only row whose (ticker, date) holds
+          a tick_10_tail row counts as none;
+        - failed file: a `collection_gaps` health_events record of a file
+          that failed to import, its table holding no row for its (ticker,
+          date);
+        - date gap: a trading day, from the first date holding a coverage row
+          through the report date, holding no coverage row.
+        Detail:
+        - per date, its gap symbols with their kinds;
+        - the date gaps;
+        - the new gaps apart from those reported before.
+        Level, against the previous successful evening end report — the
+        `evening_health_report` batch_runs row at 'success' with the latest
+        date:
+        - 'warn' when a gap is new since that report;
+        - 'info' when only gaps reported before remain;
+        - 'ok' when none remains.
+        New:
+        - a pair gap whose latest source_changes row for its (ticker, date),
+          in ohlcv_1min or tick_10, was recorded after that report's start;
+        - a failed-file gap whose failure record follows that report's start;
+        - a date gap whose date is after that report's date;
+        - every gap, when no successful report precedes.
+        The newness tests compare instants — source_changes.recorded_at as
+        UTC, batch_runs.started_at and health_events.occurred_at as
+        America/New_York.
+        Remediation (metadata_crawler.md's New JSON Ingestion): the date's
+        missing or corrected file is placed in data_root, then
+        `collect_daily.py --ingest-only --date d` runs.
 
     Returns: dict of {finding_name: {severity: 'ok'|'info'|'warn'|'abort', detail: ...}},
     severities ordered ok < info < warn < abort (alert_delivery.md's
@@ -1095,6 +1270,7 @@ def run_health_report(db_conn, today_date, log_dir, config,
     `start_outcome` — the session_start and session_start_abort paths' — adds
     finding 55, built from it."""
     findings = gather_findings(db_conn, today_date, log_dir,
+                               path=alert_key,
                                subset=findings_subset,
                                live_aggregates=live_aggregates)
     if start_outcome is not None:
@@ -1207,7 +1383,7 @@ across three files and drifted.
 | Negative bar-latency sample | `bar_close_premise_violation` | finding 27 | True | yes | yes | — |
 | Order unmapped | `order_unmapped` | finding 51 | False | yes | yes | — |
 | Evening liveness probe | `evening_liveness_probe` | DB-only findings | False | yes | yes | — |
-| Scheduled, evening end | `evening_end` | findings 1 and 4 over that evening run's stages; finding 9 when that run's `evening_execution_param_fit` SUMMARY line reports the fit executed; finding 11; finding 52 over that run's `evening_ticker_master_check` SUMMARY; findings 53 and 54 over the span since the previous report | False | yes | yes | — |
+| Scheduled, evening end | `evening_end` | findings 1 and 4 over that evening run's stages; finding 9 when that run's `evening_execution_param_fit` SUMMARY line reports the fit executed; finding 11; finding 52 over that run's `evening_ticker_master_check` SUMMARY; finding 6 when the date is the last trading day of its calendar week; findings 53, 54 and 56 over the span since the previous report; finding 57; finding 59 | False | yes | yes | — |
 | Owner lock wait | `owner_lock_wait` | finding 28 | False | **no** | yes | — |
 | Token refresh failure | `token_refresh_failed` | finding 46 | False | **no** | yes | — |
 | Owner error end | `owner_error_end` | finding 11 (that run) | False | **no** | yes | — |
@@ -1227,7 +1403,13 @@ across three files and drifted.
   access coordination helper (db_coordination.md's Helper deliveries), which
   builds their finding entries and passes them to alert_delivery.md's
   `deliver()`; the scheduled work deferred path is delivered the same way by
-  guest_supervisor.md, on every refusal of a scheduled run.
+  guest_supervisor.md, on the first scheduled refusal blocked by a given work
+  and on every refusal blocked by `restore_store`, a later refusal blocked by
+  a work carrying 'deferral_notified' recorded through `write_to_log()` alone.
+- `code_version_unattested` is an `alert_key` but not a path — its records
+  are written through `write_to_log()` alone, by run_guest and the
+  evening_tick_bar_aggregates and evening_session_stats stages, and gathered
+  as finding 56.
 - `log_write_failed` is also an `alert_key` but not a path — it is injected
   into whichever delivery is in flight (alert_delivery.md's Log Writing) and
   is never suppressed.
@@ -1280,7 +1462,7 @@ always present.
   - the missing-`SUMMARY` finding;
   - finding 1's no-row cause;
   - finding 52;
-  - finding 54, from `log_dir/health_report_{date}.log`.
+  - findings 54 and 56, from `log_dir/health_report_{date}.log`.
   Readable without the DB, which is why the DB-less paths can produce
   anything at all.
 - **DB** — findings:
@@ -1291,13 +1473,13 @@ always present.
   - 29-45;
   - 48;
   - 50;
-  - 51.
-  Of those, 30-33 and 35 read `live_scan_daily`; 33 alone reads a row
-  written by the evening batch rather than by the session being reported,
-  so on a session-end call it
-  describes the PREVIOUS day.
+  - 51;
+  - 6, 57 and 58;
+  - 59.
+  Of those, 30-33, 35 and 57 read `live_scan_daily`; 33 and 57 read keys the
+  evening batch writes, 33 describing the previous day on a session-end call
+  and 57 not gathered there.
 - **Neither**:
-  - finding 6 (placeholder);
   - finding 7 (placeholder);
   - finding 28;
   - finding 46.
@@ -1308,6 +1490,7 @@ always present.
   - finding 1's no-row cause (`run_info()`).
 - **Work records** — guest_supervisor.md's report functions over
   `resume.sqlite`, readable on every path:
+  - finding 6 (`works_for_divergence_week()`);
   - finding 11 (`work_opened_by()`);
   - finding 53 (`work_journal_view()`).
 - Finding 49, and finding 11 under `owner_error_end`, are built by the DB
@@ -1369,6 +1552,8 @@ probe values in the same row report normally.
 ## Config Keys (pipeline_config.yaml)
 
 The `alerting:` block is alert_delivery.md's (Config Keys).
+The `drift:` and `price_extremes_parity:` blocks are metadata_crawler.md's
+(Config Keys).
 
 ---
 
@@ -1396,12 +1581,12 @@ The `alerting:` block is alert_delivery.md's (Config Keys).
 - A `SUMMARY` line's absence from a crawler log (see metadata_crawler.md) is
   reported as its own finding, distinct from a nonzero `failed` count within
   a `SUMMARY` line that does exist
-- Live winning-rate divergence (finding 6) and execution-parameter divergence
-  (finding 7) are both placeholders in `gather_findings()` until their
-  respective methodology/threshold is defined (see the shadow/retraining
-  spec doc) — `health_report.py` must not compute or report either finding
-  before then. They remain two separate findings even once defined — never
-  merged into a single "things seem off" signal.
+- Execution-parameter divergence (finding 7) is a placeholder in
+  `gather_findings()` until its methodology/threshold is defined (see the
+  shadow/retraining spec doc) — `health_report.py` must not compute or
+  report it before then. It and the live winning-rate divergence (finding
+  6) remain two separate findings even once it is defined — never merged
+  into a single "things seem off" signal.
 - Finding 8 (halt-check signal-source rate) is unlike findings 6/7: it has
   no accumulation gate and is always computable from the current session's
   halt checks alone — only its warn threshold is undecided. It must not be
@@ -1421,7 +1606,7 @@ The `alerting:` block is alert_delivery.md's (Config Keys).
   the only TBD among them
 - Finding 9 (execution-parameter fit rejections) has nothing to report
   before Pilot stage produces its first fit_execution_params() run, but
-  unlike findings 6/7 has no further threshold to defer once Pilot begins
+  unlike finding 7 has no further threshold to defer once Pilot begins
   — rejection is a boolean per (parameter, order type) per week against
   `fit_rejection_multiplier` (already a concrete config value, not TBD),
   not a magnitude needing a warn cutoff decided later.

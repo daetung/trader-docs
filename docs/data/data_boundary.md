@@ -57,7 +57,10 @@ It must never appear in `FeatureExtractor.get_feature_names()` output.
 
 ```
 Allowed:   bars t-1, t-2, t-3, ..., t-N   (fully closed bars, OHLCV all confirmed)
-           may include pre-market and after-market bars within lookback window
+           the indicator bar frame: every stored hour of each prior trading
+           day of the lookback window, and the entry date's bars through t-1
+           only the bars the broker supplied: a minute without trades has no
+           bar, and none is created
 Forbidden: t bar open, high, low, close, volume
 Forbidden: any bar beyond t (t+1, t+2, ...)
 ```
@@ -65,16 +68,29 @@ Forbidden: any bar beyond t (t+1, t+2, ...)
 A "fully closed bar" means all five fields (open, high, low, close, volume) are finalized.
 The t bar does not satisfy this condition at entry detection time.
 
-**Temporal features** use `entry.hour` (t bar open time) as their reference.
-This is the clock time at which detection fired — it is not t bar OHLCV data
-and does not constitute data leakage.
+**Temporal features** read `entry.hour` (t bar open time) and the entry date
+D's calendar context:
+- `entry.hour` is the clock time at which detection fired — it is not t bar
+  OHLCV data and does not constitute data leakage;
+- the calendar context is D's `trading_calendar` row — `session_close` and the
+  schedule-context columns (db_schema.md's `trading_calendar`) — the published
+  schedule as it stood before D's session;
+- rows filled at backfill carry the calendar library's schedule at that time:
+  an unscheduled closure announced after a session is an accepted
+  approximation for history before deployment.
 
-**Lookback window (default):** last 5 trading days of 1min bars = ~1950 bars
-(390 min/day × 5). The 390 names the REGULAR session, while bars are actually
-loaded across the full 040000~200000 range — so the real supply is nearer
-960 min/day and the stated margin understates itself. Left as written because
-the check it feeds (`04_feature_extractor.md`'s `calculate_required_history()`)
-has no date in it and cannot be reached by a calendar fact.
+**Lookback window:**
+- the `indicators.lookback_days` trading days before the entry date, utils.md's
+  `prior_trading_days(entry_date, lookback_days, closes)`, its first element the
+  lookback start, and the entry date through t-1;
+- every bar of those days enters the CONTINUOUS vectorization window
+  (03_vectorizer.md);
+- an entry is admitted only when every one of those trading days has bars —
+  utils.md's `has_required_history()`;
+- the dataset's first dates take their window's trading days from
+  `trading_calendar` rows before the first ingested date, which hold no bars,
+  so their entries are not admitted (migration_tool.md's calendar
+  initialization).
 Actual lookback per indicator is configured in `configs/pipeline_config.yaml`.
 
 ---
@@ -89,9 +105,14 @@ Prior session bars used as baseline:
     Status: fully closed (all OHLCV confirmed), no data leakage
     Source: precomputed_session_stats DuckDB table (pre-calculated offline)
     Scope:  prior N sessions (n_sessions config; independent of lookback_days)
+    Slots:  a prior session contributes to slot H only when utils.session_phase()
+            gives 'premarket' or 'regular' for H on that session
 
-Today's session bars used as the measured value:
-    Boundary: same as feature input boundary — bars t-N ... t-1 only
+Today's session bars used as the measured value — the REFERENCE_SESSION today
+window:
+    the last indicators.reference_session.window_bars bars ending at t-1,
+    never before the entry date's PREMARKET_OPEN
+    each bar's value taken against the baseline of its own slot
     No future bars included
 
 Leakage check:
@@ -103,18 +124,17 @@ Leakage check:
 **gap_percentile special rules:**
 
 ```
+today_open = the open of the entry date's first regular-session bar
+             (utils.session_phase() 'regular')
+
 NaN conditions (must return NaN, not raise error):
 
-1. t bar = "093000" (first regular session bar):
-       today_open = open of 093000 bar = P_entry of this entry point
+1. The first regular-session bar's hour is not before t:
+       that bar is the t bar or later, so today_open is P_entry or unknown
        Using P_entry as a feature is FORBIDDEN (data boundary violation)
        → return NaN
 
-2. t < "093000" (pre-market entry):
-       Regular session has not opened; today_open undefined
-       → return NaN
-
-3. Insufficient baseline data:
+2. Insufficient baseline data:
        count < n_sessions / 2 in precomputed_session_stats
        → return NaN
 
@@ -157,7 +177,8 @@ Adjusted (FeatureExtractor/IndicatorCalculator layer — covers both bar-derived
 and tick-derived series; both utilities below return a new copy, never
 mutating the source table):
 
-    Bar-derived, reference_date-anchored (utils.adjust_bars_for_corporate_events()):
+    Bar-derived, reference_date-anchored (utils.adjust_bars_for_corporate_events(),
+    its frame form utils.adjust_bars_from_events()):
         FeatureExtractor/IndicatorCalculator input, all Strategy A/B indicators
             (anchored to the max date in the loaded range — today for live mode,
             the ticker's last loaded date for training; see 04_feature_extractor.md)
@@ -166,7 +187,8 @@ mutating the source table):
             in place before aggregation into avg_value/std_value (utils.md D.)
 
     Tick-derived, entry_date-direct-anchored
-    (utils.adjust_tick_derived_series_for_corporate_events()):
+    (utils.adjust_tick_derived_series_for_corporate_events(), its frame form
+    utils.adjust_tick_derived_series_from_events()):
         FeatureExtractor's tick-derived Strategy A indicators — see
             02_indicator_calculator.md's "Tick-Derived Indicator Scale
             Sensitivity" registry for the current list and each one's
@@ -176,7 +198,8 @@ mutating the source table):
 
     General principle: any indicator computed inside this layer may be
     adjusted regardless of which source table it reads from, and several
-    indicators may share a single cum_split_ratio() lookup. The only two
+    indicators may share a single cum_split_ratio() lookup, or its frame form
+    split_ratio_from_events(). The only two
     conditions that must hold are (a) the source tables (ohlcv_1min,
     tick_10) are never mutated, and (b) no consumer in the "Raw" category
     above ever receives an adjusted value. As long as both hold, registering
@@ -188,7 +211,9 @@ Scalar corrections (neither raw-only nor bar-adjusted — a single value
 derived from corporate_events applied at one specific comparison point):
     gap_percentile()'s dividend_amount        — ex-dividend cash-drop correction
                                                  (gross amount, read through
-                                                 utils.dividend_gross_amount())
+                                                 utils.dividend_gross_amount(),
+                                                 or its frame form
+                                                 utils.dividend_gross_from_events())
     Dead position Case A's exit split factor  — overnight split+dividend correction:
       and net dividend term                     the exit is multiplied by the split
                                                  factor and the net dividend added;
@@ -220,26 +245,74 @@ have known the value), never `fiscal_period_end` (the period the value
 describes) — filtering on the latter would leak pre-disclosure information
 into features computed for dates before the filing existed. See
 `utils.md`'s TTM/as-of helpers and `db_schema.md`'s `fundamentals_quarterly`.
+Further:
+- a fact is read for D only when filed before D (`filed_date < D`);
+- a monetary fact meets `market_cap` in its own currency, through
+  `utils.fx_per_usd()` at the rate dated on or before the trading day before
+  D, never a later rate;
+- `get_ttm_value()`'s annual fallback reads only facts filed before D.
+
+**Point-in-time correctness for stock_meta** — a value used for date D is one
+known before D's session:
+- its sources:
+  - `stock_meta` rows dated before D;
+  - bars of the trading days before D;
+  - `fundamentals_quarterly` facts filed before D;
+  - `corporate_events` of events effective on or before D, for the conversion
+    to D's split basis;
+- a `stock_meta` row's date is its crawl date; a field for D is read from the
+  prior-day row, the row dated the trading day `prior_trading_days(D, 1,
+  closes)` returns;
+- per field:
+  - `market_cap`: the prior-day row's value, else `estimate_historical_meta()`'s
+    — a regular-session close of the trading days before D, converted to D's
+    split basis, × the `shares_outstanding` estimate for D;
+  - `shares_outstanding`: `estimate_historical_meta()`'s tiers, the prior-day
+    row first;
+  - `price_52h` and `price_52l`: a prior-session baseline over the trading days
+    before D, D excluded; training reads `precomputed_session_stats`, live
+    follows `live_mode.price_extremes_source`;
+  - `sector` and `security_type`: the latest snapshot whatever D, an accepted
+    look-ahead;
+- a non-common `security_type` resolves `shares_outstanding` and `market_cap`
+  none in every tier; the non-common values:
+  - warrant;
+  - unit;
+  - right;
+  - preferred;
+  - debt;
+- `security_type` adr skips `estimate_historical_meta()`'s fundamentals tier;
+- a ticker without a CIK mapping or without a `stock_meta` snapshot has those
+  values missing for a reason tied to its later delisting; migration_tool.md's
+  Security Identity Audit measures it;
+- the consumers of these values follow the same rule:
+  - FeatureExtractor's meta_features, those dividing by `market_cap` included;
+  - EntryPointDetector's filter E;
+- details: utils.md's `estimate_historical_meta()` and `split_basis_value()`,
+  and db_schema.md's `stock_meta` comment.
 
 ---
 
 ## Label Search Boundary
 
 ```
-Search range: t bar open → session close (last_bar(date)), up to
-execution.max_hold_bars valid bars
+Search range: t bar open → session close (last_bar(date)), up to the holding
+deadline: execution.max_hold_minutes of wall-clock minutes from the entry,
+the minutes inside halt intervals excluded
 
 Priority:
   1. ±3pp breach → immediate label assignment
-  2. last_bar(date) reached → exit at that bar's close, assign label by pnl
-  3. execution.max_hold_bars valid bars exhausted → exit at last valid bar
-     close, assign label by pnl
+  2. last_bar(date) reached → exit at the close of the last existing bar at or
+     before last_bar(date), assign label by pnl
+  3. the holding deadline reached → exit at the close of the last existing bar
+     before the deadline, assign label by pnl
 
 Priority 2 and 3 are mutually exclusive — whichever condition is reached first determines
 the exit. After-market fallback and dead position apply to priority 2 only.
-Priority 3 exits at the last valid bar close directly, with no fallback needed.
+Priority 3 exits at the last existing bar's close directly, with no fallback needed.
 
-After-market data used only as fallback when last_bar(date) is halt/no_data (priority 2 only).
+After-market data used only as fallback when last_bar(date)'s minute lies inside
+a halt interval or the date has no data (priority 2 only).
 Dead position (overnight hold) only when after-market fallback also unavailable.
 No overnight holds in normal flow.
 ```
@@ -327,31 +400,26 @@ tick_10 `hour` field represents the **last tick** timestamp of each 10-tick bund
 
 ## Session Mode and Data Coverage
 
-All data is stored without session-of-day filtering beyond the 040000~200000
-ingestion range (see db_schema.md Ingestion Rules). That range is NOT per-date
-and does not move: its purpose is to exclude OVERNIGHT, and an early-close day
-simply has no data past its own after_hours_end, so the fixed upper bound still
-admits everything real and still excludes overnight.
+All data is stored without session-of-day filtering beyond the ingestion range
+`hour >= '040000' AND hour < '193000'` (see db_schema.md Ingestion Rules):
+- a date's files run from the preceding evening's 20:00 (overnight) to a vendor
+  cut a few seconds past 19:30; the range keeps [04:00, 19:30), excluding the
+  overnight and the cut's uneven tail;
+- the range is fixed, not per-date — an early-close day ends at 17:00 inside
+  it;
+- a tick file's rows at hours in [193000, 200000) are stored apart, in
+  `tick_10_tail`, and read by no consumer.
 Pre-market, regular session, and after-market bars are all ingested and available.
 
-Session mode (`entry_detector.session_mode`) controls which entry points are used during training:
-```
-"regular"  : regular session entry points only (093000~last_bar(date)) [default]
-"pre"      : pre-market entry points only (040000~092900)
-"combined" : both pre-market and regular session
-```
-
-After-market entry points (hour > last_bar(date)) are excluded in all modes.
-Session mode filtering is applied at the training stage — preprocessing runs for all entry points.
-
-Session mode also controls which prior session bars are used in REFERENCE_SESSION baselines:
-```
-"regular"  : prior regular session bars only (093000~last_bar(date))
-"pre"      : prior pre-market bars only (040000~092900)
-"combined" : both pre-market and regular session bars
-```
-
-Applied in `load_session_stats()` at load time — not stored separately in precomputed_session_stats.
+Entry points are regular-session only:
+- an entry whose t bar hour is not in the regular phase
+  (`utils.session_phase()` != 'regular') is excluded, by
+  `EntryPointDetector.scan()`'s first exclusion step and by the Inferencer's
+  step 1 check;
+- no other site filters entries by session;
+- the rule is fixed while `entry_detector.session_mode` is reserved; its
+  widening to premarket entries lives in open_items.md's Premarket entry
+  enablement.
 
 ---
 
@@ -359,17 +427,21 @@ Applied in `load_session_stats()` at load time — not stored separately in prec
 
 | Data | Feature Input | Label Calculation | Backtest Only | Session Stats (offline) |
 |---|---|---|---|---|
-| Bars t-N … t-1 (OHLCV, all sessions) | YES | — | — | — |
+| Bars t-N … t-1 (OHLCV, every stored hour of prior days, their after-market bars included) | YES | — | — | — |
 | t bar open time (entry.hour) | YES (temporal only) | — | — | — |
+| D's calendar context (its trading_calendar row) | YES (temporal only) | — | — | — |
 | t bar open price (P_entry) | NO (identifier only) | Reference price | Fill reference | — |
 | t bar H/L/C/V | NO | NO | NO | — |
 | Bars t+1 … session close (H/L) | NO | YES (threshold check) | — | — |
-| After-market bars | NO | Fallback only | Fallback only | — |
+| The entry date's after-market bars, after t | NO | Fallback only | Fallback only | — |
 | 10-tick before t bar | YES | — | — | — |
 | 10-tick within t bar | NO | YES (track_label_breach) | YES (entry slippage) | — |
 | 10-tick within exit bar | NO | YES (track_label_breach) | YES (exit slippage) | — |
-| Prior session bars (all) | NO (not in bars input) | — | — | YES (baseline) |
-| Prior session 10-tick | NO | — | — | YES (buy_ratio, tpm, avg_vol_per_tick) |
+| The prior sessions' bars, aggregated as baselines (precomputed_session_stats) | NO as bars — through the baselines | — | — | YES (baseline) |
+| The prior sessions' 10-tick, aggregated as baselines (precomputed_session_stats) | NO as ticks — through the baselines | — | — | YES (buy_ratio, tpm, avg_vol_per_tick) |
+
+A prior session inside the lookback window also enters the feature input
+through the "Bars t-N … t-1" and "10-tick before t bar" rows.
 
 Corporate-event (split/dividend) adjustment is a separate, orthogonal axis not
 shown in this table — see "Corporate Event Adjustment Boundary" above. As a
@@ -377,7 +449,9 @@ quick reference: every row that reads from `ohlcv_1min`/`tick_10` directly for
 same-day use (Label Calculation, Backtest Only columns) stays raw; every row
 consumed via FeatureExtractor/IndicatorCalculator or session-stats baselines
 is adjusted via `adjust_bars_for_corporate_events()` or
-`adjust_tick_derived_series_for_corporate_events()`, as appropriate to its source.
+`adjust_tick_derived_series_for_corporate_events()`, or their frame forms
+`adjust_bars_from_events()` and `adjust_tick_derived_series_from_events()`, as
+appropriate to its source.
 
 ---
 
@@ -388,23 +462,28 @@ Before submitting any module, verify:
 - [ ] No feature is derived from t bar's high, low, close, or volume
 - [ ] P_entry (t bar open price) does not appear in feature matrix columns
 - [ ] P_entry is present as an identifier column in parquet output
-- [ ] Temporal features use entry.hour (clock time only) — not t bar OHLCV
+- [ ] Temporal features use entry.hour and D's calendar context, read from D's
+       trading_calendar row alone — not t bar OHLCV
 - [ ] Label calculation starts from t bar open as the zero reference
-- [ ] When no ±3pp breach: if execution.max_hold_bars valid bars collected before last_bar(date) → exit at last valid bar close
+- [ ] When no ±3pp breach: if the holding deadline (execution.max_hold_minutes,
+       halted minutes excluded) comes before last_bar(date) → exit at the close
+       of the last existing bar before the deadline
        (time-limit; no after-market fallback, no dead position);
-       if last_bar(date) reached within execution.max_hold_bars valid bars → exit at that bar's close
+       if last_bar(date) comes first → exit at the close of the last existing
+       bar at or before last_bar(date)
        (session-end; with after-market fallback and dead position as last resort)
-- [ ] After-market used only as fallback for last_bar(date) halt/no_data (session-end path only)
+- [ ] After-market used only as fallback when last_bar(date)'s minute lies inside
+       a halt interval or the date has no data (session-end path only)
 - [ ] Every session-boundary read goes through utils.md's session_close() /
        last_bar() / exit_deadline() / after_hours_end() — never a 155900 or
        160000 literal, and never the wrong derivation: last_bar() is a data
        fact, exit_deadline() a policy, and they coincide only at the default
-       offset of 1 minute. 200000 is NOT on that forbidden list: the ingestion
-       range is fixed by decision and keeps that literal legitimately, while
-       after_hours_end() moves — the two once read as one number
-- [ ] Every valid-bar cap reads execution.max_hold_bars — never a literal, and
-       never a function-argument default standing in for it, which reads correct
-       until the key changes and then silently does not
+       offset of 1 minute. 193000 is NOT on that forbidden list: it is the
+       ingestion range's fixed upper bound, kept as a literal legitimately,
+       while after_hours_end() moves
+- [ ] The holding limit reads execution.max_hold_minutes — never a literal,
+       and never a function-argument default standing in for it, which reads
+       correct until the key changes and then silently does not
 - [ ] 10-tick data used in features is strictly filtered to before t bar open
 - [ ] Labeler uses track_label_breach() with fill_second = t bar open + 5s;
        tracking starts strictly after fill_bundle (fill_bundle excluded)
@@ -414,11 +493,14 @@ Before submitting any module, verify:
        (full day ticks): cumulative filled = min(order quantity, floor(rate × cumulative
        tick volume after the anchor))
 - [ ] REFERENCE_SESSION baselines sourced from precomputed_session_stats — not from bars input
-- [ ] gap_percentile returns NaN for t="093000" or pre-market entries (not an error)
+- [ ] gap_percentile returns NaN, not an error, unless the entry date's first
+       regular-session bar's hour is before t
 - [ ] Dead position lookup uses has_data=TRUE filter (not is_trading_day)
 - [ ] EntryPointDetector and Labeler/BacktestEngine's same-day tracking read
        raw bars/ticks only — never `adjust_bars_for_corporate_events()` or
-       `adjust_tick_derived_series_for_corporate_events()` output
+       `adjust_tick_derived_series_for_corporate_events()` output, nor their
+       frame forms' (`adjust_bars_from_events()`,
+       `adjust_tick_derived_series_from_events()`)
 - [ ] FeatureExtractor/IndicatorCalculator and `populate_precomputed_session_stats()`
        always operate on corporate-event-adjusted bars/tick-derived series, never raw
 - [ ] These are scalar corrections applied at their one specific
@@ -430,5 +512,10 @@ Before submitting any module, verify:
        - 09_backtest_engine.md's carried split normalisation and carried
          dividend;
        - filter E's `shares_outstanding`
-- [ ] `fundamentals_quarterly` lookups filter on `filed_date`, never
-       `fiscal_period_end`, for any as-of query
+- [ ] `fundamentals_quarterly` lookups read facts filed before D, by
+       `filed_date`, never `fiscal_period_end`, for any as-of query; a
+       monetary fact meets `market_cap` at the rate dated on or before the
+       trading day before D; the annual fallback reads facts filed before D
+- [ ] A stock_meta-derived value for D reads `stock_meta` rows dated before D
+       and bars of the trading days before D, never D's own row or D's own
+       bars; `sector` and `security_type` excepted

@@ -26,7 +26,7 @@ LiveModeRunner
     │       Populated eagerly at session_start via parallel session_start_compute().
     │       Active watchlist populated lazily on a ticker's first appearance
     │       in the watchdog working set.
-    ├── FeatureExtractor              (uses CachingIndicatorCalculator via DI)
+    ├── FeatureExtractor              (the ticker's CachingIndicatorCalculator, passed per call)
     ├── Inferencer                    (owns FeatureExtractor)
     ├── EntryPointDetector            (used internally by Inferencer)
     │
@@ -154,7 +154,7 @@ conn = handle.conn   # handle: Session Start Gating's acquire() result;
                      # Sub-handles: conn.cursor().
 write_lock = Lock()
                  # ALL writes funnel through db_write() below —
-                 # inference_log, indicator_cache (any mode as of R-2 — see
+                 # inference_log, inference_features, indicator_cache (any mode as of R-2 — see
                  # below; previously "db" mode only), trade_log (shadow
                  # mode), and, as of R-2, live_positions and
                  # live_session_state (see "Session Restart (Warm Start)"
@@ -188,13 +188,13 @@ def db_write(sql, params):   # contract: Callable[[str, tuple], None] —
 ## Early-Close Participation Gate
 
 Evaluated right after Session Lifecycle step 1c, beside stage consistency
-(Session Lifecycle's participation gates), on the connection Session Start
-Gating obtained, and before Session Start Probes.
+and the code-version gate (Session Lifecycle's participation gates), on the
+connection Session Start Gating obtained, and before Session Start Probes.
 
 ```
-closes, ends = load_session_boundaries(db_conn)     # utils.md, once per process
+# closes, ends: the session load's (Session Lifecycle), once per process
 today_close = session_close(today)                  # utils.md, per date
-if today_close != the ordinary close
+if today_close != REGULAR_CLOSE                     # utils.md's Session Boundary Derivations
        and not config["live_mode"]["trade_early_close_days"]:   # default false
     participation is blocked: the start's outcome 'blocked', cause
         {gate: 'early_close', detail: {session_close: today's session_close,
@@ -410,7 +410,7 @@ from a one-off measurement.
 
 ### session_diagnostics write protocol (R-9)
 
-The two probe results above, plus Health Gate 2's tier-fallback summary
+The two probe results above, plus Health Gate 2's cache-gap summary
 and two running counters, are persisted to
 `live_session_state.session_diagnostics` (JSON — see db_schema.md) instead
 of being held as in-memory tallies handed to `health_report.py` at session
@@ -429,11 +429,15 @@ Write points:
       probe flagged 'disabled' | 'succeeded' | 'fell_back' so "never ran"
       and "ran and fell back" stay distinct; boundary_source (Session Start
       Gating)
-(b) immediately after Health Gate 2
-      adds the tier-fallback summary (finding 5)
+(b) immediately after Health Gate 2, only when it ran its check
+      adds the cache-gap summary (finding 5) — its measurement time `at`,
+      per date the ticked and cached counts and the gap share, the dates
+      above 0.20
 (c) on the existing bar_latency_daily flush cadence
       refreshes the running counters — halt-check signal_source counts
-      (finding 8), inference_log dropped-row count (finding 22), and the
+      (finding 8), finding 22's dropped and failed row counts per table —
+      inference_log and inference_features, flush_features()' counts added
+      to inference_features' — and the
       per-ticker terms-acquisition tally: first-listing attempts, failures,
       and the BLOCKED TICKERS BY NAME (see "Per-Ticker Trading Terms").
       The blocked list lives here and NOT in live_scan_daily: that table's
@@ -464,7 +468,9 @@ settings, not a session baseline — unlike `session_start_cash`, which R-2
 restores rather than re-queries precisely because it IS the baseline. The
 counters at (c) RESUME from the persisted values instead of resetting to
 zero; they are session totals. `start_outcomes` is carried forward the same
-way, the persisted list kept and this start's entry appended at (e).
+way, the persisted list kept and this start's entry appended at (e). The
+cache-gap summary, with its measurement time `at`, is carried forward and
+replaced only when Health Gate 2's check runs again at (b).
 
 ## Session Shutdown
 
@@ -477,7 +483,8 @@ whichever of these comes first:
     logical order remaining
 ```
 Stage 1 performs:
-- final liquidation;
+- final liquidation — the final liquidation window (below) has run; stage 1
+  at the hard cap submits nothing, the phase being 'closed';
 - the cancel of every 'open' logical order (below);
 - one 1-tick poll at the immediate dispatch deadline for each ticker with a
   close-pending position or a carried pilot exit logical order,
@@ -485,8 +492,12 @@ Stage 1 performs:
   close, Position Manager Loop);
 - the `live_session_state` write;
 - closing any open `live_halt_episodes` interval;
-- the `bar_latency_daily` final flush;
-- the `live_scan_daily` write;
+- the `bar_latency_daily` final flush, and beside it the Inferencer's
+  `flush_features()` when an Inferencer exists;
+- the `live_scan_daily` write — its `regular_open_total` and
+  `regular_open_late` taken over the process's calculators: those with a
+  recorded regular-open hour, and those whose recorded hour is later than
+  093000 (caching_calculator.md's on_regular_session_open());
 - the session-end report and its drain (health_report.md's Shutdown Order
   and Drain);
 - `handle.close('done')` — the session state `done`, then the DuckDB close
@@ -512,11 +523,9 @@ indefinitely.
 
 The cap resolves per date: that date's `after_hours_end` minus
 `session_hard_exit_offset_minutes` — `'200000'` ordinarily, `'170000'` on an
-early close, at the default offset of zero. It is NOT the after-market
-INGESTION boundary, though the two once read as one number: that range is fixed
-by decision and does not move with the calendar (data_boundary.md,
-metadata_crawler.md), while this instant does. They coincided at `200000` and
-the coincidence was doing the explaining.
+early close, at the default offset of zero. It is NOT the ingestion range's
+upper bound, `193000`, which is fixed by decision and does not move with the
+calendar (data_boundary.md, metadata_crawler.md), while this instant does.
 
 The offset is kept rather than derived away because what the cap is FOR is a
 policy: leaving margin before the 21:00 evening batch, which is what
@@ -528,13 +537,21 @@ hold-down, and covering the delayed stream's 15-minute lag. R-7 kept
 `session_close_exit_offset_minutes` on the same ground. An early close ends the
 extended session at 17:00 and so widens that margin rather than narrowing it.
 
-**Positions still open at the hard cap** are NOT force-liquidated. They are
-left as `live_positions` rows and carried to the next session, whose
-Unified Overnight Policy (see below) targets them — the same path a
-halt-through-close position already takes. Forcing a market exit into
-after-hours liquidity would be strictly worse than the overnight carry it
-is trying to avoid, and the row is durable (R-2), so the next session
-finds it rather than discovering an orphan.
+**The final liquidation window liquidates before after_hours_end.** Inside
+[after_hours_end(today) − `execution.final_liquidation_minutes`,
+after_hours_end(today)), in every live session, the reduced session
+included, every exit remainder proceeding as limit is re-priced at k =
+max(its current k, 1.0) at the window's first re-quote, then advances by
+`exit_ladder_increment` at each re-quote up to `exit_ladder_cap`,
+regardless of `exit_order_stuck_minutes` (execution_common.md). Its
+priority is a minimal residual entering the Unified Overnight Policy. The
+window opens no exit past an existing gate — the event-day exit gate, the
+exit_submission freeze, a halted position, an unmapped ticker — and
+`live_mode.exit_reject_retry_seconds` is unchanged inside it. Positions
+still open at the hard cap are left as `live_positions` rows and carried to
+the next session, whose Unified Overnight Policy (see below) targets them;
+the row is durable (R-2), so the next session finds it rather than
+discovering an orphan.
 
 **Every 'open' logical order is canceled at stage 1**, entry and exit,
 before the session state turns `done` (`terminal_cause='shutdown'`).
@@ -589,15 +606,19 @@ stage 1.
 
 Order:
 - Session Start Gating;
+- the session load, on the connection Session Start Gating obtained (below);
 - 1a, the token coverage gate;
 - Step 1, the ticker-master fetch;
+- the shadow-position symbol check (Unified Overnight Policy), at every
+  start, blocked starts included;
 - on a cold start, the symbol-map refresh when today's
   `premarket_trading_api_symbol_map` row is not 'success';
 - the 'tradable' index build;
 - the Halt-Status Poller start;
 - 1b, the balance query;
 - 1c, the `live_session_state` INSERT with `stage`;
-- stage consistency and the Early-Close Participation Gate;
+- stage consistency, the code-version gate and the Early-Close Participation
+  Gate;
 - Session Start Probes;
 - 1d, then 1e;
 - the Position Manager loop start;
@@ -644,15 +665,16 @@ Step classes:
 Gates:
 - capability gates — each runs before the Position Manager loop starts, and
   a failure ends the session:
+  - the model gate at the session load — no model_deployments row;
   - clock_check (Session Start Probes);
   - 1a;
   - the API gates of Step 1 and 1b, which run only when those baselines are
     computed;
 - participation gates — evaluated anew at each start, cold start and warm
   restart alike:
-  - stage consistency (`live_mode.stage` differing from the row's `stage`)
-    and the Early-Close Participation Gate, each evaluated right after 1c
-    whatever the other's result;
+  - stage consistency (`live_mode.stage` differing from the row's `stage`),
+    the code-version gate and the Early-Close Participation Gate, each
+    evaluated right after 1c whatever the others' results;
   - Health Gate 1 (Gate 1d included) at Step 4;
   - the regime holdout gate at Step 7.
 
@@ -673,10 +695,16 @@ Start outcome — one per start:
   - the Early-Close cause's detail — today's `session_close` and
     `live_mode.trade_early_close_days`' value at this run;
   - the stage cause's detail — the row's `stage` and `live_mode.stage`;
-  - Gate 1d's cause detail:
-    - the table;
-    - the model's config_hash;
-    - the deployment config's config_hash;
+  - the code-version cause's detail — the lock's hash, the current hash, the
+    changed files and the changed distribution versions;
+  - Gate 1d's cause detail, per failed check of `utils.deployability_checks()`:
+    - a derived table — the table, the model's config_hash and the
+      deployment config's config_hash;
+    - the feature check — the model features absent from the extractor;
+    - the feature-contract config_hash — the differing keys, code_versions
+      included;
+  - the model gate's cause, `{gate: 'model'}`, ends the start at the session
+    load, before 1c's row exists;
   - a start ended before 1c's row exists records no entry;
 - reported — the session-start health report is invoked once per start, at
   the outcome's point, its detail carrying the start outcome
@@ -697,6 +725,28 @@ Start outcome — one per start:
 A warm restart's step behaviour is stated at each step below; "Session
 Restart (Warm Start)" holds the per-ticker recovery the Position Manager loop
 runs first on a warm restart.
+
+The session load — once per process, on the connection Session Start Gating
+obtained, before Step 1:
+- `closes, ends = load_session_boundaries(db_conn)` (utils.md); the
+  production TradingAPI client is constructed with them (trading_api.md),
+  and the Early-Close Participation Gate uses this load;
+- today's calendar context — a SELECT of today's `trading_calendar` row read
+  through `utils.calendar_context()`; Step 7 passes it to the Inferencer;
+- the session's model run_id: today's `live_session_state` row's run_id when
+  the row exists, otherwise the run_id of model_deployments' latest row; no
+  model_deployments row → the model gate, a capability gate: the start is
+  'ended', reported through `session_start_abort`;
+- the data area's code-version check (utils.md's Code Versions), its result
+  the code-version gate at the Early-Close Participation Gate's position:
+  an unattested data area blocks participation, cause `{gate:
+  'code_version', detail}` (the start outcome's cause details, above), and
+  the start runs the reduced session; health_report.md's finding 56 does not
+  report it;
+- `lookback_start_date = prior_trading_days(today_date,
+  config["indicators"]["lookback_days"], closes)[0]` — the lookback start
+  (utils.md's Trading Calendar Utilities), read by the Eager Pool and by the
+  In-Process Premarket Recheck's recompute and re-seeds.
 
 ```
 LiveModeRunner.start_session(today_date):
@@ -785,6 +835,7 @@ LiveModeRunner.start_session(today_date):
   1c. [Baseline] Persist session start (R-2):
          db_write INSERT live_session_state (date, run_id,
              session_start_cash, started_at, stage, all_tickers).
+      run_id is the session's model run_id (the session load).
       stage is live_mode.stage at this INSERT and is the session's stage:
       after 1c every runtime branch reads the row's stage, never
       live_mode.stage. A warm restart makes no INSERT: the row's values are
@@ -793,11 +844,12 @@ LiveModeRunner.start_session(today_date):
       restart restores it rather than re-querying the balance, which would
       reflect a post-fills value, not the session's original basis.
 
-  Participation gates at the 1c point, each evaluated whatever the other's
-  result:
+  Participation gates at the 1c point, each evaluated whatever the others'
+  results:
       - stage consistency — live_mode.stage differing from the row's stage
         blocks participation, cause {gate: 'stage', detail: {row_stage,
         config_stage}};
+      - the code-version gate (the session load);
       - the Early-Close Participation Gate (above).
 
   Session Start Probes (above) — clock_check a capability gate.
@@ -852,39 +904,57 @@ LiveModeRunner.start_session(today_date):
          all_stats_nested = build_session_stats_dict(
              session_stats_raw,
              delta_minutes=config["indicators"]["reference_session"]["delta_minutes"],
-             session_mode=config["entry_detector"]["session_mode"],
              closes=closes,
+             ends=ends,
          )
-         # closes has been in scope since the early-close gate, which runs
-         # after 1c.
+         # closes and ends have been in scope since the session load, before
+         # Step 1.
          # all_stats_nested: {today_date: {ticker: {metric: {hour: smoothed_avg_value}}}}
          session_stats_bulk = all_stats_nested[today_date]
          # session_stats_bulk: {ticker: {metric: {hour: smoothed_avg_value}}}
 
-  3. [Meta Bulk Load] Bulk load stock_meta for today, with per-field fallback:
-         stock_meta_today = SELECT * FROM stock_meta WHERE date = ?
-         # stock_meta is (ticker, date)-keyed (see db_schema.md V-1 fix); a row
-         # exists only if today's crawl (see metadata_crawler.md dual-schedule)
-         # succeeded for that ticker/field by session start.
+  3. [Meta Bulk Load] Bulk load stock_meta's prior-day rows, with per-field
+     resolution:
+         prior_day = prior_trading_days(today_date, 1, closes)[0]
+         stock_meta_prior = SELECT * FROM stock_meta WHERE date = prior_day
+         # stock_meta is (ticker, date)-keyed (see db_schema.md V-1 fix); a
+         # row's date is its crawl date and it serves the trading days after
+         # it, so today reads the prior-day row — the previous evening's
+         # crawl (metadata_crawler.md).
 
          meta_bulk: dict[str, dict] = {}
          for ticker in all_tickers:
+             row   = <stock_meta_prior's row for ticker, or none>
+             group = <today's precomputed_session_stats group of ticker
+                      (Step 2), its hour '000000' metrics>
              meta_bulk[ticker] = {
-                 field: (
-                     stock_meta_today.get(ticker, field)
-                     if ticker in stock_meta_today.index and pd.notna(stock_meta_today.loc[ticker, field])
-                     else utils.estimate_historical_meta(ticker, today_date, field, db_conn)
-                 )
-                 for field in ["market_cap", "shares_outstanding", "price_52h", "price_52l"]
-             } | {
-                 "sector": most recent available stock_meta.sector for ticker
-                 # sector has no derivation path — most recent snapshot regardless of date
+                 "market_cap":
+                     row.market_cap if row has it
+                     else utils.estimate_historical_meta(
+                         ticker, today_date, "market_cap", closes,
+                         config["indicators"]["lookback_days"], db_conn),
+                 "shares_outstanding":
+                     utils.estimate_historical_meta(
+                         ticker, today_date, "shares_outstanding", closes,
+                         config["indicators"]["lookback_days"], db_conn),
+                     # its first tier the prior-day row
+                 "price_52h", "price_52l", by live_mode.price_extremes_source:
+                     # 'vendor': row's value through utils.split_basis_value(),
+                     #           anchor group's metric; else group's metric;
+                     #           else NaN
+                     # 'derived': group's metric; else NaN
+                 "sector", "security_type":
+                     # each the chain-latest symbol's latest stock_meta row
+                     # with the field set, whatever the date — no derivation
+                     # path
              }
+             # The instrument rule: a non-common security_type (warrant,
+             # unit, right, preferred, debt) resolves market_cap and
+             # shares_outstanding none, the prior-day row's values included;
+             # adr skips estimate_historical_meta()'s fundamentals tier
+             # (utils.md).
          # meta_bulk is looked up (not rebuilt) inside the watchdog loop's
          # Inferencer.infer() call — see Watchdog Polling Loop step 5b.
-         # estimate_historical_meta() fallback should rarely trigger for
-         # today's own date given the dual-crawl schedule, but is not
-         # guaranteed-zero (vendor update latency — see metadata_crawler.md).
          # Moved ahead of Eager Pool (was Step 3b, after) specifically so
          # Health Gate 1 (next) can evaluate stock_meta coverage before
          # paying Eager Pool's cost — see Health Gate 1 rationale below.
@@ -906,10 +976,15 @@ LiveModeRunner.start_session(today_date):
                               : session_stats_bulk[t] not empty}|
                             / |eligible ∩ all_tickers|
             coverage_rate < 0.90 → BLOCK PARTICIPATION (hard gate; P-0-class failure)
+            |eligible ∩ all_tickers| = 0 (the prior trading day holding no
+                ingested 1-min data) → BLOCK PARTICIPATION, its detail
+                naming that prior trading day
 
      b. stock_meta coverage (per field, then aggregated):
             for field in [market_cap, shares_outstanding, price_52h,
                           price_52l, sector]:
+                # price_52h and price_52l counted only when
+                # live_mode.price_extremes_source is 'vendor'
                 eligible(field) = { t : EXISTS (SELECT 1 FROM stock_meta
                                     WHERE ticker=t AND date >= today - 20
                                     trading days AND {field} IS NOT NULL) }
@@ -918,7 +993,7 @@ LiveModeRunner.start_session(today_date):
                 # — only a ticker that normally HAS the field but is missing
                 # it today counts against coverage.
             coverage_rate = Σ_field |{(t,field) : t in eligible(field),
-                                       real value present today}|
+                                       a value present in the prior-day row}|
                             / Σ_field |eligible(field) ∩ all_tickers|
             coverage_rate < 0.80 → WARN
             coverage_rate < 0.50 → BLOCK PARTICIPATION
@@ -948,30 +1023,32 @@ LiveModeRunner.start_session(today_date):
             # Start Gating, around 04:00-05:00 ET), so its completion
             # cannot be known yet at this check regardless of stage name.
 
-     d. feature_names consistency (N-8):
-            model_features = set(meta["feature_names"])   # from the run_id's
-                                                            # model artifact
-                                                            # meta.json (see
-                                                            # base_model.md)
-            extractor_features = set(FeatureExtractor(config).get_feature_names())
-            mismatch = model_features.symmetric_difference(extractor_features)
-            mismatch is non-empty
-                → BLOCK PARTICIPATION (hard gate)
-            and, for each derived table the runner reads
-            (precomputed_session_stats), the config_hash computed from the
-            deployed model's meta.json config snapshot against the one
-            computed from the deployment config (utils.md's Config Hashing):
-            a mismatch → BLOCK PARTICIPATION, its cause detail naming:
-                - the table;
-                - the model's config_hash;
-                - the deployment config's config_hash
-            # No warn-and-proceed variant considered — a mismatch means
-            # every inference this session would either KeyError on a
-            # missing feature or silently ignore one the model never
-            # trained on, depending on direction. Both are as severe as
-            # the P-0-class session_stats coverage failure above; there is
-            # no meaningful degraded mode for "the model and the feature
-            # pipeline disagree on what a feature vector is."
+     d. deployability (N-8) — utils.deployability_checks(meta, config, lock),
+        meta the run_id's model artifact meta.json (see base_model.md); each
+        failed check → BLOCK PARTICIPATION (hard gate), its cause detail
+        (Session Lifecycle's start outcome):
+            - the feature check: model_features = set(meta["feature_names"])
+              is a subset of set(FeatureExtractor(config).get_feature_names());
+              detail: the model features absent from the extractor;
+            - for each derived table the runner reads
+              (precomputed_session_stats), the config_hash computed from the
+              deployed model's meta.json config snapshot against the one
+              computed from the deployment config (utils.md's Config
+              Hashing); detail: the table, the model's config_hash, the
+              deployment config's config_hash;
+            - the feature-contract config_hash — utils.config_hash() over the
+              keys run_preprocess.md's Config Keys Used lists inside
+              config_hash, `labeler.*` excluded, with code_versions holding
+              the data version: the model's, from its meta.json config
+              snapshot and recorded data version, against the deployment's,
+              from config and the lock's data version; detail: the differing
+              keys, code_versions included
+            # No warn-and-proceed variant considered — a model feature the
+            # extractor does not produce means every inference this session
+            # would KeyError on it. That is as severe as the P-0-class
+            # session_stats coverage failure above; there is no meaningful
+            # degraded mode for "the model needs a feature the pipeline does
+            # not produce."
             # Cheap relative to Eager Pool — reads two already-available
             # name lists, no additional DB or model-artifact I/O beyond
             # what Step 7's Inferencer init would load anyway (moved
@@ -1030,46 +1107,50 @@ LiveModeRunner.start_session(today_date):
   5. [Eager Pool] Restore-or-compute per ticker of all_tickers, on a cold
      start and a warm restart alike:
          - today's indicator_cache rows present → restore:
-           - "memory" mode — CachingIndicatorCalculator.load_from_db(),
-             then set_session_stats(session_stats_bulk.get(ticker, {})),
+           - "memory" mode — a CachingIndicatorCalculator(config, ticker,
+             today_date)'s load_from_db(db_conn), then
+             set_session_stats(session_stats_bulk.get(ticker, {})),
              retained as calculators[ticker];
            - "db" mode — nothing here: the ticker is restored at its first
              appearance in the watchdog working set (Watchdog Polling
              Loop's Phase 2);
            the Watchdog Polling Loop's Step 3 then replays today's bars
            through on_bar_close(), running on_regular_session_open() with
-           the ticker's today_dividends value when it passes the 093000 bar
+           the ticker's today_dividends value when it passes the first
+           regular-session bar
            ("Session Restart (Warm Start)" for the restore's idempotency);
          - absent → session_start_compute() and persist_to_db(), below.
-         Using worker pool (config: live_mode.session_start_workers)
+         Using worker pool (config: live_mode.session_start_workers);
+         lookback_start_date is the session load's.
 
          For each ticker without today's rows (parallelized):
              historical_bars = utils.load_ohlcv_with_history(
                  ticker, lookback_start_date, today_date, db_conn
              )
-             # Stitches in predecessor-ticker bars if a rename occurred within
-             # the lookback window (see utils.md get_ticker_history() /
-             # load_ohlcv_with_history()) — returns None-history fast path
-             # (a single direct query) for the vast majority of tickers.
+             # Reads through the symbology layer for today's symbol (utils.md's
+             # Ticker Identity Utilities), stitching the segments of its
+             # chain — the None-history fast path (a single direct query)
+             # for the vast majority of tickers.
              # Loaded in the same per-ticker parallel worker, alongside
              # historical_bars — both must be ready before session_start_compute():
-             tick_bar_history, tier_used = utils.load_tick_bar_aggregates_with_history(
+             tick_bar_history = utils.load_tick_bar_aggregates_with_history(
                  ticker,
                  indicators=[i for i in configured_tick_indicators
                              if i.precalculate_bars == "lookback"],
-                 lookback_start_date, today_date, db_conn
-             ) if any_indicator_configured_lookback else (None, {})
-             # tier_used: {indicator_name: 1|2|3} — which resolution tier
-             # fired per requested indicator; empty dict when no indicator is
-             # "lookback"-configured. Returned (not just used internally) so
-             # Step 6 can aggregate it after all workers report back — see
-             # Health Gate 2.
+                 lookback_start_date=lookback_start_date,
+                 today_date=today_date,
+                 momentum_n=config["indicators"]["lee_ready"]["momentum_n"],
+                 db_conn=db_conn,
+             ) if any_indicator_configured_lookback else None
+             # Reads through the symbology layer, its Tier 1 rows and Tier 2
+             # compute per segment symbol.
              # Corporate-event split adjustment is NOT applied here — that
              # happens inside session_start_compute() itself, anchored to
              # today_date (see caching_calculator.md).
 
-             calc = CachingIndicatorCalculator(config)
-             calc.session_start_compute(historical_bars, tick_bar_history)
+             calc = CachingIndicatorCalculator(config, ticker, today_date)
+             calc.session_start_compute(historical_bars, tick_bar_history,
+                                        db_conn)
              calc.set_session_stats(
                  session_stats_bulk.get(ticker, {})
              )
@@ -1087,7 +1168,7 @@ LiveModeRunner.start_session(today_date):
                  # statement — necessary since a half-applied delete from
                  # one worker interleaved with another's insert is exactly
                  # the kind of race a per-statement lock would not prevent.
-                 calc.persist_to_db(db_conn, today_date, ticker)
+                 calc.persist_to_db(db_conn)
              # R-2: written in BOTH modes now, as a crash-recovery backup —
              # each worker persists its own ticker as soon as it finishes,
              # not batched at the end. A later start reads this via
@@ -1103,33 +1184,32 @@ LiveModeRunner.start_session(today_date):
                                              # later start's Eager Pool, never
                                              # in normal operation.
 
-             worker returns (ticker, tier_used) alongside the calc/persist result
-
          del session_stats_bulk   # RAM released after all tickers done
 
-  6. [Health Gate 2] Post-Eager-Pool health check — tick_bar_aggregates
-     Tier-2/3 fallback rate, aggregated over the tickers Step 5 computed (a
-     restored ticker reports no tier_used; none computed → the check
-     trivially passes). Depends on Step 5's tier_used results, which is
-     why this cannot be folded into Health Gate 1 (Step 4):
+  6. [Health Gate 2] Post-Eager-Pool health check — the tick_bar_aggregates
+     cache, measured from the DB; runs only when a tick-derived indicator is
+     "lookback"-configured. A warn-only DB check, independent of Step 5's
+     output:
 
-         tier_tally = Counter()
-         for ticker, tier_used in step_5_results:
-             for indicator, tier in tier_used.items():
-                 tier_tally[tier] += 1
-         total = sum(tier_tally.values())
-         fallback_rate = (tier_tally[2] + tier_tally[3]) / total if total > 0 else None
+         per trading day d of [lookback_start_date, today_date):
+             ticked(d) = the stored symbols with has_tick TRUE in
+                         ticker_data_coverage on d
+             cached(d) = those of ticked(d) holding a tick_bar_aggregates
+                         row of the current data version (the lock's) on d
+             gap share = 1 − |cached(d)| ÷ |ticked(d)|; none when ticked(d)
+                         is empty
+         market-wide, no symbology resolution; Tier 3 is not measured
 
-         fallback_rate is None → no lookback-configured indicator exists yet;
-             check trivially passes (all 9 tick-derived indicators
-             currently ship precalculate_bars: 0)
-         fallback_rate > 0.20 → WARN + proceed (self-healing case, but batch
-             likely failed — alert operator)
+         a date above 0.20 → WARN + proceed, naming the dates, their missing
+             current-version rows, the causes (evening_tick_bar_aggregates
+             failed or not run, or a data version change) and their Tier 2
+             resolution
 
   7. Regime holdout gate, then Inferencer init:
          Before Inferencer init, read the regime_holdout_verdict row whose
-             final_run_id is the configured run_id (db_schema.md;
-             pipeline_optimizer.md's Regime Holdout Report and Verdict):
+             final_run_id is the session's model run_id (the session load;
+             db_schema.md; pipeline_optimizer.md's Regime Holdout Report and
+             Verdict):
            - record health event regime_holdout_verdict, detail {run_id,
              verdict, report} —
              the row's verdict and report items, or that no row exists;
@@ -1139,40 +1219,63 @@ LiveModeRunner.start_session(today_date):
                  - 'pass_with_warning';
                  - 'fail';
                  - no row;
-           - when optimizer.regime_holdout.gate.enabled: no row → the
-             verdict is optimizer.regime_holdout.gate.missing_result's
-             value; 'fail' → record health event regime_holdout_gate_failed
-             (finding 43, severity abort), detail {run_id,
-             optimizer_run_id, verdict}, and participation is blocked here
-             — the start's outcome 'blocked' (above).
-             'pass' and 'pass_with_warning' proceed.
-           - Enforced here only — nowhere else reads the verdict as a
-             gate. inferencer.md is unchanged: it has no db_conn, and the
-             read is this process's.
-         Pass closes in — this process holds it already, so the Inferencer
-             does not open a second acquisition for the same fact. Not ends:
-             nothing there reads it
-         Pass a HALT ACCESSOR in — a callable, not a static dict, since new
-             halts occur during the session. It serves live_halt_episodes
-             rows for the requested ticker and date, filtered to the
-             configured source list, and CLOSES any interval whose
-             halt_end IS NULL to `now` at supply time, so the consumer only
-             ever sees closed intervals (the consumers' predicate is "slot
-             overlaps a halt interval", and trading_halts' NULL-ended rows
-             carry its defined rule — the interval covers every slot of
-             that date from halt_start on (db_schema.md) — which would read
-             a halt still running as halted for the rest of today). The
-             live_halt_episodes row
-             itself stays open. This process is the single owner of
+           - the gate: utils.regime_gate(the row, config) — its verdict
+             (the row's; with no row optimizer.regime_holdout.gate.missing_result's
+             value) and blocked (optimizer.regime_holdout.gate.enabled and
+             the verdict 'fail'); blocked → record health event
+             regime_holdout_gate_failed (finding 43, severity abort),
+             detail {run_id, optimizer_run_id, verdict}, and participation
+             is blocked here — the start's outcome 'blocked' (above);
+             otherwise proceed.
+           - A session's participation is blocked by the gate here alone;
+             model_candidates' status at writing and model_deploy's
+             decisions also read the verdict. inferencer.md is unchanged:
+             it has no db_conn, and the read is this process's.
+         θ's applicability is fixed for the session here: θ applies when
+             execution.late_entry_min_expected_return_pct is not null and
+             execution.late_entry_theta_run_id equals the session's model
+             run_id; otherwise θ is inert (execution_common.md).
+         Pass closes, ends and today's calendar context in — this process
+             holds them from the session load, so the Inferencer does not
+             open a second acquisition for the same facts; its
+             regular-session check reads closes and ends, and it passes ends
+             and the calendar context to extract()
+         Pass a HALT ACCESSOR in — a callable (ticker, dates), not a static
+             dict, since new halts occur during the session. It serves the
+             halt-interval resolver's intervals for every frame date:
+             - prior dates — trading_halts through the resolver
+               (utils.md's halt_intervals()), read through the symbology
+               layer, loaded here before Inferencer init for all_tickers
+               over the lookback dates; a warm restart reloads them;
+             - today — live_halt_episodes rows filtered to the configured
+               source list, and under "until_first_bar" a continuation
+               interval when halt_open_into holds for today, closed to `now`
+               while today has no bar and ending at today's first bar, these
+               merged into one interval set; today's continuation reads only
+               the previous trading day's rows.
+             It CLOSES any today interval whose halt_end IS NULL to `now` at
+             supply time, so the consumer only ever sees closed intervals
+             (the consumers' predicate is "slot overlaps a halt interval",
+             and trading_halts' NULL-ended rows carry its defined rule — the
+             interval covers every slot of that date from halt_start on
+             (db_schema.md) — which would read a halt still running as
+             halted for the rest of today). The live_halt_episodes row
+             itself stays open. This process is the single owner of today's
              interval construction, holding both last_halt_state and the
              table; trading_halts is structurally empty for today's date
-             during a session and is not a live source.
-         Pass write_fn=db_write in — the Inferencer's entry_points and
-             inference_log writes go through the same write_lock funnel as
-             every other write here. No db_conn is passed: it has no
-             remaining reader there.
-         calculate_required_history() → self.required_bars
-         Load model artifacts (run_id from config)
+             during a session and is not a live source for today.
+         Pass write_fn=db_write in — the Inferencer's entry_points,
+             inference_log and inference_features writes go through the same
+             write_lock funnel as every other write here. No db_conn is
+             passed: it has no remaining reader there.
+         The FeatureExtractor is constructed with a DB-backed reader on this
+             process's connection — corporate_events, fundamentals_quarterly
+             and fx_rates (04_feature_extractor.md) — and the reader only:
+             the ticker's calculator reaches extract() per call, through
+             infer()'s calculator.
+         calculate_required_history() → the Inferencer keeps min_trading_days
+             and min_bars
+         Load model artifacts (the session's model run_id)
 
   The start outcome is 'participating' here (above): the session-start
   health report is invoked, then Step 8.
@@ -1184,7 +1287,8 @@ LiveModeRunner.start_session(today_date):
 **Bulk Load Memory Profile** (Steps 2-3, 5 — renamed from "Phase 1" now that
 the lifecycle no longer labels a single step that name; scope unchanged):
 ```
-session_stats_bulk peak:  ~15,000 tickers × ~18KB ≈ ~270MB
+session_stats_bulk peak:  ~15,000 tickers × ~33KB ≈ ~500MB — the premarket
+                          and regular slots of an ordinary day
                           Released after Step 5 completes.
 
 tick_bar_history (Eager Pool, only if any tick-derived indicator is
@@ -1195,7 +1299,7 @@ precalculate_bars: 0):
   config; re-profile if any indicator is switched to "lookback".
 
 calculators pool ("memory" mode):
-  ~15,000 tickers × ~790KB (Layer1 + Layer2 + session_stats) ≈ ~11.9GB sustained
+  ~15,000 tickers × ~805KB (Layer1 + Layer2 + session_stats) ≈ ~12.1GB sustained
   Recommended server: 32GB+ RAM.
   For memory-constrained environments: use indicator_cache_mode = "db"
   (50~200ms per-ticker load latency on a ticker's first appearance in the
@@ -1268,14 +1372,25 @@ watchdog and 5s position loops are not stalled):
    the deployment config through utils.populate_precomputed_session_stats()
    (db_schema.md's Derived tables). Then, for any ticker that gained a new
    same-day 'dividend' row in steps 3-4, re-read its today_dividends entry
-   (Session Lifecycle Step 4c). Then, for each ticker that gained a new
+   (Session Lifecycle Step 4c). Then, for each ticker that gained a same-day
+   split or reverse_split row in steps 3-4, its meta_bulk entry is
+   re-resolved by Session Lifecycle Step 3's rule, its group the recomputed
+   one; the re-resolved entry replaces meta_bulk[ticker] at the Watchdog
+   Polling Loop cycle boundary of that ticker's calculator swap (below) when
+   a calculator exists, at once when none exists, and at once on the late
+   recheck. Then, for each ticker that gained a new
    same-day corporate_events row in steps 3-4, once Eager Pool has run
    (always true for this scheduled path):
    - calculator exists, either indicator_cache_mode: build a new
-     CachingIndicatorCalculator for that ticker (set_session_stats() first,
-     with the recomputed stats) and call its scoped_recompute(...,
-     dividend_amount=today_dividends.get(ticker, 0.0)) (caching_calculator.md)
-     over a snapshot of today's bars, as a background task; the instance in
+     CachingIndicatorCalculator(config, ticker, today_date)
+     (set_session_stats() first, with the recomputed stats) and call its
+     scoped_recompute(historical_bars, tick_bar_history, bars_today,
+     dividend_amount=today_dividends.get(ticker, 0.0), db_conn)
+     (caching_calculator.md) — historical_bars through
+     utils.load_ohlcv_with_history(ticker, lookback_start_date, today_date,
+     db_conn), tick_bar_history through the Eager Pool's loader call,
+     bars_today a snapshot of today's bars, db_conn the calling thread's
+     handle (P-5) — as a background task; the instance in
      calculators[ticker] keeps serving meanwhile. The new instance persists
      its step-1 seed (persist_to_db(), replacing that ticker's rows for
      today's session_date); then, on completion, it is swapped into
@@ -1285,8 +1400,11 @@ watchdog and 5s position loops are not stalled):
      recomputed stats taking effect at that same boundary, and then its
      quarantine_reason is cleared if set;
    - no calculator ("db" mode, ticker not yet restored): the seed is
-     recomputed and persisted, with quarantine_reason cleared in the same
-     transaction; the recomputed stats are read at its restore
+     recomputed — a new CachingIndicatorCalculator(config, ticker,
+     today_date)'s session_start_compute(historical_bars, tick_bar_history,
+     db_conn), its inputs read as above — and persisted (persist_to_db(db_conn)),
+     with quarantine_reason cleared in the same transaction; the recomputed
+     stats are read at its restore
      (load_session_stats(), Watchdog Polling Loop).
    Each ticker's write is its own transaction under one write_lock hold,
    issued as that ticker's seed is ready; no batching across tickers.
@@ -1294,8 +1412,10 @@ watchdog and 5s position loops are not stalled):
    the recomputed stats replace those tickers' session_stats_bulk entries
    at once; the re-seed target is every ticker holding today's
    indicator_cache rows and a corporate_events row dated today, each seed
-   recomputed and persisted with quarantine_reason cleared in the same
-   transaction; any other ticker that gained a same-day row has its
+   recomputed — a new CachingIndicatorCalculator(config, ticker,
+   today_date)'s session_start_compute(historical_bars, tick_bar_history,
+   db_conn), its inputs read as above — and persisted with quarantine_reason
+   cleared in the same transaction; any other ticker that gained a same-day row has its
    quarantine_reason cleared at once if set, and Eager Pool computes on the
    fresh rows — Step 0 picks them up naturally.
 ```
@@ -1605,7 +1725,8 @@ loop every poll_interval_seconds:
   1. watchdog.get_candidates() → the current working set (cumulative,
      most-recently-fired first — see note above; NOT this cycle's new
      arrivals, which are not observable)
-     If empty AND inside the regular session: record finding 29
+     If empty AND utils.session_phase(today, now, closes, ends) is
+     'regular': record finding 29
         (once per episode, re-armed when the list refills)
 
   2. Allocate this cycle's slots (see PREFIX SCAN above), then for each
@@ -1650,9 +1771,10 @@ loop every poll_interval_seconds:
              calculators[ticker].on_bar_close(bar, ticks_for_bar)
              # ticks_for_bar: the ticker's sealed bundles selected by
              # bundle hour (Per-Ticker Tick Buffer)
-             if 093000 bar just closed:
+             if bar is the day's first regular-session bar
+                    (utils.session_phase() 'regular') and it just closed:
                  calculators[ticker].on_regular_session_open(
-                     bars_including_930,
+                     bars through it,
                      today_dividends.get(ticker, 0.0),   # Session Lifecycle Step 4c
                  )
          # Looping here (rather than assuming exactly one new bar) is what
@@ -1680,7 +1802,7 @@ loop every poll_interval_seconds:
         The superset is a FETCH LIST, never an entry list.
      b. At bar close, call Inferencer.infer( bars, ticks,
             meta_bulk[ticker], entry,
-            session_stats=calculators[ticker]._session_stats
+            calculator=calculators[ticker]
         ) for EVERY member of the superset, with no detect() pre-filter
         here. Inferencer's own step-3 detect() does the rejecting and
         returns before feature extraction or model.predict(), so this is
@@ -1743,7 +1865,9 @@ loop every poll_interval_seconds:
             event='signal_fired' row — 'freeze' | 'cap_tickers' |
             'cap_per_ticker' | 'cooldown', and likewise 'not_tradable',
             'bar_integrity' and 'no_terms' (step i), 'sizing_zero' /
-            'funds' (step ii) below. A candidate
+            'funds' / 'cap_inert' (step ii) below; the row's entry_path is
+            'bar_close' here and 'late' on the late path (Recovery Lane and
+            Promotion), which also records 'residual_edge'. A candidate
             reaching submission in step iii records 'submitted'. If step
             ii's check_funds_available() call raises (the one network call
             in this sequence — timeout, connection error) rather than
@@ -1806,13 +1930,20 @@ loop every poll_interval_seconds:
             # precede simulate_entry_fill(), which takes quantity as input)
             order_type = execution_common.permitted_order_type(
                 "buy", config["execution"]["entry_order_type"],
-                the phase now)    # execution_common.md's Session Phase
+                utils.session_phase(today, now, closes, ends))
+                # execution_common.md's Session Phase; it raises on phase
+                # 'closed' — the site submits nothing and retries at its
+                # next cycle
             limit_price = None if order_type == "market" \
                 else the Entry Limit Price rule (execution_common.md): the
                      entry_gap-derived limit rounded DOWN to tick(price),
                      capped at P_cap when execution.entry_price_cap_enabled
-                     — S from this signal's inference, computed once here.
-                     A configured market entry forced to limit takes it too.
+                     and θ applies (fixed at Session Lifecycle Step 7); with
+                     θ inert, live_mode.entry_price_cap_inert decides —
+                     "uncapped": the entry_gap-derived limit; "refuse": see
+                     below — S from this signal's inference, computed once
+                     here. A configured market entry forced to limit takes
+                     it too.
             if order_type == "market":
                 base, basis = ask1, 'ask1'       # signal_time_rest's level-1
                     # quote at this signal, when that response has arrived
@@ -1849,6 +1980,11 @@ loop every poll_interval_seconds:
             multiplying the left side by `Mgnrt0 / 100` would apply the same
             factor twice.
             if not proceed: skip, no order
+            if order_type == "limit" and θ inert
+                    and execution.entry_price_cap_enabled
+                    and live_mode.entry_price_cap_inert == "refuse":
+                skip, no order → gate_result='cap_inert'
+                # a market entry is unaffected
             # A reduced quantity from use_all_cash does NOT re-enter the
             # sizing caps above. All four sizing terms are monotone in
             # quantity and combined by min(), so any value at or below
@@ -2080,23 +2216,27 @@ inference here would reach the model and leave `entry_points` and
 `live_scan_daily.promotions_total` instead, which is also the in-session
 measure of how often the rotation cursor arrived too late in a bar.
 
-**Under `execution.late_entry_enabled` the finding takes a second path
-alongside promotion, not instead of it.** The candidate is put through
-`infer()` and then `execution_common.md`'s residual-edge gate, which prices
-the drift since the t bar's open against the edge the model still expects;
-if it passes, the entry is taken at `p_now`. Inference therefore RUNS FIRST
-on this path, which live can afford because these candidates are the small
-rotation-detected subset adjudicated mid-bar, outside the 5-second
-bar-close deadline. Promotion still happens either way — it is the fallback
-for a candidate the gate rejects, and it costs nothing when the gate
-accepts. With the flag false (the default) only promotion runs and this
-paragraph is inert.
+**Under `execution.late_entry_enabled`, with θ applying (Session Lifecycle
+Step 7), the finding takes a second path alongside promotion, not instead
+of it.** The candidate is put through `infer()`, with `calculators[ticker]`, and then
+`execution_common.md`'s residual-edge gate, which prices the drift since the
+t bar's open against the edge the model still expects; if it passes, the
+entry is taken at `p_now`, its signal_fired row's entry_path 'late'; a
+rejected candidate's row records gate_result 'residual_edge'. Inference
+therefore RUNS FIRST on this path, which live can afford because these
+candidates are the small rotation-detected subset adjudicated mid-bar,
+outside the 5-second bar-close deadline. Promotion still happens either
+way — it is the fallback for a candidate the gate rejects, and it costs
+nothing when the gate accepts. With the flag false (the default) or θ
+inert, only promotion runs — no infer(), no residual-edge gate, no
+late_entry_gate_pass or late_entry_gate_reject count — and this paragraph
+is inert.
 
 Both gate outcomes are counted into `live_scan_daily.late_entry_gate_pass`
 and `_reject`. The reject count is the one that matters: it measures what
 the gate costs in signals the model wanted, which is not observable any
-other way once the flag is on, and it is the input for deciding whether
-theta's quantile is set too high.
+other way once the path runs, and it is the input for deciding whether
+θ's quantile is set too high.
 
 This is the one place the scan produces an entry, and it does NOT weaken
 the eligibility rule in Constraints: what qualifies is still the full A-G
@@ -2267,10 +2407,9 @@ not grow with how long the ticker was away, but 60s dwarfs the 5s value
 being calibrated.
 
 Deliberately NOT filtered on bar-timestamp continuity, which was the obvious
-alternative: a thin ticker that gets no zero-volume bar for a minute (see
-Feed Outage Recovery's trigger condition 2 on exactly this uncertainty)
-produces a bar whose timestamp skipped a minute but which arrived perfectly
-on time. Rejecting those would discard valid samples from precisely the
+alternative: a minute without trades has no bar, so a thin ticker's next
+bar after such a minute has a timestamp that skipped a minute yet arrived
+perfectly on time. Rejecting those would discard valid samples from precisely the
 thinnest tickers — the ones a vendor is slowest on — biasing the curve
 optimistic. Such samples are admitted and separately counted
 (`bar_gap_samples`), which is also what distinguishes structural
@@ -2291,7 +2430,10 @@ replay, and `infer()` all land. The delta is zeroed after each flush,
 including a forced one, so the periodic timer is reset by a forced flush
 too; otherwise the next scheduled flush writes an empty delta. Runs
 unconditionally in shadow mode: the bar/price channel is identical in both
-modes, and this measures that channel, not the order path.
+modes, and this measures that channel, not the order path. Each periodic
+flush is accompanied, when an Inferencer exists, by its `flush_features()`
+(inferencer.md), whose dropped and failed counts are added to finding 22's
+inference_features counts (session_diagnostics write point (c)).
 
 **Premise violation (`d < 0`).** A negative sample means a bar exists for a
 minute that has not finished, which contradicts the `expected_minute`
@@ -2384,10 +2526,10 @@ handled by finding 29 without a freeze.
   which this condition does not evaluate (condition 1 above remains
   the only detector for that cycle). Both `min_watchlist_size` and
   `bar_close_grace_seconds` are seed values, deliberately set conservative
-  (harder to trigger) until measured — the vendor's actual quiet-minute
-  behavior (whether a thin ticker with zero trades gets a zero-volume bar
-  at all, or no bar) bears directly on how large a "normal" miss rate can
-  be, and this condition is set with that in mind.
+  (harder to trigger) until measured — a minute without trades has no bar,
+  so a thin ticker's quiet minutes count as misses and bear directly on how
+  large a "normal" miss rate can be, and this condition is set with that in
+  mind.
 
 **Where this runs.** DETECTION stays at its trigger sites and is not
 relocated: condition 1 wherever the trading-API call raises, condition 2 at
@@ -2846,6 +2988,18 @@ such write is swallowed and must not abort the reconcile.
 - Shadow carried positions liquidate through the ordinary shadow exit
   simulation (Position Manager Loop step 3) under the same labelling; no
   real order is placed for them.
+- A carried shadow position whose ticker is absent from today's ticker
+  master — its `trading_api_symbol` not among Step 1's fetched codes, or it
+  has none — closes in shadow: checked at every start, blocked starts
+  included, after Session Lifecycle Step 1 and before the Position Manager
+  loop; `exit_reason='overnight_exit'`, PnL-excluded, with no fill price.
+- A real position whose ticker is renamed is handled by Broker Reconcile's
+  Positions branch — a shortfall on the old ticker and an adoption on the
+  new, the adopted row liquidating as an overnight target. Its residual
+  differences from backtest:
+  - a dead-position labelled case on that path is PnL-excluded;
+  - BacktestEngine carries the position under the successor symbol and
+    prices its exit.
 - Out of scope: live counterparts of backtest dead-position Cases B and D.
 
 ---
@@ -2956,7 +3110,7 @@ Per-ticker recovery — the Position Manager loop, starting after Session
         exit_reason='restart_gap_exit' (see db_schema.md) — outside the
         exit_submission gate, the double-submission guard applying. If the
         position's ELAPSED MINUS HALTED hold already exceeds
-        config["execution"]["max_hold_bars"], skip retro-detection and
+        config["execution"]["max_hold_minutes"], skip retro-detection and
         liquidate immediately (still 'restart_gap_exit') — the same rule
         Position Manager Loop Step 2 applies in steady state, rather than
         the raw elapsed hold this step used to read.
@@ -3046,14 +3200,14 @@ after any gap):
   if ticker_X not in calculators:   # only possible when indicator_cache_mode == "db"
                                      # and this is genuinely the first appearance
       # Restore from DB, reload session_stats
-      calc_X = CachingIndicatorCalculator(config)
-      calc_X.load_from_db(db_conn, today_date, ticker_X)
+      calc_X = CachingIndicatorCalculator(config, ticker_X, today_date)
+      calc_X.load_from_db(db_conn)
       stats_X = load_session_stats(
           db_conn, ticker_X, today_date,
           config_hash=deployment_stats_config_hash,
           delta_minutes=config_delta_minutes,
-          session_mode=config_session_mode,
           closes=closes,
+          ends=ends,
       )
       calc_X.set_session_stats(stats_X)
       calculators[ticker_X] = calc_X
@@ -3191,12 +3345,18 @@ CachingCalculator.on_bar_close(new_bar, ticks_for_bar):
 
   For each indicator with precalculate_bars > 0 (Layer 2):
     - CONTINUOUS (ma, ema, rsi, etc.): incremental append and recalculate
-    - fibonacci: monotonic deque O(1) update (swing_high, swing_low)
+    - fibonacci: monotonic deques O(1) update (swing_high over high,
+      swing_low over low)
+  Session-scoped incremental (Layer 2, from the day's first bar):
     - vwap: accumulate today's cumsum
+    - the REFERENCE_SESSION today series (rvol, rel_dvol,
+      intraday_seasonality, relative_avg_vol_per_tick): append the bar's
+      today metric divided by its slot's baseline
+  Tick-derived at precalculate_bars 0:
     - lee_ready, tpm, avg_vol_per_tick: accumulate today's ticks
 
-  sr_levels and gap_percentile: NOT updated here.
-    - sr_levels: recomputed per-entry-point via get_for_entry()
+  sr_levels, sr_channels and gap_percentile: NOT updated here.
+    - sr_levels, sr_channels: recomputed per-entry-point via get_for_entry()
     - gap_percentile: fixed after on_regular_session_open()
 ```
 
@@ -3204,14 +3364,17 @@ CachingCalculator.on_bar_close(new_bar, ticks_for_bar):
 
 ## on_regular_session_open() Sequence
 
-Called once when the 09:30:00 bar is confirmed closed (09:31 bar arrives).
+Called once when the day's first regular-session bar (utils.session_phase()
+'regular') is confirmed closed, the warm-restart replay included.
 
 ```
-CachingCalculator.on_regular_session_open(bars_including_930, dividend_amount):
+CachingCalculator.on_regular_session_open(bars_through_regular_open, dividend_amount):
   # dividend_amount = today_dividends.get(ticker, 0.0) (Session Lifecycle Step 4c)
   gap_pct = calculator.gap_percentile(bars, date, n_sessions, session_stats,
                                       dividend_amount)
   self._fixed["gap_pct"] = gap_pct
+  self._regular_open_hour = that bar's hour   # live_scan_daily's
+                                              # regular_open_total / _late
 ```
 
 ---
@@ -3225,6 +3388,11 @@ CachingCalculator.get_for_entry(indicator, bars_up_to_t1):
   if indicator == "sr_levels":
       # per-entry-point recomputation (scipy prominence — not cacheable)
       return self.sr_levels(bars_up_to_t1.tail(window_bars), n_levels, window_bars)
+  if indicator == "sr_channels":
+      # per-entry-point recomputation (02_indicator_calculator.md's
+      # sr_channels) — the channel set of the latest recompute bar at or
+      # before t-1
+      return self.sr_channels(bars_up_to_t1, **config["indicators"]["sr_channels"])
   if indicator == "gap_pct":
       return self._fixed.get("gap_pct", float("nan"))   # scalar
   return self._cache[indicator]   # sliced to t-1 by FeatureExtractor
@@ -3285,8 +3453,11 @@ Exit Architecture's subscription derives from.
 **Derived bundles.**
 - Formed from the REST 1-tick rows only, WS `V60` rows excluded, with prints
   grouped per the vendor's `InputDivXtick=10` bundle conventions (`hour` is
-  the bundle's last print's second). Vendor 10-tick bundles are cut from a
-  fixed origin running continuously across sessions and dates (measured).
+  the bundle's last print's second). Vendor 10-tick bundles restart at 20:00
+  ET each query date: a date's data runs from the preceding evening's 20:00
+  bar to a vendor cut a few seconds past 19:30, and every print falls in a
+  bundle of its own date, the date's terminal bundle recorded however few its
+  prints (measured).
 - The phase is the one offset d in [0, 10) whose derived bundles equal every
   overlapping vendor bundle in `hour`, open, high, low, close and volume,
   compared as grid values (utils.md's Numeric Rules); a vendor bundle later
@@ -3581,7 +3752,7 @@ the only structure the halt heuristic reads, and the heuristic never
 fetches ticks of its own.
 
 - **Counting by second, not retaining ticks, is what bounds it.** Its size
-  is `execution.max_tickers` × `execution.halt_check_window_seconds`
+  is `execution.max_tickers` × `live_mode.halt_check_window_seconds`
   independently of print rate, where a list of tick timestamps would grow
   with how busy a ticker is — precisely when the memory matters least to
   the answer, since the heuristic only asks whether the rate is BELOW a
@@ -3654,7 +3825,7 @@ Breaker above, with their values in `execution:`.
 Inf mode (`0`) on either cap means "unlimited" for BacktestEngine only.
 LiveModeRunner clamps: `max_tickers` 0 → 50 (the vendor limit above, which
 is not a configurable choice), `max_positions_per_ticker` 0 →
-`floor(execution.max_hold_bars / execution.entry_cooldown_minutes)` — the
+`floor(execution.max_hold_minutes / execution.entry_cooldown_minutes)` — the
 largest same-ticker stack the cooldown can admit inside one position's
 maximum hold. Both clamps are derived, not configurable, in the same spirit
 as `get_execution_param()`'s hard bounds.
@@ -4214,8 +4385,9 @@ loop every position_check_interval_seconds (config, default: 5s):
             # its existing point-in-time snapshot of orders still
             # outstanding at report time — the event answers "how
             # often", the snapshot "what is open right now".
-        if market orders are permitted now — the CURRENT session phase
-           permitting them (execution_common.md — regular session only)
+        if market orders are permitted now — the CURRENT session phase,
+           utils.session_phase(today, now, closes, ends), permitting them
+           (execution_common.md — 'regular' only)
            and the date holding no session_phase_mismatch row (Order and
            fill ledger) — and this order's own type != "market":
             escalation: send a cancel request for the live order; only
@@ -4262,6 +4434,16 @@ loop every position_check_interval_seconds (config, default: 5s):
         # that threshold, since exiting_since dates from the prior
         # session, so k advances from its first cycle rather than after
         # a wait. That is intended — the exposure is a day old.
+        if now is inside the final liquidation window
+               [after_hours_end(today) − execution.final_liquidation_minutes,
+                after_hours_end(today)):
+            k = max(k, 1.0) at the window's first re-quote, then
+                min(k + config["execution"]["exit_ladder_increment"],
+                    config["execution"]["exit_ladder_cap"]) at each re-quote,
+                regardless of exit_order_stuck_minutes
+            # Session Shutdown's final liquidation window: it opens no exit
+            # past an existing gate, and exit_reject_retry_seconds is
+            # unchanged inside it.
         bid, ask = REST orderbook query, this ticker's current level-1
             (one call; both sides come back from it)
         target = ask - k * (ask - bid)     # execution_common.md; rounded UP
@@ -4618,13 +4800,13 @@ loop every position_check_interval_seconds (config, default: 5s):
            exit_reason = "take_profit" if breach_direction == "up" else "stop_loss"
        elif elapsed_minutes(first_entry_fill_at, now)
               - halted_minutes(position.ticker, first_entry_fill_at, now)
-              >= config["execution"]["max_hold_bars"]:
+              >= config["execution"]["max_hold_minutes"]:
            exit_reason = "time_limit"        # wall-clock — this loop, not WS
-           # Elapsed minus halted minutes IS backtest's valid-bar count:
-           # build_effective_bar_sequence() excludes halt bars and counts
-           # no_trade bars, so live reading max_hold_bars as minutes and
-           # backtest counting valid bars are ONE quantity, not two
-           # conventions (execution_common.md). Halted minutes intersect
+           # Elapsed minus halted minutes IS the holding limit in every
+           # engine: execution.max_hold_minutes is the wall-clock minutes
+           # from the entry minus the minutes inside halt intervals
+           # (live_halt_episodes here, halts_df in training and backtest —
+           # execution_common.md). Halted minutes intersect
            # [first_entry_fill_at, now] with this ticker's
            # live_halt_episodes; an open interval counts to now.
        elif now >= exit_deadline(today):
@@ -4661,9 +4843,11 @@ loop every position_check_interval_seconds (config, default: 5s):
        - Opening it cancels the position's 'open' entry logical order
          (terminal_cause='exit_opened').
        order_type = execution_common.permitted_order_type(
-           "sell", config["execution"]["exit_order_type"], the phase now)
+           "sell", config["execution"]["exit_order_type"],
+           utils.session_phase(today, now, closes, ends))
            # the first request's actual type (execution_common.md's Session
-           # Phase and Order Types)
+           # Phase and Order Types); it raises on phase 'closed' — nothing
+           # is submitted and the site retries at its next cycle
        if session_stage == "shadow":   # the session's stage, the row's
                                        # (Session Lifecycle step 1c)
            # STEP-WISE: simulate_exit_fill()'s step form over the REST
@@ -4968,7 +5152,7 @@ live_mode:
   # max_positions removed — replaced by execution.max_tickers /
   # execution.max_positions_per_ticker (two independent axes; a single
   # global count could not express "5 positions, all on one ticker").
-  # max_hold_bars removed (R-6) — execution.max_hold_bars is the single
+  # max_hold_bars removed (R-6) — execution.max_hold_minutes is the single
   # source, already read by this file's restart_gap_exit
   # cutoff and by backtest's time-limit exit.
   session_start_workers:          8      # parallel workers for session_start_compute()
@@ -5087,7 +5271,27 @@ live_mode:
                                              # and 'open' logical orders left
                                              # are managed by the reduced
                                              # session (Early-Close
-                                             # Participation Gate).
+                                             # Participation Gate). Trading
+                                             # early-close days is the occasion
+                                             # for producing the reserved
+                                             # is_early_close feature
+                                             # (04_feature_extractor.md).
+  price_extremes_source:          "vendor"   # Step 3's price_52h / price_52l:
+                                             # "vendor" — the prior-day row's
+                                             # value through split_basis_value(),
+                                             # else today's group's metric;
+                                             # "derived" — today's group's
+                                             # metric. Health Gate 1b counts the
+                                             # price fields under "vendor" only
+  entry_price_cap_inert:          "uncapped" # "uncapped" | "refuse" — with θ
+                                             # inert and
+                                             # execution.entry_price_cap_enabled
+                                             # true: "uncapped" takes the
+                                             # entry_gap-derived limit;
+                                             # "refuse" submits no limit entry
+                                             # (gate_result 'cap_inert'), a
+                                             # market entry unaffected.
+                                             # Backtest does not read it
   session_hard_exit_offset_minutes: 0        # R-9: process hard cap — see
                                              # "Session Shutdown". RENAMED AND
                                              # RE-MEANT from the former
@@ -5293,9 +5497,8 @@ trading:
 - Health Gate 1 (Step 4) runs after Steps 2-3, before Step 5's Eager Pool cost —
   session_stats/stock_meta coverage checks use only Step 2/3's already-loaded
   data; the premarket-marker check is a batch_runs lookup independent of
-  either. Health Gate 2 (Step 6) is separate and runs after Step 5 specifically
-  because its input (tier_used) does not exist until Eager Pool has run —
-  it cannot be folded into Health Gate 1
+  either. Health Gate 2 (Step 6) is separate: a warn-only DB check,
+  independent of Step 5's output
 - session_stats Phase 2 ("db" mode only): loaded per-ticker from DB on first appearance in
   the watchdog working set via load_session_stats(); in "memory" mode, session_stats
   retained in calc._session_stats
@@ -5309,8 +5512,8 @@ trading:
   PRIORITISED — it never changes an entry's ELIGIBILITY. Eligibility
   remains the full A-G expression over a COMPLETED bar in every path:
   mid-bar screening relaxes A only to build a fetch superset, and
-  promotion only reschedules. (Under `execution.late_entry_enabled` a
-  rotation-slot finding can produce an entry, which is why this is phrased
+  promotion only reschedules. (Under `execution.late_entry_enabled` with θ
+  applying a rotation-slot finding can produce an entry, which is why this is phrased
   as eligibility rather than as "scanning never produces an entry" — what
   changes there is WHEN a qualifying bar is observed and at WHAT PRICE it
   is taken, not what qualifies.)
@@ -5333,7 +5536,8 @@ trading:
   (health_report.md's Shutdown Order and Drain) — scan depth histogram,
   carryover, rotation visits/hits/misses, superset size, scan-cycle
   completion (`scan_cycle_ms_p50 | _p95` and `overrun_cycles`), bar-close
-  fetch latency, the bar-close stage timings and promotions. These are the
+  fetch latency, the bar-close stage timings, promotions, and
+  `regular_open_total` / `regular_open_late` (Session Shutdown). These are the
   only in-session evidence that N, M, the 5-second target and the derived
   ~850ms slack hold, and health_report.md's findings 30-32 and 35 read
   them
@@ -5390,9 +5594,11 @@ trading:
 - A carried position's state is never reset at session start: the startup
   procedure classifies its orders, and the Unified Overnight Policy labels
   its liquidation
-- The regime holdout gate is enforced only at Session Lifecycle step 7,
-  before Inferencer init, and only when
-  `optimizer.regime_holdout.gate.enabled`
+- A session's participation is blocked by the regime holdout gate at Session
+  Lifecycle step 7 alone, before Inferencer init, its blocked taken from
+  `utils.regime_gate()` (`optimizer.regime_holdout.gate.enabled` and the
+  verdict 'fail'); model_candidates' status at writing and model_deploy's
+  decisions also read the verdict
 - No config value is written by the system — vocabulary lists and the
   withholding rate are filled by an operator after a health event
 - Trade execution (buy/sell API calls) is LiveModeRunner's responsibility —
@@ -5401,6 +5607,7 @@ trading:
 - LiveModeRunner does not modify DuckDB historical data — only reads for
   session init. Exceptions:
   - entry_points INSERT via Inferencer; inference_log, below;
+    inference_features via Inferencer's buffer and flush_features();
   - the In-Process Premarket Recheck's writes:
     - corporate_events;
     - ticker_cik_map;
@@ -5425,10 +5632,12 @@ trading:
   INSERT OR IGNORE) — what's new here is splitting ownership by EVENT VALUE
   within a single table rather than by row-existence.
 - session_start_compute() parallelized across workers; thread-safety per-ticker guaranteed
-  (no shared state between CachingCalculator instances)
+  (no shared state between CachingCalculator instances); each call's db_conn is the
+  calling thread's handle (P-5)
 - Eager Pool bars loading (Step 5) uses `utils.load_ohlcv_with_history()`, not a raw
-  `ohlcv_1min` query — stitches predecessor-ticker bars when a rename occurred
-  within the lookback window; no-op fast path for the vast majority of tickers
+  `ohlcv_1min` query — it reads through the symbology layer for today's
+  symbol, stitching the segments of its chain; no-op fast path for the vast
+  majority of tickers
 - Corporate-event split adjustment of loaded bars happens inside
   `session_start_compute()` (see `caching_calculator.md`), anchored to
   `today_date` — not performed here in LiveModeRunner
@@ -5440,8 +5649,8 @@ trading:
   has exactly one date in play per session — unlike training's `extract_batch()`,
   which must stay date-keyed across a ticker's multiple historical entry dates
   (see `04_feature_extractor.md`)
-- `meta_bulk` depends on `metadata_crawler.md`'s premarket crawl having run
-  before session start for maximum freshness; `utils.estimate_historical_meta()`
-  fallback covers any field still missing at session start (rare, but not
-  guaranteed-zero — vendor update latency is a known, unresolvable-by-scheduling
-  limitation, see `metadata_crawler.md`)
+- `meta_bulk` depends on the previous evening's stock_meta crawl
+  (`metadata_crawler.md`) — today reads the prior-day row; market_cap falls
+  back to `utils.estimate_historical_meta()` when that row lacks it, and
+  shares_outstanding is always `estimate_historical_meta()`'s, its first tier
+  the prior-day row

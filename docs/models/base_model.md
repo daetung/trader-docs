@@ -121,9 +121,26 @@ class BaseModel(ABC, Generic[M]):
 Artifacts saved to `{model_dir}/{model_type}/{run_id}/`:
 - File format and count are subclass-defined (e.g. LGBMPipeline saves one
   `.lgb` file per classifier, not a single `{run_id}.pkl`).
-- `{run_id}_meta.json` — metadata: `model_type`, `model_version`, `feature_names`, `categorical_cols`, `eval_result`, config snapshot
+- `{run_id}_meta.json` — metadata: `model_type`, `model_version`, `feature_names`, `categorical_cols`, `eval_result`, config snapshot, and per code area its version and code_hash (utils.md's Code Versions)
+- `{run_id}_reference.json` — saved by Trainer with its artifacts, not under
+  dry_run; the drift references over the model's val split:
+  - per class probability (prob_up5, prob_up3, prob_sw, prob_dn3, prob_dn5):
+    `drift.psi_bins` quantile bin edges of its val-split predictions and each
+    bin's share (metadata_crawler.md's evening_prediction_drift);
+  - per feature of meta feature_names (metadata_crawler.md's
+    evening_feature_drift):
+    - a numeric feature: `drift.psi_bins` quantile edges, duplicate edges
+      collapsed, the outer bins open-ended; each bin's share; the NaN share;
+    - a categorical feature, one of meta categorical_cols: each category's
+      share; the NaN share.
+  The drift values are not a retraining trigger.
 
 The artifact directory is created automatically on `__init__`.
+
+The spec defines no artifact deletion. The artifacts of a run_id named by a
+model_deployments row or by an 'awaiting_approval' candidate are never
+deleted; metadata_crawler.md's evening_backup copies them to
+`backup_dir/models/{run_id}/`.
 
 ---
 

@@ -18,15 +18,15 @@ class sample counts and computation time before committing to a full pipeline ru
 
 ## CLI Usage
 
-**DB access role.** A per-run guest (db_schema.md's DB File Ownership Windows;
-db_coordination.md's Unit scope), run through guest_supervisor.md's
+**DB access role.** A per-chunk guest (db_schema.md's DB File Ownership
+Windows; db_coordination.md's Unit scope), run through guest_supervisor.md's
 `run_guest`:
 - `run_guest detection_benchmark` enters
-  `register('guest', 'detection_benchmark', trigger)` and opens one
-  `guest_unit('detection_benchmark', None)` around the body, which waits for admission
-  without limit;
-- the body is handed that unit's connection, passed wherever this tool
-  takes `db_conn`, and calls neither `register()` nor `guest_unit()`;
+  `register('guest', 'detection_benchmark', trigger)` and hands the body a
+  unit opener, each call opening one `guest_unit('detection_benchmark', None)`,
+  which waits for admission without limit;
+- the body opens its units by Units, below, and calls neither `register()`
+  nor `guest_unit()`;
 - `tools/detection_benchmark.py` run directly hands over to
   `run_guest detection_benchmark`;
 - while an owner waits past `coordination.guest_max_hold_seconds`, the run
@@ -87,6 +87,7 @@ WITH vol_avg AS (
             ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
         ) AS vol_ma_20
     FROM ohlcv_1min
+    WHERE ticker IN (SELECT unnest($chunk))   -- the chunk's tickers (Units)
 )
 SELECT ticker, date, hour
 FROM vol_avg
@@ -94,69 +95,168 @@ WHERE volume >= vol_ma_20 * 2.5   -- condition G threshold
 ```
 
 ```sql
--- Example: condition E (turnover rate) with per-date shares_outstanding
--- resolution — a fast SQL approximation of utils.estimate_historical_meta(),
--- for benchmark speed only. The canonical logic (used by 01_entry_detection.md
--- in the actual pipeline) lives in utils.py; small SQL/Python discrepancies
--- here are acceptable since this tool is diagnostic-only (threshold tuning),
--- not the training or live path itself.
+-- Example: condition E (turnover rate) with per-date shares_outstanding —
+-- a fast SQL approximation of utils.estimate_historical_meta(), without
+-- split_basis_value() and without tier 1's implied shares, for benchmark
+-- speed only. The canonical logic (used by 01_entry_detection.md in the
+-- actual pipeline) lives in utils.py; small SQL/Python discrepancies here
+-- are acceptable since this tool is diagnostic-only (threshold tuning), not
+-- the training or live path itself. Per (ticker, date), in this order:
+--   1. the stock_meta row dated the prior trading day by trading_calendar,
+--      when no split or reverse_split lies in (that day, date];
+--   2. else the latest positive fundamentals_quarterly shares_outstanding
+--      with filed_date < date, on a row whose unit is 'shares', multiplied
+--      by the split product over (its fiscal_period_end, date];
+--   3. else the most recent stock_meta row dated before date, when no split
+--      or reverse_split lies in (its date, date];
+--   4. else NULL — condition E false.
+-- The instrument rule, through the latest security_type: a non-common type
+-- (warrant, unit, right, preferred, debt) → NULL in every tier; adr → tier 2
+-- skipped, its other tiers standing.
 --
 -- Without this, a naive join against the current stock_meta snapshot would
 -- apply today's share count to every historical date, systematically
 -- under-counting turnover for dates before any split (see V-1 fix).
-WITH latest_shares AS (
-    SELECT ticker, shares_outstanding, date AS latest_date
-    FROM stock_meta
-    WHERE (ticker, date) IN (
-        SELECT ticker, MAX(date) FROM stock_meta
-        WHERE shares_outstanding IS NOT NULL GROUP BY ticker
-    )
-),
-all_ticker_dates AS (
+WITH chunk_ticker_dates AS (
     SELECT DISTINCT ticker, date FROM ohlcv_1min
+    WHERE ticker IN (SELECT unnest($chunk))
 ),
-split_ratio AS (
-    -- cumulative split ratio between each date and that ticker's latest
-    -- known shares_outstanding date; product via exp(sum(ln(.))) since
-    -- ratios are always positive (DuckDB has no built-in PRODUCT aggregate)
-    SELECT
-        d.ticker, d.date,
-        COALESCE(
-            EXP(SUM(LN(c.ratio)) FILTER (
-                WHERE c.event_type IN ('split', 'reverse_split')
-                  AND c.event_date > d.date AND c.event_date <= s.latest_date
-            )),
-            1.0
-        ) AS cum_ratio
-    FROM all_ticker_dates d
-    JOIN latest_shares s ON s.ticker = d.ticker
-    LEFT JOIN corporate_events c ON c.ticker = d.ticker
-    GROUP BY d.ticker, d.date, s.latest_date
+trading_days AS (
+    SELECT date, LAG(date) OVER (ORDER BY date) AS prior_date
+    FROM trading_calendar
+    WHERE is_trading_day
+),
+splits AS (
+    SELECT ticker, event_date, ratio FROM corporate_events
+    WHERE event_type IN ('split', 'reverse_split')
+),
+latest_type AS (
+    -- the latest stock_meta row with security_type set, whatever the date
+    SELECT ticker, arg_max(security_type, date) AS security_type
+    FROM stock_meta
+    WHERE security_type IS NOT NULL
+    GROUP BY ticker
+),
+tier1 AS (
+    -- the prior trading day's row, no split or reverse_split in (that day, date]
+    SELECT d.ticker, d.date, m.shares_outstanding AS shares
+    FROM chunk_ticker_dates d
+    JOIN trading_days td ON td.date = d.date
+    JOIN stock_meta m ON m.ticker = d.ticker AND m.date = td.prior_date
+    WHERE m.shares_outstanding IS NOT NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM splits s
+          WHERE s.ticker = d.ticker
+            AND s.event_date > td.prior_date AND s.event_date <= d.date
+      )
+),
+tier2 AS (
+    -- the latest positive 'shares' fact filed by date, times the split
+    -- product over (its fiscal_period_end, date]; product via exp(sum(ln(.)))
+    -- since ratios are always positive (DuckDB has no PRODUCT aggregate)
+    SELECT d.ticker, d.date,
+           f.value * COALESCE((
+               SELECT EXP(SUM(LN(s.ratio))) FROM splits s
+               WHERE s.ticker = d.ticker
+                 AND s.event_date > f.fiscal_period_end AND s.event_date <= d.date
+           ), 1.0) AS shares
+    FROM chunk_ticker_dates d
+    JOIN fundamentals_quarterly f
+      ON f.ticker = d.ticker AND f.filed_date < d.date
+    WHERE f.metric = 'shares_outstanding' AND f.unit = 'shares' AND f.value > 0
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY d.ticker, d.date
+        ORDER BY f.filed_date DESC, f.fiscal_period_end DESC
+    ) = 1
+),
+tier3 AS (
+    -- the most recent earlier row, no split or reverse_split in (its date, date]
+    SELECT d.ticker, d.date, m.shares_outstanding AS shares
+    FROM chunk_ticker_dates d
+    JOIN stock_meta m ON m.ticker = d.ticker AND m.date < d.date
+    WHERE m.shares_outstanding IS NOT NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM splits s
+          WHERE s.ticker = d.ticker
+            AND s.event_date > m.date AND s.event_date <= d.date
+      )
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY d.ticker, d.date ORDER BY m.date DESC
+    ) = 1
 ),
 shares_at_date AS (
-    SELECT
-        d.ticker, d.date,
-        COALESCE(m.shares_outstanding, s.shares_outstanding / r.cum_ratio)
-            AS shares_outstanding
-    FROM all_ticker_dates d
-    LEFT JOIN stock_meta m ON m.ticker = d.ticker AND m.date = d.date
-    JOIN latest_shares s ON s.ticker = d.ticker
-    JOIN split_ratio r ON r.ticker = d.ticker AND r.date = d.date
+    SELECT d.ticker, d.date,
+           CASE
+               WHEN t.security_type IN ('warrant', 'unit', 'right',
+                                        'preferred', 'debt') THEN NULL
+               ELSE COALESCE(
+                   t1.shares,
+                   CASE WHEN t.security_type = 'adr' THEN NULL ELSE t2.shares END,
+                   t3.shares
+               )
+           END AS shares_outstanding
+    FROM chunk_ticker_dates d
+    LEFT JOIN latest_type t ON t.ticker = d.ticker
+    LEFT JOIN tier1 t1 ON t1.ticker = d.ticker AND t1.date = d.date
+    LEFT JOIN tier2 t2 ON t2.ticker = d.ticker AND t2.date = d.date
+    LEFT JOIN tier3 t3 ON t3.ticker = d.ticker AND t3.date = d.date
 ),
 daily_volume AS (
     SELECT ticker, date, SUM(volume) AS vol
     FROM ohlcv_1min
-    WHERE hour >= '040000'   -- volume_base_hour
+    WHERE ticker IN (SELECT unnest($chunk))
+      AND hour >= '040000'   -- volume_base_hour
     GROUP BY ticker, date
 )
 SELECT dv.ticker, dv.date
 FROM daily_volume dv
 JOIN shares_at_date sd ON sd.ticker = dv.ticker AND sd.date = dv.date
-WHERE dv.vol / sd.shares_outstanding * 100 >= 5.0   -- condition E threshold
+WHERE dv.vol / sd.shares_outstanding * 100 >= 5.0   -- condition E threshold;
+                                                    -- NULL shares → false
 ```
 
 The composite expression `(A AND B AND C AND D) AND (E OR F OR G)` is
 assembled by combining SQL WHERE clauses per active condition.
+
+---
+
+## Units
+
+The body opens its units through the unit opener:
+- a first unit enumerates the run's tickers — those with data in the date
+  range, or `--sample-tickers`' sample of them — and records the run's mark
+  (Input Change, below);
+- one unit per chunk of `detection_benchmark.chunk_tickers` tickers (config,
+  default 1000), holding the chunk's reads:
+  - its detection queries, each taking `ticker IN chunk`;
+  - the Labeler's inputs (Constraints), each taking `ticker IN chunk` —
+    the symbology layer's reads taking the chain symbols of the chunk's
+    tickers' segments: the Labeler's next-day reads for Case A/B, which
+    resolve the successor symbol, and the halt-interval resolver's stored
+    rows;
+- labeling runs on the loaded frames outside units;
+- the decay sweep's sample, drawn over every chunk's labeled entry points,
+  is read in units per chunk of its tickers the same way;
+- a last unit counts the input change (Input Change, below).
+The summary combines the chunks' results.
+
+```yaml
+detection_benchmark:
+  chunk_tickers: 1000
+```
+
+---
+
+## Input Change
+
+A run reads across units, so its input can change between them:
+- its first unit records the run's mark, the highest `source_changes` seq;
+- its last unit counts the `source_changes` rows with a higher seq that
+  intersect the run's read set:
+  - `source` one of the tables it read;
+  - `ticker` NULL or a symbol of the chains it read;
+  - `date_from`–`date_to`, a NULL end open, holding a date it read;
+- its printed summary flags a non-zero count with the count (Output).
 
 ---
 
@@ -199,6 +299,11 @@ Detection Benchmark (full run)
     B_min_volume_1min : 50000
     G_min_ratio       : 2.5
     [full config snapshot saved to tools/benchmark_results/YYYYMMDD_HHMMSS.json]
+```
+
+Either mode's output ends, when the input-change count is non-zero, with:
+```
+  Input changed: 3 source_changes rows since the run's mark
 ```
 
 ---
@@ -289,19 +394,28 @@ Benchmark results are NOT written to `experiment_log` (that table is for model r
 
 - Must not modify any DuckDB table — read-only access to:
   `ohlcv_1min`, `stock_meta`, `tick_10`, `trading_halts`,
-  `trading_calendar`, `ticker_data_coverage`, `corporate_events`
+  `trading_calendar`, `ticker_data_coverage`, `corporate_events`,
+  `fundamentals_quarterly`, `ticker_history`, `source_changes`
 - Labeling logic must call `Labeler` directly (reuse, do not reimplement) —
   including the decay sweep, which shifts `Labeler`'s INPUTS (sliced
   `ticks_df`, substituted anchor) and never its logic or its signature
 - `Labeler.label()` requires `ticks_df`, `halts_df`, `trading_calendar`,
   `ticker_data_coverage`, and `corporate_events` — all must be loaded from
   DuckDB before calling (see 05_labeler.md — corporate_events added for
-  dead position Case A/D dividend/split adjustment)
-- Condition E's SQL (per-date shares_outstanding via split-ratio reversal) is
-  a benchmark-speed approximation of `utils.estimate_historical_meta()` —
-  acceptable here since this tool is diagnostic-only, but `01_entry_detection.md`
-  itself must call the real utility function, not reimplement this SQL
+  dead position Case A/D dividend/split adjustment); `halts_df` is the
+  halt-interval resolver's intervals for the date (utils.md's
+  halt_intervals()); the next-day reads for Case A/B resolve the successor
+  symbol through the symbology layer
+- Condition E's SQL (per-date shares_outstanding: the prior trading day's
+  stock_meta row, the fundamentals tier on 'shares' rows, the latest earlier
+  stock_meta row, each guarded against splits; the instrument rule through
+  the latest security_type) is a benchmark-speed approximation of
+  `utils.estimate_historical_meta()` without `split_basis_value()` and
+  without tier 1's implied shares — acceptable here since this tool is
+  diagnostic-only, but `01_entry_detection.md` itself must call the real
+  utility function, not reimplement this SQL
 - `--override` applies in-memory only — config file is never modified
 - SQL-based detection is mandatory for performance; Python-loop fallback only for unsupported conditions
 - Benchmark results saved to `tools/benchmark_results/` — not to `experiment_log`
-- Calls neither `register()` nor `guest_unit()` — `run_guest` opens its unit
+- Calls neither `register()` nor `guest_unit()` — the body opens its units
+  through the unit opener `run_guest` hands it

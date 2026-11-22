@@ -12,8 +12,16 @@ suppression, the senders and the drain. Its callers:
   Invocation Contract;
 - db_coordination.md's helper, for its own deliveries (`owner_error_end`,
   `guest_db_open_failed` — db_coordination.md's Helper deliveries);
-- guest_supervisor.md, for `scheduled_work_deferred` on every refusal of a
-  scheduled run by its new-run resolution.
+- guest_supervisor.md, for `scheduled_work_deferred`: the first scheduled
+  refusal blocked by a given work, and every refusal blocked by
+  `restore_store`, through `deliver()`; a later refusal blocked by a work
+  carrying `'deferral_notified'`, through `write_to_log()` alone;
+- the record-only writers of finding 56 (`code_version_unattested`), through
+  `write_to_log()` alone, not dispatched:
+  - guest_supervisor.md's `run_guest`, on a run it ends `'blocked'` with
+    cause code_unattested or code_changed;
+  - metadata_crawler.md's evening_tick_bar_aggregates and
+    evening_session_stats stages, on an unattested area.
 
 What a path delivers, its arguments and whether it needs the DB are
 health_report.md's Invocation Contract; this file holds how a delivery is

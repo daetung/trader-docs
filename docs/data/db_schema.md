@@ -58,8 +58,11 @@ Field mapping (applies to both 1min and 10tick):
 - Both directory and zip formats are supported
 - Duplicate detection: if `(ticker, date, resolution)` already exists in DuckDB, the file is skipped
 - **No session-of-day filtering at ingestion** — all bars across pre-market, regular,
-  and after-market sessions (`hour` 040000~200000) are stored; overnight (outside
-  this range) is excluded — see `migrate_json_to_duckdb.py`'s time-range filter
+  and after-market sessions inside the ingestion range
+  (`hour >= '040000' AND hour < '193000'`) are stored; the overnight and the
+  vendor cut's tail outside it are excluded, a tick file's rows at hours in
+  [193000, 200000) going to `tick_10_tail` — see Ingestion Rules and
+  `migrate_json_to_duckdb.py`'s time-range filter
 
 ---
 
@@ -144,25 +147,57 @@ CREATE TABLE IF NOT EXISTS tick_10 (
     PRIMARY KEY (ticker, date, hour, seq_id)
 );
 
+-- The vendor cut's tail: a tick file's rows at hours in [193000, 200000),
+-- outside the ingestion range (Ingestion Rules), stored apart from tick_10.
+-- Read by health_report.md's finding 59 alone, by no consumer.
+-- Not a tracked table (Source changes).
+-- Retention: purge-registry member — date_column `date`, retention_days: inf
+--   (see metadata_crawler.md's evening purge stage); a finite window returns
+--   the purged dates' straddle asymmetries to finding 59 as pair gaps.
+CREATE TABLE IF NOT EXISTS tick_10_tail (
+    ticker   VARCHAR      NOT NULL,
+    date     VARCHAR      NOT NULL,
+    hour     VARCHAR      NOT NULL,  -- 'HHMMSS', last tick of bundle (second precision)
+    seq_id   INTEGER      NOT NULL,  -- sequential index within same (ticker, date, hour)
+    open     DECIMAL(18,6) NOT NULL,  -- Oprc (first tick of bundle)
+    high     DECIMAL(18,6) NOT NULL,  -- Hprc
+    low      DECIMAL(18,6) NOT NULL,  -- Lprc
+    close    DECIMAL(18,6) NOT NULL,  -- Prpr (last tick of bundle)
+    volume   BIGINT       NOT NULL,  -- CntgVol
+    PRIMARY KEY (ticker, date, hour, seq_id)
+);
+
 -- Bar-level cache of tick-derived indicator primitives (EAV — new `indicator`
 -- values register without a schema change; mirrors indicator_cache's shape
 -- but is a PERSISTENT, growing historical store like ohlcv_1min /
 -- precomputed_session_stats, not a session-purged transient cache).
--- Populated offline (collect_daily.py, via utils.compute_tick_bar_aggregates(),
--- which calls the SAME IndicatorCalculator functions used everywhere else —
--- not a reimplementation, so cached and on-the-fly values cannot diverge).
+-- Written through utils.compute_tick_bar_aggregates(), which calls the SAME
+-- IndicatorCalculator functions used everywhere else — not a
+-- reimplementation, so cached and on-the-fly values cannot diverge. Writers:
+--   - metadata_crawler.md's evening_tick_bar_aggregates stage;
+--   - migration_tool.md's backfill;
+--   - utils.md's populate_precomputed_session_stats(), for a (ticker, date)
+--     without current-version rows, with INSERT OR IGNORE in its stats
+--     transaction.
+-- Every writer writes under the current data version, the data area's
+-- version in the lock (code_version.md). Readers use only rows of the
+-- current data version; a date without them resolves through
+-- utils.load_tick_bar_aggregates_with_history()'s Tier 2, which writes
+-- nothing.
 -- Values are RAW/native-scale for that bar's own date. Correction to a
 -- specific entry's basis happens downstream via
 -- utils.adjust_tick_derived_series_for_corporate_events() — identically
 -- whether the value came from this table or the Tier-2 on-the-fly fallback
 -- in utils.load_tick_bar_aggregates_with_history().
--- A (ticker, date, hour) with zero ticks (halt / no-trade slot) has no row
--- for any indicator — callers reindex against the full expected bar index
--- (same one used for bars) so gaps surface as explicit NaN, never a silently
--- shortened window (see 02_indicator_calculator.md Tick-Derived Indicator
--- Scale Sensitivity).
+-- A (ticker, date, hour) without a tick bundle has no row for any
+-- indicator — callers reindex against the bars' own index, so a bar with no
+-- tick bundle surfaces as explicit NaN, never a silently shortened window
+-- (see 02_indicator_calculator.md Tick-Derived Indicator Scale Sensitivity).
 -- Retention: NEVER purged — structurally excluded from the purge registry
 --   (permanent historical store).
+-- Loaded as tick_bar_history (utils.load_tick_bar_aggregates_with_history()),
+-- its columns carry these stored indicator names — lee_ready's is
+-- buyer_initiated_ratio.
 CREATE TABLE IF NOT EXISTS tick_bar_aggregates (
     ticker      VARCHAR NOT NULL,
     date        VARCHAR NOT NULL,
@@ -171,10 +206,12 @@ CREATE TABLE IF NOT EXISTS tick_bar_aggregates (
                                     -- 'vol_weighted_buy_ratio' | 'avg_delta_per_tick' |
                                     -- 'tick_realized_vol' | 'path_efficiency' |
                                     -- 'vol_concentration' | 'tick_burstiness'
+    data_version INTEGER NOT NULL,  -- the data area's lock version the row was
+                                    -- written under (code_version.md)
     value       DOUBLE,             -- NULL if indicator undefined for this bar
                                     -- (e.g. <2 tick bundles for a delta/interval-based
                                     -- indicator — see 02_indicator_calculator.md)
-    PRIMARY KEY (ticker, date, hour, indicator)
+    PRIMARY KEY (ticker, date, hour, indicator, data_version)
 );
 
 -- Bid/ask auxiliary signal collection (Real-time bid/ask spread open item).
@@ -239,15 +276,44 @@ CREATE TABLE IF NOT EXISTS bid_ask_snapshots (
 
 -- Stock metadata (crawled daily; append-only per date — see metadata_crawler.md)
 -- PRIMARY KEY includes date: a row exists only for dates actually crawled.
--- Dates before schema deployment, or individual fields that failed to crawl on
--- a given date, have no row / no value here — callers fall back to
--- utils.estimate_historical_meta(), applied per FIELD (not per row):
---   shares_outstanding, market_cap, price_52h, price_52l — when the real
---     crawled value is unavailable, derived from ohlcv_1min + corporate_events,
---     or from fundamentals_quarterly (see below) where that source covers
---     the metric
---   sector — has no derivation path; callers always use the most recent
---     available snapshot regardless of entry date (accepted approximation)
+-- A row's date is its crawl date, and a row serves the trading days after
+-- it: a consumer resolving a field for target date D reads the prior-day
+-- row, the row dated the trading day utils.prior_trading_days(D, 1, closes)
+-- returns — data_boundary.md's "Point-in-time correctness for stock_meta".
+-- Per field (utils.estimate_historical_meta() holds the details):
+--   market_cap — the prior-day row's value, else the estimate: the last
+--     regular-session bar's close on the latest of the trading days
+--     prior_trading_days(D, indicators.lookback_days, closes) returns that
+--     has one, ÷ cum_split_ratio(the close's date, D), × the
+--     shares_outstanding estimate for D; no such close or no
+--     shares_outstanding → none
+--   shares_outstanding — estimate_historical_meta()'s tiers:
+--     tier 1: the prior-day row's value through split_basis_value(), the
+--       tier 2 value as anchor; with that value absent and the prior-day
+--       row's market_cap set, market_cap ÷ the last regular-session close of
+--       the row's date, only when no split or reverse_split lies in (the
+--       row's date, D]; otherwise none
+--     tier 2: the fundamentals_quarterly tier
+--     tier 3: the most recent row dated before D whose shares_outstanding is
+--       set, its value as is, only when no split or reverse_split lies in
+--       (its date, D]; otherwise none
+--   price_52h, price_52l — a prior-session baseline, not estimated: training
+--     reads precomputed_session_stats, live follows
+--     live_mode.price_extremes_source
+--   sector, security_type — no derivation path; a consumer reads the latest
+--     row with the field set, whatever the date (accepted look-ahead)
+-- security_type — 'equity' | 'etf' | 'fund' | 'adr' | 'warrant' | 'unit' |
+--   'right' | 'preferred' | 'debt'; not a Required field. Its rule
+--   (metadata_crawler.md's metadata fetch): the Nasdaq Trader symbol
+--   directory's kind when the directory gives one; otherwise the vendor
+--   rule's result for a ticker with no type in any row, or for a ticker the
+--   received directory matched with no kind whose previous type was a
+--   directory kind; otherwise no value is written, so a consumer reads the
+--   latest row with security_type set.
+-- The instrument rule: a non-common security_type (warrant, unit, right,
+--   preferred, debt) resolves shares_outstanding and market_cap none in
+--   every tier, the prior-day row's values included; adr skips the
+--   fundamentals tier.
 -- FeatureExtractor's MetaFeatures and EntryPointDetector's filter E (condition E)
 -- share this same fallback utility rather than each implementing their own.
 -- Retention: NEVER purged — structurally excluded from the purge registry
@@ -256,6 +322,7 @@ CREATE TABLE IF NOT EXISTS stock_meta (
     ticker             VARCHAR   NOT NULL,
     date               VARCHAR   NOT NULL,   -- 'YYYYMMDD', date actually crawled
     sector             VARCHAR,
+    security_type      VARCHAR,              -- see above
     market_cap         DECIMAL(28,6),
     shares_outstanding BIGINT,
     price_52h          DECIMAL(18,6),
@@ -296,6 +363,8 @@ CREATE TABLE IF NOT EXISTS stock_meta (
 -- non-'corporate_event_anomaly' reasons without another schema change —
 -- rename_pending stays BOOLEAN since the rename case has exactly one
 -- reason by construction (there is no second way to become rename-pending).
+-- Pairings are observed from deployment; earlier dates take the current
+-- pairing.
 -- Retention: NEVER purged — structurally excluded from the purge registry
 --   (reference data).
 CREATE TABLE IF NOT EXISTS ticker_cik_map (
@@ -345,6 +414,16 @@ CREATE TABLE IF NOT EXISTS ticker_cik_map (
 -- `metric` values register without a schema change). Sourced via
 -- ticker_cik_map. Point-in-time correctness depends on `filed_date`, not
 -- `fiscal_period_end` — see data_boundary.md.
+-- Per filing (accn), a metric's values come from the highest-priority tag
+-- holding facts in that filing (configs/xbrl_tag_map.json, its entries
+-- taxonomy-qualified); within it, per period:
+--   - shares_outstanding: the 'shares' facts;
+--   - another metric: the USD-denominated unit when present; else, when
+--     every fact of the period carries the same unit, that unit; else not
+--     stored.
+-- `unit` is the companyfacts unit string of the stored fact
+-- (utils.md's resolve_xbrl_tag_value()). A row with unit NULL is not read;
+-- migration_tool.md's fundamentals backfill, re-run, repopulates such rows.
 -- Retention: NEVER purged — structurally excluded from the purge registry
 --   (historical fact, not reconstructable).
 CREATE TABLE IF NOT EXISTS fundamentals_quarterly (
@@ -367,7 +446,27 @@ CREATE TABLE IF NOT EXISTS fundamentals_quarterly (
                                           -- (Q4-only duration values are derived at
                                           -- read time as FY - (Q1+Q2+Q3), never stored)
     value             DECIMAL(28,6) NOT NULL,
+    unit              VARCHAR,            -- companyfacts unit string (see above)
     PRIMARY KEY (ticker, fiscal_period_end, metric, filed_date)
+);
+
+-- FX rates for the non-USD currencies of fundamentals_quarterly units.
+-- Written by metadata_crawler.md's evening_fx_rates stage:
+--   - currencies: the non-USD currency parts of fundamentals_quarterly units;
+--   - per currency: from the day after its latest row, or from the first
+--     trading_calendar date when it has none, through the run's date;
+--   - source per currency: ECB when ECB publishes it, per_usd being the
+--     currency per EUR ÷ USD per EUR and EUR's 1 ÷ USD per EUR; otherwise
+--     the yfinance '{CCY}=X' close.
+-- Read through utils.md's fx_per_usd(). A tracked table of Source changes.
+-- Retention: NEVER purged — structurally excluded from the purge registry
+--   (historical fact, not reconstructable).
+CREATE TABLE IF NOT EXISTS fx_rates (
+    currency  VARCHAR NOT NULL,   -- a currency part of a fundamentals_quarterly unit
+    date      VARCHAR NOT NULL,   -- 'YYYYMMDD'
+    per_usd   DOUBLE  NOT NULL,   -- the currency's units per USD
+    source    VARCHAR NOT NULL,   -- 'ecb' | 'yfinance'
+    PRIMARY KEY (currency, date)
 );
 
 -- Ticker symbol rename history (plain renames only — mergers/spin-offs excluded,
@@ -380,8 +479,11 @@ CREATE TABLE IF NOT EXISTS fundamentals_quarterly (
 -- auto-registered — logged to tools/rename_candidates.log for manual review
 -- via the same CLI used for manual entry (see metadata_crawler.md
 -- --register-rename / --list-rename-candidates).
--- Used by utils.get_ticker_history() / load_ohlcv_with_history() to stitch
--- pre-rename bars into a continuous series addressed under the current symbol.
+-- The chain of utils.md's symbology layer: ticker_segments() resolves a
+-- security's symbols over its whole rename chain into date-ranged segments,
+-- and load_ticker_rows() / slice_ticker_rows() serve the layered tables'
+-- rows per segment under the current symbol (load_ohlcv_with_history() is
+-- load_ticker_rows() on ohlcv_1min). Also read by utils.get_ticker_history().
 -- Retention: NEVER purged — structurally excluded from the purge registry
 --   (historical fact, not reconstructable).
 CREATE TABLE IF NOT EXISTS ticker_history (
@@ -406,14 +508,6 @@ CREATE TABLE IF NOT EXISTS trading_halts (
     PRIMARY KEY (ticker, date, halt_start)
 );
 
--- US market holidays (NYSE calendar)
--- Retention: NEVER purged — structurally excluded from the purge registry
---   (reference data).
-CREATE TABLE IF NOT EXISTS us_holidays (
-    date          VARCHAR   PRIMARY KEY,  -- 'YYYYMMDD'
-    holiday_name  VARCHAR
-);
-
 -- Trading calendar — all dates with trading day status, session boundaries and
 -- data availability
 -- COLUMN CLASSES — the distinction governs what a forward-filled
@@ -423,7 +517,23 @@ CREATE TABLE IF NOT EXISTS us_holidays (
 -- the date's data arrives; otherwise to (1) if the calendar library supplies
 -- it, and to (2) if it does not.
 --   (1) LIBRARY-SOURCED, knowable in advance — is_trading_day, is_holiday,
---       session_close. From pandas_market_calendars' schedule interface.
+--       session_close, and the calendar context columns:
+--         - next_closure_last_session;
+--         - next_closure_reopen;
+--         - prev_closure_last_session;
+--         - prev_closure_reopen;
+--         - next_session_close.
+--       From pandas_market_calendars' schedule interface. Each context
+--       column holds the schedule as it stood before the row's date's
+--       session; utils.md's populate_trading_calendar() computes them
+--       whatever the table's own date range and writes them:
+--         - on a row's insert;
+--         - on a row whose value is NULL, whatever its date;
+--         - otherwise only while the row's date is after the run day (the
+--           US-Eastern date on which a run executes): the daily near-term
+--           rewrite carries announced closures up to the
+--           evening before, and a row whose date is reached keeps its
+--           values.
 --   (2) MEASURED, knowable in advance but NOT from that library —
 --       after_hours_end. schedule() returns market_open/market_close only and
 --       exposes no extended-hours boundary, so this column is filled from the
@@ -469,6 +579,24 @@ CREATE TABLE IF NOT EXISTS trading_calendar (
                                           -- every site consumes it as-is — so the
                                           -- accessor exists to host that raise, not
                                           -- to compute anything.
+    next_closure_last_session VARCHAR,    -- 'YYYYMMDD' — the last trading day
+                                          -- before the first closure after this
+                                          -- date; the date itself when a closure
+                                          -- follows it. A closure: a run of
+                                          -- consecutive non-trading days holding
+                                          -- a weekday. Class (1), as are the
+                                          -- context columns below; read through
+                                          -- utils.md's calendar_context().
+    next_closure_reopen       VARCHAR,    -- 'YYYYMMDD' — the first trading day
+                                          -- after that closure.
+    prev_closure_last_session VARCHAR,    -- 'YYYYMMDD' — the last trading day
+                                          -- before the latest closure before this
+                                          -- date.
+    prev_closure_reopen       VARCHAR,    -- 'YYYYMMDD' — the first trading day
+                                          -- after that closure; the date itself
+                                          -- when it reopens after it.
+    next_session_close        VARCHAR,    -- 'HHMMSS' — the session_close of this
+                                          -- date's next trading day.
     has_data        BOOLEAN   NOT NULL,
     updated_at      VARCHAR
 );
@@ -512,13 +640,17 @@ CREATE TABLE IF NOT EXISTS batch_runs (
                                       -- 'evening_halt_comparison' |
                                       -- 'evening_execution_param_fit' |
                                       -- 'evening_fundamentals' |
+                                      -- 'evening_fx_rates' |
+                                      -- 'evening_prediction_drift' |
+                                      -- 'evening_feature_drift' |
                                       -- 'evening_retention_purge' |
                                       -- 'evening_backup' |
                                       -- 'evening_health_report'
     date         VARCHAR   NOT NULL,  -- 'YYYYMMDD' — the trading day this batch targets
     status       VARCHAR   NOT NULL,  -- 'running' | 'success' | 'failed'
-    started_at   TIMESTAMP NOT NULL,
-    finished_at  TIMESTAMP,           -- NULL while status='running'
+    started_at   TIMESTAMP NOT NULL,  -- America/New_York wall clock
+    finished_at  TIMESTAMP,           -- America/New_York wall clock; NULL
+                                      -- while status='running'
     PRIMARY KEY (stage, date)
 );
 -- The overnight token refresh writes no row here: it opens no DB connection
@@ -585,6 +717,14 @@ CREATE TABLE IF NOT EXISTS execution_params (
 --     overnight boundaries;
 --   - 09_backtest_engine.md's carried split normalisation and carried
 --     dividend.
+-- Across a rename: registering it (metadata_crawler.md's
+-- detect_rename_candidates() step 3, --register-rename) upserts each
+-- predecessor row into the successor symbol through upsert_corporate_event(),
+-- passing the row's own source and basis_date. Offline readers read a
+-- security's events under its chain-latest symbol; predecessor rows stay and
+-- are not read by them. Readers of a live position's ledger and events (the
+-- view live_position_state, live position close) read the position's
+-- recorded ticker.
 -- Retention: NEVER purged — structurally excluded from the purge registry
 --   (historical fact, not reconstructable).
 CREATE TABLE IF NOT EXISTS corporate_events (
@@ -622,7 +762,9 @@ CREATE TABLE IF NOT EXISTS corporate_events (
 -- 2.0 * 2.0 = 4.0 and silently mis-scale every adjusted price and volume
 -- that depends on it:
 --   - adjust_bars_for_corporate_events();
+--   - adjust_bars_from_events();
 --   - adjust_tick_derived_series_for_corporate_events();
+--   - adjust_tick_derived_series_from_events();
 --   - populate_precomputed_session_stats() section D;
 --   - gap_percentile();
 --   - Labeler Case A;
@@ -697,7 +839,9 @@ CREATE TABLE IF NOT EXISTS entry_points (
 
 -- Derived-table configs — one row per config_hash a derived table's rows
 -- carry (Derived tables, after this DDL region): config_json is the canonical
--- JSON text the config_hash was taken over (utils.md's Config Hashing).
+-- JSON text the config_hash was taken over (utils.md's Config Hashing),
+-- the lock's area versions inside its code_versions member; no code_hash
+-- enters it.
 -- Written by every derived table's producer with INSERT OR IGNORE in the
 -- transaction of its rows, before them.
 -- Retention: NEVER purged — structurally excluded from the purge registry
@@ -739,7 +883,8 @@ CREATE TABLE IF NOT EXISTS source_changes (
 -- only Case C (dataset-boundary artifact, not a market outcome) retains label_sw.
 -- is_ambiguous: TRUE if tp and sl thresholds simultaneously satisfied within the same
 --               10-tick bundle during Stage 1 of track_label_breach().
---               Label is still assigned (via ambiguity_priority rule).
+--               Label is still assigned, by the Labeler's utils.AmbiguityRule
+--               (labeler.ambiguity_priority).
 --               ClassBalancer can exclude these from train; Trainer can down-weight them.
 -- Retention: NEVER purged — structurally excluded from the purge registry
 --   (training reproducibility).
@@ -763,13 +908,16 @@ CREATE TABLE IF NOT EXISTS labeled_samples (
 );
 
 -- Train log (output of run_train.py — one row per training run or fold)
--- trial_idx:      -1  = outer evaluation row (not part of inner trial search)
+-- trial_idx:      -2  = champion outer evaluation row (exploitation)
+--                 -1  = outer evaluation row (not part of inner trial search;
+--                       exploitation or refit)
 --                  0  = standalone / selection / full (single implicit trial);
---                       also: exploitation final model (outer_fold_idx=-1)
+--                       also: exploitation or refit final model (outer_fold_idx=-1)
 --                 >=0 = exploitation inner trial (0-based per optimizer_run_id)
 -- fold_idx:       -1  = standalone / outer eval (no rolling fold structure)
 --                 >=0 = rolling inner fold index (0-based)
--- outer_fold_idx: -1  = non-nested run (standalone, selection, full, non-nested exploitation)
+-- outer_fold_idx: -1  = non-nested run (standalone, selection, full, non-nested
+--                       exploitation) or a final model (exploitation, refit)
 --                 >=0 = nested validation outer fold index (0-based)
 -- fold_train_start, fold_train_end, fold_train_days:
 --                 the date range the model was ACTUALLY trained on ('YYYYMMDD')
@@ -782,21 +930,27 @@ CREATE TABLE IF NOT EXISTS labeled_samples (
 --                 trading_calendar, which is why it is not stored. Dates the
 --                 regime holdout removed are in regime_holdout_dates.
 --                 fold_train_days is diagnostic only: no fold is skipped,
---                 rejected or reordered on it. session_mode filtering precedes
---                 the count, so the value varies by trial.
+--                 rejected or reordered on it. The entries it counts over are
+--                 regular-session only, fixed at scan() (data_boundary.md); no
+--                 training-stage session filter precedes the count.
 -- auc_std:        std of AUC across all folds in the same run or trial.
 --                 Pruned trials retain auc_std = NULL; is_pruned = TRUE on fold_run_ids[-1].
--- phase:          "selection" | "exploitation" | "full" | NULL (standalone)
+-- phase:          "selection" | "exploitation" | "refit" | "full" | NULL (standalone)
 -- is_pruned:      TRUE if this row is the last round of a Successive Halving pruned trial
 -- feature_config: JSON of active hyperparameter config (optimizer trials) or
---                 full config snapshot (standalone). Never NULL.
+--                 full config snapshot (standalone). Never NULL. A
+--                 selection-phase row (one per selection run: trial_idx 0,
+--                 outer_fold_idx -1) carries the run's stage descriptor:
+--                   - Stage A: the alternative;
+--                   - Stage B-1: the reducer config overrides;
+--                   - Stage B-2: the candidate.
 -- Retention: purge-registry member — date_column `run_at`, retention_days: inf
 --   (see metadata_crawler.md's evening purge stage).
 CREATE TABLE IF NOT EXISTS train_log (
     run_id              VARCHAR      NOT NULL,
     optimizer_run_id    VARCHAR,
     run_at              VARCHAR      NOT NULL,
-    phase               VARCHAR,                 -- "selection"|"exploitation"|"full"|NULL
+    phase               VARCHAR,                 -- "selection"|"exploitation"|"refit"|"full"|NULL
     trial_idx           INTEGER      NOT NULL DEFAULT 0,
     fold_idx            INTEGER      NOT NULL DEFAULT -1,
     outer_fold_idx      INTEGER      NOT NULL DEFAULT -1,
@@ -828,6 +982,9 @@ CREATE TABLE IF NOT EXISTS train_log (
 -- eval_type:       NULL              = standard backtest (standalone or non-nested exploitation)
 --                  "outer_validation"= nested validation outer fold evaluation
 --                  "regime_holdout"  = regime holdout robustness check
+--                  "champion_validation" = champion outer evaluation, the
+--                                      deployed model's configuration on the
+--                                      same outer fold (pipeline_optimizer.md)
 --   The two are scored on DIFFERENT populations: "outer_validation" rows come
 --   from the volatility-truncated remainder the regime holdout leaves behind,
 --   "regime_holdout" rows from the excluded dates. Neither is an estimate over
@@ -852,7 +1009,8 @@ CREATE TABLE IF NOT EXISTS experiment_log (
     fold_idx             INTEGER      NOT NULL DEFAULT -1,
     outer_fold_idx       INTEGER      NOT NULL DEFAULT -1,
     eval_type            VARCHAR,                -- NULL | "outer_validation" |
-                                                 -- "regime_holdout"
+                                                 -- "regime_holdout" |
+                                                 -- "champion_validation"
     execution_variant    VARCHAR,                -- NULL for the baseline pass;
                                                  --   otherwise the JSON of the
                                                  --   execution-key overrides this
@@ -876,9 +1034,10 @@ CREATE TABLE IF NOT EXISTS experiment_log (
     dead_position_count  INTEGER,
     dead_position_rate   DOUBLE,
     suppressed_count     INTEGER,
-    -- Entry-gate rejection counters (R-5). One per gate in the step-5c.0
-    -- sequence (see live_mode_runner.md); a candidate stopped at a gate has
-    -- NO trade_log row, so these are the only record it existed.
+    -- Entry-gate rejection counters (R-5): one per inference_log.gate_result
+    -- value with a backtest concept (see live_mode_runner.md for the gate
+    -- order); a candidate stopped at a gate has NO trade_log row, so these
+    -- are the only record it existed.
     -- Diagnostic ONLY: best_config() ranks on winning_rate alone and never
     -- reads these.
     -- Nullable on purpose — NULL means "run predates the caps", 0 means
@@ -886,17 +1045,23 @@ CREATE TABLE IF NOT EXISTS experiment_log (
     -- Column naming: gate_blocked_* / breaker_* prefixes group these at a
     -- glance as the table grows, and gate_blocked_* matches
     -- inference_log.gate_result's own values name-for-name.
-    -- Five counters, not eleven: `gate_result` has eleven non-'submitted'
-    -- values, but six have no counter here — 'freeze', 'not_tradable',
-    -- 'bar_integrity' and 'no_terms' have no backtest concept at all (N-5,
-    -- see execution_common.md; 'bar_integrity' is a live
-    -- bar-arrival-latency verdict, and backtest has no bar arrival to be
-    -- late; 'no_terms' is the outcome of a vendor call backtest never
-    -- makes);
+    -- The non-'submitted' `gate_result` values without a counter here:
+    -- 'freeze', 'not_tradable', 'bar_integrity', 'no_terms' and 'cap_inert'
+    -- have no backtest concept at all (N-5, see execution_common.md;
+    -- 'bar_integrity' is a live bar-arrival-latency verdict, and backtest
+    -- has no bar arrival to be late; 'no_terms' is the outcome of a vendor
+    -- call backtest never makes; 'cap_inert' is a refusal under
+    -- live_mode.entry_price_cap_inert, while backtest applies no cap with θ
+    -- inert);
     -- 'breaker' is evaluated in backtest but never enforced (see
     -- breaker_* below, which reports the underlying metrics instead of a
     -- blocked-count that would imply enforcement); 'error' has no
     -- backtest analogue since backtest makes no network calls.
+    gate_blocked_residual_edge   INTEGER,  -- late-detection candidates the
+                                 -- residual-edge gate dropped, with θ
+                                 -- applying: late_entry_expected_return()
+                                 -- not exceeding θ (09_backtest_engine.md);
+                                 -- these drops alone
     gate_blocked_cap_tickers     INTEGER,  -- candidates stopped by
                                  -- execution.max_tickers. Counts CANDIDATES,
                                  -- not distinct tickers — the name reads the
@@ -1025,11 +1190,14 @@ CREATE TABLE IF NOT EXISTS regime_holdout_dates (
     PRIMARY KEY (optimizer_run_id, date)
 );
 
--- Regime holdout verdict — one row per exploitation run that writes a
--- 'regime_holdout' experiment_log row (pipeline_optimizer.md's Regime Holdout
--- Report and Verdict). Always computed; read at live session start, before
--- Inferencer init, for the deployed run_id (live_mode_runner.md), which
--- enforces it only when optimizer.regime_holdout.gate.enabled.
+-- Regime holdout verdict — one row per exploitation or refit run that writes
+-- a 'regime_holdout' experiment_log row (pipeline_optimizer.md's Regime
+-- Holdout Report and Verdict). Always computed; decided through
+-- utils.regime_gate(). A session's participation is blocked by the gate at
+-- live_mode_runner.md's Session Lifecycle Step 7 alone, for the session's
+-- model run_id, and only when optimizer.regime_holdout.gate.enabled;
+-- model_candidates' status at writing and model_deploy's decisions also
+-- read the verdict.
 -- Retention: purge-registry member — date_column `evaluated_at`,
 --   retention_days: inf (see metadata_crawler.md's evening purge stage).
 CREATE TABLE IF NOT EXISTS regime_holdout_verdict (
@@ -1041,6 +1209,71 @@ CREATE TABLE IF NOT EXISTS regime_holdout_verdict (
     verdict          VARCHAR NOT NULL,   -- 'pass' | 'fail' | 'pass_with_warning'
     evaluated_at     VARCHAR NOT NULL,   -- 'YYYYMMDD_HHMMSS'
     PRIMARY KEY (optimizer_run_id)
+);
+
+-- Model deployments — the deployment record, one row per deployment
+-- decision of model_deploy.md. Rows are only appended; the latest row names
+-- the deployed model.
+-- Retention: NEVER purged — structurally excluded from the purge registry
+--   (deployment history).
+CREATE TABLE IF NOT EXISTS model_deployments (
+    deployed_at      VARCHAR NOT NULL,   -- 'YYYYMMDD_HHMMSS'
+    run_id           VARCHAR NOT NULL,   -- the deployed model's run_id
+    optimizer_run_id VARCHAR NOT NULL,   -- the work that produced run_id
+    action           VARCHAR NOT NULL,   -- 'approve' | 'override' | 'rollback'
+    note             VARCHAR
+);
+
+-- Model candidates — one row per final model of an 'exploitation' or
+-- 'refit' work, written by its closing step in the step's write unit
+-- (pipeline_optimizer.md).
+-- Status at writing: 'rejected' when regime_gate_blocked is true or the
+-- comparison is 'fail'; 'awaiting_approval' otherwise. Writing an
+-- 'awaiting_approval' candidate turns every older 'awaiting_approval' row
+-- 'superseded' in the same transaction; writing a 'rejected' candidate
+-- supersedes none.
+-- decided_at is set at every status change after writing — approve,
+-- approve --override and reject (model_deploy.md), and each supersede;
+-- decision_note holds the operator's note, NULL on a supersede. The status
+-- time: decided_at, or created_at when the status is unchanged since
+-- writing.
+-- Retention: purge-registry member — date_column `created_at`,
+--   retention_days: inf (see metadata_crawler.md's evening purge stage).
+CREATE TABLE IF NOT EXISTS model_candidates (
+    final_run_id        VARCHAR NOT NULL,   -- the final model's run_id
+    optimizer_run_id    VARCHAR NOT NULL,
+    phase               VARCHAR NOT NULL,   -- 'exploitation' | 'refit'
+    champion_run_id     VARCHAR,            -- the work's champion snapshot's
+                                            -- run_id; NULL without a snapshot
+    regime_verdict      VARCHAR,            -- the closing step's
+                                            -- regime_holdout_verdict verdict;
+                                            -- NULL when the step writes none
+    regime_gate_blocked BOOLEAN,            -- utils.regime_gate()'s blocked over
+                                            -- that row, under the work's config;
+                                            -- NULL when the step writes none
+    comparison_verdict  VARCHAR NOT NULL,   -- the champion comparison's verdict
+                                            -- (pipeline_optimizer.md):
+                                            -- 'not_applicable' | 'no_champion' |
+                                            -- 'champion_unavailable' |
+                                            -- 'insufficient_sample' | 'pass' |
+                                            -- 'fail'
+    comparison_detail   JSON,               -- Δ, the CI and the date counts as
+                                            -- pipeline_optimizer.md's Champion
+                                            -- Comparison defines them, and each
+                                            -- model's winning_rate, avg_pnl_pct
+                                            -- and total_trades; NULL when the
+                                            -- verdict is 'not_applicable',
+                                            -- 'no_champion' or
+                                            -- 'champion_unavailable'
+    late_entry_theta    JSON,               -- {q: {theta, n}}, the candidate
+                                            -- derivation of θ
+                                            -- (pipeline_optimizer.md)
+    status              VARCHAR NOT NULL,   -- 'awaiting_approval' | 'rejected' |
+                                            -- 'approved' | 'superseded'
+    created_at          VARCHAR NOT NULL,   -- 'YYYYMMDD_HHMMSS'
+    decided_at          VARCHAR,            -- 'YYYYMMDD_HHMMSS'; see above
+    decision_note       VARCHAR,
+    PRIMARY KEY (final_run_id)
 );
 
 -- Trade log (output of BacktestEngine — one row per executed trade;
@@ -1160,8 +1393,9 @@ CREATE TABLE IF NOT EXISTS trade_log (
     is_ambiguous            BOOLEAN      NOT NULL DEFAULT FALSE,
     is_shadow               BOOLEAN      NOT NULL DEFAULT FALSE,  -- TRUE = hypothetical
                                         -- fill from LiveModeRunner shadow mode, not a
-                                        -- real BacktestEngine run; run_id distinguishes
-                                        -- which shadow session (not a real backtest run_id)
+                                        -- real BacktestEngine run; run_id is the
+                                        -- session's model run_id, which also names
+                                        -- that model's regime backtest rows
     predicted_fill_price              DOUBLE,  -- pilot-stage only: simulate_entry_fill()
                                         -- run counterfactually against the same tick
                                         -- data as the real fill above, computed ONCE,
@@ -1253,8 +1487,8 @@ CREATE TABLE IF NOT EXISTS trade_log (
     exit_anchor_bar                   INTEGER, -- utils.hour_to_int(): the instant
     exit_anchor_date                  VARCHAR, --   the exit reason was assigned:
                                         --   the tp/sl effective_second; the
-                                        --   time_limit instant the valid-bar count
-                                        --   was reached; exit_deadline(date) for
+                                        --   holding deadline instant for
+                                        --   time_limit; exit_deadline(date) for
                                         --   session_end and the dead-position Cases
                                         --   reached through it
                                         -- in the reference mode too. Written by
@@ -1302,16 +1536,23 @@ CREATE TABLE IF NOT EXISTS inference_log (
     --   "signal_fired"   : inference completed, signal emitted (up5 or up3)
     --   "no_signal"      : inference completed, no signal
     --   "suppressed"     : signal suppressed by suppress_threshold
-    --   "preload_fail"   : insufficient bar history
+    --   "preload_fail"   : insufficient history — the trading-day check
+    --                      (utils.has_required_history()) or the bar-count
+    --                      check (min_bars) failed
     --   "bars_trimmed"   : t bar or later detected and auto-trimmed from input
     --   "no_detection"   : EntryPointDetector.detect() returned False
     gate_result   VARCHAR,             -- R-5: what became of this candidate at
                                        -- the entry gates. Populated on
                                        -- event='signal_fired' rows ONLY; NULL
-                                       -- everywhere else. Values, in the same
-                                       -- order as the step-5c.0 sequence in
-                                       -- live_mode_runner.md:
+                                       -- everywhere else. Values, in gate order
+                                       -- ('residual_edge' before the step-5c.0
+                                       -- sequence in live_mode_runner.md, the
+                                       -- rest in that sequence's order):
                                        --   'submitted'      : cleared every gate
+                                       --   'residual_edge'  : a late-path
+                                       --                      candidate the
+                                       --                      residual-edge gate
+                                       --                      rejects
                                        --   'freeze'         : a freeze_reason
                                        --                      covering
                                        --                      entry_submission
@@ -1400,6 +1641,10 @@ CREATE TABLE IF NOT EXISTS inference_log (
                                        --                      tickers by name.
                                        --   'sizing_zero'    : quantity resolved to 0
                                        --   'funds'          : check_funds_available()
+                                       --   'cap_inert'      : a limit entry refused
+                                       --                      under
+                                       --                      live_mode.entry_price_
+                                       --                      cap_inert "refuse"
                                        -- A COLUMN rather than new event values,
                                        -- because gate_result is not a separate
                                        -- occurrence: it is how the
@@ -1442,12 +1687,16 @@ CREATE TABLE IF NOT EXISTS inference_log (
                                        -- single-INSERT design has no
                                        -- "gate not yet evaluated"
                                        -- in-between state to also mean.
+    entry_path    VARCHAR,             -- 'bar_close' | 'late' on 'signal_fired'
+                                       -- rows; NULL everywhere else
     signal        VARCHAR,             -- "up5" | "up3" | NULL
     prob_up5      DOUBLE,
     prob_up3      DOUBLE,
     prob_sw       DOUBLE,
     prob_dn3      DOUBLE,
     prob_dn5      DOUBLE,
+    required_days INTEGER,             -- populated on preload_fail only
+    actual_days   INTEGER,             -- populated on preload_fail only
     required_bars INTEGER,             -- populated on preload_fail only
     actual_bars   INTEGER,             -- populated on preload_fail only
     fail_reason   VARCHAR,             -- populated on preload_fail / bars_trimmed
@@ -1477,12 +1726,87 @@ CREATE TABLE IF NOT EXISTS inference_log (
     -- never re-logs a past bar.
 );
 
+-- Inference features — one row per inference whose inference_log event is
+-- 'signal_fired', 'no_signal' or 'suppressed', carrying that row's logged_at
+-- (inferencer.md). A diagnostic write: INSERT OR IGNORE, a dropped or failed
+-- row counted (finding 22). Read by metadata_crawler.md's
+-- evening_feature_drift stage.
+-- Retention: purge-registry member — date_column `date`, retention_days: inf
+--   (see metadata_crawler.md's evening purge stage).
+CREATE TABLE IF NOT EXISTS inference_features (
+    logged_at  VARCHAR  NOT NULL,   -- the same inference's inference_log.logged_at
+    ticker     VARCHAR  NOT NULL,
+    date       VARCHAR  NOT NULL,   -- 'YYYYMMDD'
+    hour       VARCHAR  NOT NULL,   -- 'HHMMSS'
+    run_id     VARCHAR  NOT NULL,
+    features   DOUBLE[] NOT NULL,   -- in the model's meta feature_names order
+    PRIMARY KEY (logged_at, ticker, date, hour)
+);
+
+-- Prediction drift — written by metadata_crawler.md's
+-- evening_prediction_drift stage:
+--   - R: the evening's date's live_session_state.run_id; the stage computes
+--     only when that date is a session of R — a date whose run_id is R and
+--     whose session_diagnostics.start_outcomes holds an entry of kind
+--     'participating' — and replaces that date's rows of R in one
+--     transaction; otherwise 'no_session', no rows written;
+--   - window: inference_log rows of run_id R on the last
+--     drift.window_sessions sessions of R, with event 'signal_fired',
+--     'no_signal' or 'suppressed';
+--   - per class probability: the PSI of the window against R's reference
+--     file ({run_id}_reference.json), an empty bin's share floored at
+--     drift.psi_floor, and the row count;
+--   - R without a reference file → 'no_reference', no rows written.
+-- The drift values are not a retraining trigger.
+-- Retention: purge-registry member — date_column `date`, retention_days: inf
+--   (see metadata_crawler.md's evening purge stage).
+CREATE TABLE IF NOT EXISTS prediction_drift_daily (
+    date     VARCHAR NOT NULL,   -- 'YYYYMMDD', the evening's date
+    run_id   VARCHAR NOT NULL,   -- R
+    output   VARCHAR NOT NULL,   -- 'prob_up5' | 'prob_up3' | 'prob_sw' |
+                                 -- 'prob_dn3' | 'prob_dn5'
+    psi      DOUBLE,
+    n        INTEGER NOT NULL,   -- the window's row count
+    PRIMARY KEY (date, run_id, output)
+);
+
+-- Feature drift — written by metadata_crawler.md's evening_feature_drift
+-- stage, its R, date rule, window sessions and reference file the
+-- prediction drift stage's:
+--   - observations: inference_features rows of run_id R on the window's
+--     dates;
+--   - per feature: numeric — the reference bins plus a NaN bin;
+--     categorical — the reference categories plus an unseen-category bin and
+--     a NaN bin; the PSI over those bins, an empty share floored at
+--     drift.psi_floor;
+--   - a reference file without feature profiles → 'no_reference', no rows
+--     written.
+-- Retention: purge-registry member — date_column `date`, retention_days: inf
+--   (see metadata_crawler.md's evening purge stage).
+CREATE TABLE IF NOT EXISTS feature_drift_daily (
+    date                VARCHAR NOT NULL,   -- 'YYYYMMDD', the evening's date
+    run_id              VARCHAR NOT NULL,   -- R
+    feature             VARCHAR NOT NULL,
+    psi                 DOUBLE,
+    nan_share_reference DOUBLE,
+    nan_share_observed  DOUBLE,
+    n                   INTEGER NOT NULL,   -- the observation count
+    PRIMARY KEY (date, run_id, feature)
+);
+
 -- Precomputed session statistics (REFERENCE_SESSION baselines) — a derived
 -- table (Derived tables, after this DDL region).
 -- Per-bar aggregated values from prior N sessions; delta smoothing applied at load time.
 -- config_hash: the config_hash of utils.populate_precomputed_session_stats()'s
---              Config Keys Used; N is that config's
---              indicators.reference_session.n_sessions (derived_configs).
+--              Config Keys Used, with code_versions holding the data version;
+--              N is that config's indicators.reference_session.n_sessions
+--              (derived_configs).
+-- Slots: a prior session D-k contributes to slot H only when
+--              utils.session_phase(D-k, H, closes, ends) is 'premarket' or
+--              'regular'; after-hours slots, an early-close session's
+--              included, contribute nothing. The cumulative metrics
+--              (rvol_baseline, rel_dvol_baseline) accumulate from
+--              PREMARKET_OPEN.
 -- as_of_date=D: baselines computed from sessions [D-1, D-2, ..., D-N], intended for use on D.
 --              Written by utils.populate_precomputed_session_stats(), the
 --              table's producer, called by:
@@ -1502,8 +1826,10 @@ CREATE TABLE IF NOT EXISTS precomputed_session_stats (
     hour        VARCHAR  NOT NULL,   -- 'HHMMSS': time slot; '000000' for day-level metrics
     metric      VARCHAR  NOT NULL,
     -- metric values:
-    --   "rvol_baseline"        : prior N sessions avg cumulative volume at this hour
-    --   "rel_dvol_baseline"    : prior N sessions avg cumulative dollar volume at this hour
+    --   "rvol_baseline"        : prior N sessions avg cumulative volume at this hour,
+    --                            accumulated from PREMARKET_OPEN
+    --   "rel_dvol_baseline"    : prior N sessions avg cumulative dollar volume at this
+    --                            hour, accumulated from PREMARKET_OPEN
     --   "intra_vol_baseline"   : prior N sessions avg volume at this hour slot
     --   "intra_return_baseline": prior N sessions avg price_return at this hour slot
     --   "intra_tpm_baseline"   : prior N sessions avg tpm at this hour slot
@@ -1514,21 +1840,31 @@ CREATE TABLE IF NOT EXISTS precomputed_session_stats (
     --                            utils.md populate_precomputed_session_stats() D.)
     --   "gap_pct_mean"         : prior N sessions gap mean  (hour='000000')
     --   "gap_pct_std"          : prior N sessions gap std   (hour='000000')
+    --   "price_52h"            : the highest high of the regular-session bars of the
+    --                            indicators.reference_session.price_extremes_sessions
+    --                            trading days before D, D excluded, each bar's prices
+    --                            split-adjusted to D through cum_split_ratio()
+    --                            (hour='000000'; avg_value the extreme, std_value NULL)
+    --   "price_52l"            : the lowest low, the same way (hour='000000')
     avg_value   DOUBLE   NOT NULL,   -- per-bar average over prior N sessions (no delta applied)
     std_value   DOUBLE,              -- standard deviation (optional; used for gap_pct normalization)
     count       INTEGER  NOT NULL,   -- actual sessions contributing to this average.
                                      -- May be < the config's n_sessions for several reasons:
                                      --   (a) near dataset start (insufficient history)
-                                     --   (b) halt bars reduce valid session count at
-                                     --       specific hour slots (per-bar metrics only)
+                                     --   (b) a session with no bar at that slot
+                                     --       (per-bar metrics only)
                                      --   (c) gap_pct count drops when D-k has no
-                                     --       non-halt regular-session bar, or its
-                                     --       093000 bar is halted or missing
+                                     --       regular-session bar
                                      --   (d) an early-close session is excluded
                                      --       WHOLESALE from the cumulative metrics
                                      --       (rvol_baseline, rel_dvol_baseline) —
                                      --       see utils.md
                                      --       populate_precomputed_session_stats() A
+                                     --   (e) an early-close session contributes no
+                                     --       slot past its own close
+                                     -- price_52h / price_52l: count is the trading
+                                     -- days used — with fewer available, those
+                                     -- days; with none, no row.
                                      -- Granularity: per (config_hash, ticker, as_of_date, hour, metric)
                                      -- count may differ by hour slot within same ticker/date.
     source_seq  BIGINT   NOT NULL,   -- the group's mark (Derived tables)
@@ -1563,6 +1899,8 @@ CREATE TABLE IF NOT EXISTS precomputed_session_stats (
 -- runs for a ticker computed at the Eager Pool step: a ticker restored from
 -- today's rows is not purged, so today's backup survives a re-crash during
 -- recovery.
+-- The fibonacci entry's cache_data carries its monotonic deque state
+-- (_fib_*), persisted and restored with it (caching_calculator.md).
 CREATE TABLE IF NOT EXISTS indicator_cache (
     session_date  VARCHAR  NOT NULL,   -- 'YYYYMMDD'
     ticker        VARCHAR  NOT NULL,
@@ -2022,7 +2360,8 @@ FROM pending;
 --   (see metadata_crawler.md's evening purge stage).
 CREATE TABLE IF NOT EXISTS live_session_state (
     date               VARCHAR NOT NULL,
-    run_id             VARCHAR NOT NULL,
+    run_id             VARCHAR NOT NULL,  -- the session's model run_id
+                                          -- (live_mode_runner.md)
     session_start_cash DECIMAL(28,6) NOT NULL,
     started_at         VARCHAR NOT NULL,
     stage              VARCHAR NOT NULL,  -- 'shadow' | 'pilot' | 'scale'
@@ -2120,7 +2459,11 @@ CREATE TABLE IF NOT EXISTS live_session_state (
                                           -- not, once participation is
                                           -- enabled, which is the same ground
                                           -- entry_fill_rate_disabled is stored
-                                          -- on), clock_offset_start,
+                                          -- on; the code_version gate's cause
+                                          -- detail naming the lock's hash, the
+                                          -- current hash, the changed files and
+                                          -- the changed distribution versions),
+                                          -- clock_offset_start,
                                           -- clock_offset_end,
                                           -- retention_boundary (each probe also
                                           -- flagged 'disabled' | 'succeeded' |
@@ -2129,9 +2472,11 @@ CREATE TABLE IF NOT EXISTS live_session_state (
                                           -- the fallbacks are safe but they
                                           -- silently change gap-fill
                                           -- behaviour); the finding-5
-                                          -- tier-fallback summary; finding 8's
+                                          -- cache-gap summary; finding 8's
                                           -- halt-check source counts; finding
-                                          -- 22's dropped-row count; the
+                                          -- 22's dropped and failed row counts
+                                          -- per table (inference_log,
+                                          -- inference_features); the
                                           -- per-ticker terms-acquisition tally
                                           -- — first-listing attempts, failures,
                                           -- and THE BLOCKED TICKERS BY NAME
@@ -2171,16 +2516,27 @@ CREATE TABLE IF NOT EXISTS live_session_state (
                                           --   - probe values overwritten;
                                           --   - counters resumed;
                                           --   - start_outcomes carried
-                                          --     forward and appended.
+                                          --     forward and appended;
+                                          --   - the cache-gap summary, with
+                                          --     its measurement time `at`,
+                                          --     carried forward and replaced
+                                          --     only when Health Gate 2's
+                                          --     check runs again.
+                                          -- start_outcomes' readers, beside
+                                          -- health_report.md: probation, the
+                                          -- drift stages and the weekly
+                                          -- divergence evaluation. A session
+                                          -- of run_id R is a date whose run_id
+                                          -- is R and whose start_outcomes holds
+                                          -- an entry of kind 'participating'.
     PRIMARY KEY (date)
 );
 
 -- Bar-arrival latency accumulation (T-13 self-measurement — see
 -- api_contract_checklist.md and health_report.md finding 26). One row per
 -- (date, sample_class).
--- WHY A TABLE and not an in-memory tally handed to health_report.py the way
--- findings 5/8 are: those have nowhere to be stored; this does, and it needs
--- somewhere for two independent reasons.
+-- WHY A TABLE and not an in-memory tally handed to health_report.py: the
+-- counts need durable storage, for the reasons below.
 --   (a) Crash loss is NOT random with respect to what is being measured. A
 --       crash correlates with feed trouble — i.e. with exactly the
 --       high-latency days — so losing those sessions biases the curve
@@ -2452,22 +2808,43 @@ CREATE TABLE IF NOT EXISTS feed_coverage_daily (
 --   halt_start_delta_ms_p50 | _p95
 --                            start-time difference where both sides carry
 --                            the same interval, same stage
+--   halt_open_end_carried | _uncarried
+--                            tickers whose previous trading day's rows end
+--                            in a NULL-ended row, split by whether their
+--                            date has a row starting at or before its first
+--                            bar; counted market-wide from trading_halts and
+--                            ohlcv_1min through the symbology layer,
+--                            independent of halts.continuation; same stage
 --   promotions_total         completed-bar detections found by the rotation
 --                            slot and promoted
 --   late_entry_gate_pass | _reject
 --                            residual-edge gate outcomes, populated only when
---                            execution.late_entry_enabled is true
--- OVERLAP, deliberately not resolved by subtracting: a promoted ticker that
--- produced no late entry leaves no inference_log row for that bar, so it
--- appears in gap_unevaluated AND in promotions_total. gap_unevaluated is the
+--                            execution.late_entry_enabled is true and θ
+--                            applies
+--   regular_open_total | _late
+--                            calculators with a recorded on_regular_session_open()
+--                            hour, and those whose recorded hour is later than
+--                            093000; written at Session Shutdown
+--   extremes_parity_total | _diverged
+--                            evening_session_stats stage, for its date D:
+--                            tickers with a counted price_52h or price_52l
+--                            field, and those with a counted field where
+--                            |vendor ÷ derived − 1| >
+--                            price_extremes_parity.tolerance
+--                            (metadata_crawler.md)
+-- OVERLAP, deliberately not resolved by subtracting: a promoted ticker whose
+-- finding did not go through the late path leaves no inference_log row for
+-- that bar, so it appears in gap_unevaluated AND in promotions_total.
+-- gap_unevaluated is the
 -- outer set and promotions_total names a known, already-handled part of it.
 -- These two must never be added together.
 -- Re-run rule: UPSERT PER (date, metric) — NOT feed_coverage_daily's
 -- DELETE-the-date-then-INSERT. Its writers touch one date at different
 -- times: LiveModeRunner writes the in-session keys at session end, and
 -- metadata_crawler.md's evening run writes the gap_* keys from its
--- evening_detection_gap stage and the halt_* keys from its
--- evening_halt_comparison stage, hours later. A blanket delete by date on a
+-- evening_detection_gap stage, the halt_* keys from its
+-- evening_halt_comparison stage and the extremes_parity_* keys from its
+-- evening_session_stats stage, hours later. A blanket delete by date on a
 -- later write would erase an earlier writer's rows. The tables on either
 -- side of this one warn about the opposite errors — bar_latency_daily
 -- against a blanket `+=`, feed_coverage_daily against an additive merge —
@@ -2492,9 +2869,9 @@ CREATE TABLE IF NOT EXISTS live_scan_daily (
 -- one, so a per-position column would store one interval N times. A
 -- position's halted minutes are derived by intersecting
 -- [live_position_state.first_entry_fill_at, now]
--- with this ticker's rows, which is what execution.max_hold_bars' live
--- reading needs (elapsed minus halted == build_effective_bar_sequence()'s
--- valid-bar count).
+-- with this ticker's rows, which is what execution.max_hold_minutes' live
+-- reading needs (the holding minutes are the elapsed minutes minus the
+-- halted ones, as build_effective_bar_sequence() counts them).
 -- MUST NEVER be merged into or written to trading_halts. That table is the
 -- NYSE-crawled authority, structurally excluded from purging as a historical
 -- fact, carries no writer discriminator, and is read by Labeler,
@@ -2702,7 +3079,9 @@ CREATE TABLE IF NOT EXISTS exit_trigger_agreement_daily (
 --   - session_phase_mismatch;
 --   - order_unmapped;
 --   - finding 9's execution_param_fit_rejected and
---     execution_param_bound_fallback.
+--     execution_param_bound_fallback;
+--   - collection_gaps (finding 59), from the shared ingestion logic
+--     (migration_tool.md).
 -- Findings 13 and 15 deliberately do NOT: each already writes its own
 -- trade_log row (finding 13: exit_reason='restart_gap_exit'; finding 15:
 -- rows with exit_date > date OR exit_reason='overnight_exit', and
@@ -2715,15 +3094,19 @@ CREATE TABLE IF NOT EXISTS health_events (
     event_id     VARCHAR NOT NULL,   -- '{YYYYMMDD}_{HHMMSSmmm}_{4 random chars}',
                                      --   generated inside record_health_event()
                                      --   (see utils.md): time-sortable, and
-                                     --   collision-free across the two processes
-                                     --   that can write here — a live session and
-                                     --   the evening batch — without coordination
+                                     --   collision-free across the processes
+                                     --   that can write here — a live session,
+                                     --   the evening batch and a guest
+                                     --   ingestion run (`run_guest
+                                     --   migration_tool` or `collect_daily.py
+                                     --   --ingest-only`) — without coordination
     date         VARCHAR NOT NULL,   -- 'YYYYMMDD', writing process's start day,
                                      --   same rule as bar_latency_daily.date
     finding_name VARCHAR NOT NULL,   -- health_report.md's finding KEY, not its
                                      --   documentation number: the number is list
                                      --   order and shifts, the key does not
-    occurred_at  VARCHAR NOT NULL,   -- 'YYYYMMDD_HHMMSSmmm' — when the EVENT
+    occurred_at  VARCHAR NOT NULL,   -- 'YYYYMMDD_HHMMSSmmm', America/New_York
+                                     --   wall clock — when the EVENT
                                      --   happened, not when this row was written;
                                      --   the two differ whenever a write is
                                      --   retried or batched
@@ -2766,11 +3149,12 @@ CREATE TABLE IF NOT EXISTS alert_log (
                                          --   ATTEMPT, so a report going to two
                                          --   channels produces two ids
     date             VARCHAR NOT NULL,   -- 'YYYYMMDD', writing process's start day
-    alert_key        VARCHAR NOT NULL,   -- the INVOCATION PATH, not the finding:
+    alert_key        VARCHAR NOT NULL,   -- the INVOCATION PATH, not the finding;
+                                         --   the alert_keys a delivery with a DB
+                                         --   connection writes:
                                          --   'session_start' | 'session_end' |
                                          --   'breaker_trip' | 'session_start_abort' |
                                          --   'bar_close_premise_violation' |
-                                         --   'scheduled_work_deferred' |
                                          --   'order_unmapped' |
                                          --   'evening_liveness_probe' |
                                          --   'evening_end' |
@@ -2869,7 +3253,7 @@ trade.
 | `entry_canceled` | never-opened | backtest, live | not a trade | FALSE | `entry_bar` | 09_backtest_engine.md Entry Slippage Model; live_mode_runner.md Position Manager Loop | The entry ended with nothing filled, other than by rejection, whatever its terminal_cause (live_mode_runner.md); a real observation, not omitted from the table. `fit_execution_params()` reads every row for `buy_rate` — an entry that ended early read on the window it actually had (shadow_retraining.md). |
 | `entry_rejected` | never-opened | live | not a trade | FALSE | `entry_bar` | live_mode_runner.md Watchdog Polling Loop and Position Manager Loop | (R-7) The broker or the account refused the submission itself (account restriction, insufficient funds at the actual price, ticker not permitted). Same row shape as `entry_canceled`, and it likewise counts as a cooldown attempt — but it is EXCLUDED from `fit_execution_params()`, because a refusal carries no evidence about how the market absorbed an order. The two labels are opposites on exactly that point. |
 | `feed_gap_exit` | live-only operational | live | excluded | FALSE | the live rule below | live_mode_runner.md Feed Outage Recovery | Exit condition triggered during a Feed Outage Recovery gap (live_mode_runner.md). |
-| `restart_gap_exit` | live-only operational | live | excluded | FALSE | the live rule below | live_mode_runner.md Session Restart (Warm Start) | (R-2) tp/sl breached during a crash gap, detected retroactively on warm restart via gap-fill ticks + the 2-print guard, and liquidated at CURRENT price (the historical breach price is stale by then). If the gap already exceeds `execution.max_hold_bars`, retro-detection is skipped and the position is liquidated immediately, still `restart_gap_exit`. |
+| `restart_gap_exit` | live-only operational | live | excluded | FALSE | the live rule below | live_mode_runner.md Session Restart (Warm Start) | (R-2) tp/sl breached during a crash gap, detected retroactively on warm restart via gap-fill ticks + the 2-print guard, and liquidated at CURRENT price (the historical breach price is stale by then). If the gap already passes the holding deadline (`execution.max_hold_minutes`), retro-detection is skipped and the position is liquidated immediately, still `restart_gap_exit`. |
 | `overnight_exit` | live-only operational | live | excluded | FALSE | the live rule below | live_mode_runner.md Unified Overnight Policy Label rule | (R-3) A position carried from a PRIOR trading day with no exit logical order before the carry, or an adopted broker position (`origin='adopted'`), liquidated by the Unified Overnight Policy as soon as tradable. NOT covered: a halt-carried position — its ticker's `live_halt_episodes` interval on its date contains `exit_deadline(date)` — which is `dead_position`, PnL included; and a carried position with a prior exit logical order, attributed under its inherited trigger label, PnL included. |
 | `reconcile_ghost` | live-only operational | live | excluded | FALSE | the live rule below | live_mode_runner.md Position Manager Loop Position close | (R-3) A position closed by a shortfall adjustment: Broker Reconcile found fewer shares at the broker than the ledger holds (live_mode_runner.md's Positions branch). `quantity` = `entry_qty`. |
 
@@ -2900,9 +3284,10 @@ Outside:
 Key and config:
 - a derived table's key starts with `config_hash`, utils.md's `config_hash()`
   of the config keys its producer lists:
-  - `labeled_samples` — the Preprocessor work's config_hash;
+  - `labeled_samples` — the Preprocessor work's config_hash, its
+    code_versions member holding the data version;
   - `precomputed_session_stats` — `populate_precomputed_session_stats()`'s
-    Config Keys Used;
+    Config Keys Used, with code_versions holding the data version;
 - every producer writes its config's `derived_configs` row with INSERT OR
   IGNORE in the transaction of its rows, before them.
 
@@ -2930,7 +3315,9 @@ Stale:
 Footprints:
 - `precomputed_session_stats` of (T, as_of D):
   - T and its `ticker_history` predecessors;
-  - `corporate_events` from the earliest of D's n_sessions prior trading days
+  - `corporate_events` from the earliest of D's
+    `indicators.reference_session.n_sessions` and
+    `indicators.reference_session.price_extremes_sessions` prior trading days
     through D;
   - from that day through D−1:
     - `ohlcv_1min`;
@@ -2940,10 +3327,11 @@ Footprints:
     - `trading_halts`;
     - `ticker_history`;
 - `labeled_samples` of (T, D):
-  - T and its `ticker_history` predecessors;
+  - the symbols of (T, D)'s security chain;
   - D through the next trading day with `has_data`, open end when none;
-  - every tracked table but `fundamentals_quarterly`;
-- a Preprocessor batch file — run_preprocess.md.
+  - every tracked table but `fundamentals_quarterly` and `fx_rates`;
+- a Preprocessor batch file — the chain symbols of its segments; the rest in
+  run_preprocess.md.
 
 Provisional:
 - a derived row is provisional (`is_provisional = TRUE`, set by its writer)
@@ -2988,18 +3376,20 @@ Tracked tables:
 - `trading_halts`;
 - `corporate_events`;
 - `ticker_history`;
-- `fundamentals_quarterly`.
+- `fundamentals_quarterly`;
+- `fx_rates`.
 
 Write rule:
-- a write that inserts a row of a tracked table or changes a stored value
-  appends its `source_changes` rows in the same transaction;
+- a write that inserts a row of a tracked table, changes a stored value or
+  deletes a row appends its `source_changes` rows in the same transaction;
 - a write that changes nothing appends none;
 - a derived table's writes append none.
 
 Rows per writer:
 - ingestion — per imported (table, ticker, date), that date;
-- `populate_ticker_coverage()` — none, its rows covered by the ingestion rows
-  of the same (ticker, date);
+- `populate_ticker_coverage()` — none, its rows covered by the
+  `source_changes` rows of the same (ticker, date) that the ingestion or the
+  Ingestion-Range Cleanup appends;
 - `crawl_nyse_halts()` — per (ticker, date) whose `trading_halts` rows were
   inserted or changed, that date;
 - `populate_trading_calendar()` — per inserted or changed date, ticker NULL;
@@ -3012,7 +3402,12 @@ Rows per writer:
   - an effective_date correction — current_ticker, from the earlier date to
     the day before the later;
 - `fundamentals_quarterly` — per inserted or changed (ticker, filed_date),
-  from filed_date, open end.
+  from filed_date, open end;
+- `fx_rates` (metadata_crawler.md's evening_fx_rates stage) — per write, a
+  row for each ticker holding a `fundamentals_quarterly` row in that
+  currency, its date range the written dates;
+- migration_tool.md's Ingestion-Range Cleanup — per (table, ticker, date) it
+  removes rows from, that date.
 
 ---
 
@@ -3052,6 +3447,7 @@ Roles:
   - detection_benchmark;
   - init_db;
   - migration_tool;
+  - model_deploy;
   - the DuckDB recovery (`restore_db()`).
 
 Precedence: runner > premarket > evening > guest. The evening run yields at
@@ -3290,7 +3686,8 @@ exp_results = con.execute("""
            winning_rate, total_trades, suppressed_count
     FROM experiment_log
     WHERE optimizer_run_id = ?
-      AND (eval_type IS NULL OR eval_type NOT IN ('outer_validation', 'regime_holdout'))
+      AND (eval_type IS NULL OR eval_type NOT IN ('outer_validation', 'regime_holdout',
+                                                  'champion_validation'))
     ORDER BY fold_idx
 """, ["20250519_143022"]).df()
 ```
@@ -3302,10 +3699,18 @@ exp_results = con.execute("""
 - All numeric fields from JSON are stored as strings → parsed to the column's
   type on insert: prices `DECIMAL(18,6)`, volumes `BIGINT` (utils.md's
   Numeric Rules)
-- **No session filtering** — all sessions (pre-market, regular, after-market;
-  `hour` 040000~200000) are stored; overnight is excluded by the ingestion
-  time-range filter — see `migrate_json_to_duckdb.py` / `metadata_crawler.md`
-- `seq_id` for tick_10: assigned as row-order index within each `(ticker, date, hour)` group, starting from 0
+- **No session filtering** — the ingestion range is
+  `hour >= '040000' AND hour < '193000'` for `ohlcv_1min` and `tick_10`, all
+  sessions inside it stored (pre-market, regular, after-market) — see
+  `migrate_json_to_duckdb.py` / `metadata_crawler.md`:
+  - a date's files run from the preceding evening's 20:00 (overnight) to a
+    vendor cut a few seconds past 19:30; the range keeps [04:00, 19:30),
+    excluding the overnight and the cut's uneven tail;
+  - it is fixed, not per-date, an early-close day ending at 17:00 inside it;
+  - a tick file's rows at hours in [193000, 200000) go to `tick_10_tail`, in
+    the file's import transaction; the duplicate skip stays on `tick_10`, and
+    INSERT OR IGNORE absorbs a re-import's tail rows
+- `seq_id` for `tick_10` and `tick_10_tail`: assigned as row-order index within each `(ticker, date, hour)` group, starting from 0
 - Duplicate skip: check existence of `(ticker, date)` pair in target table before inserting; skip entire file if already present
 - entry_points table: INSERT OR IGNORE — written by both Preprocessor (training) and Inferencer (live)
 - After ingestion: `trading_calendar` and `ticker_data_coverage` updated via

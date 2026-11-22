@@ -55,10 +55,11 @@ class ImportanceProvider(ABC):
         Averaging strategy controlled by:
             config["dimensionality_reducer"]["importance_averaging"]
             "uniform"        — simple mean across classifiers
-            "sample_weighted" — weighted by training sample count per classifier;
-                                equal to "uniform" while every classifier is
-                                trained on the shared train split, and kept as
-                                the slot for a later weighting basis
+            "sample_weighted" — each classifier weighted by inverse positive
+                                prevalence: weight[label] = 1 / p_label, p_label
+                                the positive fraction of train_labels[label]; a
+                                label with no positives gets weight 0; weights
+                                normalized to sum 1
 
         Returns:
             pd.Series: index=feature_name, values=importance score (float)
@@ -113,7 +114,9 @@ if importance_averaging == "uniform":
     result = mean(imp.values())
 
 if importance_averaging == "sample_weighted":
-    weight[label] = train_labels[label].shape[0]   # n_samples per classifier
+    p_label       = train_labels[label].mean()      # positive fraction
+    weight[label] = 1 / p_label if p_label > 0 else 0
+    weight        = weight / sum(weight.values())   # normalized to sum 1
     result = weighted_mean(imp.values(), weights=weight.values())
 ```
 
@@ -123,7 +126,7 @@ For each classifier in models:
     explainer = shap.TreeExplainer(booster)
     shap_vals[label] = |explainer.shap_values(X)|.mean(axis=0)
 
-averaging: same strategy as get_importance()
+averaging: same strategy as get_importance(), "sample_weighted" included
 
 Note: X passed here is already subsampled if shap_subsample_n is configured.
       Provider does not apply additional subsampling.
@@ -208,7 +211,8 @@ For each pair (fi, fj) where |corr(fi, fj)| > threshold:
     remove the feature with lower importance_scores value
     (alphabetical tiebreak if scores are equal)
 
-Default threshold: 0.95 (configurable)
+threshold: config dimensionality_reducer.correlation_filter.threshold, passed
+by run_all()
 ```
 
 ### Stage 2: Importance Filter
@@ -218,7 +222,8 @@ Uses the same `importance_scores` obtained in `run_all()` — no additional prov
 ```
 Remove features in the bottom percentile by importance score.
 
-Default: remove bottom 20% (configurable)
+bottom_pct: config dimensionality_reducer.importance_filter.bottom_pct, passed
+by run_all()
 ```
 
 ### Stage 3: SHAP Filter (optional)
@@ -299,7 +304,7 @@ class DimensionalityReducer:
         self,
         X: pd.DataFrame,
         importance_scores: pd.Series,
-        threshold: float = 0.95,
+        threshold: float,
     ) -> list[str]:
         """
         importance_scores: pre-computed from provider.get_importance() in run_all().
@@ -311,7 +316,7 @@ class DimensionalityReducer:
         self,
         feature_names: list[str],
         importance_scores: pd.Series,
-        bottom_pct: float = 0.20,
+        bottom_pct: float,
     ) -> list[str]:
         """
         importance_scores: same pre-computed scores from run_all().
@@ -344,7 +349,9 @@ class DimensionalityReducer:
         Calls provider.get_importance() exactly once at entry.
         Passes resulting importance_scores to correlation_filter()
         and importance_filter() directly — no additional provider calls
-        for importance within this method.
+        for importance within this method — and passes from its config
+        correlation_filter.threshold to correlation_filter() and
+        importance_filter.bottom_pct to importance_filter().
 
         Returns (selected_features, reduction_report).
         reduction_report includes importance_scores, selected_features,
@@ -401,25 +408,30 @@ def frequency_vote(
 ## Integration with PipelineOptimizer
 
 ```
-Selection phase (PipelineOptimizer):
+Selection phase (PipelineOptimizer) — Stage A, then Stage B:
 
-For each fold in generate_folds():
-    1. Train model on full feature set              → fold model
+Stage A (group competition): reducer-off training per fold and per
+alternative; DimensionalityReducer not used.
+
+Stage B-1, for each fold and each reducer config (a Stage B grid point
+without its vote_threshold):
+    1. Train model on Stage B's input set, run_reducer=True → fold model
     2. create_importance_provider(...)              → provider
     3. reducer.run_all(X_train, X_valid, provider)  → selected_features, reduction_report
        (reduction_report["selected_features"] populated automatically)
-    4. Accumulate reduction_reports list
-    5. Include reduction_report["importance_scores"] in feature_selection_log
+    4. The reduction report is written per fold and reducer config
 
-After all folds:
-    6. frequency_vote(reduction_reports, threshold=vote_threshold)
-       → confirmed selected_features
-    7. Save to configs/selected_features.json
-    8. Save feature_selection_log.json (includes per-fold importance_scores)
-    (No per-fold retraining on selected features)
+Stage B-2, for each candidate (a grid point):
+    5. frequency_vote(that reducer config's fold reports,
+       threshold=the candidate's vote_threshold) → its voted set
+    6. Per-fold reducer-off retraining on the voted set; the candidate's
+       score is the mean over folds of its runs' auc_mean
+    7. The pick (dimensionality_reducer.auc_tolerance) is saved to
+       configs/selected_features.json (pipeline_optimizer.md)
 
-Exploitation phase (PipelineOptimizer):
+Exploitation and refit phases (PipelineOptimizer):
     DimensionalityReducer not used — selected_features loaded from JSON
+    (exploitation) or from the retained configuration (refit)
 ```
 
 ---
@@ -429,9 +441,9 @@ Exploitation phase (PipelineOptimizer):
 ```yaml
 dimensionality_reducer:
   importance_averaging: "uniform"   # "uniform" | "sample_weighted"
-                                    # a selection-phase setting, not searched;
-                                    # searching it needs a selection-phase
-                                    # search step (open_items.md)
+                                    # a selection-phase setting; Stage B
+                                    # searches it (optimizer.selection
+                                    # .search_space, pipeline_optimizer.md)
   vote_threshold: 0.5               # fraction of folds a feature must appear in
                                     # to be included in selected_features
                                     # used by PipelineOptimizer frequency_vote()
@@ -450,7 +462,9 @@ dimensionality_reducer:
                                     # null = use full X_train (no subsampling)
                                     # recommended: 500 for selection phase speed
   auc_tolerance: 0.005              # acceptable AUC drop from reduction
-                                    # used by run_train.py --reduce CLI flow only
+                                    # used by the selection phase's pick
+                                    # (pipeline_optimizer.md) and run_train.md's
+                                    # --reduce gate
 ```
 
 ---

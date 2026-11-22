@@ -70,7 +70,8 @@ should be confirmed against live responses.
   `rsp_cd` nor `rsp_msg`:
   - `'unmapped'` — the ticker has no `trading_api_symbol`;
   - `'phase_refused'` — an order type the current session phase does not
-    permit (Layer Responsibility Split's validation);
+    permit, every order type at phase `'closed'` included (Layer
+    Responsibility Split's validation);
 - sent and refused, the result carrying `rsp_cd` and `rsp_msg` verbatim:
   - `'rejected'` — a vendor business code;
   - `'phase_mismatch'` — a vendor session-phase code (the session-phase
@@ -524,7 +525,13 @@ with an economic consequence. What this module owns is validation — refusing
 an order type the current session phase does not permit, checked against the
 same session-phase table `permitted_order_type()` implements, before it
 reaches the vendor, because letting it through returns an `rsp_cd` the
-caller would have to decode.
+caller would have to decode. The validation:
+- the production client is constructed with `closes` and `ends` (utils.md's
+  Session Boundary Derivations); a client constructed without them raises on
+  every order request — new, amend and cancel — not an order result kind;
+- new and amend requests are validated against `utils.session_phase()` at
+  the call instant, `'closed'` giving `'phase_refused'`;
+- cancel requests are never phase-validated.
 
 ---
 
@@ -660,6 +667,10 @@ Applying it:
   read-only material and are not part of the Spec File Structure
 - Order submission, amendment and cancellation are never re-attempted at this
   layer, whatever re-attempt budget a caller passes
+- New and amend requests are phase-validated through `utils.session_phase()`
+  at the call instant, on the `closes` and `ends` the production client is
+  constructed with; cancel requests are never phase-validated; a client
+  constructed without them raises on every order request, cancel included
 - Order identity is `(order_date, OrdNo)`, never `OrdNo` alone
 - CONVERT targets for prices, amounts and quantities are `Decimal` (V1); a
   quantity's integrality is asserted where it is written to
